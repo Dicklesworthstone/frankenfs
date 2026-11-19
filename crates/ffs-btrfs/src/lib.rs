@@ -9046,11 +9046,11 @@ impl BtrfsExtentAllocator {
     /// so an item added here still reaches disk.
     ///
     /// # Errors
-    /// [`BtrfsMutationError::NoSpace`] when no SYSTEM block group has room. Note
-    /// that growth does not yet cover this case: `plan_growth_for_commit` only
-    /// plans METADATA chunks, so an exhausted system chunk fails rather than
-    /// growing. The `alloc_no_space_*` diagnostic names the required flags, so
-    /// the failure says which resource ran out.
+    /// [`BtrfsMutationError::NoSpace`] when no SYSTEM block group has room.
+    /// Commit-time SYSTEM chunk growth is planned ahead of serialization via
+    /// [`plan_growth_for_shortfall`] (`ChunkKind::System`) in `ffs-core`; if the
+    /// device itself has no free run left, `alloc_no_space_*` names the required
+    /// flags so the failure says which resource ran out.
     pub fn alloc_system_for_tree(
         &mut self,
         num_bytes: u64,

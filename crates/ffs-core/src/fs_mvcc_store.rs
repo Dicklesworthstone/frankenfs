@@ -71,11 +71,13 @@ pub enum FsMvccStore {
     Single {
         lock: RwLock<MvccStore>,
         ssi_enabled: AtomicBool,
+        extent_cache: std::sync::OnceLock<Arc<ffs_block::ShardedExtentReadCache>>,
     },
     /// Sharded store: default in-memory parallel-write path.
     Sharded {
         store: ShardedMvccStore,
         ssi_enabled: AtomicBool,
+        extent_cache: std::sync::OnceLock<Arc<ffs_block::ShardedExtentReadCache>>,
     },
 }
 
@@ -88,6 +90,7 @@ impl FsMvccStore {
         Self::Single {
             lock: RwLock::new(store),
             ssi_enabled: AtomicBool::new(false),
+            extent_cache: std::sync::OnceLock::new(),
         }
     }
 
@@ -103,6 +106,7 @@ impl FsMvccStore {
         Self::Sharded {
             store: ShardedMvccStore::for_host_parallelism(),
             ssi_enabled: AtomicBool::new(false),
+            extent_cache: std::sync::OnceLock::new(),
         }
     }
 
@@ -113,6 +117,23 @@ impl FsMvccStore {
                 mode,
             ),
             ssi_enabled: AtomicBool::new(false),
+            extent_cache: std::sync::OnceLock::new(),
+        }
+    }
+
+    pub(super) fn attach_extent_read_cache(&self, cache: Arc<ffs_block::ShardedExtentReadCache>) {
+        match self {
+            Self::Single { extent_cache, .. } | Self::Sharded { extent_cache, .. } => {
+                let _ = extent_cache.set(cache);
+            }
+        }
+    }
+
+    fn extent_cache(&self) -> Option<&Arc<ffs_block::ShardedExtentReadCache>> {
+        match self {
+            Self::Single { extent_cache, .. } | Self::Sharded { extent_cache, .. } => {
+                extent_cache.get()
+            }
         }
     }
 
@@ -224,17 +245,51 @@ impl FsMvccStore {
         if self.is_ssi_enabled() {
             return self.commit_ssi(txn);
         }
-        match self {
+        let staged_blocks: smallvec::SmallVec<[BlockNumber; 8]> = if self.extent_cache().is_some() {
+            txn.write_set().keys().copied().collect()
+        } else {
+            smallvec::SmallVec::new()
+        };
+        if let Some(cache) = self.extent_cache()
+            && !staged_blocks.is_empty()
+        {
+            cache.invalidate_blocks(&staged_blocks);
+        }
+        let res = match self {
             Self::Single { lock, .. } => lock.write().commit(txn),
             Self::Sharded { store, .. } => store.commit(txn).map_err(|(error, _txn)| error),
+        };
+        if res.is_ok()
+            && let Some(cache) = self.extent_cache()
+            && !staged_blocks.is_empty()
+        {
+            cache.invalidate_blocks(&staged_blocks);
         }
+        res
     }
 
     pub(super) fn commit_ssi(&self, txn: Transaction) -> Result<CommitSeq, CommitError> {
-        match self {
+        let staged_blocks: smallvec::SmallVec<[BlockNumber; 8]> = if self.extent_cache().is_some() {
+            txn.write_set().keys().copied().collect()
+        } else {
+            smallvec::SmallVec::new()
+        };
+        if let Some(cache) = self.extent_cache()
+            && !staged_blocks.is_empty()
+        {
+            cache.invalidate_blocks(&staged_blocks);
+        }
+        let res = match self {
             Self::Single { lock, .. } => lock.write().commit_ssi(txn),
             Self::Sharded { store, .. } => store.commit_ssi(txn).map_err(|(error, _txn)| error),
+        };
+        if res.is_ok()
+            && let Some(cache) = self.extent_cache()
+            && !staged_blocks.is_empty()
+        {
+            cache.invalidate_blocks(&staged_blocks);
         }
+        res
     }
 
     pub(super) fn abort(&self, txn: Transaction, reason: TxnAbortReason, detail: Option<String>) {
@@ -853,7 +908,7 @@ impl<D: BlockDevice> BlockDevice for FsMvccBlockDevice<D> {
         let count_u64 = u64::try_from(count)
             .map_err(|_| FfsError::Format("block range exceeds u64".to_owned()))?;
         self.validate_range(start, count_u64)?;
-        if self.reads_base_directly() {
+        if self.reads_base_directly() || self.store.version_count() == 0 {
             self.base.read_contiguous_into(cx, start, dst)?;
             return cx.checkpoint().map_err(|_| FfsError::Cancelled);
         }

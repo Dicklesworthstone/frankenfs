@@ -2349,6 +2349,10 @@ impl FrankenFuse {
                     Ok(moved_len)
                 }) {
                     Ok(moved_len) => {
+                        self.inner.readahead.invalidate_inode(InodeNumber(ino));
+                        if let Some(donor) = donor_ino {
+                            self.inner.readahead.invalidate_inode(donor);
+                        }
                         let mut success_ctx = log_ctx;
                         success_ctx.donor_ino = donor_ino;
                         Self::log_move_ext_success(success_ctx, moved_len);
@@ -3374,7 +3378,10 @@ impl FrankenFuse {
                     self.inner.ops.commit_request_scope(cx, scope)?;
                     Ok(())
                 }) {
-                    Ok(()) => IoctlResult::Data(Vec::new()),
+                    Ok(()) => {
+                        self.inner.readahead.invalidate_inode(InodeNumber(ino));
+                        IoctlResult::Data(Vec::new())
+                    }
                     Err(error) => IoctlResult::Error(error.to_errno()),
                 }
             }
@@ -3409,7 +3416,10 @@ impl FrankenFuse {
                     self.inner.ops.commit_request_scope(cx, scope)?;
                     Ok(())
                 }) {
-                    Ok(()) => IoctlResult::Data(Vec::new()),
+                    Ok(()) => {
+                        self.inner.readahead.invalidate_inode(InodeNumber(ino));
+                        IoctlResult::Data(Vec::new())
+                    }
                     Err(error) => IoctlResult::Error(error.to_errno()),
                 }
             }

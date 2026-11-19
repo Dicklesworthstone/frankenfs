@@ -1254,7 +1254,11 @@ impl FsOps for OpenFs {
                             // Only what the growth planner can actually place:
                             // not the reserved head, the superblock mirrors, or
                             // runs too short for a chunk (generic/103, bd-5cf5p).
-                            let unallocated = if self.btrfs_grow_data_chunks_enabled() {
+                            // Refuse to advertise growable space when the chunk or
+                            // device tree failed to load completely (bd-a136s).
+                            let unallocated = if self.btrfs_grow_data_chunks_enabled()
+                                && alloc.chunk_trees_authoritative
+                            {
                                 match (
                                     ffs_btrfs::chunk_entries_from_chunk_tree(&alloc.chunk_tree),
                                     ffs_btrfs::GrowthDevice::from_chunk_tree(
@@ -5354,6 +5358,8 @@ impl FsOps for OpenFs {
             && let Some(stale) = view.as_mut()
         {
             **stale = true;
+            self.file_data_extent_cache.clear();
+            self.btrfs_decompressed_extent_cache.clear();
         }
         drop(view);
         drop(publication);

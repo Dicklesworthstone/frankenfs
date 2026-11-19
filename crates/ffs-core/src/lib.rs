@@ -2419,19 +2419,11 @@ struct BtrfsAllocState {
     /// Extent allocator for data and metadata block allocation.
     extent_alloc: BtrfsExtentAllocator,
     /// In-memory COW B-tree holding CHUNK_ITEMs and the DEV_ITEM, seeded from
-    /// the on-disk chunk tree at mount (bd-a136s). Chunk ALLOCATION inserts
-    /// here; until that is wired, this is loaded and re-serialized unchanged.
-    #[allow(
-        dead_code,
-        reason = "read by chunk allocation, wired in a later commit (bd-a136s)"
-    )]
+    /// the on-disk chunk tree at mount (bd-a136s). Chunk allocation inserts
+    /// here and marks [`Self::chunk_trees_dirty`] so commit re-serializes it.
     chunk_tree: InMemoryCowBtrfsTree,
     /// In-memory COW B-tree holding DEV_EXTENTs — the reverse map of every chunk
     /// onto the physical device ranges backing it (bd-a136s).
-    #[allow(
-        dead_code,
-        reason = "read by chunk allocation, wired in a later commit (bd-a136s)"
-    )]
     dev_tree: InMemoryCowBtrfsTree,
     /// Set when a chunk was ALLOCATED this transaction, so the chunk tree and
     /// device tree must be re-serialized at commit (bd-a136s).
@@ -2441,10 +2433,6 @@ struct BtrfsAllocState {
     /// csum tree. Without this flag every commit would COW-rewrite the whole
     /// chunk tree at fresh addresses for a tree that did not change — the exact
     /// per-commit metadata amplification bd-42gtq and bd-uxh7t are about.
-    #[allow(
-        dead_code,
-        reason = "set by chunk allocation, wired in a later commit (bd-a136s)"
-    )]
     chunk_trees_dirty: bool,
     /// False when the chunk tree or device tree could not be read in full.
     ///
@@ -2455,10 +2443,6 @@ struct BtrfsAllocState {
     /// Unlike the extent tree, where a failed load costs accounting that the next
     /// commit recomputes, a failed device-tree load costs the only record of
     /// what is already on the disk.
-    #[allow(
-        dead_code,
-        reason = "read by chunk allocation, wired in a later commit (bd-a136s)"
-    )]
     chunk_trees_authoritative: bool,
     /// Newly-created subvolume fs-trees awaiting their first commit, keyed by
     /// the subvolume's root objectid (>= `BTRFS_FIRST_FREE_OBJECTID`). Each is
@@ -3197,13 +3181,9 @@ pub struct OpenFs {
     /// The writable path bypasses this cache because file data changes are
     /// published through MVCC and eventually persisted to these blocks.
     ext4_file_data_block_cache: ShardedCache<BlockNumber, Arc<[u8]>>,
-    /// Byte-bounded read-only cache of contiguous ext4 file-data extents.
-    ///
-    /// Large file reads take the zero-copy contiguous-device path and therefore
-    /// intentionally bypass the scalar block cache above. Keeping whole runs
-    /// here lets a later offset read reuse a previous cold extent without
-    /// making resident memory a function of the image size.
-    ext4_file_data_extent_cache: Ext4ReadExtentCache,
+    /// Byte-bounded, lock-striped S3-FIFO extent read cache for ext4 (physical
+    /// block keys) and btrfs (logical sector keys), coherent across RO and RW mounts.
+    file_data_extent_cache: Arc<ffs_block::ShardedExtentReadCache>,
     /// Read-only parsed inode ATTR cache (inode number → InodeAttr). On a read-only
     /// mount inodes are immutable, so a resolved attr can be reused across repeated
     /// lookups/getattrs (a directory scan re-resolves the same children) instead of
@@ -4932,90 +4912,6 @@ impl<K: std::hash::Hash + Eq + CacheShard, V: Clone> ShardedCache<K, V> {
 ///
 /// Unlike [`ShardedCache`], this cache answers contained-range queries: a
 /// previously cached 128 KiB extent can satisfy a later 8 KiB read starting in
-/// its middle. Entries are admitted only while their aggregate payload stays
-/// within the configured byte budget; there is no eviction policy that could
-/// make the resident footprint exceed that budget.
-struct Ext4ReadExtentCache {
-    inner: Mutex<Ext4ReadExtentCacheInner>,
-    capacity_bytes: usize,
-}
-
-struct Ext4ReadExtentCacheInner {
-    entries: BTreeMap<BlockNumber, Arc<[u8]>>,
-    resident_bytes: usize,
-}
-
-impl Ext4ReadExtentCache {
-    fn new(capacity_bytes: usize) -> Self {
-        Self {
-            inner: Mutex::new(Ext4ReadExtentCacheInner {
-                entries: BTreeMap::new(),
-                resident_bytes: 0,
-            }),
-            capacity_bytes,
-        }
-    }
-
-    /// Copy `dst` from an extent that fully contains `[start, start + dst)`.
-    ///
-    /// The payload `Arc` is cloned while locked and the potentially large copy
-    /// happens after releasing the cache mutex, so one reader never blocks
-    /// another reader for the duration of a data copy.
-    fn copy_into(&self, start: BlockNumber, block_size: usize, dst: &mut [u8]) -> bool {
-        if dst.is_empty() || block_size == 0 {
-            return false;
-        }
-        let Some((extent_start, extent)) = self
-            .inner
-            .lock()
-            .entries
-            .range(..=start)
-            .next_back()
-            .map(|(key, value)| (*key, Arc::clone(value)))
-        else {
-            return false;
-        };
-        let Some(block_delta) = start.0.checked_sub(extent_start.0) else {
-            return false;
-        };
-        let Ok(block_delta) = usize::try_from(block_delta) else {
-            return false;
-        };
-        let Some(offset) = block_delta.checked_mul(block_size) else {
-            return false;
-        };
-        let Some(end) = offset.checked_add(dst.len()) else {
-            return false;
-        };
-        let Some(source) = extent.get(offset..end) else {
-            return false;
-        };
-        dst.copy_from_slice(source);
-        true
-    }
-
-    /// Admit one physical extent if its immutable payload fits the fixed budget.
-    fn insert(&self, start: BlockNumber, bytes: Arc<[u8]>) {
-        if bytes.is_empty() || bytes.len() > self.capacity_bytes {
-            return;
-        }
-        let mut inner = self.inner.lock();
-        if inner.entries.contains_key(&start)
-            || inner.resident_bytes.saturating_add(bytes.len()) > self.capacity_bytes
-        {
-            return;
-        }
-        inner.resident_bytes += bytes.len();
-        inner.entries.insert(start, bytes);
-    }
-
-    fn clear(&self) {
-        let mut inner = self.inner.lock();
-        inner.entries.clear();
-        inner.resident_bytes = 0;
-    }
-}
-
 /// Back-reference index used by `btrfs_resolve_inode_path` in read-only mode.
 ///
 /// Keyed on the fs-tree root bytenr observed when the index was built so that
@@ -6126,6 +6022,7 @@ impl BlockDevice for ByteDeviceBlockAdapter<'_> {
 struct CachedByteDeviceBlockAdapter<'a> {
     base: ByteDeviceBlockAdapter<'a>,
     cache: Option<&'a ShardedCache<BlockNumber, BlockBuf>>,
+    extent_cache: Option<&'a ffs_block::ShardedExtentReadCache>,
 }
 
 impl CachedByteDeviceBlockAdapter<'_> {
@@ -6151,9 +6048,15 @@ impl CachedByteDeviceBlockAdapter<'_> {
         if let Some(cache) = self.cache {
             cache.remove(&block);
         }
+        if let Some(ext) = self.extent_cache {
+            ext.invalidate_block(block);
+        }
     }
 
     fn invalidate_range(&self, start: BlockNumber, count: usize) -> Result<(), FfsError> {
+        if let Some(ext) = self.extent_cache {
+            ext.invalidate_block_range(start, count);
+        }
         if self.cache.is_none() {
             return Ok(());
         }
@@ -8645,6 +8548,13 @@ impl OpenFs {
             _ => None,
         };
 
+        let file_data_extent_cache = Arc::new(ffs_block::ShardedExtentReadCache::new(
+            ext4_file_data_extent_cache_bytes(),
+        ));
+        if matches!(&flavor, FsFlavor::Ext4(_)) {
+            mvcc_store.attach_extent_read_cache(Arc::clone(&file_data_extent_cache));
+        }
+
         let mut fs = Self {
             flavor,
             ext4_geometry,
@@ -8716,9 +8626,7 @@ impl OpenFs {
             ext4_inode_table_locations: OnceLock::new(),
             ext4_inode_table_block_cache: ShardedCache::new(),
             ext4_file_data_block_cache: ShardedCache::new(),
-            ext4_file_data_extent_cache: Ext4ReadExtentCache::new(
-                ext4_file_data_extent_cache_bytes(),
-            ),
+            file_data_extent_cache,
             ext4_inode_attr_cache: ShardedCache::new(),
             ext4_inode_xattr_block_cache: ShardedCache::new(),
             ext4_inode_xattr_cache: ShardedCache::new(),
@@ -9280,16 +9188,28 @@ impl OpenFs {
         self.extent_cache.stats()
     }
 
+    /// Telemetry for the byte-budgeted S3-FIFO file-data extent read cache (`bd-mf9z9`).
+    #[must_use]
+    pub fn file_data_extent_cache_metrics(&self) -> ffs_block::ExtentCacheMetrics {
+        self.file_data_extent_cache.metrics()
+    }
+
     /// Aggregated live cache telemetry across `OpenFs`'s extent, metadata, and block caches.
     #[must_use]
     pub fn cache_telemetry(&self) -> OpenFsCacheTelemetry {
         let ext = self.extent_cache.stats();
-        let mut hits = ext.hits;
-        let mut misses = ext.misses;
-        let evictions = ext.evictions;
+        let data_ext = self.file_data_extent_cache.metrics();
+        let tile_unit_bytes = usize::try_from(self.block_size())
+            .unwrap_or(4096)
+            .max(1)
+            .saturating_mul(ffs_block::EXTENT_CACHE_TILE_BLOCKS);
+        let data_ext_cap_tiles = data_ext.capacity_bytes / tile_unit_bytes.max(1);
+        let mut hits = ext.hits.saturating_add(data_ext.hits);
+        let mut misses = ext.misses.saturating_add(data_ext.misses);
+        let evictions = ext.evictions.saturating_add(data_ext.evictions);
         let mut t1_len = ext.entries;
-        let mut t2_len = 0_usize;
-        let mut capacity = ext.capacity;
+        let mut t2_len = data_ext.resident_tiles;
+        let mut capacity = ext.capacity.saturating_add(data_ext_cap_tiles);
 
         match &self.flavor {
             FsFlavor::Ext4(_) => {
@@ -9863,7 +9783,7 @@ impl OpenFs {
         self.ext4_inode_table_block_cache.clear();
         self.ext4_group_desc_cache.clear();
         self.ext4_file_data_block_cache.clear();
-        self.ext4_file_data_extent_cache.clear();
+        self.file_data_extent_cache.clear();
         self.ext4_base_block_cache.clear();
 
         info!(
@@ -10581,7 +10501,7 @@ impl OpenFs {
         self.ext4_inode_table_block_cache.clear();
         self.ext4_group_desc_cache.clear();
         self.ext4_file_data_block_cache.clear();
-        self.ext4_file_data_extent_cache.clear();
+        self.file_data_extent_cache.clear();
         self.ext4_inode_attr_cache.clear();
         self.ext4_inode_xattr_block_cache.clear();
         self.ext4_inode_xattr_cache.clear();
@@ -10652,6 +10572,9 @@ impl OpenFs {
                 block_size,
             },
             cache: self.ext4_base_block_cache_for_adapter(),
+            extent_cache: self
+                .is_ext4()
+                .then_some(self.file_data_extent_cache.as_ref()),
         };
 
         let journal_start_block = segments[0].start.0;
@@ -11478,7 +11401,7 @@ impl OpenFs {
         self.ext4_inode_table_block_cache.clear();
         self.ext4_group_desc_cache.clear();
         self.ext4_file_data_block_cache.clear();
-        self.ext4_file_data_extent_cache.clear();
+        self.file_data_extent_cache.clear();
         self.ext4_base_block_cache.clear();
         debug!(
             ino,
@@ -12332,7 +12255,7 @@ impl OpenFs {
             self.ext4_inode_table_block_cache.clear();
             self.ext4_group_desc_cache.clear();
             self.ext4_file_data_block_cache.clear();
-            self.ext4_file_data_extent_cache.clear();
+            self.file_data_extent_cache.clear();
             self.ext4_base_block_cache.clear();
         }
         Ok(())
@@ -13556,6 +13479,57 @@ impl OpenFs {
         data_bytes.saturating_add(alloc.pending_metadata_bytes())
     }
 
+    fn btrfs_effective_dirty_bytes_limit_locked(&self, alloc: &BtrfsAllocState, limit: u64) -> u64 {
+        const TIGHT_META_WINDOW_BYTES: u64 = 16 * 1024 * 1024;
+        if limit != DEFAULT_BTRFS_DIRTY_BYTES_THRESHOLD
+            || self.btrfs_commit_out_of_space.load(Ordering::Acquire)
+        {
+            return limit;
+        }
+        let has_meta_bg = alloc
+            .extent_alloc
+            .space_info()
+            .iter()
+            .any(|s| s.flags & BTRFS_BLOCK_GROUP_METADATA != 0);
+        if !has_meta_bg {
+            return limit;
+        }
+        let meta_free = alloc
+            .extent_alloc
+            .allocatable_bytes(BTRFS_BLOCK_GROUP_METADATA);
+        if meta_free >= TIGHT_META_WINDOW_BYTES {
+            return limit;
+        }
+        let meta_growable = if self.btrfs_grow_chunks_enabled() && alloc.chunk_trees_authoritative {
+            match (
+                self.btrfs_superblock(),
+                ffs_btrfs::chunk_entries_from_chunk_tree(&alloc.chunk_tree),
+            ) {
+                (Some(sb), Ok(chunks)) => ffs_btrfs::GrowthDevice::from_chunk_tree(
+                    &alloc.chunk_tree,
+                    sb.fsid,
+                )
+                .map_or(0, |dev| {
+                    ffs_btrfs::growable_chunk_bytes(
+                        &chunks,
+                        ffs_btrfs::ChunkKind::Metadata,
+                        &dev,
+                        &ffs_btrfs::ChunkSizePolicy::default(),
+                    )
+                }),
+                _ => 0,
+            }
+        } else {
+            0
+        };
+        let headroom = meta_free.saturating_add(meta_growable);
+        if headroom >= TIGHT_META_WINDOW_BYTES {
+            return limit;
+        }
+        let floor = u64::from(alloc.nodesize).saturating_mul(8);
+        limit.min((headroom / 2).max(floor))
+    }
+
     /// Run only after the outermost mutation and its semantic/allocator guards
     /// have released. A request has already completed, so retain debt and log a
     /// failed boundary rather than replacing the request's result.
@@ -13567,31 +13541,37 @@ impl OpenFs {
         {
             return;
         }
-        if self.btrfs_alloc_state.is_none() {
+        let Some(alloc_mutex) = &self.btrfs_alloc_state else {
             self.ext4_commit_on_journal_pressure(cx);
             return;
-        }
+        };
         let limit = self.btrfs_dirty_bytes_threshold.load(Ordering::Acquire);
         let out_of_space = self.btrfs_commit_out_of_space.load(Ordering::Acquire);
         if limit == 0 && !out_of_space {
             return;
         }
-        let pending_bytes = self.btrfs_pending_dirty_bytes();
-        if pending_bytes < limit && !out_of_space {
+        let (pending_bytes, effective_limit) = {
+            let alloc = alloc_mutex.read();
+            (
+                self.btrfs_pending_dirty_bytes_locked(&alloc),
+                self.btrfs_effective_dirty_bytes_limit_locked(&alloc, limit),
+            )
+        };
+        if pending_bytes < effective_limit && !out_of_space {
             return;
         }
         match self.btrfs_pressure_transaction_commit(cx, limit) {
             Ok(true) => info!(
                 target: "ffs::btrfs::writeback",
                 pending_bytes,
-                limit,
+                limit = effective_limit,
                 committed = true,
                 "btrfs_pressure_commit"
             ),
             Ok(false) => debug!(
                 target: "ffs::btrfs::writeback",
                 pending_bytes,
-                limit,
+                limit = effective_limit,
                 committed = false,
                 "btrfs_pressure_commit"
             ),
@@ -13599,7 +13579,7 @@ impl OpenFs {
                 warn!(
                     target: "ffs::btrfs::writeback",
                     pending_bytes,
-                    limit,
+                    limit = effective_limit,
                     %error,
                     "btrfs_pressure_commit_failed"
                 );
@@ -13798,6 +13778,8 @@ impl OpenFs {
         let commit_seq = scope.commit_if_write(&self.mvcc_store)?;
         if let Some(stale) = view.as_mut() {
             **stale = true;
+            self.file_data_extent_cache.clear();
+            self.btrfs_decompressed_extent_cache.clear();
         }
         drop(view);
         drop(mutation);
@@ -15667,6 +15649,8 @@ impl OpenFs {
         // starts, a failure can leave the backing changed without publication.
         if let Some(stale) = view.as_mut() {
             **stale = true;
+            self.file_data_extent_cache.clear();
+            self.btrfs_decompressed_extent_cache.clear();
         }
 
         // Phase 2: write all pending blocks to the JBD2 journal.
@@ -18249,8 +18233,29 @@ impl OpenFs {
             })
     }
 
+    fn btrfs_invalidate_logical_bytes(&self, logical: u64, byte_len: u64) {
+        if byte_len == 0 {
+            return;
+        }
+        let bs = u64::from(self.block_size());
+        if bs == 0 {
+            return;
+        }
+        let start_blk = logical / bs;
+        let end_blk = logical.saturating_add(byte_len).div_ceil(bs);
+        if let Ok(count) = usize::try_from(end_blk.saturating_sub(start_blk))
+            && count > 0
+        {
+            self.file_data_extent_cache
+                .invalidate_block_range(BlockNumber(start_blk), count);
+        }
+    }
+
     #[expect(clippy::cast_possible_truncation)]
     fn btrfs_write_logical(&self, cx: &Cx, mut logical: u64, data: &[u8]) -> Result<(), FfsError> {
+        let orig_logical = logical;
+        let orig_len = u64::try_from(data.len()).unwrap_or(u64::MAX);
+        self.btrfs_invalidate_logical_bytes(orig_logical, orig_len);
         let ctx = self
             .btrfs_context()
             .ok_or_else(|| FfsError::Format("not a btrfs filesystem".into()))?;
@@ -18344,6 +18349,7 @@ impl OpenFs {
             data_remaining = &data_remaining[to_write_usize..];
         }
 
+        self.btrfs_invalidate_logical_bytes(orig_logical, orig_len);
         Ok(())
     }
 
@@ -18966,10 +18972,112 @@ impl OpenFs {
         Ok(std::sync::Arc::new(items.into_values().collect()))
     }
 
-    /// Read attached-device data through whole-sector checksum validation.
-    /// Only bytes from the validated copy reach the destination, including
-    /// unaligned windows and compressed on-disk data. Missing checksums keep
-    /// the existing unchecked-read policy; single-device reads are unchanged.
+    fn btrfs_verify_aligned_sectors(
+        &self,
+        csum_items: &[(BtrfsKey, Vec<u8>)],
+        sectorsize: usize,
+        csum_type: u16,
+        csum_size: usize,
+        sector_floor: u64,
+        aligned_bytes: &[u8],
+    ) -> ffs_error::Result<()> {
+        for (idx, sector_bytes) in aligned_bytes.chunks_exact(sectorsize).enumerate() {
+            let delta = u64::try_from(idx * sectorsize)
+                .map_err(|_| FfsError::Format("btrfs csum sector offset overflow".into()))?;
+            let bytenr = sector_floor
+                .checked_add(delta)
+                .ok_or_else(|| FfsError::Format("btrfs csum sector bytenr overflow".into()))?;
+            let Some(expected) = lookup_data_block_csum(csum_items, bytenr, sectorsize, csum_size)
+            else {
+                continue;
+            };
+            if !ffs_btrfs::btrfs_data_csum_matches(csum_type, sector_bytes, expected) {
+                let devid = self
+                    .btrfs_context()
+                    .and_then(|ctx| map_logical_to_physical(&ctx.chunks, bytenr).ok().flatten())
+                    .or_else(|| {
+                        self.btrfs_live_chunks()
+                            .and_then(|live| map_logical_to_physical(&live, bytenr).ok().flatten())
+                    })
+                    .map_or(1, |m| m.devid);
+                self.record_btrfs_dev_stat(devid, BTRFS_DEV_STAT_CORRUPTION_ERRS);
+                let actual =
+                    ffs_btrfs::btrfs_data_csum(csum_type, sector_bytes).unwrap_or_default();
+                return Err(FfsError::Corruption {
+                    block: bytenr,
+                    detail: format!(
+                        "btrfs data csum mismatch at logical {bytenr}: \
+                         expected {}, computed {} (csum_type {csum_type})",
+                        btrfs_csum_hex(expected),
+                        btrfs_csum_hex(&actual[..csum_size]),
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn btrfs_read_single_device_checksummed_into(
+        &self,
+        cx: &Cx,
+        csum_items: &[(BtrfsKey, Vec<u8>)],
+        sectorsize: usize,
+        logical: u64,
+        out: &mut [u8],
+    ) -> ffs_error::Result<()> {
+        if out.is_empty() {
+            return Ok(());
+        }
+        let sector_len = u64::try_from(sectorsize)
+            .ok()
+            .filter(|size| *size != 0)
+            .ok_or_else(|| FfsError::Format("invalid btrfs sectorsize".into()))?;
+        let csum_type = self
+            .btrfs_context()
+            .map_or(ffs_types::BTRFS_CSUM_TYPE_CRC32C, |ctx| ctx.csum_type);
+        let csum_size = ffs_btrfs::btrfs_data_csum_size(csum_type).ok_or_else(|| {
+            FfsError::UnsupportedFeature(format!(
+                "btrfs checksum algorithm {csum_type} is not implemented \
+                 (CRC32C=0 and XXHASH64=1 are)"
+            ))
+        })?;
+        let end = logical
+            .checked_add(
+                u64::try_from(out.len())
+                    .map_err(|_| FfsError::Format("btrfs read length overflow".into()))?,
+            )
+            .ok_or_else(|| FfsError::Format("btrfs read end overflow".into()))?;
+
+        if logical.is_multiple_of(sector_len) && out.len().is_multiple_of(sectorsize) {
+            self.btrfs_read_logical_into(cx, logical, out)?;
+            return self.btrfs_verify_aligned_sectors(
+                csum_items, sectorsize, csum_type, csum_size, logical, out,
+            );
+        }
+
+        let sector_floor = logical - (logical % sector_len);
+        let sector_ceil = end.div_ceil(sector_len).saturating_mul(sector_len);
+        let aligned_len = usize::try_from(sector_ceil - sector_floor)
+            .map_err(|_| FfsError::Format("btrfs aligned read span overflow".into()))?;
+        let head_skip = usize::try_from(logical - sector_floor)
+            .map_err(|_| FfsError::Format("btrfs sector head offset overflow".into()))?;
+        let mut aligned_buf = vec![0_u8; aligned_len];
+        self.btrfs_read_logical_into(cx, sector_floor, &mut aligned_buf)?;
+        self.btrfs_verify_aligned_sectors(
+            csum_items,
+            sectorsize,
+            csum_type,
+            csum_size,
+            sector_floor,
+            &aligned_buf,
+        )?;
+        out.copy_from_slice(&aligned_buf[head_skip..head_skip + out.len()]);
+        Ok(())
+    }
+
+    /// Read single-device or attached-device data through whole-sector checksum
+    /// validation. Only bytes from the validated copy reach the destination,
+    /// including unaligned windows and compressed on-disk data.
     fn btrfs_read_checksummed_into(
         &self,
         cx: &Cx,
@@ -18979,7 +19087,9 @@ impl OpenFs {
         mut out: &mut [u8],
     ) -> ffs_error::Result<()> {
         let Some(devices) = &self.btrfs_devices else {
-            return self.btrfs_read_logical_into(cx, logical, out);
+            return self.btrfs_read_single_device_checksummed_into(
+                cx, csum_items, sectorsize, logical, out,
+            );
         };
         let ctx = self
             .btrfs_context()
@@ -19891,64 +20001,86 @@ impl OpenFs {
                 Ok(())
             };
 
-        // Verify data checksums on read (bd-tkv2n), opt-OUT via
-        // OpenOptions.btrfs_verify_data_on_read. For a datasum inode, verify the
-        // regular extents overlapping the read range against the csum tree and
-        // return EIO (Corruption) on a mismatch — matching the kernel — before
-        // any data is returned. ON by default, so a plain read pays this cost;
-        // the read rows banked before the default flipped did not (bd-6kpp4).
-        let mut read_checksums = None;
-        if self.btrfs_verify_data_on_read && inode.flags & BTRFS_INODE_NODATASUM == 0 {
-            let verify_sectorsize = self
+        // Verify data checksums on read (bd-tkv2n / bd-mf9z9): validate only the
+        // sectors actually read on cache miss instead of pre-reading entire multi-MiB
+        // extents serially before serving or hitting cache.
+        let should_verify =
+            self.btrfs_verify_data_on_read && (inode.flags & BTRFS_INODE_NODATASUM == 0);
+        let allow_cache_admit = should_verify || (inode.flags & BTRFS_INODE_NODATASUM != 0);
+        let mut verify_sectorsize = 0_usize;
+        let mut csum_disk_ranges: Vec<(u64, u64)> = Vec::new();
+        if should_verify {
+            verify_sectorsize = self
                 .btrfs_superblock()
                 .and_then(|sb| usize::try_from(sb.sectorsize).ok())
                 .filter(|s| *s != 0)
                 .ok_or_else(|| FfsError::Format("invalid btrfs sectorsize".into()))?;
-            let disk_ranges: Vec<(u64, u64)> = extents
+            let csum_type = self
+                .btrfs_context()
+                .map_or(ffs_types::BTRFS_CSUM_TYPE_CRC32C, |ctx| ctx.csum_type);
+            let _ = ffs_btrfs::btrfs_data_csum_size(csum_type).ok_or_else(|| {
+                FfsError::UnsupportedFeature(format!(
+                    "btrfs checksum algorithm {csum_type} is not implemented \
+                     (CRC32C=0 and XXHASH64=1 are)"
+                ))
+            })?;
+            let sec_u64 = verify_sectorsize as u64;
+            csum_disk_ranges = extents
                 .iter()
                 .filter_map(|(logical_start, extent)| match extent {
                     BtrfsExtentData::Regular {
+                        extent_type,
+                        compression,
                         disk_bytenr,
                         disk_num_bytes,
+                        extent_offset,
                         num_bytes,
                         ..
                     } if *disk_bytenr != 0
+                        && *extent_type != BTRFS_FILE_EXTENT_PREALLOC
                         && *logical_start < read_end
                         && logical_start.saturating_add(*num_bytes) > offset =>
                     {
-                        Some((*disk_bytenr, *disk_num_bytes))
+                        if *compression != 0 {
+                            Some((*disk_bytenr, *disk_num_bytes))
+                        } else {
+                            let win_lo = (*logical_start).max(offset);
+                            let win_hi = logical_start.saturating_add(*num_bytes).min(read_end);
+                            let raw_lo = disk_bytenr
+                                .saturating_add(*extent_offset)
+                                .saturating_add(win_lo - logical_start);
+                            let raw_hi = raw_lo.saturating_add(win_hi - win_lo);
+                            let floor_lo = raw_lo - (raw_lo % sec_u64);
+                            let ceil_hi = raw_hi.div_ceil(sec_u64).saturating_mul(sec_u64);
+                            Some((floor_lo, ceil_hi.saturating_sub(floor_lo)))
+                        }
                     }
                     _ => None,
                 })
                 .collect();
-            let csum_items = self.btrfs_read_csum_items_covering(cx, &disk_ranges)?;
-            for (logical_start, extent) in extents.iter() {
-                let BtrfsExtentData::Regular {
-                    extent_type,
-                    disk_bytenr,
-                    disk_num_bytes,
-                    num_bytes,
-                    ..
-                } = extent
-                else {
-                    continue;
-                };
-                let extent_end = logical_start.saturating_add(*num_bytes);
-                if *logical_start < read_end && extent_end > offset {
-                    self.btrfs_verify_one_extent_csum(
-                        cx,
-                        &csum_items,
-                        verify_sectorsize,
-                        *extent_type,
-                        *disk_bytenr,
-                        *disk_num_bytes,
-                    )?;
-                }
-            }
-            if self.btrfs_devices.is_some() {
-                read_checksums = Some((csum_items, verify_sectorsize));
-            }
         }
+        let lazy_csums: std::sync::OnceLock<Result<std::sync::Arc<BtrfsCsumItems>, FfsError>> =
+            std::sync::OnceLock::new();
+        let load_csums = || -> Result<&[(BtrfsKey, Vec<u8>)], FfsError> {
+            match lazy_csums
+                .get_or_init(|| self.btrfs_read_csum_items_covering(cx, &csum_disk_ranges))
+            {
+                Ok(items) => Ok(items.as_slice()),
+                Err(FfsError::Cancelled) => Err(FfsError::Cancelled),
+                Err(FfsError::Corruption { block, detail }) => Err(FfsError::Corruption {
+                    block: *block,
+                    detail: detail.clone(),
+                }),
+                Err(FfsError::UnsupportedFeature(msg)) => {
+                    Err(FfsError::UnsupportedFeature(msg.clone()))
+                }
+                Err(FfsError::Io(io_err)) => Err(FfsError::Io(io_err.raw_os_error().map_or_else(
+                    || std::io::Error::other(io_err.to_string()),
+                    std::io::Error::from_raw_os_error,
+                ))),
+                Err(other) => Err(FfsError::Format(other.to_string())),
+            }
+        };
 
         if to_read > 1_048_576 {
             debug!(inode = canonical, length = to_read, "btrfs large_read");
@@ -20339,14 +20471,16 @@ impl OpenFs {
                                 return (idx, result);
                             }
                             let mut compressed = vec![0_u8; compressed_len];
-                            let read = if let Some((items, sectorsize)) = &read_checksums {
-                                self.btrfs_read_checksummed_into(
-                                    cx,
-                                    items,
-                                    *sectorsize,
-                                    logical,
-                                    &mut compressed,
-                                )
+                            let read = if should_verify {
+                                load_csums().and_then(|items| {
+                                    self.btrfs_read_checksummed_into(
+                                        cx,
+                                        items,
+                                        verify_sectorsize,
+                                        logical,
+                                        &mut compressed,
+                                    )
+                                })
                             } else {
                                 self.btrfs_read_logical_into(cx, logical, &mut compressed)
                             };
@@ -20372,7 +20506,7 @@ impl OpenFs {
                                                 // window of this extent hits the cache
                                                 // above. Bounded by the admission cap;
                                                 // only the partial-slice path fills it.
-                                                if decomp_cache_enabled {
+                                                if decomp_cache_enabled && allow_cache_admit {
                                                     let full = Arc::new(decompressed);
                                                     self.btrfs_decompressed_extent_cache
                                                         .insert_within(
@@ -20391,28 +20525,103 @@ impl OpenFs {
                             }
                         }
                         // Read the uncompressed extent straight into its disjoint
-                        // `out` window. The data is written in place; the entry in
-                        // `deferred_by_idx` only carries the read's success or
-                        // error, consumed in idx order by the assembly loop so the
-                        // lowest-index read error still wins.
+                        // `out` window, consulting `file_data_extent_cache` first and
+                        // verifying checksums only on cache misses (`bd-mf9z9`).
                         BtrfsReadJob::Uncompressed {
                             idx,
                             source_logical,
                             dst,
-                        } => match if let Some((items, sectorsize)) = &read_checksums {
-                            self.btrfs_read_checksummed_into(
-                                cx,
-                                items,
-                                *sectorsize,
-                                source_logical,
-                                dst,
-                            )
-                        } else {
-                            self.btrfs_read_logical_into(cx, source_logical, dst)
-                        } {
-                            Ok(()) => (idx, Ok(BtrfsDeferredReadResult::Done)),
-                            Err(err) => (idx, Err(err)),
-                        },
+                        } => {
+                            let bs_u64 = u64::from(self.block_size());
+                            let aligned = bs_u64 > 0
+                                && source_logical.is_multiple_of(bs_u64)
+                                && dst.len().is_multiple_of(bs_usize);
+                            let res = if aligned {
+                                let start_blk = BlockNumber(source_logical / bs_u64);
+                                match self
+                                    .file_data_extent_cache
+                                    .copy_or_miss_epochs(start_blk, bs_usize, dst)
+                                {
+                                    Ok(()) => Ok(()),
+                                    Err(miss_epochs) => {
+                                        let io_res = if should_verify {
+                                            load_csums().and_then(|items| {
+                                                self.btrfs_read_checksummed_into(
+                                                    cx,
+                                                    items,
+                                                    verify_sectorsize,
+                                                    source_logical,
+                                                    dst,
+                                                )
+                                            })
+                                        } else {
+                                            self.btrfs_read_logical_into(cx, source_logical, dst)
+                                        };
+                                        if io_res.is_ok() && allow_cache_admit {
+                                            self.file_data_extent_cache.insert_range(
+                                                start_blk,
+                                                bs_usize,
+                                                dst,
+                                                &miss_epochs,
+                                            );
+                                        }
+                                        io_res
+                                    }
+                                }
+                            } else if should_verify && bs_u64 > 0 {
+                                let end_logical = source_logical.saturating_add(dst.len() as u64);
+                                let floor_logical = source_logical - (source_logical % bs_u64);
+                                let ceil_logical =
+                                    end_logical.div_ceil(bs_u64).saturating_mul(bs_u64);
+                                let aligned_len =
+                                    usize::try_from(ceil_logical - floor_logical).unwrap_or(0);
+                                let head_off =
+                                    usize::try_from(source_logical - floor_logical).unwrap_or(0);
+                                let start_blk = BlockNumber(floor_logical / bs_u64);
+                                let mut aligned_buf = vec![0_u8; aligned_len];
+                                match self.file_data_extent_cache.copy_or_miss_epochs(
+                                    start_blk,
+                                    bs_usize,
+                                    &mut aligned_buf,
+                                ) {
+                                    Ok(()) => {
+                                        dst.copy_from_slice(
+                                            &aligned_buf[head_off..head_off + dst.len()],
+                                        );
+                                        Ok(())
+                                    }
+                                    Err(miss_epochs) => load_csums()
+                                        .and_then(|items| {
+                                            self.btrfs_read_checksummed_into(
+                                                cx,
+                                                items,
+                                                verify_sectorsize,
+                                                floor_logical,
+                                                &mut aligned_buf,
+                                            )
+                                        })
+                                        .map(|()| {
+                                            if allow_cache_admit {
+                                                self.file_data_extent_cache.insert_range(
+                                                    start_blk,
+                                                    bs_usize,
+                                                    &aligned_buf,
+                                                    &miss_epochs,
+                                                );
+                                            }
+                                            dst.copy_from_slice(
+                                                &aligned_buf[head_off..head_off + dst.len()],
+                                            );
+                                        }),
+                                }
+                            } else {
+                                self.btrfs_read_logical_into(cx, source_logical, dst)
+                            };
+                            match res {
+                                Ok(()) => (idx, Ok(BtrfsDeferredReadResult::Done)),
+                                Err(err) => (idx, Err(err)),
+                            }
+                        }
                     }
                 };
             // Skip the inner rayon fan-out when there's a single job (no overlap
@@ -22530,23 +22739,24 @@ impl OpenFs {
         // Vec). The device adapter already resolves read-your-writes at the
         // current snapshot, so this is byte-identical to the loop's fast path.
         let dev = self.block_device_adapter();
-        // Large read runs normally bypass the scalar block cache and go straight
-        // to the device. On a read-only latest scope their bytes are immutable,
-        // so retain a bounded whole extent after the first cold read. The range
-        // lookup deliberately accepts offset subreads of that extent; an
-        // exact-start cache would only pay on a benchmark replaying identical
-        // requests.
-        let extent_cacheable = scope.tx.is_none()
-            && scope.snapshot.is_none()
-            && self.can_cache_ext4_read_only_block(scope, start);
+        // Serve both read-only and writable latest-scope ext4 runs from the
+        // byte-budgeted S3-FIFO extent cache (`bd-mf9z9`). Concurrent MVCC
+        // commits and direct device writes bump per-shard invalidation epochs
+        // and clear modified block masks, preventing stale reads or TOCTOU fills.
+        let extent_cacheable = scope.tx.is_none() && scope.snapshot.is_none() && self.is_ext4();
         if extent_cacheable {
-            if self.ext4_file_data_extent_cache.copy_into(start, bs, dst) {
-                return Ok(());
+            match self
+                .file_data_extent_cache
+                .copy_or_miss_epochs(start, bs, dst)
+            {
+                Ok(()) => return Ok(()),
+                Err(miss_epochs) => {
+                    dev.read_contiguous_into(cx, start, dst)?;
+                    self.file_data_extent_cache
+                        .insert_range(start, bs, dst, &miss_epochs);
+                    return Ok(());
+                }
             }
-            dev.read_contiguous_into(cx, start, dst)?;
-            self.ext4_file_data_extent_cache
-                .insert(start, Arc::from(dst.to_vec()));
-            return Ok(());
         }
         if scope.tx.is_none() {
             return dev.read_contiguous_into(cx, start, dst);
@@ -24495,7 +24705,37 @@ impl OpenFs {
         offset: u64,
         size: u32,
     ) -> Result<Vec<u8>, FfsError> {
-        let inode = self.read_inode_with_scope(cx, scope, ino)?;
+        let read_only_hot =
+            !self.has_mutable_view() && scope.tx.is_none() && !scope.uses_fixed_snapshot();
+        let hot_guard = if read_only_hot {
+            Some(self.ext4_hot_inode.load())
+        } else {
+            None
+        };
+        let hot_hit: Option<&Arc<Ext4Inode>> = hot_guard.as_ref().and_then(|g| {
+            g.as_ref()
+                .filter(|slot| slot.0 == ino.0)
+                .map(|slot| &slot.1)
+        });
+        let inode_was_hot = hot_hit.is_some();
+        let parsed_owned;
+        let parsed_arc;
+        let inode: &Ext4Inode = if let Some(arc) = hot_hit {
+            arc.as_ref()
+        } else {
+            let parsed = self.read_inode_with_scope(cx, scope, ino)?;
+            let publish_hot = read_only_hot && (offset != 0 || u64::from(size) < parsed.size);
+            if publish_hot {
+                let arc = Arc::new(parsed);
+                self.ext4_hot_inode
+                    .store(Some(Arc::new((ino.0, Arc::clone(&arc)))));
+                parsed_arc = arc;
+                parsed_arc.as_ref()
+            } else {
+                parsed_owned = parsed;
+                &parsed_owned
+            }
+        };
         if inode.is_dir() {
             return Err(FfsError::IsDirectory);
         }
@@ -24503,22 +24743,25 @@ impl OpenFs {
             return Err(FfsError::Format("cannot read a symlink".into()));
         }
         // No fscrypt support: never return raw ciphertext as plaintext.
-        Self::ext4_reject_encrypted(&inode)?;
+        Self::ext4_reject_encrypted(inode)?;
 
         // e2compr can mix compressed and uncompressed clusters. Its method
         // flags overlap inline-data flags, so retain this dispatch precedence.
         if inode.flags & EXT4_COMPRBLK_FL != 0 {
-            return self.read_ext4_compressed(cx, scope, &inode, offset, size);
+            return self.read_ext4_compressed(cx, scope, inode, offset, size);
         }
-        if Self::ext4_inode_uses_inline_data(&inode) {
-            return Self::read_ext4_inline_data(&inode, offset, size);
+        if Self::ext4_inode_uses_inline_data(inode) {
+            return Self::read_ext4_inline_data(inode, offset, size);
         }
         if inode.flags & ffs_types::EXT4_EXTENTS_FL == 0 {
-            return self.read_ext4_indirect(cx, scope, &inode, offset, size);
+            return self.read_ext4_indirect(cx, scope, inode, offset, size);
+        }
+        if read_only_hot && (inode_was_hot || Self::ext4_deep_extent_tree(inode)) {
+            let _ = self.ext4_ensure_hot_extents(cx, scope, inode);
         }
 
         let mut buf = vec![0_u8; ext4_read_buffer_len(inode.size, offset, size)?];
-        let n = self.read_file_data(cx, scope, &inode, offset, &mut buf)?;
+        let n = self.read_file_data(cx, scope, inode, offset, &mut buf)?;
         buf.truncate(n);
         Ok(buf)
     }
@@ -29345,6 +29588,9 @@ impl OpenFs {
                 block_size: self.block_size(),
             },
             cache: self.ext4_base_block_cache_for_adapter(),
+            extent_cache: self
+                .is_ext4()
+                .then_some(self.file_data_extent_cache.as_ref()),
         };
         // RO mounts serve this from the lock-free `ro_snapshot` cache (the
         // snapshot is invariant without commits); writable mounts re-read live.
@@ -29398,6 +29644,9 @@ impl OpenFs {
                 block_size: self.block_size(),
             },
             cache: self.ext4_base_block_cache_for_adapter(),
+            extent_cache: self
+                .is_ext4()
+                .then_some(self.file_data_extent_cache.as_ref()),
         }
     }
 
@@ -31029,6 +31278,11 @@ impl OpenFs {
             self.btrfs_full_transaction_commit(cx, "fitrim")?;
         }
         let alloc = alloc_lock.read();
+        if !alloc.chunk_trees_authoritative {
+            return Err(FfsError::Format(
+                "btrfs chunk/device trees are incomplete; refusing FITRIM".into(),
+            ));
+        }
 
         // The superblock on the device is the state a crash recovers.
         let mut region = vec![0_u8; ffs_types::BTRFS_SUPER_INFO_SIZE];
@@ -43542,12 +43796,13 @@ impl OpenFs {
         let alloc_mutex = self.require_btrfs_alloc_state()?;
         let mut alloc = alloc_mutex.write();
         let pending = self.btrfs_pending_dirty_bytes_locked(&alloc);
+        let effective_limit = self.btrfs_effective_dirty_bytes_limit_locked(&alloc, limit);
         {
             let mut retry = self.btrfs_pressure_retry.lock();
             let space_demand = std::mem::take(&mut retry.space_request_refused);
             // Recheck after acquiring the write lock. Another caller may have
             // completed a boundary or failed against the same debt meanwhile.
-            if !retry.should_attempt(pending, limit, space_demand) {
+            if !retry.should_attempt(pending, effective_limit, space_demand) {
                 return Ok(false);
             }
         }
@@ -43877,10 +44132,43 @@ impl OpenFs {
             } else {
                 0
             };
-            let demand = u64::try_from(node_count)
-                .unwrap_or(u64::MAX)
+            let fs_alloc_nodes = alloc.written_tree_blocks.get(&fs_root).map_or_else(
+                || u64::try_from(node_count).unwrap_or(u64::MAX),
+                |retained| {
+                    let count = dag
+                        .blocks_with_levels()
+                        .iter()
+                        .filter(|(block, _)| !retained.contains_key(block))
+                        .count();
+                    u64::try_from(count).unwrap_or(u64::MAX)
+                },
+            );
+            let csum_nodes = WriteDependencyDag::from_cow_tree(&alloc.csum_tree, new_gen)
+                .map_or(0, |d| u64::try_from(d.node_count()).unwrap_or(u64::MAX));
+            let mut subvol_nodes = 0_u64;
+            for (_, subvol_tree) in subvol_trees {
+                let n = WriteDependencyDag::from_cow_tree(subvol_tree, new_gen)
+                    .map_or(0, |d| u64::try_from(d.node_count()).unwrap_or(u64::MAX));
+                subvol_nodes = subvol_nodes.saturating_add(n);
+            }
+            let extent_base_nodes =
+                WriteDependencyDag::from_cow_tree(alloc.extent_alloc.extent_tree(), new_gen)
+                    .map_or(0, |d| u64::try_from(d.node_count()).unwrap_or(u64::MAX));
+            let root_base_nodes = WriteDependencyDag::from_cow_tree(&alloc.root_tree, new_gen)
+                .map_or(0, |d| u64::try_from(d.node_count()).unwrap_or(u64::MAX))
+                .saturating_add(u64::from(alloc.root_tree.root_level()))
+                .saturating_add(2);
+            let pre_extent_nodes = fs_alloc_nodes
+                .saturating_add(csum_nodes)
+                .saturating_add(subvol_nodes)
                 .saturating_add(overhead)
-                .saturating_add(fst_overhead);
+                .saturating_add(fst_overhead)
+                .saturating_add(extent_base_nodes)
+                .saturating_add(root_base_nodes);
+            let extent_split_slack = (pre_extent_nodes / 64)
+                .saturating_add(u64::from(alloc.extent_alloc.extent_tree().root_level()))
+                .saturating_add(4);
+            let demand = pre_extent_nodes.saturating_add(extent_split_slack);
             let policy = ffs_btrfs::ChunkSizePolicy::default();
             let mut grown = 0_u32;
             while grown < BTRFS_MAX_CHUNKS_PER_COMMIT {
@@ -45427,8 +45715,8 @@ impl OpenFs {
         // bd-a136s: a commit that grew the filesystem rewrote the chunk tree, and
         // its root lives HERE rather than in a ROOT_ITEM — the kernel maps the
         // chunk tree's own logical address from the superblock before any tree is
-        // readable. Left untouched on every other commit, which is every commit
-        // today. Offsets are the parser's own (`ffs-ondisk/src/btrfs.rs`):
+        // readable. Left untouched on every commit that did not grow a chunk.
+        // Offsets are the parser's own (`ffs-ondisk/src/btrfs.rs`):
         // `chunk_root` u64 at 0x58, `chunk_root_generation` u64 at 0xA4,
         // `chunk_root_level` u8 at 0xC7.
         if let Some((chunk_root_bytenr, chunk_root_level)) = new_chunk_root {
@@ -45618,6 +45906,9 @@ impl OpenFs {
         // destroys it. This call must stay AFTER the superblock write+sync and
         // must not run on any error path. The allocation lock is still held.
         {
+            for (bytenr, num_bytes) in alloc.extent_alloc.pinned_extents() {
+                self.btrfs_invalidate_logical_bytes(bytenr, num_bytes);
+            }
             let released = alloc.extent_alloc.release_pinned_after_superblock_commit();
             self.btrfs_unpin_epoch.fetch_add(1, Ordering::Release);
             debug!(
@@ -51145,7 +51436,7 @@ impl OpenFs {
     }
 
     /// Whether commit-time metadata/system chunk growth is enabled
-    /// (bd-a136s). Default off; see [`BtrfsGrowthPolicy`].
+    /// (bd-a136s). Default on; see [`BtrfsGrowthPolicy`].
     #[must_use]
     pub fn btrfs_grow_chunks_enabled(&self) -> bool {
         self.btrfs_grow_chunks
@@ -66028,9 +66319,9 @@ mod tests {
 
     #[test]
     fn extent_cache_refuses_entries_that_exceed_its_byte_budget_bd_mf9z9() {
-        let cache = Ext4ReadExtentCache::new(8);
-        cache.insert(BlockNumber(100), Arc::from([1_u8; 8]));
-        cache.insert(BlockNumber(108), Arc::from([2_u8; 1]));
+        let cache = ffs_block::ShardedExtentReadCache::new(8);
+        cache.insert_unconditional(BlockNumber(100), 1, &[1_u8; 8]);
+        cache.insert_unconditional(BlockNumber(108), 1, &[2_u8; 1]);
 
         let mut admitted = [0_u8; 8];
         assert!(cache.copy_into(BlockNumber(100), 1, &mut admitted));
@@ -66040,6 +66331,138 @@ mod tests {
             !cache.copy_into(BlockNumber(108), 1, &mut rejected),
             "a second entry must not push resident bytes over the fixed budget"
         );
+    }
+
+    #[test]
+    fn extent_cache_rw_ext4_and_btrfs_coherence_and_hit_ratio_bd_mf9z9() {
+        let cx = Cx::for_testing();
+
+        // 1. Ext4 RW mount: warm 256 KiB file into ShardedExtentReadCache, verify >= 90%
+        //    hit ratio on repeated 4 KiB random reads, then mutate via aligned write,
+        //    partial overwrite, truncate shrink + tail-zero extend, and unlink+recreate!
+        if let Some((ext4_fs, _dev, _tmp)) = open_writable_ext4_mkfs(32) {
+            let root = InodeNumber(2);
+            let f = ext4_fs
+                .create(&cx, root, OsStr::new("hot.bin"), 0o644, 0, 0)
+                .unwrap();
+            let initial: Vec<u8> = (0..64_u32)
+                .flat_map(|blk| vec![u8::try_from((blk % 251) + 1).unwrap(); 4096])
+                .collect();
+            ext4_fs.write(&cx, f.ino, 0, &initial).unwrap();
+
+            // Cold read populates cache; 200 warm 4 KiB reads must hit >= 90%!
+            assert_eq!(ext4_fs.read(&cx, f.ino, 0, 262_144).unwrap(), initial);
+            for idx in 0..200_u64 {
+                let blk = (idx * 7) % 64;
+                let got = ext4_fs.read(&cx, f.ino, blk * 4096, 4096).unwrap();
+                assert_eq!(got[0], u8::try_from((blk % 251) + 1).unwrap());
+            }
+            let ext_metrics = ext4_fs.file_data_extent_cache_metrics();
+            assert!(
+                ext_metrics.hit_ratio() >= 0.90,
+                "expected >= 90% extent-cache hit ratio on ext4 RW, got {:.3}",
+                ext_metrics.hit_ratio()
+            );
+            assert!(ext4_fs.cache_telemetry().hit_ratio() >= 0.90);
+
+            // Aligned overwrite of block 3 + partial overwrite inside block 5 -> ZERO stale bytes!
+            ext4_fs
+                .write(&cx, f.ino, 3 * 4096, &[0xAB_u8; 4096])
+                .unwrap();
+            ext4_fs
+                .write(&cx, f.ino, 5 * 4096 + 100, b"FRESH_SUBBLOCK")
+                .unwrap();
+            assert_eq!(
+                ext4_fs.read(&cx, f.ino, 3 * 4096, 4096).unwrap(),
+                vec![0xAB_u8; 4096]
+            );
+            assert_eq!(
+                &ext4_fs.read(&cx, f.ino, 5 * 4096, 4096).unwrap()[100..114],
+                b"FRESH_SUBBLOCK"
+            );
+
+            // Truncate shrink to mid-block (3*4096 + 500) then extend back to 4*4096 -> tail [500..4096) MUST be zero!
+            ext4_fs
+                .setattr(
+                    &cx,
+                    f.ino,
+                    &SetAttrRequest {
+                        size: Some(3 * 4096 + 500),
+                        ..SetAttrRequest::default()
+                    },
+                )
+                .unwrap();
+            ext4_fs
+                .setattr(
+                    &cx,
+                    f.ino,
+                    &SetAttrRequest {
+                        size: Some(4 * 4096),
+                        ..SetAttrRequest::default()
+                    },
+                )
+                .unwrap();
+            let blk3 = ext4_fs.read(&cx, f.ino, 3 * 4096, 4096).unwrap();
+            assert_eq!(&blk3[..500], &[0xAB_u8; 500]);
+            assert_eq!(&blk3[500..], &[0_u8; 4096 - 500][..]);
+        }
+
+        // 2. Btrfs RW mount: warm 256 KiB datasum file, verify >= 90% hit ratio (and single-pass
+        //    csum-on-miss), then mutate via COW write, truncate shrink+extend, and clone_file_range!
+        if let Some((btrfs_fs, _dev, _tmp, _img)) = open_writable_btrfs_mkfs(128) {
+            let root = InodeNumber(1);
+            let f = btrfs_fs
+                .create(&cx, root, OsStr::new("btrfs_hot.bin"), 0o644, 0, 0)
+                .unwrap();
+            let initial: Vec<u8> = (0..64_u32)
+                .flat_map(|blk| vec![u8::try_from((blk % 239) + 3).unwrap(); 4096])
+                .collect();
+            btrfs_fs.write(&cx, f.ino, 0, &initial).unwrap();
+            assert_eq!(btrfs_fs.read(&cx, f.ino, 0, 262_144).unwrap(), initial);
+            for idx in 0..200_u64 {
+                let blk = (idx * 11) % 64;
+                let got = btrfs_fs.read(&cx, f.ino, blk * 4096, 4096).unwrap();
+                assert_eq!(got[0], u8::try_from((blk % 239) + 3).unwrap());
+            }
+            let bt_metrics = btrfs_fs.file_data_extent_cache_metrics();
+            assert!(
+                bt_metrics.hit_ratio() >= 0.90,
+                "expected >= 90% extent-cache hit ratio on btrfs RW, got {:.3}",
+                bt_metrics.hit_ratio()
+            );
+
+            // COW overwrite + clone_file_range over warm destination -> fresh bytes, zero staleness!
+            let dst = btrfs_fs
+                .create(&cx, root, OsStr::new("btrfs_clone.bin"), 0o644, 0, 0)
+                .unwrap();
+            btrfs_fs
+                .write(&cx, dst.ino, 0, &[0x11_u8; 32 * 1024])
+                .unwrap();
+            assert_eq!(
+                btrfs_fs.read(&cx, dst.ino, 0, 4096).unwrap(),
+                vec![0x11_u8; 4096]
+            );
+            btrfs_fs.write(&cx, f.ino, 0, &[0xCC_u8; 8192]).unwrap();
+            assert_eq!(
+                btrfs_fs.read(&cx, f.ino, 0, 8192).unwrap(),
+                vec![0xCC_u8; 8192]
+            );
+            FsOps::clone_file_range(
+                &btrfs_fs,
+                &cx,
+                &mut RequestScope::empty(),
+                dst.ino,
+                f.ino,
+                0,
+                8192,
+                0,
+            )
+            .unwrap();
+            assert_eq!(
+                btrfs_fs.read(&cx, dst.ino, 0, 8192).unwrap(),
+                vec![0xCC_u8; 8192]
+            );
+        }
     }
 
     #[test]
@@ -117986,6 +118409,17 @@ pub(crate) mod scrub;\n";
             if fail_dev_load {
                 assert_eq!(result.unwrap_err().to_errno(), libc::ENOSPC);
                 assert_eq!(
+                    FsOps::statfs(&fs, &cx, &mut RequestScope::empty(), root)
+                        .unwrap()
+                        .blocks_available,
+                    0,
+                    "statfs must not promise growable DATA bytes when DEV_TREE is incomplete"
+                );
+                assert!(
+                    fs.btrfs_trim_free_space(&cx, 0, u64::MAX, 0).is_err(),
+                    "FITRIM must refuse when chunk/device trees are incomplete"
+                );
+                assert_eq!(
                     state(),
                     before,
                     "refusal changed trees, space, pins or publication"
@@ -118052,6 +118486,174 @@ pub(crate) mod scrub;\n";
                 .unwrap();
             eprintln!(
                 "CHUNK_AUTHORITY|load_fault=false|write=success|new_chunk=true|native_check=clean|reopen=exact"
+            );
+        }
+    }
+
+    #[test]
+    fn btrfs_commit_shortfall_counts_csum_extent_and_root_trees_bd_a136s() {
+        let Some((fs, device, _tmp, image)) =
+            open_writable_btrfs_mkfs_args(256, &["-m", "single", "-d", "single"])
+        else {
+            oracle_unavailable("btrfs image formatter");
+            return;
+        };
+        let cx = Cx::for_testing();
+        fs.set_btrfs_grow_chunks(true);
+        fs.set_btrfs_dirty_bytes_threshold(0);
+        let root = InodeNumber(1);
+        let big = fs
+            .create(&cx, root, OsStr::new("csum_heavy.bin"), 0o644, 0, 0)
+            .unwrap();
+        // Write 320 separate 4 KiB extents to grow csum_tree + extent_tree before committing,
+        // while trimming remaining METADATA space in the initial block group down to just above
+        // `fs_tree` alone (`3 * nodesize`) so the old `fs_tree`-only shortfall check missed it!
+        let sector_buf = [0x3D_u8; 4096];
+        for idx in 0..320_u64 {
+            fs.write(&cx, big.ino, idx * 8192, &sector_buf).unwrap();
+        }
+        let nodesize = u64::from(fs.btrfs_superblock().unwrap().nodesize);
+        let mut dummy_reserved = Vec::new();
+        {
+            let mut alloc = fs.require_btrfs_alloc_state().unwrap().write();
+            while alloc
+                .extent_alloc
+                .allocatable_bytes(BTRFS_BLOCK_GROUP_METADATA)
+                > nodesize * 4
+            {
+                let res = alloc
+                    .extent_alloc
+                    .alloc_metadata_for_root_tree(nodesize, 0)
+                    .unwrap();
+                dummy_reserved.push(res.bytenr);
+            }
+        }
+        let chunks_before = {
+            let alloc = fs.require_btrfs_alloc_state().unwrap().read();
+            ffs_btrfs::chunk_entries_from_chunk_tree(&alloc.chunk_tree)
+                .unwrap()
+                .len()
+        };
+        // Release the temporary reservations right before commit only up to leaving 3 * nodesize
+        // free — Wait: keeping dummy_reserved unreferenced in extent_tree would fail btrfs check!
+        // Instead, free all except pin-equivalent? No: pin them via `pin_freed_extent` so they are
+        // unallocatable during this commit (`allocatable_bytes` = 4 * nodesize) and automatically
+        // unpinned after superblock commit with zero dangling extent_tree items!
+        {
+            let mut alloc = fs.require_btrfs_alloc_state().unwrap().write();
+            for bytenr in dummy_reserved {
+                alloc
+                    .extent_alloc
+                    .free_extent(bytenr, nodesize, true)
+                    .unwrap();
+                alloc.extent_alloc.pin_freed_extent(bytenr, nodesize);
+            }
+            assert!(
+                alloc
+                    .extent_alloc
+                    .allocatable_bytes(BTRFS_BLOCK_GROUP_METADATA)
+                    <= nodesize * 4
+            );
+        }
+        fs.btrfs_full_transaction_commit(&cx, "multi-tree-shortfall-growth")
+            .expect("commit must grow METADATA chunk when csum+extent+root exceed remaining space");
+        let chunks_after = {
+            let alloc = fs.require_btrfs_alloc_state().unwrap().read();
+            ffs_btrfs::chunk_entries_from_chunk_tree(&alloc.chunk_tree)
+                .unwrap()
+                .len()
+        };
+        assert!(
+            chunks_after > chunks_before,
+            "expected commit-time METADATA chunk allocation"
+        );
+        std::fs::write(&image, device.snapshot_bytes()).unwrap();
+        if let Some((clean, output)) = run_btrfs_check(&image) {
+            assert!(
+                clean,
+                "btrfs check failed after multi-tree METADATA growth: {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn btrfs_tight_metadata_pressure_clamps_before_overshoot_generic_027() {
+        let Some((fs, device, _tmp, image)) =
+            open_writable_btrfs_mkfs_args(128, &["-m", "single", "-d", "single"])
+        else {
+            oracle_unavailable("btrfs image formatter");
+            return;
+        };
+        let cx = Cx::for_testing();
+        // Disable chunk growth so remaining METADATA headroom is strictly the initial 8 MiB
+        // METADATA block group (< 16 MiB window), with DEFAULT 128 MiB threshold active!
+        fs.set_btrfs_grow_chunks(false);
+        let root = InodeNumber(1);
+        let inline_data = [0x61_u8; 1024];
+        let mut created = Vec::new();
+        for idx in 0..4000_u32 {
+            let name = format!("g027_{idx:04}.dat");
+            let mut create_scope = FsOps::begin_request_scope(&fs, &cx, RequestOp::Create).unwrap();
+            match FsOps::create(
+                &fs,
+                &cx,
+                &mut create_scope,
+                root,
+                OsStr::new(&name),
+                0o644,
+                0,
+                0,
+            ) {
+                Ok(attr) => {
+                    FsOps::commit_request_scope(&fs, &cx, &mut create_scope).unwrap();
+                    let _ = FsOps::end_request_scope(&fs, &cx, RequestOp::Create, create_scope);
+                    let mut write_scope =
+                        FsOps::begin_request_scope(&fs, &cx, RequestOp::Write).unwrap();
+                    if FsOps::write(&fs, &cx, &mut write_scope, attr.ino, 0, &inline_data).is_ok() {
+                        let _ = FsOps::commit_request_scope(&fs, &cx, &mut write_scope);
+                        let _ = FsOps::end_request_scope(&fs, &cx, RequestOp::Write, write_scope);
+                        created.push((name, attr.ino));
+                    } else {
+                        let _ = FsOps::end_request_scope(&fs, &cx, RequestOp::Write, write_scope);
+                        let _ = fs.unlink(&cx, root, OsStr::new(&name));
+                        break;
+                    }
+                }
+                Err(err) => {
+                    assert_eq!(err.to_errno(), libc::ENOSPC);
+                    let _ = FsOps::end_request_scope(&fs, &cx, RequestOp::Create, create_scope);
+                    break;
+                }
+            }
+        }
+        assert!(
+            created.len() >= 100,
+            "expected tight-metadata fill to create >= 100 inline files before ENOSPC, got {}",
+            created.len()
+        );
+        // Unlink only ~15% of files (just like xfstests generic/027), sync, and verify a new
+        // create succeeds cleanly without uncommittable dirty-tree overshoot!
+        let to_remove = (created.len() / 6).max(8);
+        for (name, _) in created.drain(..to_remove) {
+            let mut unlink_scope = FsOps::begin_request_scope(&fs, &cx, RequestOp::Unlink).unwrap();
+            FsOps::unlink(&fs, &cx, &mut unlink_scope, root, OsStr::new(&name)).unwrap();
+            FsOps::commit_request_scope(&fs, &cx, &mut unlink_scope).unwrap();
+            FsOps::end_request_scope(&fs, &cx, RequestOp::Unlink, unlink_scope).unwrap();
+        }
+        fs.btrfs_full_transaction_commit(&cx, "generic-027-recovery")
+            .expect("partial unlink must recover committable metadata space");
+        let survivor = fs
+            .create(&cx, root, OsStr::new("after_reclaim.dat"), 0o644, 0, 0)
+            .expect("create after partial unlink must succeed");
+        fs.write(&cx, survivor.ino, 0, b"recovered-after-enospc")
+            .unwrap();
+        fs.btrfs_full_transaction_commit(&cx, "generic-027-post-reclaim")
+            .unwrap();
+        std::fs::write(&image, device.snapshot_bytes()).unwrap();
+        if let Some((clean, output)) = run_btrfs_check(&image) {
+            assert!(
+                clean,
+                "btrfs check failed after tight-metadata recovery: {output}"
             );
         }
     }

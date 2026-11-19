@@ -5,7 +5,7 @@ use asupersync::Cx;
 use criterion::{BatchSize, Criterion, criterion_group};
 use ffs_block::{
     ArcCache, ArcWritePolicy, BlockBuf, BlockDevice, ByteBlockDevice, ByteDevice, MemoryPressure,
-    ShardedArcCache,
+    ShardedArcCache, ShardedExtentReadCache,
 };
 use ffs_error::Result;
 use ffs_types::{BlockNumber, ByteOffset, TxnId};
@@ -347,6 +347,33 @@ fn database_like_case() -> WorkloadCase {
     }
 }
 
+fn repeated_working_set_case() -> WorkloadCase {
+    let seed = 0xA1A1_0006_u64;
+    let capacity = 1_024_usize;
+    let working_set = 768_usize;
+    let cold_noise = 2_048_usize;
+    let block_count = working_set + cold_noise + 64;
+    let accesses = 20_000_usize;
+    let mut rng = Rng64::seeded(seed);
+    let mut trace = Vec::with_capacity(accesses);
+    for _ in 0..accesses {
+        if rng.next_usize(100) < 96 {
+            trace.push(BlockNumber(rng.next_usize(working_set) as u64));
+        } else {
+            trace.push(BlockNumber(
+                (working_set + rng.next_usize(cold_noise)) as u64,
+            ));
+        }
+    }
+    WorkloadCase {
+        workload: "repeated_working_set",
+        seed,
+        block_count,
+        capacity,
+        trace,
+    }
+}
+
 fn all_workload_cases() -> Vec<WorkloadCase> {
     vec![
         sequential_scan_case(),
@@ -354,6 +381,7 @@ fn all_workload_cases() -> Vec<WorkloadCase> {
         mixed_seq_hot_case(),
         compile_like_case(),
         database_like_case(),
+        repeated_working_set_case(),
     ]
 }
 
@@ -904,6 +932,28 @@ fn bench_workload_database_like(c: &mut Criterion) {
     bench_cache_workload(c, &database_like_case());
 }
 
+fn bench_workload_repeated_working_set(c: &mut Criterion) {
+    bench_cache_workload(c, &repeated_working_set_case());
+}
+
+fn bench_sharded_extent_read_cache_repeated_working_set(c: &mut Criterion) {
+    let cache = ShardedExtentReadCache::new(8 * 1024 * 1024);
+    let tile_fill = vec![0x5A_u8; 32 * 4096];
+    for tile in 0..32_u64 {
+        cache.insert_unconditional(BlockNumber(tile * 32), 4096, &tile_fill);
+    }
+    let mut rng = Rng64::seeded(0xE710_4096);
+    c.bench_function("extent_read_cache_hot_4k_randread", |b| {
+        let mut dst = [0_u8; 4096];
+        b.iter(|| {
+            let blk = BlockNumber(rng.next_usize(32 * 32) as u64);
+            let hit = cache.copy_into(black_box(blk), 4096, &mut dst);
+            debug_assert!(hit);
+            black_box(dst[0]);
+        });
+    });
+}
+
 criterion_group!(
     cache_benches,
     bench_cache_hit,
@@ -921,6 +971,8 @@ criterion_group!(
     bench_workload_mixed_seq_hot,
     bench_workload_compile_like,
     bench_workload_database_like,
+    bench_workload_repeated_working_set,
+    bench_sharded_extent_read_cache_repeated_working_set,
     bench_concurrent_hot_read_64threads,
     bench_sharded_concurrent_hot_read_64threads,
     bench_shard_route_power2_modulo_baseline,

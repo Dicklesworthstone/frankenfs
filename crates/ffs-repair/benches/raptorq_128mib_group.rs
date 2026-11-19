@@ -9,7 +9,8 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use ffs_block::{BlockDevice, ByteBlockDevice, ByteDevice};
 use ffs_error::{FfsError, Result};
 use ffs_repair::codec::{
-    BlockDelta, StripedGroupConfig, encode_group_striped, update_striped_group_delta,
+    BlockDelta, StripedGroupConfig, decode_group_striped, encode_group_striped,
+    update_striped_group_delta,
 };
 use ffs_types::{BlockNumber, ByteOffset, GroupNumber};
 use std::hint::black_box;
@@ -152,6 +153,35 @@ fn bench_raptorq_128mib_group(c: &mut Criterion) {
             toggle = !toggle;
             update_striped_group_delta(black_box(&mut encoded), black_box(&[delta]))
                 .expect("delta refresh");
+        });
+    });
+
+    let encoded_clean = encode_group_striped(
+        &cx,
+        &device,
+        &FS_UUID,
+        GroupNumber(0),
+        BlockNumber(0),
+        GROUP_BLOCKS_128_MIB,
+        config,
+    )
+    .expect("clean 128 MiB encode for decode bench");
+    let sanity = decode_group_striped(&cx, &device, &FS_UUID, &encoded_clean, &[1337])
+        .expect("single-block striped decode");
+    assert_eq!(sanity.recovered.len(), 1);
+    assert_eq!(sanity.recovered[0].data, old_block);
+
+    group.bench_function("decode_single_4k_block_in_128mib_striped", |b| {
+        b.iter(|| {
+            let out = decode_group_striped(
+                &cx,
+                black_box(&device),
+                &FS_UUID,
+                black_box(&encoded_clean),
+                black_box(&[1337]),
+            )
+            .expect("single-block striped decode");
+            black_box(out.recovered.len())
         });
     });
 

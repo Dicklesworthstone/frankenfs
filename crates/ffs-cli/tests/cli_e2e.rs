@@ -7882,3 +7882,430 @@ fn cli_mount_native_ext4_and_btrfs_rw_self_healing_sigkill_and_restart_bd_j7a4e(
         None,
     );
 }
+
+#[test]
+#[ignore = "live mounted /dev/fuse + 128 MiB RaptorQ + TUI PLAN_TO_PORT §9.5 performance baselines (vkibu)"]
+fn measure_and_verify_section_9_5_performance_baselines_vkibu() {
+    use asupersync::Cx;
+    use ffs_block::{ByteBlockDevice, ByteDevice};
+    use ffs_core::{FsOps, OpenFs, OpenOptions, RequestScope};
+    use ffs_repair::codec::{StripedGroupConfig, decode_group_striped, encode_group_striped};
+    use ffs_types::{BlockNumber, ByteOffset, GroupNumber, InodeNumber};
+    use std::os::unix::fs::FileExt;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    struct MemGroupDevice {
+        bytes: Vec<u8>,
+    }
+    impl ByteDevice for MemGroupDevice {
+        fn len_bytes(&self) -> u64 {
+            self.bytes.len() as u64
+        }
+        fn read_exact_at(
+            &self,
+            _cx: &Cx,
+            offset: ByteOffset,
+            buf: &mut [u8],
+        ) -> ffs_error::Result<()> {
+            let start = usize::try_from(offset.0).unwrap();
+            buf.copy_from_slice(&self.bytes[start..start + buf.len()]);
+            Ok(())
+        }
+        fn write_all_at(
+            &self,
+            _cx: &Cx,
+            _offset: ByteOffset,
+            _buf: &[u8],
+        ) -> ffs_error::Result<()> {
+            Err(ffs_error::FfsError::ReadOnly)
+        }
+        fn sync(&self, _cx: &Cx) -> ffs_error::Result<()> {
+            Ok(())
+        }
+    }
+
+    assert!(
+        Path::new("/dev/fuse").exists(),
+        "/dev/fuse required for §9.5 mounted performance baselines"
+    );
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let seed_dir = dir.path().join("seed");
+    fs::create_dir_all(&seed_dir).unwrap();
+    let file_len = 32 * 1024 * 1024_usize; // 32 MiB payload file
+    let mut payload = vec![0_u8; file_len];
+    for (idx, chunk) in payload.chunks_exact_mut(4096).enumerate() {
+        chunk.fill(u8::try_from((idx % 251) + 1).unwrap());
+    }
+    fs::write(seed_dir.join("bench32m.bin"), &payload).unwrap();
+
+    let img_path = dir.path().join("sec95.ext4");
+    {
+        let f = fs::File::create(&img_path).unwrap();
+        f.set_len(128 * 1024 * 1024).unwrap();
+    }
+    let mkfs = Command::new("mkfs.ext4")
+        .args([
+            "-F",
+            "-q",
+            "-b",
+            "4096",
+            "-d",
+            seed_dir.to_str().unwrap(),
+            img_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("mkfs.ext4");
+    assert!(mkfs.status.success(), "mkfs.ext4 failed");
+
+    // ── Row 3 & Direct Engine Cached 4K IOPS (`OpenFs` + `ShardedExtentReadCache`) ──
+    let cx = Cx::for_testing();
+    let open_fs = Arc::new(
+        OpenFs::open_with_options(&cx, &img_path, &OpenOptions::default())
+            .expect("OpenFs::open_with_options"),
+    );
+    let bench_attr = FsOps::lookup(
+        open_fs.as_ref(),
+        &cx,
+        &mut RequestScope::empty(),
+        InodeNumber(2),
+        std::ffi::OsStr::new("bench32m.bin"),
+    )
+    .expect("lookup bench32m.bin");
+
+    // Warm 16 MiB working set (4,096 blocks) into ShardedExtentReadCache, then issue
+    // 20,000 4 KiB reads (96% hot working set, 4% cold blocks 4096..8192):
+    let _ = open_fs
+        .read(&cx, bench_attr.ino, 0, 16 * 1024 * 1024)
+        .expect("warm 16 MiB");
+    for step in 0..20_000_u64 {
+        let blk = if step.is_multiple_of(25) {
+            4096 + ((step * 13) % 4096)
+        } else {
+            (step * 37) % 4096
+        };
+        let got = open_fs.read(&cx, bench_attr.ino, blk * 4096, 4096).unwrap();
+        std::hint::black_box(got[0]);
+    }
+    let extent_cache_hit_ratio = open_fs.file_data_extent_cache_metrics().hit_ratio();
+    let total_cache_hit_ratio = open_fs.cache_telemetry().hit_ratio();
+
+    // Multi-threaded 8-worker OpenFs cached 4K random-read IOPS:
+    let engine_iops_ops = 80_000_u64;
+    let engine_start = Instant::now();
+    std::thread::scope(|s| {
+        for tid in 0..8_u64 {
+            let fs_clone = Arc::clone(&open_fs);
+            let ino = bench_attr.ino;
+            s.spawn(move || {
+                let tcx = Cx::for_testing();
+                let mut dst = [0_u8; 4096];
+                for i in 0..10_000_u64 {
+                    let blk = (tid.wrapping_mul(131) + i.wrapping_mul(17)) % 4096;
+                    let n = fs_clone.read_into(&tcx, ino, blk * 4096, &mut dst).unwrap();
+                    assert_eq!(n, 4096);
+                    std::hint::black_box(dst[0]);
+                }
+            });
+        }
+    });
+    let engine_rand4k_iops = (engine_iops_ops as f64) / engine_start.elapsed().as_secs_f64();
+    drop(open_fs);
+
+    // ── Rows 1, 2, 4, 7 over Live `/dev/fuse` Mount (`ffs-cli mount` + `ffs-cli tui`) ──
+    let mnt = dir.path().join("mnt");
+    fs::create_dir_all(&mnt).unwrap();
+    let mnt_log = dir.path().join("mount.log");
+    let cli_bin = env!("CARGO_BIN_EXE_ffs-cli");
+    let mut daemon = Command::new(cli_bin)
+        .args([
+            "mount",
+            img_path.to_str().unwrap(),
+            mnt.to_str().unwrap(),
+            "--no-background-scrub",
+        ])
+        .env("FFS_AUTO_UNMOUNT", "0")
+        .stdout(std::process::Stdio::null())
+        .stderr(fs::File::create(&mnt_log).unwrap())
+        .spawn()
+        .expect("spawn ffs-cli mount");
+
+    let mnt_canon = mnt.canonicalize().unwrap().to_string_lossy().into_owned();
+    let wait_deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < wait_deadline {
+        if fs::read_to_string("/proc/self/mountinfo")
+            .unwrap_or_default()
+            .lines()
+            .any(|l| l.split(' ').nth(4) == Some(mnt_canon.as_str()))
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let mounted_file_path = mnt.join("bench32m.bin");
+    let mounted_file = Arc::new(fs::File::open(&mounted_file_path).expect("open mounted file"));
+
+    // Warm 1 pass over FUSE:
+    {
+        let mut warm_buf = vec![0_u8; 1024 * 1024];
+        for chunk_idx in 0..32_u64 {
+            mounted_file
+                .read_exact_at(&mut warm_buf, chunk_idx * 1024 * 1024)
+                .unwrap();
+        }
+    }
+
+    // Row 1: Sequential read throughput (8 passes x 32 MiB = 256 MiB):
+    let seq_passes = 8_u64;
+    let seq_start = Instant::now();
+    {
+        let mut seq_buf = vec![0_u8; 1024 * 1024];
+        for _ in 0..seq_passes {
+            for chunk_idx in 0..32_u64 {
+                mounted_file
+                    .read_exact_at(&mut seq_buf, chunk_idx * 1024 * 1024)
+                    .unwrap();
+                std::hint::black_box(seq_buf[0]);
+            }
+        }
+    }
+    let seq_total_mb = (seq_passes * 32) as f64 * (1_048_576.0 / 1_000_000.0);
+    let seq_read_mb_s = seq_total_mb / seq_start.elapsed().as_secs_f64();
+
+    // Row 2: Mounted cached 4 KiB random read IOPS (4 client threads x 16,000 = 64,000 preads):
+    let fuse_rand_ops = 64_000_u64;
+    let fuse_rand_start = Instant::now();
+    std::thread::scope(|s| {
+        for tid in 0..4_u64 {
+            let mounted_handle = Arc::clone(&mounted_file);
+            s.spawn(move || {
+                let mut buf = [0_u8; 4096];
+                for i in 0..16_000_u64 {
+                    let blk = (tid.wrapping_mul(257) + i.wrapping_mul(31)) % 8192;
+                    mounted_handle.read_exact_at(&mut buf, blk * 4096).unwrap();
+                    std::hint::black_box(buf[0]);
+                }
+            });
+        }
+    });
+    let mounted_rand4k_iops = (fuse_rand_ops as f64) / fuse_rand_start.elapsed().as_secs_f64();
+
+    // Row 4: Mounted FUSE `getattr` latency (`p50`, `p95`, `p99` over 10,000 calls):
+    for _ in 0..500 {
+        let _ = fs::symlink_metadata(&mounted_file_path).unwrap();
+    }
+    let mut getattr_ns = Vec::with_capacity(10_000);
+    for _ in 0..10_000 {
+        let t0 = Instant::now();
+        let meta = fs::symlink_metadata(&mounted_file_path).unwrap();
+        std::hint::black_box(meta.len());
+        getattr_ns.push(u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX));
+    }
+    getattr_ns.sort_unstable();
+    let getattr_median_us = getattr_ns[5_000] as f64 / 1_000.0;
+    let getattr_tail95_us = getattr_ns[9_500] as f64 / 1_000.0;
+    let getattr_tail99_us = getattr_ns[9_900] as f64 / 1_000.0;
+    drop(mounted_file);
+
+    let _ = Command::new("fusermount3")
+        .args(["-u", mnt.to_str().unwrap()])
+        .status();
+    let _ = daemon.wait();
+
+    // Row 7: Idle TUI refresh CPU overhead (`ffs-cli tui <img_path> --mountpoint <tui_mnt> --refresh-ms 500`
+    // over a verified live 4s idle window with continuous telemetry frames):
+    let read_proc_ticks = |pid: u32| -> u64 {
+        let proc_stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        let after_comm = proc_stat.rfind(')').map_or("", |idx| &proc_stat[idx + 2..]);
+        let fields: Vec<&str> = after_comm.split_whitespace().collect();
+        let user_ticks = fields
+            .get(11)
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        let sys_ticks = fields
+            .get(12)
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        user_ticks + sys_ticks
+    };
+    let clk_tck = unsafe_free_clk_tck();
+    let tui_mnt = dir.path().join("tui_mnt");
+    fs::create_dir_all(&tui_mnt).unwrap();
+    let tui_err = dir.path().join("tui.stderr");
+    let mut tui_child = Command::new(cli_bin)
+        .args([
+            "tui",
+            img_path.to_str().unwrap(),
+            "--mountpoint",
+            tui_mnt.to_str().unwrap(),
+            "--refresh-ms",
+            "500",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(fs::File::create(&tui_err).unwrap())
+        .spawn()
+        .expect("spawn ffs-cli tui");
+    let mut tui_stdout = tui_child.stdout.take().expect("tui stdout pipe");
+    let sample_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sample_counter_bg = Arc::clone(&sample_counter);
+    let drain_handle = std::thread::spawn(move || {
+        let mut chunk = [0_u8; 8192];
+        let mut carry = Vec::new();
+        while let Ok(n) = tui_stdout.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            carry.extend_from_slice(&chunk[..n]);
+            while let Some(nl) = carry.iter().position(|&b| b == b'\n') {
+                let line = &carry[..nl];
+                if line.windows(7).any(|w| w == b"Sample:") {
+                    sample_counter_bg.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                carry.drain(..=nl);
+            }
+        }
+    });
+    let tui_ready_deadline = Instant::now() + Duration::from_secs(20);
+    while sample_counter.load(std::sync::atomic::Ordering::Relaxed) < 2 {
+        assert!(
+            tui_child.try_wait().unwrap().is_none(),
+            "ffs-cli tui exited prematurely before live telemetry started: {}",
+            fs::read_to_string(&tui_err).unwrap_or_default()
+        );
+        assert!(
+            Instant::now() < tui_ready_deadline,
+            "ffs-cli tui timed out waiting for initial live telemetry samples"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let samples_before = sample_counter.load(std::sync::atomic::Ordering::Relaxed);
+    let ticks_before = read_proc_ticks(tui_child.id());
+    let idle_wall_start = Instant::now();
+    std::thread::sleep(Duration::from_secs(4));
+    assert!(
+        tui_child.try_wait().unwrap().is_none(),
+        "ffs-cli tui exited during idle CPU measurement window"
+    );
+    let ticks_after = read_proc_ticks(tui_child.id());
+    let samples_after = sample_counter.load(std::sync::atomic::Ordering::Relaxed);
+    let idle_wall_secs = idle_wall_start.elapsed().as_secs_f64();
+    assert!(
+        samples_after >= samples_before + 5,
+        "expected >= 5 live TUI telemetry frames during 4s idle window, got {}",
+        samples_after.saturating_sub(samples_before)
+    );
+    let _ = Command::new("fusermount3")
+        .args(["-u", tui_mnt.to_str().unwrap()])
+        .status();
+    let _ = Command::new("kill")
+        .args(["-INT", &tui_child.id().to_string()])
+        .status();
+    let _ = tui_child.wait();
+    let _ = drain_handle.join();
+    let tui_idle_cpu_pct =
+        ((ticks_after.saturating_sub(ticks_before) as f64 / clk_tck) / idle_wall_secs) * 100.0;
+
+    // ── Rows 5 & 6: 128 MiB RaptorQ Encode (< 100 ms) & Single-Block Decode (< 10 ms) ──
+    let rq_blocks = 32_768_u32;
+    let rq_blocks_usize = usize::try_from(rq_blocks).unwrap();
+    let mut rq_bytes = vec![0_u8; rq_blocks_usize * 4096];
+    for (b_idx, blk) in rq_bytes.chunks_exact_mut(4096).enumerate() {
+        blk[0..8].copy_from_slice(&(b_idx as u64).to_le_bytes());
+    }
+    let orig_1337 = rq_bytes[1337 * 4096..1338 * 4096].to_vec();
+    let rq_dev = ByteBlockDevice::new(MemGroupDevice { bytes: rq_bytes }, 4096).unwrap();
+    let rq_cfg = StripedGroupConfig {
+        max_stripe_blocks: 64,
+        repair_blocks_per_stripe: 4,
+    };
+    let rq_uuid = *b"ffs-sec95-raptor";
+    let mut encode_samples_ms = Vec::with_capacity(5);
+    let mut last_encoded = None;
+    for _ in 0..5 {
+        let t0 = Instant::now();
+        let enc = encode_group_striped(
+            &cx,
+            &rq_dev,
+            &rq_uuid,
+            GroupNumber(0),
+            BlockNumber(0),
+            rq_blocks,
+            rq_cfg,
+        )
+        .unwrap();
+        encode_samples_ms.push(t0.elapsed().as_secs_f64() * 1_000.0);
+        last_encoded = Some(enc);
+    }
+    encode_samples_ms.sort_by(f64::total_cmp);
+    let rq_encode_128mib_p50_ms = encode_samples_ms[2];
+    let encoded_ref = last_encoded.as_ref().unwrap();
+
+    let mut decode_samples_ms = Vec::with_capacity(25);
+    for _ in 0..25 {
+        let t0 = Instant::now();
+        let dec = decode_group_striped(&cx, &rq_dev, &rq_uuid, encoded_ref, &[1337]).unwrap();
+        decode_samples_ms.push(t0.elapsed().as_secs_f64() * 1_000.0);
+        assert_eq!(dec.recovered[0].data, orig_1337);
+    }
+    decode_samples_ms.sort_by(f64::total_cmp);
+    let rq_decode_single_p50_ms = decode_samples_ms[12];
+    let rq_decode_single_p99_ms = decode_samples_ms[24];
+
+    let report = serde_json::json!({
+        "seq_read_mb_s": seq_read_mb_s,
+        "mounted_rand4k_cached_iops": mounted_rand4k_iops,
+        "engine_rand4k_cached_iops": engine_rand4k_iops,
+        "extent_cache_hit_ratio": extent_cache_hit_ratio,
+        "total_cache_hit_ratio": total_cache_hit_ratio,
+        "getattr_p50_us": getattr_median_us,
+        "getattr_p95_us": getattr_tail95_us,
+        "getattr_p99_us": getattr_tail99_us,
+        "raptorq_encode_128mib_p50_ms": rq_encode_128mib_p50_ms,
+        "raptorq_decode_single_4k_p50_ms": rq_decode_single_p50_ms,
+        "raptorq_decode_single_4k_p99_ms": rq_decode_single_p99_ms,
+        "tui_idle_cpu_pct": tui_idle_cpu_pct,
+    });
+    println!("SECTION_9_5_BASELINES|{report}");
+
+    assert!(
+        seq_read_mb_s >= 200.0,
+        "§9.5 sequential read throughput {seq_read_mb_s:.1} MB/s < 200 MB/s"
+    );
+    assert!(
+        mounted_rand4k_iops >= 50_000.0 && engine_rand4k_iops >= 50_000.0,
+        "§9.5 4K cached randread IOPS below 50K (mounted={mounted_rand4k_iops:.0}, engine={engine_rand4k_iops:.0})"
+    );
+    assert!(
+        extent_cache_hit_ratio >= 0.90 && total_cache_hit_ratio >= 0.90,
+        "§9.5 cache hit ratio below 90% (extent={extent_cache_hit_ratio:.4}, total={total_cache_hit_ratio:.4})"
+    );
+    assert!(
+        getattr_tail99_us < 100.0,
+        "§9.5 getattr p99 {getattr_tail99_us:.2} us >= 100 us"
+    );
+    assert!(
+        rq_encode_128mib_p50_ms < 100.0,
+        "§9.5 128 MiB RaptorQ encode {rq_encode_128mib_p50_ms:.2} ms >= 100 ms"
+    );
+    assert!(
+        rq_decode_single_p50_ms < 10.0,
+        "§9.5 single-block RaptorQ decode {rq_decode_single_p50_ms:.3} ms >= 10 ms"
+    );
+    assert!(
+        tui_idle_cpu_pct < 1.0,
+        "§9.5 idle TUI CPU {tui_idle_cpu_pct:.3}% >= 1.0%"
+    );
+}
+
+fn unsafe_free_clk_tck() -> f64 {
+    Command::new("getconf")
+        .arg("CLK_TCK")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|&v| v > 0.0)
+        .unwrap_or(100.0)
+}

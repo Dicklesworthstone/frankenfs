@@ -4187,6 +4187,745 @@ impl<D: BlockDevice> ArcCache<D> {
     }
 }
 
+// ── Byte-Budgeted Sharded Extent Read Cache (`bd-mf9z9`) ─────────────────────
+
+/// Number of blocks grouped into one extent-cache tile (`128 KiB` at `4 KiB` blocks).
+pub const EXTENT_CACHE_TILE_BLOCKS: usize = 32;
+/// Maximum number of lock-striped shards in [`ShardedExtentReadCache`].
+pub const DEFAULT_EXTENT_CACHE_SHARDS: usize = 64;
+
+/// Per-shard invalidation epoch captured on a cache miss so concurrent writes,
+/// truncates, or unlinks prevent stale miss fills from entering the cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtentMissEpoch {
+    pub shard_idx: usize,
+    pub epoch: u64,
+}
+
+/// Inline-allocated vector of [`ExtentMissEpoch`] tokens for a missed range.
+pub type ExtentMissEpochs = smallvec::SmallVec<[ExtentMissEpoch; 4]>;
+
+/// Aggregated hit/miss/eviction and byte-budget telemetry for [`ShardedExtentReadCache`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExtentCacheMetrics {
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+    pub resident_tiles: usize,
+    pub resident_bytes: usize,
+    pub capacity_bytes: usize,
+}
+
+impl ExtentCacheMetrics {
+    #[must_use]
+    pub fn hit_ratio(&self) -> f64 {
+        let total = self.hits.saturating_add(self.misses);
+        if total == 0 {
+            0.0
+        } else {
+            self.hits as f64 / total as f64
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExtentS3Queue {
+    Small,
+    Main,
+}
+
+#[derive(Debug, Clone)]
+struct ExtentTileEntry {
+    block_size: u32,
+    base_slot: u8,
+    slot_len: u8,
+    valid_mask: u32,
+    queue: ExtentS3Queue,
+    freq: u8,
+    data: Arc<[u8]>,
+}
+
+#[derive(Debug)]
+struct ExtentCacheShard {
+    entries: HashMap<u64, ExtentTileEntry>,
+    small_fifo: VecDeque<u64>,
+    main_fifo: VecDeque<u64>,
+    ghost_fifo: VecDeque<u64>,
+    ghost_set: HashSet<u64>,
+    s_bytes: usize,
+    m_bytes: usize,
+    resident_bytes: usize,
+    budget_bytes: usize,
+    ghost_cap: usize,
+    invalidation_epoch: u64,
+    hits: u64,
+    misses: u64,
+    evictions: u64,
+}
+
+#[inline]
+fn extent_tile_slot_mask(slot_lo: u8, slot_hi: u8) -> u32 {
+    debug_assert!(slot_lo < slot_hi && slot_hi <= 32);
+    let width = u32::from(slot_hi - slot_lo);
+    if width >= 32 {
+        u32::MAX
+    } else {
+        ((1_u32 << width) - 1) << u32::from(slot_lo)
+    }
+}
+
+impl ExtentCacheShard {
+    fn new(budget_bytes: usize) -> Self {
+        let ghost_cap = (budget_bytes / (16 * 1024)).clamp(16, 1024);
+        Self {
+            entries: HashMap::new(),
+            small_fifo: VecDeque::new(),
+            main_fifo: VecDeque::new(),
+            ghost_fifo: VecDeque::new(),
+            ghost_set: HashSet::new(),
+            s_bytes: 0,
+            m_bytes: 0,
+            resident_bytes: 0,
+            budget_bytes,
+            ghost_cap,
+            invalidation_epoch: 1,
+            hits: 0,
+            misses: 0,
+            evictions: 0,
+        }
+    }
+
+    fn record_ghost(&mut self, tile_id: u64) {
+        if self.ghost_set.insert(tile_id) {
+            if self.ghost_fifo.len() >= self.ghost_cap
+                && let Some(oldest) = self.ghost_fifo.pop_front()
+            {
+                self.ghost_set.remove(&oldest);
+            }
+            self.ghost_fifo.push_back(tile_id);
+        }
+    }
+
+    fn remove_entry_accounting(&mut self, tile_id: u64) -> Option<ExtentTileEntry> {
+        let removed = self.entries.remove(&tile_id)?;
+        let len = removed.data.len();
+        self.resident_bytes = self.resident_bytes.saturating_sub(len);
+        match removed.queue {
+            ExtentS3Queue::Small => self.s_bytes = self.s_bytes.saturating_sub(len),
+            ExtentS3Queue::Main => self.m_bytes = self.m_bytes.saturating_sub(len),
+        }
+        Some(removed)
+    }
+
+    fn evict_to_fit(&mut self, needed_bytes: usize) {
+        if needed_bytes > self.budget_bytes {
+            return;
+        }
+        let small_target = (self.budget_bytes / 10).max(1);
+        let mut guard_steps = (self.small_fifo.len() + self.main_fifo.len()).saturating_mul(4) + 16;
+        while self.resident_bytes.saturating_add(needed_bytes) > self.budget_bytes {
+            if guard_steps == 0 {
+                self.entries.clear();
+                self.small_fifo.clear();
+                self.main_fifo.clear();
+                self.s_bytes = 0;
+                self.m_bytes = 0;
+                self.resident_bytes = 0;
+                break;
+            }
+            guard_steps -= 1;
+
+            if (self.s_bytes > small_target || self.main_fifo.is_empty())
+                && let Some(candidate) = self.small_fifo.pop_front()
+            {
+                let Some(entry) = self.entries.get_mut(&candidate) else {
+                    continue;
+                };
+                if entry.queue != ExtentS3Queue::Small {
+                    continue;
+                }
+                let len = entry.data.len();
+                if entry.freq > 0 && self.m_bytes.saturating_add(len) <= self.budget_bytes {
+                    self.s_bytes = self.s_bytes.saturating_sub(len);
+                    self.m_bytes = self.m_bytes.saturating_add(len);
+                    entry.queue = ExtentS3Queue::Main;
+                    entry.freq = 0;
+                    self.main_fifo.push_back(candidate);
+                } else {
+                    let _ = self.remove_entry_accounting(candidate);
+                    self.evictions = self.evictions.saturating_add(1);
+                    self.record_ghost(candidate);
+                }
+                continue;
+            }
+
+            if let Some(candidate) = self.main_fifo.pop_front() {
+                let Some(entry) = self.entries.get_mut(&candidate) else {
+                    continue;
+                };
+                if entry.queue != ExtentS3Queue::Main {
+                    continue;
+                }
+                if entry.freq > 0 {
+                    entry.freq -= 1;
+                    self.main_fifo.push_back(candidate);
+                } else {
+                    let _ = self.remove_entry_accounting(candidate);
+                    self.evictions = self.evictions.saturating_add(1);
+                }
+            } else if self.small_fifo.is_empty() {
+                self.entries.clear();
+                self.s_bytes = 0;
+                self.m_bytes = 0;
+                self.resident_bytes = 0;
+                break;
+            }
+        }
+    }
+
+    fn insert_tile_slice(
+        &mut self,
+        tile_id: u64,
+        block_size: usize,
+        slot_lo: u8,
+        slot_hi: u8,
+        src: &[u8],
+    ) {
+        let Ok(bs_u32) = u32::try_from(block_size) else {
+            return;
+        };
+        let new_mask = extent_tile_slot_mask(slot_lo, slot_hi);
+        if let Some(existing) = self.entries.get(&tile_id).cloned()
+            && existing.block_size == bs_u32
+        {
+            if (existing.valid_mask & new_mask) == new_mask
+                && slot_lo >= existing.base_slot
+                && slot_hi <= existing.base_slot.saturating_add(existing.slot_len)
+            {
+                let rel_lo = usize::from(slot_lo - existing.base_slot) * block_size;
+                let rel_hi = usize::from(slot_hi - existing.base_slot) * block_size;
+                if existing.data.get(rel_lo..rel_hi) == Some(src) {
+                    return;
+                }
+            }
+            let combined_mask = existing.valid_mask | new_mask;
+            let merged_base = u8::try_from(combined_mask.trailing_zeros()).unwrap_or(0);
+            let merged_end = u8::try_from(32 - combined_mask.leading_zeros()).unwrap_or(32);
+            let merged_slot_len = merged_end.saturating_sub(merged_base);
+            let merged_bytes = usize::from(merged_slot_len) * block_size;
+            if merged_bytes > self.budget_bytes {
+                return;
+            }
+            let _ = self.remove_entry_accounting(tile_id);
+            self.evict_to_fit(merged_bytes);
+            if self.resident_bytes.saturating_add(merged_bytes) > self.budget_bytes {
+                return;
+            }
+            let mut merged = vec![0_u8; merged_bytes];
+            for slot in existing.base_slot..existing.base_slot.saturating_add(existing.slot_len) {
+                if (existing.valid_mask & (1_u32 << u32::from(slot))) != 0 {
+                    let old_off = usize::from(slot - existing.base_slot) * block_size;
+                    let new_off = usize::from(slot - merged_base) * block_size;
+                    merged[new_off..new_off + block_size]
+                        .copy_from_slice(&existing.data[old_off..old_off + block_size]);
+                }
+            }
+            let write_off = usize::from(slot_lo - merged_base) * block_size;
+            merged[write_off..write_off + src.len()].copy_from_slice(src);
+            match existing.queue {
+                ExtentS3Queue::Small => self.s_bytes = self.s_bytes.saturating_add(merged_bytes),
+                ExtentS3Queue::Main => self.m_bytes = self.m_bytes.saturating_add(merged_bytes),
+            }
+            self.resident_bytes = self.resident_bytes.saturating_add(merged_bytes);
+            self.entries.insert(
+                tile_id,
+                ExtentTileEntry {
+                    block_size: bs_u32,
+                    base_slot: merged_base,
+                    slot_len: merged_slot_len,
+                    valid_mask: combined_mask,
+                    queue: existing.queue,
+                    freq: existing.freq,
+                    data: Arc::from(merged),
+                },
+            );
+            return;
+        }
+
+        let _ = self.remove_entry_accounting(tile_id);
+        let tile_bytes = src.len();
+        if tile_bytes == 0 || tile_bytes > self.budget_bytes {
+            return;
+        }
+        self.evict_to_fit(tile_bytes);
+        if self.resident_bytes.saturating_add(tile_bytes) > self.budget_bytes {
+            return;
+        }
+        let queue = if self.ghost_set.remove(&tile_id) {
+            self.m_bytes = self.m_bytes.saturating_add(tile_bytes);
+            self.main_fifo.push_back(tile_id);
+            ExtentS3Queue::Main
+        } else {
+            self.s_bytes = self.s_bytes.saturating_add(tile_bytes);
+            self.small_fifo.push_back(tile_id);
+            ExtentS3Queue::Small
+        };
+        self.resident_bytes = self.resident_bytes.saturating_add(tile_bytes);
+        self.entries.insert(
+            tile_id,
+            ExtentTileEntry {
+                block_size: bs_u32,
+                base_slot: slot_lo,
+                slot_len: slot_hi - slot_lo,
+                valid_mask: new_mask,
+                queue,
+                freq: 0,
+                data: Arc::from(src),
+            },
+        );
+    }
+
+    fn invalidate_tile_slots(&mut self, tile_id: u64, slot_lo: u8, slot_hi: u8) {
+        self.invalidation_epoch = self.invalidation_epoch.wrapping_add(1);
+        let clear_mask = extent_tile_slot_mask(slot_lo, slot_hi);
+        let Some(entry) = self.entries.get_mut(&tile_id) else {
+            return;
+        };
+        entry.valid_mask &= !clear_mask;
+        if entry.valid_mask == 0 {
+            let _ = self.remove_entry_accounting(tile_id);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.invalidation_epoch = self.invalidation_epoch.wrapping_add(1);
+        self.entries.clear();
+        self.small_fifo.clear();
+        self.main_fifo.clear();
+        self.ghost_fifo.clear();
+        self.ghost_set.clear();
+        self.s_bytes = 0;
+        self.m_bytes = 0;
+        self.resident_bytes = 0;
+    }
+}
+
+/// Lock-striped, byte-budgeted, scan-resistant (S3-FIFO) 32-block tile read cache
+/// for bulk and random extent reads across ext4 and btrfs (`bd-mf9z9`).
+#[derive(Debug)]
+pub struct ShardedExtentReadCache {
+    shards: Box<[Mutex<ExtentCacheShard>]>,
+    shard_mask: usize,
+    capacity_bytes: usize,
+}
+
+impl ShardedExtentReadCache {
+    const MIN_SHARD_BUDGET_BYTES: usize = 256 * 1024;
+
+    #[must_use]
+    pub fn new(capacity_bytes: usize) -> Self {
+        let mut shard_count = DEFAULT_EXTENT_CACHE_SHARDS;
+        while shard_count > 1 && capacity_bytes / shard_count < Self::MIN_SHARD_BUDGET_BYTES {
+            shard_count /= 2;
+        }
+        let base_budget = capacity_bytes / shard_count;
+        let remainder = capacity_bytes % shard_count;
+        let shards: Vec<Mutex<ExtentCacheShard>> = (0..shard_count)
+            .map(|idx| {
+                let extra = usize::from(idx < remainder);
+                Mutex::new(ExtentCacheShard::new(base_budget + extra))
+            })
+            .collect();
+        Self {
+            shards: shards.into_boxed_slice(),
+            shard_mask: shard_count - 1,
+            capacity_bytes,
+        }
+    }
+
+    #[must_use]
+    pub fn capacity_bytes(&self) -> usize {
+        self.capacity_bytes
+    }
+
+    #[inline]
+    fn shard_index(&self, tile_id: u64) -> usize {
+        let mixed = tile_id.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        ((mixed ^ (mixed >> 32)) as usize) & self.shard_mask
+    }
+
+    fn record_epoch_once(epochs: &mut ExtentMissEpochs, shard_idx: usize, epoch: u64) {
+        if !epochs.iter().any(|item| item.shard_idx == shard_idx) {
+            epochs.push(ExtentMissEpoch { shard_idx, epoch });
+        }
+    }
+
+    /// Serve `[start .. start + dst.len() / block_size)` into `dst` on a full cache
+    /// hit (`Ok(())`, copying payload slices outside shard locks), or return per-shard
+    /// invalidation epochs (`Err(epochs)`) to pass to [`Self::insert_range`] after I/O.
+    pub fn copy_or_miss_epochs(
+        &self,
+        start: BlockNumber,
+        block_size: usize,
+        dst: &mut [u8],
+    ) -> std::result::Result<(), ExtentMissEpochs> {
+        if self.capacity_bytes == 0
+            || dst.is_empty()
+            || block_size == 0
+            || !dst.len().is_multiple_of(block_size)
+        {
+            return Err(ExtentMissEpochs::new());
+        }
+        let Ok(bs_u32) = u32::try_from(block_size) else {
+            return Err(ExtentMissEpochs::new());
+        };
+        let count = dst.len() / block_size;
+        let Ok(count_u64) = u64::try_from(count) else {
+            return Err(ExtentMissEpochs::new());
+        };
+        let Some(end_block) = start.0.checked_add(count_u64) else {
+            return Err(ExtentMissEpochs::new());
+        };
+
+        let tile_blocks_u64 = EXTENT_CACHE_TILE_BLOCKS as u64;
+        let mut cursor = start.0;
+        let mut dst_off = 0_usize;
+        let mut missed = false;
+        let mut miss_epochs = ExtentMissEpochs::new();
+
+        while cursor < end_block {
+            let tile_id = cursor / tile_blocks_u64;
+            let slot_lo = u8::try_from(cursor % tile_blocks_u64).unwrap_or(0);
+            let tile_end = (tile_id + 1).saturating_mul(tile_blocks_u64).min(end_block);
+            let len_blocks = usize::try_from(tile_end - cursor).unwrap_or(0);
+            let slot_hi = slot_lo + u8::try_from(len_blocks).unwrap_or(0);
+            let req_mask = extent_tile_slot_mask(slot_lo, slot_hi);
+            let shard_idx = self.shard_index(tile_id);
+            let byte_span = len_blocks * block_size;
+
+            if missed {
+                let epoch = self.shards[shard_idx].lock().invalidation_epoch;
+                Self::record_epoch_once(&mut miss_epochs, shard_idx, epoch);
+            } else {
+                let hit_payload = {
+                    let mut shard = self.shards[shard_idx].lock();
+                    let current_epoch = shard.invalidation_epoch;
+                    if let Some(entry) = shard.entries.get_mut(&tile_id)
+                        && entry.block_size == bs_u32
+                        && (entry.valid_mask & req_mask) == req_mask
+                    {
+                        entry.freq = entry.freq.saturating_add(1).min(3);
+                        let base_slot = entry.base_slot;
+                        let data = Arc::clone(&entry.data);
+                        shard.hits = shard.hits.saturating_add(1);
+                        Some((base_slot, data))
+                    } else {
+                        shard.misses = shard.misses.saturating_add(1);
+                        Self::record_epoch_once(&mut miss_epochs, shard_idx, current_epoch);
+                        None
+                    }
+                };
+                if let Some((base_slot, data)) = hit_payload {
+                    let src_lo = usize::from(slot_lo - base_slot) * block_size;
+                    let src_hi = src_lo + byte_span;
+                    dst[dst_off..dst_off + byte_span].copy_from_slice(&data[src_lo..src_hi]);
+                } else {
+                    missed = true;
+                }
+            }
+
+            cursor = tile_end;
+            dst_off += byte_span;
+        }
+
+        if missed {
+            // Ensure earlier shards in a multi-tile read that hit before the first
+            // missing tile also have their current epochs recorded for `insert_range`.
+            let mut rescan = start.0;
+            while rescan < end_block {
+                let tile_id = rescan / tile_blocks_u64;
+                let shard_idx = self.shard_index(tile_id);
+                if !miss_epochs.iter().any(|item| item.shard_idx == shard_idx) {
+                    let epoch = self.shards[shard_idx].lock().invalidation_epoch;
+                    miss_epochs.push(ExtentMissEpoch { shard_idx, epoch });
+                }
+                rescan = (tile_id + 1).saturating_mul(tile_blocks_u64).min(end_block);
+            }
+            Err(miss_epochs)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn copy_into(&self, start: BlockNumber, block_size: usize, dst: &mut [u8]) -> bool {
+        self.copy_or_miss_epochs(start, block_size, dst).is_ok()
+    }
+
+    /// Insert `[start .. start + bytes.len() / block_size)` guarded by `miss_epochs`
+    /// captured before the backing read began. Any shard invalidated in the interim
+    /// rejects the stale fill.
+    pub fn insert_range(
+        &self,
+        start: BlockNumber,
+        block_size: usize,
+        bytes: &[u8],
+        miss_epochs: &[ExtentMissEpoch],
+    ) {
+        self.insert_range_inner(start, block_size, bytes, Some(miss_epochs));
+    }
+
+    /// Unconditionally insert `bytes` (used in unit tests and synthetic warmups).
+    pub fn insert_unconditional(&self, start: BlockNumber, block_size: usize, bytes: &[u8]) {
+        self.insert_range_inner(start, block_size, bytes, None);
+    }
+
+    fn insert_range_inner(
+        &self,
+        start: BlockNumber,
+        block_size: usize,
+        bytes: &[u8],
+        miss_epochs: Option<&[ExtentMissEpoch]>,
+    ) {
+        if self.capacity_bytes == 0
+            || bytes.is_empty()
+            || block_size == 0
+            || !bytes.len().is_multiple_of(block_size)
+        {
+            return;
+        }
+        if let Some(epochs) = miss_epochs
+            && epochs.is_empty()
+        {
+            return;
+        }
+        let count = bytes.len() / block_size;
+        let Ok(count_u64) = u64::try_from(count) else {
+            return;
+        };
+        let Some(end_block) = start.0.checked_add(count_u64) else {
+            return;
+        };
+
+        let tile_blocks_u64 = EXTENT_CACHE_TILE_BLOCKS as u64;
+        let mut cursor = start.0;
+        let mut src_off = 0_usize;
+
+        while cursor < end_block {
+            let tile_id = cursor / tile_blocks_u64;
+            let slot_lo = u8::try_from(cursor % tile_blocks_u64).unwrap_or(0);
+            let tile_end = (tile_id + 1).saturating_mul(tile_blocks_u64).min(end_block);
+            let len_blocks = usize::try_from(tile_end - cursor).unwrap_or(0);
+            let slot_hi = slot_lo + u8::try_from(len_blocks).unwrap_or(0);
+            let byte_span = len_blocks * block_size;
+            let shard_idx = self.shard_index(tile_id);
+
+            {
+                let mut shard = self.shards[shard_idx].lock();
+                let epoch_valid = miss_epochs.is_none_or(|epochs| {
+                    epochs
+                        .iter()
+                        .any(|e| e.shard_idx == shard_idx && e.epoch == shard.invalidation_epoch)
+                });
+                if epoch_valid {
+                    shard.insert_tile_slice(
+                        tile_id,
+                        block_size,
+                        slot_lo,
+                        slot_hi,
+                        &bytes[src_off..src_off + byte_span],
+                    );
+                }
+            }
+
+            cursor = tile_end;
+            src_off += byte_span;
+        }
+    }
+
+    pub fn invalidate_block(&self, block: BlockNumber) {
+        self.invalidate_block_range(block, 1);
+    }
+
+    pub fn invalidate_block_range(&self, start: BlockNumber, count: usize) {
+        if self.capacity_bytes == 0 || count == 0 {
+            return;
+        }
+        let Ok(count_u64) = u64::try_from(count) else {
+            return;
+        };
+        let end_block = start.0.saturating_add(count_u64);
+        let tile_blocks_u64 = EXTENT_CACHE_TILE_BLOCKS as u64;
+        let mut cursor = start.0;
+        while cursor < end_block {
+            let tile_id = cursor / tile_blocks_u64;
+            let slot_lo = u8::try_from(cursor % tile_blocks_u64).unwrap_or(0);
+            let tile_end = (tile_id + 1).saturating_mul(tile_blocks_u64).min(end_block);
+            let len_blocks = usize::try_from(tile_end - cursor).unwrap_or(0);
+            let slot_hi = slot_lo + u8::try_from(len_blocks).unwrap_or(0);
+            let shard_idx = self.shard_index(tile_id);
+            self.shards[shard_idx]
+                .lock()
+                .invalidate_tile_slots(tile_id, slot_lo, slot_hi);
+            cursor = tile_end;
+        }
+    }
+
+    pub fn invalidate_blocks(&self, blocks: &[BlockNumber]) {
+        if self.capacity_bytes == 0 || blocks.is_empty() {
+            return;
+        }
+        for &block in blocks {
+            self.invalidate_block_range(block, 1);
+        }
+    }
+
+    pub fn clear(&self) {
+        if self.capacity_bytes == 0 {
+            return;
+        }
+        for shard in &self.shards {
+            shard.lock().clear();
+        }
+    }
+
+    #[must_use]
+    pub fn metrics(&self) -> ExtentCacheMetrics {
+        let mut out = ExtentCacheMetrics {
+            capacity_bytes: self.capacity_bytes,
+            ..ExtentCacheMetrics::default()
+        };
+        for shard in &self.shards {
+            let guard = shard.lock();
+            out.hits = out.hits.saturating_add(guard.hits);
+            out.misses = out.misses.saturating_add(guard.misses);
+            out.evictions = out.evictions.saturating_add(guard.evictions);
+            out.resident_tiles = out.resident_tiles.saturating_add(guard.entries.len());
+            out.resident_bytes = out.resident_bytes.saturating_add(guard.resident_bytes);
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod extent_read_cache_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    #[test]
+    fn extent_cache_s3fifo_resists_streaming_scan_and_preserves_hot_working_set() {
+        let bs = 4096_usize;
+        let budget = 2 * 1024 * 1024; // 2 MiB total budget
+        let cache = ShardedExtentReadCache::new(budget);
+
+        // Hot working set = 1 MiB (8 x 128 KiB tiles = blocks 0..256), touched twice
+        // so S3-FIFO promotes hot tiles from Small -> Main on eviction!
+        let tile_bytes = EXTENT_CACHE_TILE_BLOCKS * bs;
+        for pass in 0..2_u8 {
+            for tile in 0..8_u64 {
+                let start = BlockNumber(tile * 32);
+                let mut probe = vec![0_u8; tile_bytes];
+                match cache.copy_or_miss_epochs(start, bs, &mut probe) {
+                    Ok(()) => assert_eq!(pass, 1, "second pass must hit"),
+                    Err(epochs) => {
+                        let fill = vec![u8::try_from(tile + 1).unwrap(); tile_bytes];
+                        cache.insert_range(start, bs, &fill, &epochs);
+                    }
+                }
+            }
+        }
+
+        // Stream a 16 MiB one-pass sequential scan (8x larger than the 2 MiB budget!).
+        for tile in 100..228_u64 {
+            let start = BlockNumber(tile * 32);
+            let mut probe = vec![0_u8; tile_bytes];
+            if let Err(epochs) = cache.copy_or_miss_epochs(start, bs, &mut probe) {
+                let fill = vec![0xEE_u8; tile_bytes];
+                cache.insert_range(start, bs, &fill, &epochs);
+            }
+            assert!(
+                cache.metrics().resident_bytes <= budget,
+                "resident_bytes exceeded budget during scan"
+            );
+        }
+
+        // Now issue 256 4 KiB random reads across the 1 MiB hot working set and verify >= 95% hits!
+        let before = cache.metrics();
+        let mut block_buf = [0_u8; 4096];
+        for blk in 0..256_u64 {
+            let expected_byte = u8::try_from(blk / 32 + 1).unwrap();
+            assert!(
+                cache.copy_into(BlockNumber(blk), bs, &mut block_buf),
+                "hot block {blk} evicted by one-pass streaming scan"
+            );
+            assert_eq!(block_buf[0], expected_byte);
+        }
+        let after = cache.metrics();
+        assert_eq!(after.hits - before.hits, 256);
+        assert!(after.resident_bytes <= budget);
+    }
+
+    #[test]
+    fn extent_cache_cross_tile_straddle_and_epoch_invalidation_reject_stale_miss() {
+        let bs = 4096_usize;
+        let cache = ShardedExtentReadCache::new(1024 * 1024);
+
+        // Insert blocks 30..34 (straddling tile 0 [30..32) and tile 1 [0..2))!
+        let mut initial = vec![0_u8; 4 * bs];
+        for (i, chunk) in initial.chunks_exact_mut(bs).enumerate() {
+            chunk.fill(u8::try_from(10 + i).unwrap());
+        }
+        cache.insert_unconditional(BlockNumber(30), bs, &initial);
+
+        let mut straddle = vec![0_u8; 4 * bs];
+        assert!(cache.copy_into(BlockNumber(30), bs, &mut straddle));
+        assert_eq!(straddle, initial);
+
+        // Partial sub-tile invalidation on block 31 leaves 30, 32, 33 valid while 31 misses!
+        cache.invalidate_block(BlockNumber(31));
+        assert!(!cache.copy_into(BlockNumber(30), bs, &mut straddle));
+        let mut single = vec![0_u8; bs];
+        assert!(cache.copy_into(BlockNumber(30), bs, &mut single));
+        assert_eq!(single[0], 10);
+        assert!(cache.copy_into(BlockNumber(32), bs, &mut single));
+        assert_eq!(single[0], 12);
+
+        // Simulate TOCTOU: reader captures miss epoch on block 31, writer invalidates block 31
+        // before reader finishes stale disk read -> `insert_range` MUST reject the stale fill!
+        let stale_epochs = cache
+            .copy_or_miss_epochs(BlockNumber(31), bs, &mut single)
+            .expect_err("block 31 was invalidated");
+        cache.invalidate_block(BlockNumber(31));
+        cache.insert_range(BlockNumber(31), bs, &[0x99_u8; 4096], &stale_epochs);
+        assert!(
+            !cache.copy_into(BlockNumber(31), bs, &mut single),
+            "stale miss fill after concurrent invalidation must be rejected"
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn prop_extent_cache_never_exceeds_byte_budget(
+            ops in prop::collection::vec((0_u64..192, 1_usize..=16, any::<bool>(), any::<u8>()), 1..120)
+        ) {
+            let bs = 4096_usize;
+            let budget = 384 * 1024; // 384 KiB tight budget (96 blocks)
+            let cache = ShardedExtentReadCache::new(budget);
+            for (start, count, is_invalidate, fill_byte) in ops {
+                if is_invalidate {
+                    cache.invalidate_block_range(BlockNumber(start), count);
+                } else {
+                    let mut buf = vec![0_u8; count * bs];
+                    if let Err(epochs) = cache.copy_or_miss_epochs(BlockNumber(start), bs, &mut buf) {
+                        buf.fill(fill_byte);
+                        cache.insert_range(BlockNumber(start), bs, &buf, &epochs);
+                    }
+                }
+                prop_assert!(cache.metrics().resident_bytes <= budget);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "cache_transaction_tests.rs"]
 mod cache_transaction_tests;
