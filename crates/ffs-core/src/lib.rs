@@ -20007,10 +20007,8 @@ impl OpenFs {
         let should_verify =
             self.btrfs_verify_data_on_read && (inode.flags & BTRFS_INODE_NODATASUM == 0);
         let allow_cache_admit = should_verify || (inode.flags & BTRFS_INODE_NODATASUM != 0);
-        let mut verify_sectorsize = 0_usize;
-        let mut csum_disk_ranges: Vec<(u64, u64)> = Vec::new();
-        if should_verify {
-            verify_sectorsize = self
+        let (verify_sectorsize, csum_disk_ranges): (usize, Vec<(u64, u64)>) = if should_verify {
+            let sec_usize = self
                 .btrfs_superblock()
                 .and_then(|sb| usize::try_from(sb.sectorsize).ok())
                 .filter(|s| *s != 0)
@@ -20024,8 +20022,8 @@ impl OpenFs {
                      (CRC32C=0 and XXHASH64=1 are)"
                 ))
             })?;
-            let sec_u64 = verify_sectorsize as u64;
-            csum_disk_ranges = extents
+            let sec_u64 = sec_usize as u64;
+            let ranges = extents
                 .iter()
                 .filter_map(|(logical_start, extent)| match extent {
                     BtrfsExtentData::Regular {
@@ -20058,7 +20056,10 @@ impl OpenFs {
                     _ => None,
                 })
                 .collect();
-        }
+            (sec_usize, ranges)
+        } else {
+            (0, Vec::new())
+        };
         let lazy_csums: std::sync::OnceLock<Result<std::sync::Arc<BtrfsCsumItems>, FfsError>> =
             std::sync::OnceLock::new();
         let load_csums = || -> Result<&[(BtrfsKey, Vec<u8>)], FfsError> {
