@@ -258,6 +258,8 @@ impl PlacementScope {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Workload {
     WarmStat,
+    RandRead4k,
+    RandRead4kColdCache,
     ParallelMetadataWrite,
     ParallelRead8,
     ParallelRead8ColdCache,
@@ -273,6 +275,8 @@ impl Workload {
     const fn label(self) -> &'static str {
         match self {
             Self::WarmStat => "warm_stat",
+            Self::RandRead4k => "rand_read_4k",
+            Self::RandRead4kColdCache => "rand_read_4k_cold_cache",
             Self::ParallelMetadataWrite => "parallel_metadata_write",
             Self::ParallelRead8 => "parallel_read_multifile_8t",
             Self::ParallelRead8ColdCache => "parallel_read_multifile_8t_cold_cache",
@@ -315,6 +319,8 @@ impl Workload {
                 DEFAULT_PARALLEL_THREADS
             }
             Self::WarmStat
+            | Self::RandRead4k
+            | Self::RandRead4kColdCache
             | Self::CreateDeleteStorm
             | Self::FsyncJournalCommit
             | Self::BulkDurableWrite
@@ -349,6 +355,8 @@ impl Workload {
         match self {
             Self::FsyncJournalCommit => Some(192),
             Self::WarmStat
+            | Self::RandRead4k
+            | Self::RandRead4kColdCache
             | Self::ParallelMetadataWrite
             | Self::ParallelRead8
             | Self::ParallelRead8ColdCache
@@ -370,6 +378,8 @@ impl Workload {
                 "overwrite_preallocated_1m_chunks_with_o_direct_then_single_file_fsync"
             }
             Self::WarmStat
+            | Self::RandRead4k
+            | Self::RandRead4kColdCache
             | Self::ParallelRead8
             | Self::ParallelRead8ColdCache
             | Self::ReaddirStat8
@@ -388,6 +398,8 @@ impl Workload {
             | Self::ParallelRead8ColdCache
             | Self::ReaddirStat8 => "unique Linux TIDs reported by workers inside each timed batch",
             Self::WarmStat
+            | Self::RandRead4k
+            | Self::RandRead4kColdCache
             | Self::CreateDeleteStorm
             | Self::FsyncJournalCommit
             | Self::BulkDurableWrite
@@ -403,6 +415,19 @@ impl Workload {
             Self::WarmStat => format!(
                 "one warm-cache metadata report job: issue {operations} stat calls for one \
                  mounted file and aggregate the observed metadata"
+            ),
+            Self::RandRead4k => format!(
+                "one warm-cache random 4 KiB read job: open payload.bin once and issue \
+                 {operations} deterministic pseudo-random 4096-byte aligned preads ({} total \
+                 bytes) and aggregate a content digest",
+                operations.saturating_mul(4096)
+            ),
+            Self::RandRead4kColdCache => format!(
+                "one cold-cache random 4 KiB read job: before every timed batch, sync and write \
+                 3 to /proc/sys/vm/drop_caches; then open payload.bin and issue {operations} \
+                 deterministic pseudo-random 4096-byte aligned preads ({} total bytes) and \
+                 aggregate a content digest",
+                operations.saturating_mul(4096)
             ),
             Self::ParallelMetadataWrite => format!(
                 "one parallel namespace job: {client_threads} workers create exactly \
@@ -494,6 +519,20 @@ impl Workload {
                 "stat_calls": operations,
                 "input_files": 1,
             }),
+            Self::RandRead4k => json!({
+                "positioned_reads": operations,
+                "bytes_per_read": 4096,
+                "total_bytes_read": operations.saturating_mul(4096),
+                "input_files": 1,
+            }),
+            Self::RandRead4kColdCache => json!({
+                "positioned_reads": operations,
+                "bytes_per_read": 4096,
+                "total_bytes_read": operations.saturating_mul(4096),
+                "input_files": 1,
+                "cache_clear_before_every_timed_batch": "sync; write 3 to /proc/sys/vm/drop_caches",
+                "warmup_batches": 0,
+            }),
             Self::ParallelMetadataWrite => json!({
                 "files_created": operations,
                 "worker_directories_fsynced": client_threads,
@@ -571,7 +610,10 @@ impl Workload {
     }
 
     const fn uses_cold_cache(self) -> bool {
-        matches!(self, Self::ParallelRead8ColdCache)
+        matches!(
+            self,
+            Self::ParallelRead8ColdCache | Self::RandRead4kColdCache
+        )
     }
 
     const fn warmup_rounds(self) -> usize {
@@ -1870,6 +1912,8 @@ impl RetrievalProvenance {
 fn parse_workload(value: &str) -> Result<Workload> {
     match value {
         "warm-stat" => Ok(Workload::WarmStat),
+        "rand-read-4k" => Ok(Workload::RandRead4k),
+        "rand-read-4k-cold-cache" => Ok(Workload::RandRead4kColdCache),
         "parallel-metadata-write" | "parallel-metadata-write-8t" => {
             Ok(Workload::ParallelMetadataWrite)
         }
@@ -1882,7 +1926,7 @@ fn parse_workload(value: &str) -> Result<Workload> {
         "direct-durable-write" => Ok(Workload::DirectDurableWrite),
         "xattr-get-list-report" => Ok(Workload::XattrGetListReport),
         _ => bail!(
-            "unsupported --workload {value}; expected warm-stat|parallel-metadata-write|parallel-read-8t|parallel-read-8t-cold-cache|create-delete-storm|readdir-stat-8t|fsync-journal-commit|bulk-durable-write|direct-durable-write|xattr-get-list-report"
+            "unsupported --workload {value}; expected warm-stat|rand-read-4k|rand-read-4k-cold-cache|parallel-metadata-write|parallel-read-8t|parallel-read-8t-cold-cache|create-delete-storm|readdir-stat-8t|fsync-journal-commit|bulk-durable-write|direct-durable-write|xattr-get-list-report"
         ),
     }
 }
@@ -2582,7 +2626,7 @@ fn create_fixture_tree(run_dir: &Path, config: &Config) -> Result<PathBuf> {
     )
     .context("write fixture sentinel")?;
     match config.workload {
-        Workload::WarmStat => {}
+        Workload::WarmStat | Workload::RandRead4k | Workload::RandRead4kColdCache => {}
         Workload::ParallelMetadataWrite => {
             let parent = root.join("parallel-metadata");
             fs::create_dir(&parent).with_context(|| format!("create {}", parent.display()))?;
@@ -4234,6 +4278,36 @@ fn stat_batch(path: &Path, operations: usize) -> Result<(u64, u64)> {
     Ok((elapsed, digest))
 }
 
+fn rand_read_4k_batch(path: &Path, operations: usize) -> Result<(u64, u64)> {
+    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let block_count = u64::try_from(PAYLOAD_BYTES / 4096).unwrap_or(256);
+    let mut rng = 0x5241_4E44_344B_5F31_u64;
+    let mut digest = 0x9E37_79B9_7F4A_7C15_u64;
+    let mut buf = [0_u8; 4096];
+    let started = Instant::now();
+    for index in 0..operations {
+        rng = rng
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let blk = (rng >> 32) % block_count;
+        file.read_exact_at(&mut buf, blk * 4096)
+            .with_context(|| format!("timed 4 KiB pread {}", path.display()))?;
+        let head = u64::from_le_bytes([
+            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+        ]);
+        let tail = u64::from_le_bytes([
+            buf[4088], buf[4089], buf[4090], buf[4091], buf[4092], buf[4093], buf[4094], buf[4095],
+        ]);
+        digest = digest.rotate_left(11)
+            ^ head.wrapping_mul(0xBF58_476D_1CE4_E5B9)
+            ^ tail.rotate_left(23)
+            ^ u64::try_from(index).unwrap_or(u64::MAX);
+    }
+    let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    black_box(digest);
+    Ok((elapsed, digest))
+}
+
 fn fold_xattr_bytes(mut digest: u64, bytes: &[u8]) -> u64 {
     digest ^= u64::try_from(bytes.len()).unwrap_or(u64::MAX);
     digest = digest.wrapping_mul(0x0000_0100_0000_01B3);
@@ -5127,6 +5201,8 @@ fn workload_batch(
         }
         Workload::ReaddirStat8 => return readdir_stat_batch(root, config.operations, pinning),
         Workload::WarmStat
+        | Workload::RandRead4k
+        | Workload::RandRead4kColdCache
         | Workload::CreateDeleteStorm
         | Workload::FsyncJournalCommit
         | Workload::BulkDurableWrite
@@ -5139,6 +5215,9 @@ fn workload_batch(
     let driver_tid_before = current_linux_tid()?;
     let (elapsed_ns, digest) = match config.workload {
         Workload::WarmStat => stat_batch(&root.join("payload.bin"), config.operations)?,
+        Workload::RandRead4k | Workload::RandRead4kColdCache => {
+            rand_read_4k_batch(&root.join("payload.bin"), config.operations)?
+        }
         Workload::ParallelMetadataWrite
         | Workload::ParallelRead8
         | Workload::ParallelRead8ColdCache
@@ -8929,6 +9008,40 @@ fuse_null_median={:.6},inflation_suspected={},gate_input=false",
         );
     }
 
+    let fuse_daemon_memory: serde_json::Map<String, Value> = mounts
+        .iter()
+        .filter_map(|mount| match &mount.kind {
+            MountedArmKind::Fuse { child, .. } => {
+                let status_path = format!("/proc/{}/status", child.id());
+                let (mut vm_rss_kib, mut vm_hwm_kib) = (None, None);
+                if let Ok(text) = fs::read_to_string(&status_path) {
+                    for line in text.lines() {
+                        if let Some(rest) = line.strip_prefix("VmRSS:") {
+                            vm_rss_kib = rest
+                                .split_whitespace()
+                                .next()
+                                .and_then(|t| t.parse::<u64>().ok());
+                        } else if let Some(rest) = line.strip_prefix("VmHWM:") {
+                            vm_hwm_kib = rest
+                                .split_whitespace()
+                                .next()
+                                .and_then(|t| t.parse::<u64>().ok());
+                        }
+                    }
+                }
+                Some((
+                    mount.arm.label().to_owned(),
+                    json!({
+                        "pid": child.id(),
+                        "vm_rss_kib": vm_rss_kib,
+                        "vm_hwm_kib": vm_hwm_kib,
+                    }),
+                ))
+            }
+            MountedArmKind::Kernel => None,
+        })
+        .collect();
+
     for mount in mounts.iter_mut().rev() {
         mount.unmount()?;
     }
@@ -9474,6 +9587,7 @@ fuse_null_median={:.6},inflation_suspected={},gate_input=false",
         "diagnostic_side_throughput": diagnostic_throughput_json,
         "abba_symmetry": abba_symmetry_json,
         "fuse_dispatch_metrics": fuse_dispatch_metrics,
+        "daemon_memory_kib_by_arm": fuse_daemon_memory,
         "workload_digests": workload_digests,
         "kernel_aa": kernel_aa_json,
         "fuse_aa": fuse_aa_json,
@@ -11687,6 +11801,8 @@ mod tests {
             Workload::ParallelRead8,
             Workload::ParallelRead8ColdCache,
             Workload::WarmStat,
+            Workload::RandRead4k,
+            Workload::RandRead4kColdCache,
             Workload::CreateDeleteStorm,
             Workload::FsyncJournalCommit,
             Workload::BulkDurableWrite,
@@ -14066,6 +14182,8 @@ mod tests {
         // measured unindexed on BOTH construction paths (the audit's negative control).
         for workload in [
             Workload::WarmStat,
+            Workload::RandRead4k,
+            Workload::RandRead4kColdCache,
             Workload::ParallelMetadataWrite,
             Workload::CreateDeleteStorm,
             Workload::FsyncJournalCommit,

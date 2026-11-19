@@ -1155,6 +1155,7 @@ dependencies = [
  "crc32c",
  "criterion",
  "ctrlc",
+ "ffs",
  "ffs-alloc",
  "ffs-block",
  "ffs-btrfs",

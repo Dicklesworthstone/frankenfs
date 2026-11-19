@@ -174,7 +174,7 @@ impl ExecutedEvidence {
         Self::run_captured_with_env(command, args, &[])
     }
 
-    fn run_captured_with_env(
+    pub(crate) fn run_captured_with_env(
         command: &str,
         args: &[&str],
         extra_env: &[(&str, &str)],

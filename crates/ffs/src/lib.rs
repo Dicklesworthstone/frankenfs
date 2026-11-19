@@ -14,10 +14,11 @@ pub use ffs_ondisk::partition::{
     PartitionSelector, PartitionTable, SyntheticGptPartitionSpec, write_gpt_partition_table,
 };
 pub use native::{
-    ImageSource, PartitionByteDevice, ReadOnlyBackend, ReadOnlyFs, ReadOnlyOpenOptions,
-    ZfsMissingMembers, ZfsReadOptions, ZfsRootSelection, discover_partitions,
-    discover_partitions_on_device, open_partition_read_only, open_read_only, open_read_only_device,
-    select_partition_device,
+    BoundedByteDevice, BoundedWalkSummary, ImageSource, PartitionByteDevice, ReadOnlyBackend,
+    ReadOnlyFs, ReadOnlyOpenOptions, ReferenceDepthGuard, ResourceBudget, ResourceTracker,
+    ResourceUsageSnapshot, RetainedBytesGuard, ZfsMissingMembers, ZfsReadOptions, ZfsRootSelection,
+    discover_partitions, discover_partitions_on_device, open_partition_read_only, open_read_only,
+    open_read_only_device, select_partition_device,
 };
 
 pub use ffs_fat as fat;

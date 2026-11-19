@@ -251,6 +251,7 @@ impl SixFormatCliArgs {
             uid,
             gid,
             backend,
+            budget: ffs::ResourceBudget::default(),
         })
     }
 }
@@ -1656,6 +1657,8 @@ pub fn maybe_route_mount_cmd(
         .then(|| sha256_regular_file(image_path))
         .flatten();
 
+    let uid = nix::unistd::Uid::current().as_raw();
+    let gid = nix::unistd::Gid::current().as_raw();
     let fs_ops: Box<dyn ffs_core::FsOps> = if options.read_write {
         match kind {
             FsFormatKind::Fat16 | FsFormatKind::Fat32 => {
@@ -1668,7 +1671,7 @@ pub fn maybe_route_mount_cmd(
                     sidecar: None,
                 };
                 let volume = ffs_fat::reader::replacement::open_volume(&cx, &img, true)?;
-                let fat_fs = ffs_fat::FatFs::new_with_mode(&cx, volume, 0, 0, true)?;
+                let fat_fs = ffs_fat::FatFs::new_with_mode(&cx, volume, uid, gid, true)?;
                 Box::new(fat_fs)
             }
             FsFormatKind::Ntfs => {
@@ -1683,7 +1686,7 @@ pub fn maybe_route_mount_cmd(
                         recover_dirty: false,
                     },
                 )?;
-                let ntfs_fs = ffs_ntfs::NtfsFs::from_engine(&cx, engine, 0, 0)?;
+                let ntfs_fs = ffs_ntfs::NtfsFs::from_engine(&cx, engine, uid, gid)?;
                 Box::new(ntfs_fs)
             }
             FsFormatKind::Zfs => {
@@ -1734,8 +1737,8 @@ pub fn maybe_route_mount_cmd(
             kind,
             Some(options.btrfs_mount_selection.clone()),
             &options.btrfs_device_paths,
-            0,
-            0,
+            uid,
+            gid,
         )?;
         let opened = open_read_only(&cx, image_path, &ro_opts)?;
         opened.filesystem

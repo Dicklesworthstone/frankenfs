@@ -7,14 +7,14 @@
     "meta": "Harness plumbing, operational readiness reports, evidence packaging, dashboards, gates, schedulers, benchmark/report metadata, and CLI/runtime support around those lanes."
   },
   "summary": {
-    "modules": 90,
-    "total_loc": 174113,
-    "conformance_modules": 24,
-    "conformance_loc": 43838,
-    "conformance_loc_basis_points": 2518,
+    "modules": 91,
+    "total_loc": 175543,
+    "conformance_modules": 25,
+    "conformance_loc": 45267,
+    "conformance_loc_basis_points": 2579,
     "meta_modules": 66,
-    "meta_loc": 130275,
-    "meta_loc_basis_points": 7482
+    "meta_loc": 130276,
+    "meta_loc_basis_points": 7421
   },
   "modules": [
     {
@@ -55,7 +55,7 @@
     {
       "path": "src/bin/ffs_mounted_kernel_bench.rs",
       "classification": "conformance",
-      "loc": 14359
+      "loc": 14477
     },
     {
       "path": "src/btrfs_capability_drift.rs",
@@ -170,7 +170,7 @@
     {
       "path": "src/lib.rs",
       "classification": "meta",
-      "loc": 3736
+      "loc": 3737
     },
     {
       "path": "src/log_contract.rs",
@@ -386,6 +386,11 @@
       "path": "src/scrub_repair_scheduler.rs",
       "classification": "conformance",
       "loc": 1025
+    },
+    {
+      "path": "src/six_format_qualification.rs",
+      "classification": "conformance",
+      "loc": 1311
     },
     {
       "path": "src/soak_canary_campaign.rs",

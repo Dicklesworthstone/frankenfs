@@ -1369,9 +1369,24 @@ fn open_read_only_device_enforces_zero_write_sync_authority_and_rejects_path_com
             panic!("open_read_only_device must never invoke write_all_at");
         }
 
+        fn write_vectored_all_at(
+            &self,
+            _cx: &Cx,
+            _offset: ByteOffset,
+            _bufs: &[&[u8]],
+        ) -> Result<()> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            panic!("open_read_only_device must never invoke write_vectored_all_at");
+        }
+
         fn sync(&self, _cx: &Cx) -> Result<()> {
             self.writes.fetch_add(1, Ordering::SeqCst);
             panic!("open_read_only_device must never invoke sync");
+        }
+
+        fn begin_durability_commit(&self, _cx: &Cx) -> Result<()> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            panic!("open_read_only_device must never invoke begin_durability_commit");
         }
 
         fn discard(&self, _cx: &Cx, _offset: ByteOffset, _length: u64) -> Result<()> {

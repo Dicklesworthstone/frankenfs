@@ -117,7 +117,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             e2fsprogs libext2fs-dev btrfs-progs fuse3 \
-            dosfstools ntfs-3g zfsutils-linux \
+            dosfstools mtools ntfs-3g zfsutils-linux \
             build-essential autoconf automake pkg-config \
             uuid-dev libblkid-dev zlib1g-dev liblzo2-dev libzstd-dev libudev-dev
           # The unignored live TUI test uses fuser's auto-unmount helper.
@@ -158,11 +158,21 @@ jobs:
 
       # The mounted comparator's scratch-root guard only accepts paths under
       # /data/tmp (the offload hosts' scratch volume), and its unit tests
-      # exercise that guard in place. Give the runner the same root.
+      # exercise that guard in place. Give the runner the same root, plus
+      # NVMe-backed swap and corpus storage so Ubuntu 26.04's Swap=0B + RAM
+      # tmpfs /tmp never OOM-kills the runner during multi-target test links.
       - name: Provide the /data/tmp scratch root
         run: |
-          sudo mkdir -p /data/tmp
-          sudo chmod 1777 /data/tmp
+          sudo mkdir -p /data/tmp /data/tmp/ffs-section22-corpus
+          sudo chmod 1777 /data/tmp /data/tmp/ffs-section22-corpus
+          if [ "$(awk 'NR>1 {sum+=$3} END {print sum+0}' /proc/swaps)" -eq 0 ]; then
+            sudo fallocate -l 16G /data/tmp/ci.swap || sudo dd if=/dev/zero of=/data/tmp/ci.swap bs=1M count=16384 status=none
+            sudo chmod 0600 /data/tmp/ci.swap
+            sudo mkswap /data/tmp/ci.swap
+            sudo swapon /data/tmp/ci.swap
+          fi
+          free -h
+          echo "FFS_SECTION22_CORPUS_DIR=/data/tmp/ffs-section22-corpus" >> "$GITHUB_ENV"
 
       - name: Generate native ext4 unit-test inputs
         run: |
@@ -189,7 +199,7 @@ jobs:
       - name: Unit tests
         env:
           FFS_REQUIRE_ORACLES: "1"
-        run: cargo test --workspace --no-fail-fast -- --nocapture
+        run: cargo -Z checksum-freshness test --workspace --no-fail-fast -- --nocapture
 
       # The ext4/btrfs reference and kernel-differential suites compare against
       # mkfs.ext4/debugfs and pinned btrfs-progs v6.16 output. `--strict-all-suites`
@@ -374,7 +384,15 @@ jobs:
       - name: Install FUSE and ext4 prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install -y fuse3 libfuse3-dev e2fsprogs btrfs-progs dosfstools attr bubblewrap ntfs-3g zfsutils-linux
+          sudo apt-get install -y fuse3 libfuse3-dev e2fsprogs btrfs-progs dosfstools mtools attr bubblewrap ntfs-3g zfsutils-linux
+          sudo mkdir -p /data/tmp
+          sudo chmod 1777 /data/tmp
+          if [ "$(awk 'NR>1 {sum+=$3} END {print sum+0}' /proc/swaps)" -eq 0 ]; then
+            sudo fallocate -l 16G /data/tmp/ci.swap || sudo dd if=/dev/zero of=/data/tmp/ci.swap bs=1M count=16384 status=none
+            sudo chmod 0600 /data/tmp/ci.swap
+            sudo mkswap /data/tmp/ci.swap
+            sudo swapon /data/tmp/ci.swap
+          fi
           sudo loginctl enable-linger "$(id -un)"
           sudo systemctl start "user@$(id -u).service"
           # fusermount3 needs this for fuser's automatic-unmount helper.
@@ -535,6 +553,18 @@ jobs:
             grep -qF "PROTECTED_FAT_CLI_RESULT|$operation|PASS|" "$RUNNER_TEMP/protected-mount-repair.log"
           done
           cargo test -p ffs-cli --bin ffs-protected-mount -- bd_tqrnc --nocapture --test-threads=1
+
+      - name: Six-format native interchange and restart qualification
+        if: ${{ !cancelled() && steps.native_build.conclusion == 'success' }}
+        timeout-minutes: 30
+        env:
+          FFS_REQUIRE_FUSE: "1"
+          FFS_REQUIRE_ORACLES: "1"
+          FFS_SIX_FORMAT_RECEIPT_DIR: ${{ runner.temp }}/ffs-cli-proof/artifacts/six-format-qualification
+        run: |
+          set -euo pipefail
+          cargo test -p ffs-harness --test six_format_qualification -- --include-ignored --nocapture --test-threads=1
+          ls -lh "$FFS_SIX_FORMAT_RECEIPT_DIR"/*.json
 
       # bd-53dub: a mounted test that cannot mount fails here instead of
       # passing vacuously (FUSE, fuse3, e2fsprogs and btrfs-progs are installed
@@ -710,6 +740,7 @@ jobs:
             ${{ runner.temp }}/btrfs-differential-positive.log
             ${{ runner.temp }}/btrfs-differential-controls.*/*.log
             ${{ runner.temp }}/protected-mount-repair.log
+            ${{ runner.temp }}/ffs-cli-proof/artifacts/six-format-qualification/*.json
             ${{ runner.temp }}/ffs-cli-proof/artifacts/ffs-protected-mount-*/*.log
             ${{ runner.temp }}/ffs-cli-proof/artifacts/ffs-protected-mount-*/*.json
             ${{ runner.temp }}/ffs-cli-proof/artifacts/ffs-protected-mount-*/*.stdout

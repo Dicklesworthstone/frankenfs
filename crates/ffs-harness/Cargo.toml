@@ -14,8 +14,10 @@ asupersync = { workspace = true }
 # reclaims leaked FUSE mounts on abrupt exit; the `termination` feature makes it
 # also fire on SIGTERM (the signal a test runner's timeout-kill sends).
 ctrlc = { workspace = true, features = ["termination"] }
+ffs-block = { workspace = true }
 ffs-btrfs = { workspace = true }
 ffs-core = { workspace = true }
+ffs-error = { workspace = true }
 ffs-fuse = { workspace = true }
 ffs-ondisk = { workspace = true }
 ffs-types = { workspace = true }
@@ -41,9 +43,8 @@ asupersync = { workspace = true, features = ["test-internals"] }
 blake3 = { workspace = true }
 crc32c = { workspace = true }
 criterion = { workspace = true }
+ffs = { workspace = true }
 ffs-alloc = { workspace = true }
-ffs-block = { workspace = true }
-ffs-error = { workspace = true }
 ffs-inode = { workspace = true }
 ffs-xattr = { workspace = true }
 flate2 = { workspace = true }

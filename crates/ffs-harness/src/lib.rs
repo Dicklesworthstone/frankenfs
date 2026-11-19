@@ -77,6 +77,7 @@ pub mod report_schema_inventory;
 pub mod runtime_console_report;
 pub mod rw_background_repair_gate;
 pub mod scrub_repair_scheduler;
+pub mod six_format_qualification;
 pub mod soak_canary_campaign;
 pub mod stale_mounts;
 pub mod support_state_accounting;

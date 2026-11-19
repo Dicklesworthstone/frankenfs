@@ -4,18 +4,367 @@ use asupersync::Cx;
 use ffs_block::io_engine::{VolumeAccess, VolumeDevice};
 use ffs_block::{ByteDevice, FileByteDevice};
 use ffs_core::{
-    BtrfsMountSelection, DetectedFilesystem, DetectionError, Ext4JournalReplayMode, FsFormatKind,
-    FsOps, OpenFs, OpenOptions, detect_all_filesystems_on_device,
+    BtrfsMountSelection, DetectedFilesystem, DetectionError, Ext4JournalReplayMode, FileType,
+    FsFormatKind, FsOps, OpenFs, OpenOptions, RequestScope, detect_all_filesystems_on_device,
 };
 use ffs_error::{FfsError, Result};
 use ffs_ondisk::fat::FatOemCodePage;
 use ffs_ondisk::partition::{
     PartitionEntry, PartitionParseError, PartitionParseOptions, PartitionSelector, PartitionTable,
 };
-use ffs_types::ByteOffset;
+use ffs_types::{ByteOffset, InodeNumber};
 use std::io::IoSliceMut;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+/// Six-axis independent resource budget for untrusted or bounded native image reads (`bd-mizd2`).
+///
+/// A metadata-count cap alone cannot stop sparse/decompression expansion bombs,
+/// deep/cyclic reference chains, or degraded-replica retry storms; each axis is
+/// tracked and enforced independently. `None` on an axis leaves that axis unbounded
+/// at the facade layer while still recording exact usage telemetry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResourceBudget {
+    pub max_physical_io_bytes: Option<u64>,
+    pub max_decoded_bytes: Option<u64>,
+    pub max_retained_bytes: Option<u64>,
+    pub max_reference_depth: Option<u32>,
+    pub max_operations: Option<u64>,
+    pub max_retry_attempts: Option<u32>,
+}
+
+/// Point-in-time snapshot of the six independent resource counters on [`ReadOnlyFs`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResourceUsageSnapshot {
+    pub physical_io_bytes: u64,
+    pub decoded_bytes: u64,
+    pub retained_bytes: u64,
+    pub peak_retained_bytes: u64,
+    pub current_reference_depth: u32,
+    pub peak_reference_depth: u32,
+    pub operations: u64,
+    pub retry_attempts: u32,
+}
+
+/// Shared atomic tracker enforcing a [`ResourceBudget`] across primary/companion
+/// [`BoundedByteDevice`] handles and bounded facade traversals.
+#[derive(Debug)]
+pub struct ResourceTracker {
+    budget: ResourceBudget,
+    physical_io_bytes: AtomicU64,
+    decoded_bytes: AtomicU64,
+    retained_bytes: AtomicU64,
+    peak_retained_bytes: AtomicU64,
+    current_reference_depth: AtomicU32,
+    peak_reference_depth: AtomicU32,
+    operations: AtomicU64,
+    retry_attempts: AtomicU32,
+}
+
+impl ResourceTracker {
+    #[must_use]
+    pub fn new(budget: ResourceBudget) -> Self {
+        Self {
+            budget,
+            physical_io_bytes: AtomicU64::new(0),
+            decoded_bytes: AtomicU64::new(0),
+            retained_bytes: AtomicU64::new(0),
+            peak_retained_bytes: AtomicU64::new(0),
+            current_reference_depth: AtomicU32::new(0),
+            peak_reference_depth: AtomicU32::new(0),
+            operations: AtomicU64::new(0),
+            retry_attempts: AtomicU32::new(0),
+        }
+    }
+
+    #[must_use]
+    pub const fn budget(&self) -> ResourceBudget {
+        self.budget
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> ResourceUsageSnapshot {
+        ResourceUsageSnapshot {
+            physical_io_bytes: self.physical_io_bytes.load(Ordering::SeqCst),
+            decoded_bytes: self.decoded_bytes.load(Ordering::SeqCst),
+            retained_bytes: self.retained_bytes.load(Ordering::SeqCst),
+            peak_retained_bytes: self.peak_retained_bytes.load(Ordering::SeqCst),
+            current_reference_depth: self.current_reference_depth.load(Ordering::SeqCst),
+            peak_reference_depth: self.peak_reference_depth.load(Ordering::SeqCst),
+            operations: self.operations.load(Ordering::SeqCst),
+            retry_attempts: self.retry_attempts.load(Ordering::SeqCst),
+        }
+    }
+
+    pub fn charge_operation(&self) -> Result<()> {
+        let prev = self.operations.fetch_add(1, Ordering::SeqCst);
+        let next = prev.saturating_add(1);
+        if let Some(limit) = self.budget.max_operations
+            && next > limit
+        {
+            self.operations.fetch_sub(1, Ordering::SeqCst);
+            return Err(FfsError::Io(std::io::Error::other(format!(
+                "resource budget exceeded: operations {next} > max_operations {limit}"
+            ))));
+        }
+        Ok(())
+    }
+
+    pub fn charge_physical_io(&self, bytes: u64) -> Result<()> {
+        self.charge_operation()?;
+        let prev = self.physical_io_bytes.fetch_add(bytes, Ordering::SeqCst);
+        let Some(next) = prev.checked_add(bytes) else {
+            self.physical_io_bytes.fetch_sub(bytes, Ordering::SeqCst);
+            return Err(FfsError::Io(std::io::Error::other(
+                "resource budget overflow: physical_io_bytes",
+            )));
+        };
+        if let Some(limit) = self.budget.max_physical_io_bytes
+            && next > limit
+        {
+            self.physical_io_bytes.fetch_sub(bytes, Ordering::SeqCst);
+            return Err(FfsError::Io(std::io::Error::other(format!(
+                "resource budget exceeded: physical_io_bytes {next} > max_physical_io_bytes {limit}"
+            ))));
+        }
+        Ok(())
+    }
+
+    pub fn charge_decoded_bytes(&self, bytes: u64) -> Result<()> {
+        let prev = self.decoded_bytes.fetch_add(bytes, Ordering::SeqCst);
+        let Some(next) = prev.checked_add(bytes) else {
+            self.decoded_bytes.fetch_sub(bytes, Ordering::SeqCst);
+            return Err(FfsError::Io(std::io::Error::other(
+                "resource budget overflow: decoded_bytes",
+            )));
+        };
+        if let Some(limit) = self.budget.max_decoded_bytes
+            && next > limit
+        {
+            self.decoded_bytes.fetch_sub(bytes, Ordering::SeqCst);
+            return Err(FfsError::Io(std::io::Error::other(format!(
+                "resource budget exceeded: decoded_bytes {next} > max_decoded_bytes {limit}"
+            ))));
+        }
+        Ok(())
+    }
+
+    pub fn acquire_retained_bytes(self: &Arc<Self>, bytes: u64) -> Result<RetainedBytesGuard> {
+        let prev = self.retained_bytes.fetch_add(bytes, Ordering::SeqCst);
+        let Some(next) = prev.checked_add(bytes) else {
+            self.retained_bytes.fetch_sub(bytes, Ordering::SeqCst);
+            return Err(FfsError::Io(std::io::Error::other(
+                "resource budget overflow: retained_bytes",
+            )));
+        };
+        if let Some(limit) = self.budget.max_retained_bytes
+            && next > limit
+        {
+            self.retained_bytes.fetch_sub(bytes, Ordering::SeqCst);
+            return Err(FfsError::Io(std::io::Error::other(format!(
+                "resource budget exceeded: retained_bytes {next} > max_retained_bytes {limit}"
+            ))));
+        }
+        self.peak_retained_bytes.fetch_max(next, Ordering::SeqCst);
+        Ok(RetainedBytesGuard {
+            tracker: Arc::clone(self),
+            bytes,
+        })
+    }
+
+    pub fn enter_reference_depth(self: &Arc<Self>) -> Result<ReferenceDepthGuard> {
+        let prev = self.current_reference_depth.fetch_add(1, Ordering::SeqCst);
+        let next = prev.saturating_add(1);
+        if let Some(limit) = self.budget.max_reference_depth
+            && next > limit
+        {
+            self.current_reference_depth.fetch_sub(1, Ordering::SeqCst);
+            return Err(FfsError::Io(std::io::Error::other(format!(
+                "resource budget exceeded: reference_depth {next} > max_reference_depth {limit}"
+            ))));
+        }
+        self.peak_reference_depth.fetch_max(next, Ordering::SeqCst);
+        Ok(ReferenceDepthGuard {
+            tracker: Arc::clone(self),
+        })
+    }
+
+    pub fn charge_retry_attempt(&self) -> Result<()> {
+        let prev = self.retry_attempts.fetch_add(1, Ordering::SeqCst);
+        let next = prev.saturating_add(1);
+        if let Some(limit) = self.budget.max_retry_attempts
+            && next > limit
+        {
+            self.retry_attempts.fetch_sub(1, Ordering::SeqCst);
+            return Err(FfsError::Io(std::io::Error::other(format!(
+                "resource budget exceeded: retry_attempts {next} > max_retry_attempts {limit}"
+            ))));
+        }
+        Ok(())
+    }
+}
+
+/// RAII guard releasing retained working-memory bytes when dropped.
+#[derive(Debug)]
+pub struct RetainedBytesGuard {
+    tracker: Arc<ResourceTracker>,
+    bytes: u64,
+}
+
+impl Drop for RetainedBytesGuard {
+    fn drop(&mut self) {
+        self.tracker
+            .retained_bytes
+            .fetch_sub(self.bytes, Ordering::SeqCst);
+    }
+}
+
+/// RAII guard decrementing reference traversal depth when dropped.
+#[derive(Debug)]
+pub struct ReferenceDepthGuard {
+    tracker: Arc<ResourceTracker>,
+}
+
+impl Drop for ReferenceDepthGuard {
+    fn drop(&mut self) {
+        self.tracker
+            .current_reference_depth
+            .fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Read-only [`ByteDevice`] decorator enforcing physical-I/O, operation-count, and
+/// replica-retry budgets while rejecting every write, sync, commit, or discard before
+/// reaching the inner device.
+#[derive(Clone, Debug)]
+pub struct BoundedByteDevice {
+    inner: Arc<dyn ByteDevice>,
+    tracker: Arc<ResourceTracker>,
+}
+
+impl BoundedByteDevice {
+    #[must_use]
+    pub fn new(inner: Arc<dyn ByteDevice>, tracker: Arc<ResourceTracker>) -> Self {
+        Self { inner, tracker }
+    }
+
+    #[must_use]
+    pub const fn tracker(&self) -> &Arc<ResourceTracker> {
+        &self.tracker
+    }
+
+    /// Execute a read across candidate replica devices, charging one retry attempt per
+    /// failed replica fallback and failing closed if `max_retry_attempts` is exceeded.
+    pub fn read_across_replicas(
+        cx: &Cx,
+        replicas: &[Self],
+        offset: ByteOffset,
+        buf: &mut [u8],
+    ) -> Result<usize> {
+        checkpoint(cx)?;
+        if replicas.is_empty() {
+            return Err(FfsError::Io(std::io::Error::other(
+                "no replica devices supplied",
+            )));
+        }
+        let mut last_err = None;
+        for (idx, replica) in replicas.iter().enumerate() {
+            if idx > 0 {
+                replica.tracker.charge_retry_attempt()?;
+            }
+            match replica.read_exact_at(cx, offset, buf) {
+                Ok(()) => return Ok(idx),
+                Err(err) => last_err = Some(err),
+            }
+        }
+        Err(last_err.unwrap_or(FfsError::ReadOnly))
+    }
+}
+
+impl ByteDevice for BoundedByteDevice {
+    fn len_bytes(&self) -> u64 {
+        self.inner.len_bytes()
+    }
+
+    fn supports_vectored_reads(&self) -> bool {
+        self.inner.supports_vectored_reads()
+    }
+
+    fn preserves_read_exact_at_destination_on_error(&self) -> bool {
+        self.inner.preserves_read_exact_at_destination_on_error()
+    }
+
+    fn preserves_read_vectored_destinations_on_error(&self) -> bool {
+        self.inner.preserves_read_vectored_destinations_on_error()
+    }
+
+    fn read_exact_at(&self, cx: &Cx, offset: ByteOffset, buf: &mut [u8]) -> Result<()> {
+        checkpoint(cx)?;
+        let count = u64::try_from(buf.len())
+            .map_err(|_| FfsError::InvalidGeometry("read buffer overflows u64".to_owned()))?;
+        self.tracker.charge_physical_io(count)?;
+        self.inner.read_exact_at(cx, offset, buf)
+    }
+
+    fn read_exact_at_volatile(&self, cx: &Cx, offset: ByteOffset, buf: &mut [u8]) -> Result<()> {
+        checkpoint(cx)?;
+        let count = u64::try_from(buf.len())
+            .map_err(|_| FfsError::InvalidGeometry("read buffer overflows u64".to_owned()))?;
+        self.tracker.charge_physical_io(count)?;
+        self.inner.read_exact_at_volatile(cx, offset, buf)
+    }
+
+    fn read_vectored_exact_at(
+        &self,
+        cx: &Cx,
+        offset: ByteOffset,
+        bufs: &mut [IoSliceMut<'_>],
+    ) -> Result<()> {
+        checkpoint(cx)?;
+        let mut total = 0_u64;
+        for b in bufs.iter() {
+            let len = u64::try_from(b.len()).map_err(|_| {
+                FfsError::InvalidGeometry("vectored read buffer overflows u64".to_owned())
+            })?;
+            total = total.checked_add(len).ok_or_else(|| {
+                FfsError::InvalidGeometry("vectored read total overflows u64".to_owned())
+            })?;
+        }
+        self.tracker.charge_physical_io(total)?;
+        self.inner.read_vectored_exact_at(cx, offset, bufs)
+    }
+
+    fn write_all_at(&self, _cx: &Cx, _offset: ByteOffset, _buf: &[u8]) -> Result<()> {
+        Err(FfsError::ReadOnly)
+    }
+
+    fn write_vectored_all_at(&self, _cx: &Cx, _offset: ByteOffset, _bufs: &[&[u8]]) -> Result<()> {
+        Err(FfsError::ReadOnly)
+    }
+
+    fn sync(&self, _cx: &Cx) -> Result<()> {
+        Err(FfsError::ReadOnly)
+    }
+
+    fn begin_durability_commit(&self, _cx: &Cx) -> Result<()> {
+        Err(FfsError::ReadOnly)
+    }
+
+    fn discard(&self, _cx: &Cx, _offset: ByteOffset, _length: u64) -> Result<()> {
+        Err(FfsError::ReadOnly)
+    }
+}
+
+/// Summary returned by [`ReadOnlyFs::walk_bounded`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BoundedWalkSummary {
+    pub directories_visited: u64,
+    pub files_visited: u64,
+    pub symlinks_visited: u64,
+    pub decoded_file_bytes: u64,
+    pub usage: ResourceUsageSnapshot,
+}
 
 /// An explicitly selected volume or journal inside an additional backing image.
 /// The file must remain offline and immutable for the lifetime of the reader.
@@ -109,6 +458,9 @@ pub struct ReadOnlyOpenOptions {
     pub uid: u32,
     pub gid: u32,
     pub backend: ReadOnlyBackend,
+    /// Six-axis independent resource budget enforced across primary/companion I/O
+    /// and bounded facade traversals (`bd-mizd2`).
+    pub budget: ResourceBudget,
 }
 
 /// Zero-copy, range-clamped [`ByteDevice`] window bound to a validated MBR or GPT
@@ -362,6 +714,7 @@ pub struct ReadOnlyFs {
     pub partition: Option<PartitionEntry>,
     pub filesystem: Box<dyn FsOps>,
     ntfs: Option<Arc<ffs_ntfs::NtfsFs>>,
+    tracker: Arc<ResourceTracker>,
 }
 
 impl ReadOnlyFs {
@@ -374,6 +727,173 @@ impl ReadOnlyFs {
         self.ntfs
             .as_ref()
             .and_then(|filesystem| filesystem.volume())
+    }
+
+    /// Snapshot the six independent resource counters accumulated on this reader.
+    #[must_use]
+    pub fn resource_usage(&self) -> ResourceUsageSnapshot {
+        self.tracker.snapshot()
+    }
+
+    /// Borrow the shared [`ResourceTracker`] governing this reader.
+    #[must_use]
+    pub const fn tracker(&self) -> &Arc<ResourceTracker> {
+        &self.tracker
+    }
+
+    /// Stream-read `[offset, offset + total_len)` in `chunk_size` increments while
+    /// enforcing `max_operations`, `max_decoded_bytes`, and `max_retained_bytes`
+    /// before growing the output buffer (`bd-mizd2`).
+    pub fn read_bounded(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        offset: u64,
+        total_len: u64,
+        chunk_size: u32,
+    ) -> Result<Vec<u8>> {
+        checkpoint(cx)?;
+        if chunk_size == 0 {
+            return Err(FfsError::InvalidGeometry(
+                "bounded read chunk_size must be non-zero".to_owned(),
+            ));
+        }
+        let end = offset.checked_add(total_len).ok_or_else(|| {
+            FfsError::InvalidGeometry("bounded read range overflows u64".to_owned())
+        })?;
+        let mut scope = RequestScope::empty();
+        let mut out = Vec::new();
+        let mut retained_guards = Vec::new();
+        let mut pos = offset;
+        while pos < end {
+            checkpoint(cx)?;
+            self.tracker.charge_operation()?;
+            let req = u32::try_from((end - pos).min(u64::from(chunk_size))).unwrap_or(chunk_size);
+            let chunk = self.filesystem.read(cx, &mut scope, ino, pos, req)?;
+            if chunk.is_empty() {
+                break;
+            }
+            let len_u64 = u64::try_from(chunk.len())
+                .map_err(|_| FfsError::InvalidGeometry("chunk length overflows u64".to_owned()))?;
+            self.tracker.charge_decoded_bytes(len_u64)?;
+            retained_guards.push(self.tracker.acquire_retained_bytes(len_u64)?);
+            out.extend_from_slice(&chunk);
+            pos = pos.saturating_add(len_u64);
+        }
+        drop(retained_guards);
+        Ok(out)
+    }
+
+    /// Traverse the namespace from `/` (`InodeNumber(1)`) while enforcing all six
+    /// [`ResourceBudget`] axes (`max_reference_depth`, `max_operations`,
+    /// `max_physical_io_bytes`, `max_decoded_bytes`, `max_retained_bytes`) and
+    /// cycle detection.
+    pub fn walk_bounded(&self, cx: &Cx, read_files: bool) -> Result<BoundedWalkSummary> {
+        checkpoint(cx)?;
+        let mut scope = RequestScope::empty();
+        let mut summary = BoundedWalkSummary::default();
+        let mut active_ancestors = Vec::new();
+        self.walk_dir_inner(
+            cx,
+            &mut scope,
+            InodeNumber(1),
+            read_files,
+            &mut active_ancestors,
+            &mut summary,
+        )?;
+        summary.usage = self.tracker.snapshot();
+        Ok(summary)
+    }
+
+    fn walk_dir_inner(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        dir_ino: InodeNumber,
+        read_files: bool,
+        active_ancestors: &mut Vec<InodeNumber>,
+        summary: &mut BoundedWalkSummary,
+    ) -> Result<()> {
+        checkpoint(cx)?;
+        if active_ancestors.contains(&dir_ino) {
+            return Err(FfsError::Corruption {
+                block: 0,
+                detail: format!("cyclic directory reference detected at inode {}", dir_ino.0),
+            });
+        }
+        let _depth = self.tracker.enter_reference_depth()?;
+        active_ancestors.push(dir_ino);
+        self.tracker.charge_operation()?;
+        summary.directories_visited = summary.directories_visited.saturating_add(1);
+
+        let mut children = Vec::new();
+        let mut offset = 0_u64;
+        loop {
+            checkpoint(cx)?;
+            self.tracker.charge_operation()?;
+            let page = self.filesystem.readdir(cx, scope, dir_ino, offset)?;
+            if page.is_empty() {
+                break;
+            }
+            let next = page
+                .as_slice()
+                .last()
+                .ok_or_else(|| FfsError::Io(std::io::Error::other("empty directory page")))?
+                .offset;
+            if next == offset {
+                return Err(FfsError::Corruption {
+                    block: 0,
+                    detail: format!(
+                        "directory continuation cookie {offset} made no progress at inode {}",
+                        dir_ino.0
+                    ),
+                });
+            }
+            for entry in &page {
+                if entry.name == b"." || entry.name == b".." {
+                    continue;
+                }
+                children.push(entry.ino);
+            }
+            offset = next;
+        }
+
+        for child_ino in children {
+            checkpoint(cx)?;
+            self.tracker.charge_operation()?;
+            let attr = self.filesystem.getattr(cx, scope, child_ino)?;
+            match attr.kind {
+                FileType::Directory => {
+                    self.walk_dir_inner(
+                        cx,
+                        scope,
+                        attr.ino,
+                        read_files,
+                        active_ancestors,
+                        summary,
+                    )?;
+                }
+                FileType::RegularFile => {
+                    summary.files_visited = summary.files_visited.saturating_add(1);
+                    if read_files && attr.size > 0 {
+                        let _leaf_depth = self.tracker.enter_reference_depth()?;
+                        let data = self.read_bounded(cx, attr.ino, 0, attr.size, 65_536)?;
+                        let n = u64::try_from(data.len()).unwrap_or(u64::MAX);
+                        summary.decoded_file_bytes = summary.decoded_file_bytes.saturating_add(n);
+                    }
+                }
+                FileType::Symlink => {
+                    let _sym_depth = self.tracker.enter_reference_depth()?;
+                    self.tracker.charge_operation()?;
+                    let _ = self.filesystem.readlink(cx, scope, attr.ino)?;
+                    summary.symlinks_visited = summary.symlinks_visited.saturating_add(1);
+                }
+                _ => {}
+            }
+        }
+
+        active_ancestors.pop();
+        Ok(())
     }
 }
 
@@ -634,6 +1154,8 @@ fn open_admitted_volume(
     if !allow_companion_paths {
         validate_device_only_backend(&options.backend)?;
     }
+    let tracker = Arc::new(ResourceTracker::new(options.budget));
+    let device = BoundedByteDevice::new(Arc::new(device), Arc::clone(&tracker));
     let effective_offset = resolved_partition
         .as_ref()
         .map_or(options.offset, |entry| entry.start_byte);
@@ -672,12 +1194,11 @@ fn open_admitted_volume(
                 ReadOnlyBackend::Ext4 {
                     external_journal: Some(source),
                 } => {
-                    external_journal = Some(Arc::new(open_image(
-                        cx,
-                        &source.path,
-                        source.offset,
-                        source.length,
-                    )?));
+                    let jdev = open_image(cx, &source.path, source.offset, source.length)?;
+                    external_journal = Some(Arc::new(BoundedByteDevice::new(
+                        Arc::new(jdev),
+                        Arc::clone(&tracker),
+                    )));
                 }
                 ReadOnlyBackend::Btrfs {
                     root,
@@ -685,12 +1206,11 @@ fn open_admitted_volume(
                 } => {
                     core_options.btrfs_mount_selection.clone_from(root);
                     for source in additional_devices {
-                        btrfs_additional.push(Arc::new(open_image(
-                            cx,
-                            &source.path,
-                            source.offset,
-                            source.length,
-                        )?));
+                        let mdev = open_image(cx, &source.path, source.offset, source.length)?;
+                        btrfs_additional.push(Arc::new(BoundedByteDevice::new(
+                            Arc::new(mdev),
+                            Arc::clone(&tracker),
+                        )));
                     }
                 }
                 _ => {}
@@ -765,7 +1285,10 @@ fn open_admitted_volume(
                 length,
             )?);
             for source in &selection.additional_images {
-                let member = open_image(cx, &source.path, source.offset, source.length)?;
+                let member = BoundedByteDevice::new(
+                    Arc::new(open_image(cx, &source.path, source.offset, source.length)?),
+                    Arc::clone(&tracker),
+                );
                 let length = member.len_bytes();
                 leaves.push(ffs_zfs::reader::Leaf::from_device(
                     cx,
@@ -813,6 +1336,7 @@ fn open_admitted_volume(
         partition: resolved_partition,
         filesystem,
         ntfs,
+        tracker,
     })
 }
 
