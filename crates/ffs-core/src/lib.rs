@@ -13490,7 +13490,7 @@ impl OpenFs {
             .extent_alloc
             .space_info()
             .iter()
-            .any(|s| s.flags & BTRFS_BLOCK_GROUP_METADATA != 0);
+            .any(|&(flags, _, _)| flags & BTRFS_BLOCK_GROUP_METADATA != 0);
         if !has_meta_bg {
             return limit;
         }
@@ -44137,7 +44137,6 @@ impl OpenFs {
                 |retained| {
                     let count = dag
                         .blocks_with_levels()
-                        .iter()
                         .filter(|(block, _)| !retained.contains_key(block))
                         .count();
                     u64::try_from(count).unwrap_or(u64::MAX)
@@ -45906,7 +45905,7 @@ impl OpenFs {
         // destroys it. This call must stay AFTER the superblock write+sync and
         // must not run on any error path. The allocation lock is still held.
         {
-            for (bytenr, num_bytes) in alloc.extent_alloc.pinned_extents() {
+            for (bytenr, num_bytes, _) in alloc.extent_alloc.pinned_extents() {
                 self.btrfs_invalidate_logical_bytes(bytenr, num_bytes);
             }
             let released = alloc.extent_alloc.release_pinned_after_superblock_commit();
@@ -66340,7 +66339,7 @@ mod tests {
         // 1. Ext4 RW mount: warm 256 KiB file into ShardedExtentReadCache, verify >= 90%
         //    hit ratio on repeated 4 KiB random reads, then mutate via aligned write,
         //    partial overwrite, truncate shrink + tail-zero extend, and unlink+recreate!
-        if let Some((ext4_fs, _dev, _tmp)) = open_writable_ext4_mkfs(32) {
+        if let Some((ext4_fs, _tmp)) = open_writable_ext4_mkfs(32) {
             let root = InodeNumber(2);
             let f = ext4_fs
                 .create(&cx, root, OsStr::new("hot.bin"), 0o644, 0, 0)
