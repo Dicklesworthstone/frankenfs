@@ -7976,16 +7976,31 @@ fn measure_and_verify_section_9_5_performance_baselines_vkibu() {
 
     // Warm 16 MiB working set (4,096 blocks) into ShardedExtentReadCache, then issue
     // 20,000 4 KiB reads (96% hot working set, 4% cold blocks 4096..8192):
-    let _ = open_fs
-        .read(&cx, bench_attr.ino, 0, 16 * 1024 * 1024)
-        .expect("warm 16 MiB");
+    let mut read_scope = RequestScope::empty();
+    let _ = FsOps::read(
+        open_fs.as_ref(),
+        &cx,
+        &mut read_scope,
+        bench_attr.ino,
+        0,
+        16 * 1024 * 1024,
+    )
+    .expect("warm 16 MiB");
     for step in 0..20_000_u64 {
         let blk = if step.is_multiple_of(25) {
             4096 + ((step * 13) % 4096)
         } else {
             (step * 37) % 4096
         };
-        let got = open_fs.read(&cx, bench_attr.ino, blk * 4096, 4096).unwrap();
+        let got = FsOps::read(
+            open_fs.as_ref(),
+            &cx,
+            &mut read_scope,
+            bench_attr.ino,
+            blk * 4096,
+            4096,
+        )
+        .unwrap();
         std::hint::black_box(got[0]);
     }
     let extent_cache_hit_ratio = open_fs.file_data_extent_cache_metrics().hit_ratio();
