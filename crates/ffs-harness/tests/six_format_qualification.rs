@@ -1486,11 +1486,13 @@ fn qualify_all_seven_profiles_interchange_faults_sigkill_and_workflow_cost() {
             }
             QualificationProfileId::ZfsV5000Single | QualificationProfileId::ZfsV5000Mirror => {
                 let is_mirror = profile == QualificationProfileId::ZfsV5000Mirror;
-                let leg0 = work_dir.join("zfs_leg0.img");
+                let vdev_dir = work_dir.join("vdevs");
+                fs::create_dir_all(&vdev_dir).unwrap();
+                let leg0 = vdev_dir.join("zfs_leg0.img");
                 ensure_sparse_file(&leg0, 128 * 1024 * 1024);
                 member_paths.push(leg0.clone());
                 let leg1_opt = if is_mirror {
-                    let leg1 = work_dir.join("zfs_leg1.img");
+                    let leg1 = vdev_dir.join("zfs_leg1.img");
                     ensure_sparse_file(&leg1, 128 * 1024 * 1024);
                     member_paths.push(leg1.clone());
                     Some(leg1)
@@ -2087,12 +2089,13 @@ fn qualify_all_seven_profiles_interchange_faults_sigkill_and_workflow_cost() {
                     }
                 }
                 QualificationProfileId::ZfsV5000Single | QualificationProfileId::ZfsV5000Mirror => {
+                    let zdb_env = [("LC_ALL", "C"), ("ZDB_NO_ZLE", "1")];
                     for (idx, mp) in paths.iter().enumerate() {
                         let c = run_checked_streaming_cmd(
                             &format!("{step_prefix}_zdb_label_{idx}"),
                             &oracle_path("zdb"),
                             &["-lu", mp.to_str().unwrap()],
-                            &[],
+                            &zdb_env,
                             &artifact_dir,
                             err_out,
                             |_| Ok(()),
@@ -2114,7 +2117,7 @@ fn qualify_all_seven_profiles_interchange_faults_sigkill_and_workflow_cost() {
                         &format!("{step_prefix}_zdb_bccm"),
                         &oracle_path("zdb"),
                         &["-e", "-p", parent_dir, "-bccm", &pool_name],
-                        &[],
+                        &zdb_env,
                         &artifact_dir,
                         err_out,
                         |_| Ok(()),
@@ -2345,30 +2348,34 @@ fn qualify_all_seven_profiles_interchange_faults_sigkill_and_workflow_cost() {
             "wrong PorKey must be rejected by verify-set"
         );
 
-        // Inject deterministic corruption inside `native_mutated.bin`'s data block on member 0
-        // (or safe vdev data region at 8 MiB when compressed on ZFS), then mount RW with
-        // `ffs-protected-mount --rw --require-trusted-root`, verify online RaptorQ repair,
-        // mutate `/protected_sealed.txt` + fsync, unmount, and verify `NativeCommitBinding` re-sealed!
-        {
+        // Mount RW with `ffs-protected-mount --rw --require-trusted-root`, inject deterministic
+        // post-admission media corruption inside `native_mutated.bin`'s data block on member 0
+        // (`startup_difference_is_not_silently_rolled_back` rightly rejects pre-mount offline
+        // drift), verify online RaptorQ repair heals both the FUSE read and the underlying
+        // member block, mutate `/protected_sealed.txt` + fsync, unmount, and verify
+        // `NativeCommitBinding` re-sealed!
+        let corrupt_off = {
             let img_bytes = fs::read(&member_paths[0]).unwrap();
             let needle = &mutated_payload[..64];
-            let corrupt_off = img_bytes
+            let pos = img_bytes
                 .windows(needle.len())
                 .position(|w| w == needle)
-                .map_or(8 * 1024 * 1024_u64, |pos| (pos as u64) & !4095_u64);
-            let f = StdOpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&member_paths[0])
-                .unwrap();
+                .unwrap_or_else(|| {
+                    panic!(
+                        "native_mutated.bin payload must be present verbatim on member 0 ({})",
+                        profile.as_str()
+                    )
+                });
+            (pos as u64) & !4095_u64
+        };
+        let saved_orig = {
             let mut orig = [0_u8; 4096];
-            f.read_exact_at(&mut orig, corrupt_off).unwrap();
-            for b in &mut orig {
-                *b ^= 0xFF;
-            }
-            f.write_all_at(&orig, corrupt_off).unwrap();
-            f.sync_all().unwrap();
-        }
+            File::open(&member_paths[0])
+                .unwrap()
+                .read_exact_at(&mut orig, corrupt_off)
+                .unwrap();
+            orig
+        };
 
         let prot_mnt = work_dir.join("prot_mnt");
         fs::create_dir_all(&prot_mnt).unwrap();
@@ -2402,11 +2409,38 @@ fn qualify_all_seven_profiles_interchange_faults_sigkill_and_workflow_cost() {
                 .expect("spawn ffs-protected-mount --rw");
             wait_until_mounted(&mut daemon, &prot_mnt, &prot_log, "protected_mount_rw");
 
+            {
+                let mut damaged = saved_orig;
+                for byte in &mut damaged {
+                    *byte ^= 0xFF;
+                }
+                let fault_fd = StdOpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&member_paths[0])
+                    .unwrap();
+                fault_fd.write_all_at(&damaged, corrupt_off).unwrap();
+                fault_fd.sync_all().unwrap();
+            }
+
             assert_eq!(
                 fs::read(prot_mnt.join("native_mutated.bin")).unwrap(),
                 mutated_payload,
                 "online RaptorQ repair must heal corrupted member blocks"
             );
+            {
+                let mut healed_disk = [0_u8; 4096];
+                File::open(&member_paths[0])
+                    .unwrap()
+                    .read_exact_at(&mut healed_disk, corrupt_off)
+                    .unwrap();
+                assert_eq!(
+                    healed_disk,
+                    saved_orig,
+                    "online RaptorQ repair must write healed block back to member 0 ({})",
+                    profile.as_str()
+                );
+            }
             assert_eq!(
                 fs::read(prot_mnt.join("zzz_final_element.bin")).unwrap(),
                 final_payload
@@ -2558,6 +2592,7 @@ fn qualify_all_seven_profiles_interchange_faults_sigkill_and_workflow_cost() {
                 );
                 let z2_mnt = work_dir.join("zfs_wave2_mnt");
                 fs::create_dir_all(&z2_mnt).unwrap();
+                let vdev_parent = member_paths[0].parent().unwrap().to_str().unwrap();
                 if Command::new("sudo")
                     .args([
                         "-n",
@@ -2565,7 +2600,7 @@ fn qualify_all_seven_profiles_interchange_faults_sigkill_and_workflow_cost() {
                         "import",
                         "-f",
                         "-d",
-                        work_dir.to_str().unwrap(),
+                        vdev_parent,
                         "-o",
                         "cachefile=none",
                         "-R",
