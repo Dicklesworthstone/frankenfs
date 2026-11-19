@@ -201,20 +201,20 @@ fn build_minimal_ext4_with_sparse_and_deep_dirs(dir: &Path) -> PathBuf {
 }
 
 fn build_native_fat_image(cx: &Cx, dir: &Path, kind: &str) -> PathBuf {
-    use clap::Parser;
     let img = dir.join(format!("{kind}.img"));
-    let cli = ffs::fat::Cli::try_parse_from([
-        "ffs-fat",
-        "format",
-        img.to_str().unwrap(),
-        "--kind",
-        kind,
-        "--size-mib",
-        if kind == "fat16" { "8" } else { "64" },
-    ])
-    .expect("parse ffs-fat format");
-    let ffs::fat::Command::Format { options } = cli.command else {
-        panic!("expected format");
+    let options = ffs::fat::formatter::FormatArgs {
+        image: img.clone(),
+        kind: if kind == "fat16" {
+            ffs::fat::formatter::FormatKind::Fat16
+        } else {
+            ffs::fat::formatter::FormatKind::Fat32
+        },
+        size_mib: if kind == "fat16" { 8 } else { 64 },
+        sectors_per_cluster: None,
+        label: None,
+        serial: None,
+        source_dir: None,
+        sidecar: None,
     };
     ffs::fat::formatter::create(cx, &options).expect("format native FAT");
     let args = ffs::fat::ImageArgs {
@@ -963,7 +963,6 @@ fn qualify_flush_prefix_cut_partial_order_and_post_commit_cancel_non_duplication
             OsStr::new("rename_src.txt"),
             InodeNumber(1),
             OsStr::new("rename_dst.txt"),
-            0,
         )
         .unwrap();
         ffs_core::FsOps::commit_request_scope(&rw_fs, &cx, &mut rsc).unwrap();
@@ -981,7 +980,6 @@ fn qualify_flush_prefix_cut_partial_order_and_post_commit_cancel_non_duplication
             OsStr::new("rename_src.txt"),
             InodeNumber(1),
             OsStr::new("rename_dst.txt"),
-            0,
         );
         assert!(matches!(retry_res, Err(FfsError::NotFound(_))));
         ffs_core::FsOps::end_request_scope(&rw_fs, &cx, ffs_core::RequestOp::Rename, retry_sc)
@@ -1819,15 +1817,15 @@ fn qualify_all_seven_profiles_interchange_faults_sigkill_and_workflow_cost() {
         };
 
         // RO FUSE mount (`ffs-cli mount` -> verify read + EROFS + byte-identical SHA-256)!
-        let ro_mnt = work_dir.join("ro_mnt");
-        fs::create_dir_all(&ro_mnt).unwrap();
-        let ro_log = work_dir.join("ro_mount.log");
+        let readonly_mnt = work_dir.join("ro_mnt");
+        fs::create_dir_all(&readonly_mnt).unwrap();
+        let readonly_log = work_dir.join("ro_mount.log");
         {
             let mut mnt_cmd = Command::new(&bins.ffs_cli);
             mnt_cmd
                 .arg("mount")
                 .arg(&member_paths[0])
-                .arg(&ro_mnt)
+                .arg(&readonly_mnt)
                 .arg("--no-background-scrub");
             if matches!(
                 profile,
@@ -1845,19 +1843,22 @@ fn qualify_all_seven_profiles_interchange_faults_sigkill_and_workflow_cost() {
             let mut daemon = mnt_cmd
                 .env("FFS_AUTO_UNMOUNT", "0")
                 .stdout(Stdio::null())
-                .stderr(File::create(&ro_log).unwrap())
+                .stderr(File::create(&readonly_log).unwrap())
                 .spawn()
                 .expect("spawn RO ffs-cli mount");
-            wait_until_mounted(&mut daemon, &ro_mnt, &ro_log, "ro_mount");
-            assert_eq!(fs::read(ro_mnt.join("hello.txt")).unwrap(), hello_payload);
+            wait_until_mounted(&mut daemon, &readonly_mnt, &readonly_log, "ro_mount");
             assert_eq!(
-                fs::read(ro_mnt.join("zzz_final_element.bin")).unwrap(),
+                fs::read(readonly_mnt.join("hello.txt")).unwrap(),
+                hello_payload
+            );
+            assert_eq!(
+                fs::read(readonly_mnt.join("zzz_final_element.bin")).unwrap(),
                 final_payload
             );
-            let erofs = fs::write(ro_mnt.join("forbid.txt"), b"nope")
+            let erofs = fs::write(readonly_mnt.join("forbid.txt"), b"nope")
                 .expect_err("RO FUSE must reject write");
             assert_eq!(erofs.raw_os_error(), Some(libc::EROFS));
-            unmount_and_wait(daemon, &ro_mnt);
+            unmount_and_wait(daemon, &readonly_mnt);
         }
         regimes.insert(ProofRegime::LiveMountedFuse);
         ops_executed.push("ro_facade_cli_and_fuse_verified".to_owned());
@@ -1890,9 +1891,9 @@ fn qualify_all_seven_profiles_interchange_faults_sigkill_and_workflow_cost() {
         };
 
         // ── Phase C: Native RW FUSE Mutation + Open-Unlink + Cookies + External Oracle Check ──
-        let rw_mnt = work_dir.join("rw_mnt");
-        fs::create_dir_all(&rw_mnt).unwrap();
-        let rw_log = work_dir.join("rw_mount.log");
+        let writable_mnt = work_dir.join("rw_mnt");
+        fs::create_dir_all(&writable_mnt).unwrap();
+        let writable_log = work_dir.join("rw_mount.log");
         let sync_4k_ns;
         {
             let mut mnt_cmd = Command::new(&bins.ffs_cli);
@@ -1900,7 +1901,7 @@ fn qualify_all_seven_profiles_interchange_faults_sigkill_and_workflow_cost() {
                 .arg("mount")
                 .arg("--rw")
                 .arg(&member_paths[0])
-                .arg(&rw_mnt)
+                .arg(&writable_mnt)
                 .arg("--no-background-scrub");
             if matches!(
                 profile,
@@ -1931,21 +1932,21 @@ fn qualify_all_seven_profiles_interchange_faults_sigkill_and_workflow_cost() {
             let mut daemon = mnt_cmd
                 .env("FFS_AUTO_UNMOUNT", "0")
                 .stdout(Stdio::null())
-                .stderr(File::create(&rw_log).unwrap())
+                .stderr(File::create(&writable_log).unwrap())
                 .spawn()
                 .expect("spawn RW ffs-cli mount");
-            wait_until_mounted(&mut daemon, &rw_mnt, &rw_log, "rw_mount");
+            wait_until_mounted(&mut daemon, &writable_mnt, &writable_log, "rw_mount");
 
             // 1) Create, multi-block write, partial overwrite, mkdir, rename, and timed 4KiB fsync!
-            fs::create_dir_all(rw_mnt.join("native_dir")).expect("mkdir native_dir");
+            fs::create_dir_all(writable_mnt.join("native_dir")).expect("mkdir native_dir");
             {
-                let mut f = File::create(rw_mnt.join("native_mutated.bin")).expect("create");
+                let mut f = File::create(writable_mnt.join("native_mutated.bin")).expect("create");
                 f.write_all(&mutated_payload)
                     .expect("write mutated_payload");
                 f.sync_all().expect("fsync native_mutated.bin");
             }
             {
-                let mut f4k = File::create(rw_mnt.join("sync4k.bin")).expect("create sync4k");
+                let mut f4k = File::create(writable_mnt.join("sync4k.bin")).expect("create sync4k");
                 let sync_start = Instant::now();
                 f4k.write_all(&[0x42_u8; 4096]).expect("write 4KiB");
                 f4k.sync_all().expect("fsync 4KiB");
@@ -1954,7 +1955,7 @@ fn qualify_all_seven_profiles_interchange_faults_sigkill_and_workflow_cost() {
 
             // 2) Open-unlink lifetime: keep fd open across unlink -> read & fstat still succeed!
             {
-                let eph = rw_mnt.join("ephemeral_open_unlink.txt");
+                let eph = writable_mnt.join("ephemeral_open_unlink.txt");
                 fs::write(&eph, b"alive-while-open").expect("write ephemeral");
                 let mut open_fd = File::open(&eph).expect("open ephemeral");
                 fs::remove_file(&eph).expect("unlink while open");
@@ -1965,33 +1966,35 @@ fn qualify_all_seven_profiles_interchange_faults_sigkill_and_workflow_cost() {
                 assert_eq!(buf, b"alive-while-open");
                 assert_eq!(open_fd.metadata().expect("fstat unlinked").len(), 16);
             }
-            assert!(!rw_mnt.join("ephemeral_open_unlink.txt").exists());
+            assert!(!writable_mnt.join("ephemeral_open_unlink.txt").exists());
 
             // 3) Directory cookie stability + atomic rename over existing target!
             for idx in 0..12_u32 {
                 fs::write(
-                    rw_mnt.join("native_dir").join(format!("item_{idx:02}.txt")),
+                    writable_mnt
+                        .join("native_dir")
+                        .join(format!("item_{idx:02}.txt")),
                     format!("v{idx}"),
                 )
                 .expect("seed cookie dir");
             }
-            fs::remove_file(rw_mnt.join("native_dir/item_05.txt")).expect("unlink mid-dir");
+            fs::remove_file(writable_mnt.join("native_dir/item_05.txt")).expect("unlink mid-dir");
             fs::rename(
-                rw_mnt.join("native_dir/item_02.txt"),
-                rw_mnt.join("native_dir/item_03.txt"),
+                writable_mnt.join("native_dir/item_02.txt"),
+                writable_mnt.join("native_dir/item_03.txt"),
             )
             .expect("atomic rename over target");
-            let remaining: BTreeSet<String> = fs::read_dir(rw_mnt.join("native_dir"))
+            let remaining: BTreeSet<String> = fs::read_dir(writable_mnt.join("native_dir"))
                 .expect("readdir native_dir")
                 .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
                 .collect();
             assert!(!remaining.contains("item_02.txt") && !remaining.contains("item_05.txt"));
             assert_eq!(
-                fs::read(rw_mnt.join("native_dir/item_03.txt")).unwrap(),
+                fs::read(writable_mnt.join("native_dir/item_03.txt")).unwrap(),
                 b"v2"
             );
 
-            unmount_and_wait(daemon, &rw_mnt);
+            unmount_and_wait(daemon, &writable_mnt);
         }
         ops_executed.push("native_rw_fuse_mutations_and_lifetime".to_owned());
 
@@ -2293,7 +2296,7 @@ fn qualify_all_seven_profiles_interchange_faults_sigkill_and_workflow_cost() {
                 "zfs"
             }
         };
-        let mut pset_args: Vec<String> = vec![
+        let mut protect_set_args: Vec<String> = vec![
             "protect-set".to_owned(),
             manifest_path.display().to_string(),
             "--filesystem".to_owned(),
@@ -2303,22 +2306,22 @@ fn qualify_all_seven_profiles_interchange_faults_sigkill_and_workflow_cost() {
             "--offline".to_owned(),
         ];
         for (mp, sc) in member_paths.iter().zip(sidecars.iter()) {
-            pset_args.push("--member".to_owned());
-            pset_args.push(mp.display().to_string());
-            pset_args.push(sc.display().to_string());
+            protect_set_args.push("--member".to_owned());
+            protect_set_args.push(mp.display().to_string());
+            protect_set_args.push(sc.display().to_string());
         }
-        let pset_refs: Vec<&str> = pset_args.iter().map(String::as_str).collect();
-        let pset_out = run_checked_streaming_cmd(
+        let protect_set_refs: Vec<&str> = protect_set_args.iter().map(String::as_str).collect();
+        let protect_set_out = run_checked_streaming_cmd(
             "protect_set",
             bins.ffs_image_repair.to_str().unwrap(),
-            &pset_refs,
+            &protect_set_refs,
             &[],
             &artifact_dir,
             &mut error_sink,
             |_| Ok(()),
         )
         .expect("ffs-image-repair protect-set");
-        cmd_evidence.push(pset_out.evidence);
+        cmd_evidence.push(protect_set_out.evidence);
 
         // Negative trust controls: wrong PorKey AND missing key with --require-trusted-root MUST fail!
         let mut bad_verify_args = vec![
@@ -2416,7 +2419,7 @@ fn qualify_all_seven_profiles_interchange_faults_sigkill_and_workflow_cost() {
             unmount_and_wait(daemon, &prot_mnt);
         }
 
-        let mut vset_args: Vec<String> = vec![
+        let mut verify_set_args: Vec<String> = vec![
             "verify-set".to_owned(),
             manifest_path.display().to_string(),
             "--trust-key-file".to_owned(),
@@ -2424,22 +2427,22 @@ fn qualify_all_seven_profiles_interchange_faults_sigkill_and_workflow_cost() {
             "--require-trusted-root".to_owned(),
         ];
         for (mp, sc) in member_paths.iter().zip(sidecars.iter()) {
-            vset_args.push("--member".to_owned());
-            vset_args.push(mp.display().to_string());
-            vset_args.push(sc.display().to_string());
+            verify_set_args.push("--member".to_owned());
+            verify_set_args.push(mp.display().to_string());
+            verify_set_args.push(sc.display().to_string());
         }
-        let vset_refs: Vec<&str> = vset_args.iter().map(String::as_str).collect();
-        let vset_out = run_checked_streaming_cmd(
+        let verify_set_refs: Vec<&str> = verify_set_args.iter().map(String::as_str).collect();
+        let verify_set_out = run_checked_streaming_cmd(
             "verify_set_resealed",
             bins.ffs_image_repair.to_str().unwrap(),
-            &vset_refs,
+            &verify_set_refs,
             &[],
             &artifact_dir,
             &mut error_sink,
             |_| Ok(()),
         )
         .expect("verify-set after protected RW commit re-seal");
-        cmd_evidence.push(vset_out.evidence);
+        cmd_evidence.push(verify_set_out.evidence);
         let protected_heal_reseal_ns =
             u64::try_from(prot_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
 
@@ -2601,12 +2604,12 @@ fn qualify_all_seven_profiles_interchange_faults_sigkill_and_workflow_cost() {
         // Final FrankenFS reopen verifying `/protected_sealed.txt`, `/zzz_final_element.bin`,
         // AND `/external_wave2.txt`!
         let final_ro = open_read_only(&cx, &member_paths[0], &ro_opts).expect("final reopen");
-        let mut fscope = RequestScope::empty();
+        let mut final_scope = RequestScope::empty();
         let sealed_attr = final_ro
             .filesystem
             .lookup(
                 &cx,
-                &mut fscope,
+                &mut final_scope,
                 InodeNumber(1),
                 OsStr::new("protected_sealed.txt"),
             )
@@ -2614,7 +2617,7 @@ fn qualify_all_seven_profiles_interchange_faults_sigkill_and_workflow_cost() {
         assert_eq!(
             final_ro
                 .filesystem
-                .read(&cx, &mut fscope, sealed_attr.ino, 0, 128)
+                .read(&cx, &mut final_scope, sealed_attr.ino, 0, 128)
                 .unwrap(),
             b"resealed-native-commit-v3"
         );
@@ -2622,7 +2625,7 @@ fn qualify_all_seven_profiles_interchange_faults_sigkill_and_workflow_cost() {
             .filesystem
             .lookup(
                 &cx,
-                &mut fscope,
+                &mut final_scope,
                 InodeNumber(1),
                 OsStr::new("zzz_final_element.bin"),
             )
@@ -2636,7 +2639,7 @@ fn qualify_all_seven_profiles_interchange_faults_sigkill_and_workflow_cost() {
                 .filesystem
                 .lookup(
                     &cx,
-                    &mut fscope,
+                    &mut final_scope,
                     InodeNumber(1),
                     OsStr::new("external_wave2.txt"),
                 )
@@ -2644,7 +2647,7 @@ fn qualify_all_seven_profiles_interchange_faults_sigkill_and_workflow_cost() {
             assert_eq!(
                 final_ro
                     .filesystem
-                    .read(&cx, &mut fscope, w2_attr.ino, 0, 128)
+                    .read(&cx, &mut final_scope, w2_attr.ino, 0, 128)
                     .unwrap(),
                 ext_wave2_bytes
             );
@@ -2679,7 +2682,7 @@ fn qualify_all_seven_profiles_interchange_faults_sigkill_and_workflow_cost() {
                         .filesystem
                         .lookup(
                             &cx,
-                            &mut fscope,
+                            &mut final_scope,
                             InodeNumber(1),
                             OsStr::new("protected_sealed.txt"),
                         )
@@ -2691,7 +2694,7 @@ fn qualify_all_seven_profiles_interchange_faults_sigkill_and_workflow_cost() {
                         .filesystem
                         .lookup(
                             &cx,
-                            &mut fscope,
+                            &mut final_scope,
                             InodeNumber(1),
                             OsStr::new("external_wave2.txt"),
                         )
