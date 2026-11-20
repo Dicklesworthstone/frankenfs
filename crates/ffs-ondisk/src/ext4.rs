@@ -11,6 +11,17 @@ use ffs_types::{
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
+pub mod unicode_12_1;
+pub use unicode_12_1::{
+    Ext4CasefoldError, is_assigned_unicode_12_1, is_default_ignorable_12_1, unicode_12_1_ccc,
+    utf8_nfdicf_12_1,
+};
+
+/// On-disk `s_encoding` identifier for Unicode 12.1.0 UTF-8 (`EXT4_ENC_UTF8_12_1`).
+pub const EXT4_ENC_UTF8_12_1: u16 = 1;
+/// On-disk `s_encoding_flags` bit rejecting invalid UTF-8 and unassigned code points.
+pub const EXT4_ENC_STRICT_MODE_FL: u16 = 0x0001;
+
 const EXT4_EXTENT_MAGIC: u16 = 0xF30A;
 pub const EXT_INIT_MAX_LEN: u16 = 1_u16 << 15;
 pub const EXT4_MAX_NAME_BYTES: usize = 255;
@@ -1255,6 +1266,18 @@ impl Ext4Superblock {
     #[must_use]
     pub fn has_metadata_csum(&self) -> bool {
         self.has_ro_compat(Ext4RoCompatFeatures::METADATA_CSUM)
+    }
+
+    /// Whether this superblock enables `EXT4_FEATURE_INCOMPAT_CASEFOLD`.
+    #[must_use]
+    pub fn has_casefold(&self) -> bool {
+        self.has_incompat(Ext4IncompatFeatures::CASEFOLD)
+    }
+
+    /// Whether this superblock enables strict UTF-8 encoding enforcement (`EXT4_ENC_STRICT_MODE_FL`).
+    #[must_use]
+    pub fn has_strict_encoding(&self) -> bool {
+        self.has_casefold() && (self.encoding_flags & EXT4_ENC_STRICT_MODE_FL) != 0
     }
 
     #[must_use]
@@ -4364,12 +4387,40 @@ pub enum Ext4CasefoldEncoding {
 
 /// Return the comparison key used by FrankenFS for ext4 casefold lookup.
 ///
-/// The key is suitable for collision checks before create or rename: two names
-/// that produce the same key would resolve to the same casefold directory
-/// entry in this clean-room model.
+/// Uses full Unicode 12.1.0 `utf8nfdicf` (`EXT4_ENC_UTF8_12_1`) on valid UTF-8
+/// and ASCII-lowercase byte fallback on non-UTF-8 sequences.
 #[must_use]
 pub fn ext4_casefold_key(name: &[u8]) -> Vec<u8> {
     casefold_name(name)
+}
+
+/// Validate and normalize `name` under `EXT4_ENC_UTF8_12_1` (`utf8nfdicf`).
+///
+/// # Errors
+/// Returns [`Ext4CasefoldError::InvalidUtf8`] on malformed UTF-8 or
+/// [`Ext4CasefoldError::UnassignedCodepoint`] when `strict` is `true` and `name`
+/// contains a scalar value unassigned in Unicode 12.1.0.
+pub fn ext4_casefold_key_strict(name: &[u8], strict: bool) -> Result<Vec<u8>, Ext4CasefoldError> {
+    unicode_12_1::utf8_nfdicf_12_1(name, strict)
+}
+
+/// Compute the on-disk `(major, minor)` `dx_hash` for a filename in an
+/// `EXT4_CASEFOLD_FL` directory (`fs/ext4/hash.c:ext4fs_dirhash_uf`).
+///
+/// Hashes the Unicode 12.1.0 `utf8nfdicf` byte stream when `name` is valid under
+/// `strict`, or falls back to hashing the opaque raw `name` bytes when decoding
+/// fails in non-strict mode (matching Linux `ext4fs_dirhash_uf`).
+#[must_use]
+pub fn ext4_dx_hash_casefold_bytes(
+    hash_version: u8,
+    name: &[u8],
+    seed: &[u32; 4],
+    strict: bool,
+) -> (u32, u32) {
+    unicode_12_1::utf8_nfdicf_12_1(name, strict).map_or_else(
+        |_| dx_hash(hash_version, name, seed),
+        |folded| dx_hash(hash_version, &folded, seed),
+    )
 }
 
 /// Whether `name`'s casefold key equals an already-folded target key, without
@@ -4466,53 +4517,24 @@ pub fn ext4_casefold_name_diagnostics(name: &[u8]) -> Ext4CasefoldNameDiagnostic
     }
 }
 
-/// Apply Unicode casefold to a filename for case-insensitive comparison.
-///
-/// Converts UTF-8 filenames to a canonical comparison form. This intentionally
-/// covers the multi-code-point sharp-s fold (`ß`/`ẞ` -> `ss`) that ext4
-/// casefold directories rely on for stable case-insensitive lookup. Non-UTF-8
-/// filenames are compared byte-by-byte with ASCII case folding only.
+/// Apply Unicode 12.1.0 `utf8nfdicf` casefold to a filename for case-insensitive
+/// comparison (`EXT4_ENC_UTF8_12_1`), falling back to ASCII-only byte folding on
+/// invalid UTF-8.
 fn casefold_name(name: &[u8]) -> Vec<u8> {
-    if name.is_ascii() {
-        let mut folded = name.to_vec();
-        folded.make_ascii_lowercase();
-        return folded;
-    }
-
-    std::str::from_utf8(name).map_or_else(
-        |_| {
-            // Non-UTF-8: ASCII case fold only.
-            name.iter()
-                .map(|&b| {
-                    if b.is_ascii_uppercase() {
-                        b.to_ascii_lowercase()
-                    } else {
-                        b
-                    }
-                })
-                .collect()
-        },
-        |s| {
-            let mut folded = String::with_capacity(s.len());
-            for ch in s.chars() {
-                push_casefolded_char(&mut folded, ch);
-            }
-            folded.into_bytes()
-        },
-    )
+    unicode_12_1::utf8_nfdicf_12_1(name, false).unwrap_or_else(|_| {
+        name.iter()
+            .map(|&b| {
+                if b.is_ascii_uppercase() {
+                    b.to_ascii_lowercase()
+                } else {
+                    b
+                }
+            })
+            .collect()
+    })
 }
 
-/// Canonical (NFD) decomposition of a precomposed single-mark letter into its
-/// lowercased base char + combining mark, for casefold comparison. The kernel's
-/// casefold table NFD-normalizes before folding, so a precomposed letter and
-/// its decomposed form must fold to the same key; this makes the read-path
-/// linear-scan lookup match either spelling for covered Latin, Greek, and
-/// Cyrillic rows (bd-qdmlu / bd-gegku, read-correctness increments of bd-vsuni).
-/// Multi-mark Latin Extended Additional / Vietnamese forms live in
-/// [`precomposed_multi_mark_nfd_casefold`]. Returns `None` otherwise (e.g. Æ,
-/// Ð, Ø, Þ, ß, Đ, Ł, Œ, ŋ — no canonical decomposition, handled elsewhere or
-/// left as-is). The tables are pinned to canonical Unicode 12.1 decompositions
-/// used by the ext4 casefold contract.
+#[cfg(test)]
 fn precomposed_nfd_casefold(ch: char) -> Option<(char, char)> {
     precomposed_latin1_nfd_casefold(ch)
         .or_else(|| precomposed_latin_extended_a_nfd_casefold(ch))
@@ -4523,6 +4545,7 @@ fn precomposed_nfd_casefold(ch: char) -> Option<(char, char)> {
         .or_else(|| precomposed_cyrillic_nfd_casefold(ch))
 }
 
+#[cfg(test)]
 const fn precomposed_latin1_nfd_casefold(ch: char) -> Option<(char, char)> {
     Some(match ch {
         'À' | 'à' => ('a', '\u{0300}'),
@@ -4556,6 +4579,7 @@ const fn precomposed_latin1_nfd_casefold(ch: char) -> Option<(char, char)> {
     })
 }
 
+#[cfg(test)]
 const fn precomposed_latin_extended_a_nfd_casefold(ch: char) -> Option<(char, char)> {
     Some(match ch {
         'Ā' | 'ā' => ('a', '\u{0304}'),
@@ -4616,6 +4640,7 @@ const fn precomposed_latin_extended_a_nfd_casefold(ch: char) -> Option<(char, ch
     })
 }
 
+#[cfg(test)]
 const fn precomposed_latin_extended_additional_a_l_nfd_casefold(ch: char) -> Option<(char, char)> {
     Some(match ch {
         'Ḁ' | 'ḁ' => ('a', '\u{0325}'),
@@ -4647,6 +4672,7 @@ const fn precomposed_latin_extended_additional_a_l_nfd_casefold(ch: char) -> Opt
     })
 }
 
+#[cfg(test)]
 const fn precomposed_latin_extended_additional_m_z_nfd_casefold(ch: char) -> Option<(char, char)> {
     Some(match ch {
         'Ḿ' | 'ḿ' => ('m', '\u{0301}'),
@@ -4692,6 +4718,7 @@ const fn precomposed_latin_extended_additional_m_z_nfd_casefold(ch: char) -> Opt
     })
 }
 
+#[cfg(test)]
 const fn precomposed_vietnamese_single_mark_nfd_casefold(ch: char) -> Option<(char, char)> {
     Some(match ch {
         // Latin Extended-B bases used by Vietnamese precomposed letters.
@@ -4716,6 +4743,7 @@ const fn precomposed_vietnamese_single_mark_nfd_casefold(ch: char) -> Option<(ch
     })
 }
 
+#[cfg(test)]
 const fn precomposed_greek_nfd_casefold(ch: char) -> Option<(char, char)> {
     Some(match ch {
         'Ά' | 'ά' => ('α', '\u{0301}'),
@@ -4734,6 +4762,7 @@ const fn precomposed_greek_nfd_casefold(ch: char) -> Option<(char, char)> {
 /// Cyrillic letters with canonical Unicode 12.1 decompositions. ext4's
 /// casefold table NFD-normalizes before folding, so composed spellings like
 /// `Й` and decomposed spellings like `и` + COMBINING BREVE must collide.
+#[cfg(test)]
 const fn precomposed_cyrillic_nfd_casefold(ch: char) -> Option<(char, char)> {
     Some(match ch {
         'Ѐ' | 'ѐ' => ('е', '\u{0300}'),
@@ -4769,6 +4798,7 @@ const fn precomposed_cyrillic_nfd_casefold(ch: char) -> Option<(char, char)> {
 /// Canonical (NFD) decomposition for Latin Extended Additional / Vietnamese
 /// letters whose Unicode 12.1 decomposition recursively expands to more than
 /// one combining mark. Marks are already in canonical combining-class order.
+#[cfg(test)]
 fn precomposed_multi_mark_nfd_casefold(ch: char) -> Option<(char, &'static str)> {
     let mapped = match ch {
         'Ḉ' | 'ḉ' => ('c', "\u{0327}\u{0301}"),
@@ -4822,6 +4852,7 @@ fn precomposed_multi_mark_nfd_casefold(ch: char) -> Option<(char, &'static str)>
     Some(mapped)
 }
 
+#[cfg(test)]
 const fn greek_breathing_accent_suffix(form: u32) -> &'static str {
     match form & 0x7 {
         0 => "\u{0313}",
@@ -4836,6 +4867,7 @@ const fn greek_breathing_accent_suffix(form: u32) -> &'static str {
     }
 }
 
+#[cfg(test)]
 const fn greek_breathing_accent_iota_suffix(form: u32) -> &'static str {
     match form & 0x7 {
         0 => "\u{0313}ι",
@@ -4853,6 +4885,7 @@ const fn greek_breathing_accent_iota_suffix(form: u32) -> &'static str {
 /// Greek Extended NFD + casefold coverage for polytonic forms. Some forms
 /// include U+0345 COMBINING GREEK YPOGEGRAMMENI in NFD; casefold expands that
 /// mark to a spacing iota, so the suffix may include Greek letters too.
+#[cfg(test)]
 fn precomposed_greek_extended_nfd_casefold(ch: char) -> Option<(char, &'static str)> {
     let code = u32::from(ch);
     let mapped = match code {
@@ -4930,6 +4963,7 @@ fn precomposed_greek_extended_nfd_casefold(ch: char) -> Option<(char, &'static s
     Some(mapped)
 }
 
+#[cfg(test)]
 fn push_precomposed_nfd_casefold(folded: &mut String, ch: char) -> bool {
     if let Some((base, mark)) = precomposed_nfd_casefold(ch) {
         folded.push(base);
@@ -4947,30 +4981,6 @@ fn push_precomposed_nfd_casefold(folded: &mut String, ch: char) -> bool {
         return true;
     }
     false
-}
-
-fn push_casefolded_char(folded: &mut String, ch: char) {
-    if push_precomposed_nfd_casefold(folded, ch) {
-        return;
-    }
-    match ch {
-        'ß' | 'ẞ' => folded.push_str("ss"),
-        'Α'..='Ρ' | 'Σ'..='Ϋ' => {
-            let lower = char::from_u32(u32::from(ch) + 0x20)
-                .expect("Greek uppercase range maps to valid lowercase scalar");
-            folded.push(lower);
-        }
-        'Ё' => folded.push('ё'),
-        'ſ' => folded.push('s'),
-        'ς' => folded.push('σ'),
-        'А'..='Я' => {
-            let lower = char::from_u32(u32::from(ch) + 0x20)
-                .expect("Cyrillic uppercase range maps to valid lowercase scalar");
-            folded.push(lower);
-        }
-        '\u{0590}'..='\u{05FF}' | '\u{4E00}'..='\u{9FFF}' => folded.push(ch),
-        _ => folded.extend(ch.to_lowercase()),
-    }
 }
 
 // ── Zero-allocation directory block iterator ────────────────────────────────
@@ -21419,5 +21429,157 @@ mod dir_csum_incremental_verify {
             parsed.write_to_region(&mut short),
             Err(ParseError::InsufficientData { .. })
         ));
+    }
+
+    #[test]
+    fn unicode_12_1_nfdicf_matches_hangul_ccc_ignorable_and_multicodepoint_bd_vsuni_3() {
+        // Hangul syllable algorithmic L+V+T decomposition + ASCII folding.
+        assert_eq!(
+            ext4_casefold_key("한글.txt".as_bytes()),
+            ext4_casefold_key("\u{1112}\u{1161}\u{11AB}\u{1100}\u{1173}\u{11AF}.TXT".as_bytes())
+        );
+
+        // Canonical Combining Class reordering: CCC(U+0328)=202 < CCC(U+0301)=230.
+        assert_eq!(
+            ext4_casefold_key("A\u{0301}\u{0328}".as_bytes()),
+            ext4_casefold_key("a\u{0328}\u{0301}".as_bytes())
+        );
+
+        // Linux fs/unicode utf8nfdicf quirk: Default_Ignorable_Code_Point (U+034F CGJ)
+        // has CCC=0 (STOPPER) during decomposition/reordering BEFORE it is stripped,
+        // blocking U+0323 (CCC=220) from bubble-sorting across U+0301 (CCC=230).
+        let with_cgj = ext4_casefold_key("bar\u{0301}\u{034F}\u{0323}".as_bytes());
+        assert_eq!(with_cgj, "bar\u{0301}\u{0323}".as_bytes());
+        let without_cgj = ext4_casefold_key("bar\u{0301}\u{0323}".as_bytes());
+        assert_eq!(without_cgj, "bar\u{0323}\u{0301}".as_bytes());
+        assert_ne!(with_cgj, without_cgj);
+
+        // Multi-codepoint full casefolds & non-Latin scripts.
+        assert_eq!(ext4_casefold_key("ﬃ".as_bytes()), b"ffi");
+        assert_eq!(
+            ext4_casefold_key("Straße".as_bytes()),
+            ext4_casefold_key("STRAẞE".as_bytes())
+        );
+        assert_eq!(
+            ext4_casefold_key("İSTANBUL".as_bytes()),
+            "i\u{0307}stanbul".as_bytes()
+        );
+        assert_eq!(
+            ext4_casefold_key("\u{AB70}".as_bytes()), // Cherokee Small Letter A
+            ext4_casefold_key("\u{13A0}".as_bytes())  // Cherokee Letter A
+        );
+    }
+
+    #[test]
+    fn unicode_12_1_strict_mode_and_opaque_invalid_utf8_dx_hash_bd_vsuni_3() {
+        let seed = [0x1122_3344, 0x5566_7788, 0x99AA_BBCC, 0xDDEE_FF00];
+        let invalid_utf8 = b"Cafe\xff\xfe.TXT";
+
+        assert_eq!(
+            ext4_casefold_key_strict(invalid_utf8, true),
+            Err(Ext4CasefoldError::InvalidUtf8)
+        );
+        assert_eq!(
+            ext4_dx_hash_casefold_bytes(1, invalid_utf8, &seed, true),
+            Err(Ext4CasefoldError::InvalidUtf8)
+        );
+        // Non-strict dx_hash hashes opaque raw bytes verbatim (fs/ext4/hash.c:254-265).
+        assert_eq!(
+            ext4_dx_hash_casefold_bytes(1, invalid_utf8, &seed, false).unwrap(),
+            dx_hash(1, invalid_utf8, &seed)
+        );
+
+        // U+1FA70 (Ballet Shoes) was unassigned in Unicode 12.1.0 (added in 13.0).
+        let post_12_1 = "\u{1FA70}.txt".as_bytes();
+        assert_eq!(
+            ext4_casefold_key_strict(post_12_1, true),
+            Err(Ext4CasefoldError::UnassignedCodepoint('\u{1FA70}'))
+        );
+        assert_eq!(
+            ext4_casefold_key_strict(post_12_1, false).unwrap(),
+            "\u{1FA70}.txt".as_bytes()
+        );
+    }
+
+    #[test]
+    fn split_htree_leaf_with_casefold_routes_unicode_12_1_variants_bd_vsuni_3() {
+        let block_size = 1024_usize;
+        let bs_u32 = u32::try_from(block_size).unwrap();
+        let seed = [0x6745_2301, 0xEFCD_AB89, 0x98BA_DCFE, 0x1032_5476];
+        let csum_seed = 0xCAFE_1234_u32;
+        let dir_ino = 19_u32;
+        let generation = 7_u32;
+
+        let mut names = Vec::new();
+        for i in 0..24_u32 {
+            names.push((
+                100 + i,
+                format!("Straße_한글_Ὀδυσσεύς_{i:02}.TXT"),
+                format!("STRASSE_\u{1112}\u{1161}\u{11AB}\u{1100}\u{1173}\u{11AF}_ὀδυσσεύς_{i:02}.txt"),
+            ));
+        }
+        let initial_refs: Vec<(u32, u8, &[u8])> = names[..16]
+            .iter()
+            .map(|(ino, stored, _)| (*ino, EXT4_FT_REG_FILE, stored.as_bytes()))
+            .collect();
+        let blocks = build_htree_directory_stamped_with_large_dir_casefold(
+            dir_ino,
+            2,
+            &initial_refs,
+            block_size,
+            1,
+            &seed,
+            Some((csum_seed, generation)),
+            false,
+            true,
+        )
+        .expect("build initial casefold htree");
+        assert_eq!(blocks.len(), 2, "16 entries fit in 1 leaf + dx_root");
+
+        let split = split_htree_leaf_with_casefold(
+            &blocks[0],
+            &blocks[1],
+            1,
+            2,
+            block_size,
+            1,
+            &seed,
+            true,
+            false,
+            csum_seed,
+            dir_ino,
+            generation,
+            true,
+        )
+        .expect("split casefold htree leaf");
+
+        verify_dx_block_checksum(
+            &split.dx_root,
+            csum_seed,
+            dir_ino,
+            generation,
+            DX_ROOT_COUNT_OFFSET,
+        )
+        .expect("dx_root csum");
+        verify_dir_block_checksum(&split.old_leaf, csum_seed, dir_ino, generation)
+            .expect("old_leaf csum");
+        verify_dir_block_checksum(&split.new_leaf, csum_seed, dir_ino, generation)
+            .expect("new_leaf csum");
+
+        let after_blocks = [split.dx_root, split.old_leaf, split.new_leaf];
+        for (expected_ino, _, query) in &names[..16] {
+            let found = htree_find_entry_casefold(
+                bs_u32,
+                &seed,
+                false,
+                query.as_bytes(),
+                |logical| after_blocks.get(usize::try_from(logical).ok()?).cloned(),
+            )
+            .expect("casefold htree lookup after split");
+            match found {
+                HtreeFindResult::Found { entry, .. } => assert_eq!(entry.inode, *expected_ino),
+                other => panic!("expected Found for {query}, got {other:?}"),
+            }
+        }
     }
 }

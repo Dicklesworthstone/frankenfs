@@ -1721,3 +1721,111 @@ fn literal_native_colon_name_precedes_stream_projection() {
         b"literal colon name"
     );
 }
+
+#[test]
+fn root_system_metafiles_without_unnamed_data_are_hidden_from_host_namespace() {
+    let cx = Cx::for_testing();
+    let mut bytes = image();
+    let mut vol_info = [0; 12];
+    vol_info[8..10].copy_from_slice(&[3, 1]);
+    put(
+        &mut bytes,
+        3,
+        &record(
+            3,
+            false,
+            1,
+            &[
+                standard(),
+                resident(0x30, 1, "", &filename(5, "$Volume", 3)),
+                resident(0x70, 2, "", &vol_info),
+            ],
+        ),
+    );
+    put(
+        &mut bytes,
+        9,
+        &record(
+            9,
+            false,
+            1,
+            &[
+                standard(),
+                resident(0x30, 1, "", &filename(5, "$Secure", 3)),
+                resident(DATA, 2, "$SDS", &[0_u8; 64]),
+            ],
+        ),
+    );
+    put(
+        &mut bytes,
+        11,
+        &record(
+            11,
+            true,
+            1,
+            &[
+                standard(),
+                resident(0x30, 1, "", &filename(5, "$Extend", 3)),
+                index(&[], 11),
+            ],
+        ),
+    );
+    put(
+        &mut bytes,
+        5,
+        &record(
+            5,
+            true,
+            1,
+            &[
+                standard(),
+                resident(0x30, 501, "", &filename(5, ".", 3)),
+                index(
+                    &[
+                        (11, "$Extend", 3),
+                        (9, "$Secure", 3),
+                        (3, "$Volume", 3),
+                        (24, "hello.txt", 1),
+                        (24, "HELLO~1.TXT", 2),
+                    ],
+                    5,
+                ),
+            ],
+        ),
+    );
+    let fs = open(bytes.clone(), Arc::default(), None).unwrap();
+    let mut scope = RequestScope::empty();
+    let page = fs.readdir(&cx, &mut scope, ROOT, 0).unwrap();
+    let names: Vec<Vec<u8>> = page.iter().map(|e| e.name.clone()).collect();
+    assert_eq!(
+        names,
+        vec![b".".to_vec(), b"..".to_vec(), b"hello.txt".to_vec()]
+    );
+    for entry in &page {
+        fs.getattr(&cx, &mut scope, entry.ino).unwrap();
+    }
+    for sys_name in ["$Volume", "$Secure", "$Extend", "$volume"] {
+        assert!(matches!(
+            fs.lookup(&cx, &mut scope, ROOT, OsStr::new(sys_name)),
+            Err(FfsError::NotFound(_))
+        ));
+    }
+    let volume = NtfsVolume::from_device(
+        &cx,
+        Box::new(Memory {
+            bytes,
+            reads: Arc::default(),
+            fail_at: None,
+        }),
+        BASE as u64,
+        LENGTH as u64,
+    )
+    .unwrap();
+    let indexed_fs = NtfsFs::new_indexed(&cx, volume, 123, 456).unwrap();
+    for sys_name in ["$Volume", "$Secure", "$Extend", "$volume"] {
+        assert!(matches!(
+            indexed_fs.lookup(&cx, &mut scope, ROOT, OsStr::new(sys_name)),
+            Err(FfsError::NotFound(_))
+        ));
+    }
+}

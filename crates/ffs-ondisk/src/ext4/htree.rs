@@ -738,12 +738,14 @@ fn build_htree_layout(
         usable
     };
 
-    // Casefold directories index by the case-folded name (byte-exact for ASCII),
-    // while the leaf still stores the original-case name; non-casefold hashes the
-    // name verbatim.
+    // Casefold directories index by the Unicode 12.1.0 NFDICF casefolded name
+    // (or opaque raw bytes on invalid UTF-8 in non-strict mode, matching
+    // `fs/ext4/hash.c:254-265`), while leaves retain the original-case name.
     let name_hash = |name: &[u8]| -> u32 {
         if casefold {
-            dx_hash(hash_version, &casefold_name(name), hash_seed).0
+            ext4_dx_hash_casefold_bytes(hash_version, name, hash_seed, false)
+                .expect("non-strict casefold dx_hash cannot fail")
+                .0
         } else {
             dx_hash(hash_version, name, hash_seed).0
         }
@@ -1316,18 +1318,14 @@ where
     let (root_hash_version, root_indirect_levels) =
         invalid_unless!(parse_dx_root_info_with_large_dir(block0.as_ref(), has_large_dir).ok());
     let hash_version = effective_hash_version(root_hash_version);
-    // For casefold dirs the kernel hashes the case-folded name; matching that
-    // (byte-exact for ASCII, where casefold == ASCII-lowercase) lets the htree
-    // index resolve case-insensitive lookups. An exotic-Unicode fold that
-    // differs from the kernel's simply misses here, and the caller falls back
-    // to the linear casefold scan, so correctness is never at risk.
-    let folded = if casefold {
-        Some(casefold_name(name))
+    // For casefold dirs the kernel hashes the Unicode 12.1.0 NFDICF folded name
+    // (falling back to opaque raw bytes on invalid UTF-8 in non-strict mode).
+    let (hash, _minor) = if casefold {
+        ext4_dx_hash_casefold_bytes(hash_version, name, hash_seed, false)
+            .expect("non-strict casefold dx_hash cannot fail")
     } else {
-        None
+        dx_hash(hash_version, name, hash_seed)
     };
-    let hash_input = folded.as_deref().unwrap_or(name);
-    let (hash, _minor) = dx_hash(hash_version, hash_input, hash_seed);
     let indirect_levels = usize::from(root_indirect_levels);
 
     // Fast path (bd-cc-dxraw): a single-level htree — the common shape for moderate
@@ -1527,15 +1525,14 @@ where
         parse_dx_root_info_with_large_dir(block0.as_ref(), has_large_dir).ok()?;
 
     let hash_version = effective_hash_version(root_hash_version);
-    // Casefold dirs index by the folded name (byte-exact for ASCII), so the
-    // target leaf for an insert is the one the folded hash maps to.
-    let folded = if casefold {
-        Some(casefold_name(name))
+    // Casefold dirs index by the Unicode 12.1.0 NFDICF folded name (or opaque
+    // raw bytes on invalid UTF-8 in non-strict mode).
+    let (hash, _minor) = if casefold {
+        ext4_dx_hash_casefold_bytes(hash_version, name, hash_seed, false)
+            .expect("non-strict casefold dx_hash cannot fail")
     } else {
-        None
+        dx_hash(hash_version, name, hash_seed)
     };
-    let hash_input = folded.as_deref().unwrap_or(name);
-    let (hash, _minor) = dx_hash(hash_version, hash_input, hash_seed);
 
     let mut block_data = block0;
     let mut count_limit_offset = 0x20;
@@ -1860,6 +1857,45 @@ pub fn split_htree_leaf(
     dir_ino: u32,
     generation: u32,
 ) -> Result<HtreeLeafSplit, HtreeSplitFallback> {
+    split_htree_leaf_with_casefold(
+        dx_root_block,
+        target_leaf,
+        target_leaf_logical,
+        new_leaf_logical,
+        block_size,
+        hash_version,
+        hash_seed,
+        has_metadata_csum,
+        has_large_dir,
+        csum_seed,
+        dir_ino,
+        generation,
+        false,
+    )
+}
+
+/// Casefold-aware variant of [`split_htree_leaf`].
+///
+/// When `casefold` is `true`, each leaf entry is hashed via
+/// [`ext4_dx_hash_casefold_bytes`] (`EXT4_ENC_UTF8_12_1` NFDICF with opaque
+/// raw-byte fallback on invalid UTF-8) while preserving original-case names on
+/// disk.
+#[allow(clippy::too_many_arguments)]
+pub fn split_htree_leaf_with_casefold(
+    dx_root_block: &[u8],
+    target_leaf: &[u8],
+    target_leaf_logical: u32,
+    new_leaf_logical: u32,
+    block_size: usize,
+    hash_version: u8,
+    hash_seed: &[u32; 4],
+    has_metadata_csum: bool,
+    has_large_dir: bool,
+    csum_seed: u32,
+    dir_ino: u32,
+    generation: u32,
+    casefold: bool,
+) -> Result<HtreeLeafSplit, HtreeSplitFallback> {
     if dx_root_block.len() != block_size || target_leaf.len() != block_size {
         return Err(HtreeSplitFallback::Unsupported);
     }
@@ -1892,7 +1928,13 @@ pub fn split_htree_leaf(
         if e.name.is_empty() || e.name == b"." || e.name == b".." {
             continue;
         }
-        let hash = dx_hash(hash_version, e.name, hash_seed).0;
+        let hash = if casefold {
+            ext4_dx_hash_casefold_bytes(hash_version, e.name, hash_seed, false)
+                .expect("non-strict casefold dx_hash cannot fail")
+                .0
+        } else {
+            dx_hash(hash_version, e.name, hash_seed).0
+        };
         real.push((hash, e.inode, e.file_type.to_raw(), e.name));
     }
 
@@ -2002,6 +2044,38 @@ pub fn split_htree_leaf_in_dx_node(
     dir_ino: u32,
     generation: u32,
 ) -> Result<HtreeNodeLeafSplit, HtreeSplitFallback> {
+    split_htree_leaf_in_dx_node_with_casefold(
+        dx_node_block,
+        target_leaf,
+        target_leaf_logical,
+        new_leaf_logical,
+        block_size,
+        hash_version,
+        hash_seed,
+        has_metadata_csum,
+        csum_seed,
+        dir_ino,
+        generation,
+        false,
+    )
+}
+
+/// Casefold-aware variant of [`split_htree_leaf_in_dx_node`].
+#[allow(clippy::too_many_arguments)]
+pub fn split_htree_leaf_in_dx_node_with_casefold(
+    dx_node_block: &[u8],
+    target_leaf: &[u8],
+    target_leaf_logical: u32,
+    new_leaf_logical: u32,
+    block_size: usize,
+    hash_version: u8,
+    hash_seed: &[u32; 4],
+    has_metadata_csum: bool,
+    csum_seed: u32,
+    dir_ino: u32,
+    generation: u32,
+    casefold: bool,
+) -> Result<HtreeNodeLeafSplit, HtreeSplitFallback> {
     if dx_node_block.len() != block_size || target_leaf.len() != block_size {
         return Err(HtreeSplitFallback::Unsupported);
     }
@@ -2026,7 +2100,13 @@ pub fn split_htree_leaf_in_dx_node(
         if e.name.is_empty() || e.name == b"." || e.name == b".." {
             continue;
         }
-        let hash = dx_hash(hash_version, e.name, hash_seed).0;
+        let hash = if casefold {
+            ext4_dx_hash_casefold_bytes(hash_version, e.name, hash_seed, false)
+                .expect("non-strict casefold dx_hash cannot fail")
+                .0
+        } else {
+            dx_hash(hash_version, e.name, hash_seed).0
+        };
         real.push((hash, e.inode, e.file_type.to_raw(), e.name));
     }
     // Unstable: ties are irrelevant (an equal-hash run never straddles the

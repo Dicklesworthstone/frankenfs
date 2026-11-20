@@ -55,7 +55,8 @@ impl NtfsFs {
             return Err(FfsError::NotFound(format!("NTFS name {name}")));
         };
         if parent == ROOT
-            && self.is_hidden_root_folded_name(&self.fold_units(&entry.filename.name))?
+            && (Self::is_system_metafile(entry.reference)
+                || self.is_hidden_root_folded_name(&self.fold_units(&entry.filename.name))?)
         {
             return Err(FfsError::NotFound(format!("NTFS name {name}")));
         }

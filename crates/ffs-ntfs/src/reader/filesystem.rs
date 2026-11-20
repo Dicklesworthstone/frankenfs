@@ -270,6 +270,10 @@ impl NtfsFs {
         Ok(result)
     }
 
+    pub(super) const fn is_system_metafile(reference: NtfsReference) -> bool {
+        reference.record < 16 && reference.record != 5
+    }
+
     fn inode(&self, reference: NtfsReference) -> Result<InodeNumber> {
         if reference == self.root {
             return Ok(ROOT);
@@ -329,6 +333,9 @@ impl NtfsFs {
             };
             if sequence == 0 || reference.record == 5 {
                 return Err(corrupt(0, "noncanonical NTFS mount inode"));
+            }
+            if Self::is_system_metafile(reference) {
+                return Err(FfsError::NotFound(format!("NTFS inode {}", ino.0)));
             }
             reference
         };
@@ -600,7 +607,8 @@ impl NtfsFs {
         for entry in native {
             checkpoint(cx)?;
             if ino == ROOT
-                && self.is_hidden_root_folded_name(&self.fold_units(&entry.filename.name))?
+                && (Self::is_system_metafile(entry.reference)
+                    || self.is_hidden_root_folded_name(&self.fold_units(&entry.filename.name))?)
             {
                 continue;
             }
