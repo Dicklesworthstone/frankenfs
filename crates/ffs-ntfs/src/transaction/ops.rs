@@ -1834,11 +1834,11 @@ impl NtfsTransactionEngine {
     /// Write at a byte offset without truncating the existing suffix. Gaps beyond
     /// EOF are initialized to zero before the new stream becomes reachable.
     ///
-    /// A nonempty write's resulting stream must fit [`super::MAX_FILE_EDIT_BYTES`].
-    /// The current implementation stages a bounded complete replacement, then
-    /// uses the same native WAL and disjoint-cluster publication as
-    /// [`Self::write_file_data`]. An empty write validates the native target and
-    /// commits without staging data, preserving even a larger stream at any offset.
+    /// [`super::MAX_FILE_EDIT_BYTES`] bounds the payload and newly initialized
+    /// span, not the logical file size. Large streams use cluster-range COW,
+    /// preserving untouched allocations and the native WAL publication boundary.
+    /// An empty write validates the native target and commits without staging
+    /// data, preserving even a larger stream at any offset.
     pub fn write_file_range(
         &mut self,
         cx: &Cx,
@@ -2281,7 +2281,11 @@ impl NtfsTransactionEngine {
             FileDataEdit::Write { .. } => 0,
             FileDataEdit::Truncate { size } => size,
         };
-        if requested_end > super::MAX_FILE_EDIT_BYTES {
+        let exceeds_edit_budget = match edit {
+            FileDataEdit::Write { data, .. } => data.len() as u64 > super::MAX_FILE_EDIT_BYTES,
+            FileDataEdit::Truncate { size } => size > super::MAX_FILE_EDIT_BYTES,
+        };
+        if exceeds_edit_budget || requested_end > i64::MAX as u64 {
             return Err(too_large());
         }
 
@@ -2343,7 +2347,32 @@ impl NtfsTransactionEngine {
             FileDataEdit::Truncate { size } => size,
         };
         if new_size > super::MAX_FILE_EDIT_BYTES {
-            return Err(too_large());
+            let FileDataEdit::Write { offset, data } = edit else {
+                return Err(too_large());
+            };
+            // Preserve the path/name/ownership preflight above. Only the data
+            // planner changes: it stages the touched clusters and any bytes
+            // newly exposed by advancing ValidDataLength, never the entire file.
+            let plan = self.plan_stream_write(
+                cx,
+                reference,
+                stream_name,
+                offset,
+                data,
+                false,
+                DEFAULT_NTFS_FILETIME,
+                digest,
+            )?;
+            return Ok(PreparedTxPlan {
+                operation,
+                operation_digest: plan.operation_digest,
+                result_value: reference,
+                pre_payload_writes: plan.pre_payload_writes,
+                mft_zero_writes: plan.mft_zero_writes,
+                open_attr_registrations: plan.open_attr_registrations,
+                mutation_specs: plan.mutation_specs,
+                target_writes: plan.target_writes,
+            });
         }
         let new_len = usize::try_from(new_size).map_err(|_| too_large())?;
         let retained = usize::try_from(stream.size.min(new_size)).map_err(|_| too_large())?;

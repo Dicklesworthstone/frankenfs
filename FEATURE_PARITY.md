@@ -1,5 +1,15 @@
 # FEATURE_PARITY
 
+> **Extent read-cache lifetime bounds (2026-11-20):**
+> The S3-FIFO cache bounds invalidation tombstones relative to live residents,
+> even when payload pressure never triggers eviction. Generation-tagged resident
+> and ghost tokens preserve admission order across invalidation and refill.
+> Partial-tile growth reserves only additional bytes and keeps the resident in
+> its eviction queue while making room. Unit/property regressions cover repeated
+> invalidation, block-size replacement, FIFO reincarnation, pressured merges,
+> exact queue membership, ghost history and payload accounting. These are queue
+> and payload bounds; allocator capacity and mounted RSS are separate measures.
+
 > **NTFS named DATA lifecycle (2026-11-15):**
 > The native logged writer can create and remove ordinary named DATA streams
 > through sequence-bound references and paths. Resident/nonresident payloads,

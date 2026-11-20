@@ -22361,6 +22361,135 @@ mod tests {
         Arc::new(fs)
     }
 
+    fn ssi_fuse_read_fixture() -> (Arc<ffs_core::OpenFs>, FrankenFuse, RequestScope) {
+        let fs = preserved_scope_ext4();
+        fs.set_mvcc_isolation_mode(ffs_core::MvccIsolationMode::Serializable);
+        let cx = Cx::for_testing();
+        let mut seed = fs.begin_transaction();
+        // Block 13 is hello.txt's data; block 20 models the second value a
+        // transaction depends on. Only this private constructed image is used.
+        for block in [ffs_types::BlockNumber(13), ffs_types::BlockNumber(20)] {
+            fs.stage_block_write(&mut seed, block, vec![0; 4096]);
+        }
+        fs.commit_transaction(&cx, seed).unwrap();
+        let mut pivot = fs.begin_request_scope(&cx, RequestOp::Write).unwrap();
+        assert_eq!(
+            fs.read_block_with_scope(&cx, &pivot, ffs_types::BlockNumber(20))
+                .unwrap()[0],
+            0
+        );
+        fs.stage_block_write(
+            pivot.tx.as_mut().unwrap(),
+            ffs_types::BlockNumber(13),
+            vec![1; 4096],
+        );
+        let mut outgoing = fs.begin_transaction();
+        fs.stage_block_write(&mut outgoing, ffs_types::BlockNumber(20), vec![1; 4096]);
+        fs.commit_transaction(&cx, outgoing).unwrap();
+        let fuse = FrankenFuse::with_options(
+            Box::new(Arc::clone(&fs)),
+            &MountOptions {
+                read_only: false,
+                ..MountOptions::default()
+            },
+        );
+        (fs, fuse, pivot)
+    }
+
+    #[test]
+    fn ssi_read_only_fuse_reply_retains_dependency_for_later_writer() {
+        let (fs, fuse, mut pivot) = ssi_fuse_read_fixture();
+        let cx = Cx::for_testing();
+        let observed = fuse
+            .with_request_scope(&cx, RequestOp::Read, |cx, scope| {
+                let x = fuse.inner.ops.read(cx, scope, InodeNumber(11), 0, 1)?[0];
+                let y = fs.read_block_with_scope(cx, scope, ffs_types::BlockNumber(20))?[0];
+                Ok((x, y))
+            })
+            .expect("safe until the pivot tries to commit");
+        assert_eq!(observed, (0, 1));
+        let result = fs.commit_request_scope(&cx, &mut pivot);
+        fs.end_request_scope(&cx, RequestOp::Write, pivot).unwrap();
+        assert!(
+            matches!(result, Err(FfsError::MvccConflict { .. })),
+            "a successful FUSE observation must be retained in SSI history: {result:?}"
+        );
+        assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+        assert_eq!(fs.as_ref().read(&cx, InodeNumber(11), 0, 1).unwrap(), [0]);
+    }
+
+    #[test]
+    fn ssi_read_only_fuse_retries_validation_conflict_before_reply() {
+        let (fs, fuse, pivot) = ssi_fuse_read_fixture();
+        let cx = Cx::for_testing();
+        let mut pending_pivot = Some(pivot);
+        let mut attempts = 0;
+        let observed = fuse
+            .with_request_scope(&cx, RequestOp::Read, |cx, scope| {
+                attempts += 1;
+                let x = fuse.inner.ops.read(cx, scope, InodeNumber(11), 0, 1)?[0];
+                let y = fs.read_block_with_scope(cx, scope, ffs_types::BlockNumber(20))?[0];
+                if let Some(mut pivot) = pending_pivot.take() {
+                    assert_eq!((x, y), (0, 1));
+                    fs.commit_request_scope(cx, &mut pivot)?;
+                    fs.end_request_scope(cx, RequestOp::Write, pivot)?;
+                }
+                // The body succeeded, but its first result is not serializable.
+                // Completion must reject it and retry before returning bytes.
+                Ok((x, y))
+            })
+            .unwrap();
+        assert_eq!(observed, (1, 1));
+        assert_eq!(attempts, 2);
+        assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+        let metrics = fuse.metrics().snapshot();
+        assert_eq!(metrics.requests_total, 1);
+        assert_eq!(metrics.requests_ok, 1);
+        assert_eq!(metrics.requests_err, 0);
+    }
+
+    #[test]
+    fn ssi_read_only_fuse_error_panic_and_cancellation_discard_observations() {
+        for failure in 0..3 {
+            let (fs, fuse, mut pivot) = ssi_fuse_read_fixture();
+            let request_cx = Cx::for_testing();
+            let before = fs.current_snapshot();
+            let result = fuse.with_request_scope(&request_cx, RequestOp::Read, |cx, scope| {
+                let x = fuse.inner.ops.read(cx, scope, InodeNumber(11), 0, 1)?[0];
+                let y = fs.read_block_with_scope(cx, scope, ffs_types::BlockNumber(20))?[0];
+                assert_eq!((x, y), (0, 1));
+                match failure {
+                    0 => Err(FfsError::NotFound("failed observation".to_owned())),
+                    1 => panic!("injected read handler panic"),
+                    _ => {
+                        cx.set_cancel_requested(true);
+                        Ok((x, y))
+                    }
+                }
+            });
+            let error = result.expect_err("failed observations cannot return a successful reply");
+            assert_eq!(
+                error.to_errno(),
+                match failure {
+                    0 => libc::ENOENT,
+                    1 => libc::EIO,
+                    _ => libc::EINTR,
+                }
+            );
+            assert_eq!(fs.current_snapshot(), before);
+            assert_eq!(
+                fs.mvcc_active_snapshot_count(),
+                1,
+                "only pivot remains pinned"
+            );
+            let cx = Cx::for_testing();
+            fs.commit_request_scope(&cx, &mut pivot)
+                .expect("unreturned observations must not constrain the writer");
+            fs.end_request_scope(&cx, RequestOp::Write, pivot).unwrap();
+            assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+        }
+    }
+
     #[test]
     fn snapshot_read_scope_retries_real_conflict_with_new_view() {
         let fs = preserved_scope_ext4();

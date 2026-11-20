@@ -3715,7 +3715,15 @@ impl FrankenFuse {
                     // and never get here; unwinding builds now answer EIO, keep
                     // the worker, and stay mountable.
                     let op_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        f(cx, &mut scope)
+                        let value = f(cx, &mut scope)?;
+                        // An SSI reader may close a cycle through a committed
+                        // writer, or provide the incoming edge for one that
+                        // finishes later. Validate before returning the reply;
+                        // failed/cancelled bodies must never enter read history.
+                        if scope.requires_read_validation() {
+                            self.inner.ops.commit_request_scope(cx, &mut scope)?;
+                        }
+                        Ok(value)
                     }))
                     .unwrap_or_else(|_| {
                         error!(?op, "FUSE handler panicked; request answered EIO");
@@ -3762,9 +3770,11 @@ impl FrankenFuse {
     fn dispatch_opendir(&self, cx: &Cx, ino: InodeNumber) -> ffs_error::Result<(u64, u32)> {
         self.with_request_scope(cx, RequestOp::Opendir, |cx, scope| {
             let attr = self.inner.ops.getattr(cx, scope, ino)?;
-            Self::validate_opendir_attr(&attr)?;
-            Ok((self.inner.dir_handles.open(), 0))
-        })
+            Self::validate_opendir_attr(&attr)
+        })?;
+        // Do not allocate a handle until read validation and scope cleanup
+        // succeed: an error reply would leave the kernel unable to release it.
+        Ok((self.inner.dir_handles.open(), 0))
     }
 
     fn validate_opendir_attr(attr: &InodeAttr) -> ffs_error::Result<()> {

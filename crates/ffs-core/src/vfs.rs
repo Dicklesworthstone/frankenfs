@@ -643,6 +643,11 @@ pub struct RequestScope {
     /// Read-set tracker populated when `isolation_mode == Serializable`.
     #[serde(skip)]
     pub(crate) ssi_reads: Option<SsiReadTracker>,
+    /// SSI identity for an observation on a mutable filesystem. Keep this
+    /// separate from `tx`: a read must not acquire mutation semantics merely
+    /// because its dependencies need validation and committed history.
+    #[serde(skip)]
+    pub(crate) ssi_read_tx: Option<ffs_mvcc::Transaction>,
     /// Set by callers (e.g. `readdirplus`) that immediately `getattr` every
     /// returned entry themselves, so the readdir-internal inode-table prefetch
     /// fan-out is pure duplicate work (a second parallel pass over the same
@@ -751,6 +756,16 @@ impl RequestScope {
             .map_or(0, ffs_mvcc::Transaction::pending_writes)
     }
 
+    /// Whether a successful observation still needs SSI validation.
+    ///
+    /// Call [`FsOps::commit_request_scope`] before returning its result to the
+    /// caller. [`FsOps::end_request_scope`] only releases or aborts the scope;
+    /// it cannot distinguish a successful observation from a failed request.
+    #[must_use]
+    pub const fn requires_read_validation(&self) -> bool {
+        self.ssi_read_tx.is_some()
+    }
+
     /// Commit the transaction if one is present.
     ///
     /// Returns the commit sequence on success, or an error if the commit failed.
@@ -759,10 +774,40 @@ impl RequestScope {
         &mut self,
         mvcc_store: &FsMvccStore,
     ) -> ffs_error::Result<CommitSeq> {
+        if self.tx.is_none() {
+            // A read observation keeps its tracker until commit_read_only.
+            // Probing for a pending write must not erase those dependencies.
+            return Ok(CommitSeq(0));
+        }
         let use_ssi =
             self.isolation_mode == MvccIsolationMode::Serializable || mvcc_store.is_ssi_enabled();
-        let ssi_reads = self.ssi_reads.take();
-        self.tx.take().map_or(Ok(CommitSeq(0)), |mut tx| {
+        Self::commit_tracked_transaction(mvcc_store, self.tx.take(), self.ssi_reads.take(), use_ssi)
+    }
+
+    pub(crate) fn commit_read_only(
+        &mut self,
+        mvcc_store: &FsMvccStore,
+    ) -> ffs_error::Result<CommitSeq> {
+        if self.tx.is_some() || self.has_ext4_staged_effects() {
+            return Err(ffs_error::FfsError::Format(
+                "an SSI read scope cannot publish mutations".to_owned(),
+            ));
+        }
+        Self::commit_tracked_transaction(
+            mvcc_store,
+            self.ssi_read_tx.take(),
+            self.ssi_reads.take(),
+            true,
+        )
+    }
+
+    fn commit_tracked_transaction(
+        mvcc_store: &FsMvccStore,
+        tx: Option<ffs_mvcc::Transaction>,
+        ssi_reads: Option<SsiReadTracker>,
+        use_ssi: bool,
+    ) -> ffs_error::Result<CommitSeq> {
+        tx.map_or(Ok(CommitSeq(0)), |mut tx| {
             if let Some(tracker) = ssi_reads {
                 tracker.fold_into(&mut tx);
             }
@@ -3064,7 +3109,12 @@ pub trait FsOps: Send + Sync {
         Ok(())
     }
 
-    /// Commit any write transaction attached to the request scope.
+    /// Commit a write transaction or validate a successful SSI observation.
+    ///
+    /// A scope whose [`RequestScope::requires_read_validation`] is true must
+    /// complete this step before the observation is returned to its caller.
+    /// On operation failure, skip this method and call `end_request_scope` to
+    /// abort. Default backends have no transaction or read validation to commit.
     fn commit_request_scope(
         &self,
         _cx: &Cx,

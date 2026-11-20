@@ -5168,7 +5168,8 @@ impl FsOps for OpenFs {
             self.enter_mutation_gate();
         }
         let read_snapshot_pinned = !op.is_write() && self.has_mutable_view();
-        let (snapshot, tx) = if op.is_write() {
+        let isolation_mode = self.mvcc_isolation_mode();
+        let (snapshot, tx, ssi_read_tx) = if op.is_write() {
             // Write operations must use a transaction for isolation and atomicity.
             let txn = self.mvcc_store.begin_registered();
             let snapshot = txn.snapshot;
@@ -5178,13 +5179,22 @@ impl FsOps for OpenFs {
                 txn_id = txn.id().0,
                 "mvcc_request_scope_begin_write"
             );
-            (Some(snapshot), Some(txn))
+            (Some(snapshot), Some(txn), None)
         } else {
             // Writable readers must retain one view across all block accesses.
             // Capture and registration share GC's lock, so pruning cannot pass
             // the selected head between those two steps. Immutable read-only
             // mounts need no GC registration or transaction allocation.
-            let snapshot = if read_snapshot_pinned {
+            // A serializable observation must also retain its own identity:
+            // read-only transactions can be the incoming end of I -> P -> O.
+            // Merely pinning their bytes and then dropping their read sets
+            // allows a writer to complete that cycle after the read returns.
+            let ssi_read_tx = (read_snapshot_pinned
+                && isolation_mode == crate::vfs::MvccIsolationMode::Serializable)
+                .then(|| self.mvcc_store.begin_registered());
+            let snapshot = if let Some(read_tx) = &ssi_read_tx {
+                read_tx.snapshot()
+            } else if read_snapshot_pinned {
                 self.mvcc_store.register_current_snapshot()
             } else {
                 self.current_snapshot()
@@ -5195,10 +5205,9 @@ impl FsOps for OpenFs {
                 snapshot_high = snapshot.high.0,
                 "mvcc_request_scope_begin_read"
             );
-            (Some(snapshot), None)
+            (Some(snapshot), None, ssi_read_tx)
         };
 
-        let isolation_mode = self.mvcc_isolation_mode();
         let ssi_reads = (isolation_mode == crate::vfs::MvccIsolationMode::Serializable
             && (op.is_write() || read_snapshot_pinned))
             .then(crate::vfs::SsiReadTracker::new);
@@ -5212,6 +5221,7 @@ impl FsOps for OpenFs {
             origin_op: Some(op),
             composite: false,
             ssi_reads,
+            ssi_read_tx,
             skip_readdir_prefetch: false,
             ext4_block_deltas: std::collections::BTreeMap::new(),
             ext4_initialized_bitmaps: std::collections::BTreeSet::new(),
@@ -5227,8 +5237,8 @@ impl FsOps for OpenFs {
         scope: RequestScope,
     ) -> ffs_error::Result<()> {
         let deferred = scope.is_deferred_until_flush();
-        // A committed write has already consumed its transaction; a managed
-        // writable read never allocated one. Both still own a snapshot pin.
+        // A successful publication/SSI observation consumed its transaction.
+        // Failed or abandoned requests still release the same snapshot pin.
         if (op.is_write() || scope.read_snapshot_pinned)
             && let Some(snapshot) = scope.snapshot
         {
@@ -5259,6 +5269,17 @@ impl FsOps for OpenFs {
                 op = ?op,
                 txn_id,
                 "mvcc_request_scope_end_write_aborted"
+            );
+        }
+        if let Some(tx) = scope.ssi_read_tx {
+            let txn_id = tx.id().0;
+            self.mvcc_store
+                .abort(tx, ffs_mvcc::TxnAbortReason::Timeout, None);
+            trace!(
+                target: "ffs::mvcc",
+                op = ?op,
+                txn_id,
+                "mvcc_request_scope_end_read_aborted"
             );
         }
 
@@ -5316,7 +5337,7 @@ impl FsOps for OpenFs {
         Self::abort_writeback_batch_scope(self, cx, scope)
     }
 
-    /// Commit any transaction in the request scope.
+    /// Commit a transaction or validate a successful read in the request scope.
     ///
     /// # Errors
     ///
@@ -5326,6 +5347,17 @@ impl FsOps for OpenFs {
         cx: &Cx,
         scope: &mut RequestScope,
     ) -> ffs_error::Result<CommitSeq> {
+        if scope.requires_read_validation() {
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            // Read validation writes no filesystem blocks and must remain
+            // usable after write authority is revoked. It only publishes SSI
+            // dependencies, with the snapshot pin held until scope cleanup.
+            let result = scope.commit_read_only(&self.mvcc_store);
+            if let Ok(commit_seq) = result {
+                self.prune_mvcc_after_commit_if_due(commit_seq);
+            }
+            return result;
+        }
         if scope.tx.is_some() {
             cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
             self.reject_btrfs_unsupported_mutation()?;

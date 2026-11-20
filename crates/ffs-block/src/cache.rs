@@ -4234,6 +4234,12 @@ enum ExtentS3Queue {
     Main,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExtentFifoEntry {
+    tile_id: u64,
+    generation: u64,
+}
+
 #[derive(Debug, Clone)]
 struct ExtentTileEntry {
     block_size: u32,
@@ -4241,6 +4247,7 @@ struct ExtentTileEntry {
     slot_len: u8,
     valid_mask: u32,
     queue: ExtentS3Queue,
+    generation: u64,
     freq: u8,
     data: Arc<[u8]>,
 }
@@ -4248,10 +4255,11 @@ struct ExtentTileEntry {
 #[derive(Debug)]
 struct ExtentCacheShard {
     entries: HashMap<u64, ExtentTileEntry>,
-    small_fifo: VecDeque<u64>,
-    main_fifo: VecDeque<u64>,
-    ghost_fifo: VecDeque<u64>,
-    ghost_set: HashSet<u64>,
+    small_fifo: VecDeque<ExtentFifoEntry>,
+    main_fifo: VecDeque<ExtentFifoEntry>,
+    ghost_fifo: VecDeque<ExtentFifoEntry>,
+    ghost_generations: HashMap<u64, u64>,
+    next_fifo_generation: u64,
     s_bytes: usize,
     m_bytes: usize,
     resident_bytes: usize,
@@ -4282,7 +4290,8 @@ impl ExtentCacheShard {
             small_fifo: VecDeque::new(),
             main_fifo: VecDeque::new(),
             ghost_fifo: VecDeque::new(),
-            ghost_set: HashSet::new(),
+            ghost_generations: HashMap::new(),
+            next_fifo_generation: 1,
             s_bytes: 0,
             m_bytes: 0,
             resident_bytes: 0,
@@ -4295,15 +4304,58 @@ impl ExtentCacheShard {
         }
     }
 
-    fn record_ghost(&mut self, tile_id: u64) {
-        if self.ghost_set.insert(tile_id) {
-            if self.ghost_fifo.len() >= self.ghost_cap
-                && let Some(oldest) = self.ghost_fifo.pop_front()
-            {
-                self.ghost_set.remove(&oldest);
-            }
-            self.ghost_fifo.push_back(tile_id);
+    fn compact_resident_queues(&mut self) {
+        let entries = &self.entries;
+        self.small_fifo.retain(|queued| {
+            entries.get(&queued.tile_id).is_some_and(|entry| {
+                entry.queue == ExtentS3Queue::Small && entry.generation == queued.generation
+            })
+        });
+        self.main_fifo.retain(|queued| {
+            entries.get(&queued.tile_id).is_some_and(|entry| {
+                entry.queue == ExtentS3Queue::Main && entry.generation == queued.generation
+            })
+        });
+    }
+
+    fn compact_resident_queues_if_sparse(&mut self) {
+        // Invalidations and replacements leave tombstones so the ordinary
+        // removal path stays O(1). Bound their storage even when no admission
+        // ever fills the payload budget and starts FIFO eviction.
+        let physical_len = self.small_fifo.len().saturating_add(self.main_fifo.len());
+        if self.entries.is_empty()
+            || physical_len > self.entries.len().saturating_mul(2).saturating_add(16)
+        {
+            self.compact_resident_queues();
         }
+    }
+
+    fn next_fifo_entry(&mut self, tile_id: u64) -> Option<ExtentFifoEntry> {
+        let generation = self.next_fifo_generation;
+        // Exhaustion may decline an optional cache fill, but must never let
+        // an old queue token alias a new incarnation of the same tile.
+        self.next_fifo_generation = generation.checked_add(1)?;
+        Some(ExtentFifoEntry {
+            tile_id,
+            generation,
+        })
+    }
+
+    fn record_ghost(&mut self, tile_id: u64) {
+        if self.ghost_generations.contains_key(&tile_id) {
+            return;
+        }
+        let Some(queued) = self.next_fifo_entry(tile_id) else {
+            return;
+        };
+        if self.ghost_fifo.len() >= self.ghost_cap
+            && let Some(oldest) = self.ghost_fifo.pop_front()
+            && self.ghost_generations.get(&oldest.tile_id) == Some(&oldest.generation)
+        {
+            self.ghost_generations.remove(&oldest.tile_id);
+        }
+        self.ghost_generations.insert(tile_id, queued.generation);
+        self.ghost_fifo.push_back(queued);
     }
 
     fn remove_entry_accounting(&mut self, tile_id: u64) -> Option<ExtentTileEntry> {
@@ -4314,34 +4366,47 @@ impl ExtentCacheShard {
             ExtentS3Queue::Small => self.s_bytes = self.s_bytes.saturating_sub(len),
             ExtentS3Queue::Main => self.m_bytes = self.m_bytes.saturating_sub(len),
         }
+        self.compact_resident_queues_if_sparse();
         Some(removed)
     }
 
-    fn evict_to_fit(&mut self, needed_bytes: usize) {
+    fn evict_to_fit(&mut self, needed_bytes: usize, protected_tile: Option<u64>) {
         if needed_bytes > self.budget_bytes {
             return;
         }
         let small_target = (self.budget_bytes / 10).max(1);
-        let mut guard_steps = (self.small_fifo.len() + self.main_fifo.len()).saturating_mul(4) + 16;
+        let mut guard_steps = self
+            .small_fifo
+            .len()
+            .saturating_add(self.main_fifo.len())
+            .saturating_mul(5)
+            .saturating_add(16);
         while self.resident_bytes.saturating_add(needed_bytes) > self.budget_bytes {
             if guard_steps == 0 {
-                self.entries.clear();
-                self.small_fifo.clear();
-                self.main_fifo.clear();
-                self.s_bytes = 0;
-                self.m_bytes = 0;
-                self.resident_bytes = 0;
+                // Refuse this fill if the queues cannot make progress. Never
+                // discard unrelated residents or the tile being extended.
                 break;
             }
             guard_steps -= 1;
 
-            if (self.s_bytes > small_target || self.main_fifo.is_empty())
+            let (protected_small, protected_main) = protected_tile
+                .and_then(|tile_id| self.entries.get(&tile_id))
+                .map_or((0, 0), |entry| match entry.queue {
+                    ExtentS3Queue::Small => (entry.data.len(), 0),
+                    ExtentS3Queue::Main => (0, entry.data.len()),
+                });
+            if (self.s_bytes.saturating_sub(protected_small) > small_target
+                || self.m_bytes == protected_main)
                 && let Some(candidate) = self.small_fifo.pop_front()
             {
-                let Some(entry) = self.entries.get_mut(&candidate) else {
+                let Some(entry) = self.entries.get_mut(&candidate.tile_id) else {
                     continue;
                 };
-                if entry.queue != ExtentS3Queue::Small {
+                if entry.queue != ExtentS3Queue::Small || entry.generation != candidate.generation {
+                    continue;
+                }
+                if protected_tile == Some(candidate.tile_id) {
+                    self.small_fifo.push_back(candidate);
                     continue;
                 }
                 let len = entry.data.len();
@@ -4352,32 +4417,32 @@ impl ExtentCacheShard {
                     entry.freq = 0;
                     self.main_fifo.push_back(candidate);
                 } else {
-                    let _ = self.remove_entry_accounting(candidate);
+                    let _ = self.remove_entry_accounting(candidate.tile_id);
                     self.evictions = self.evictions.saturating_add(1);
-                    self.record_ghost(candidate);
+                    self.record_ghost(candidate.tile_id);
                 }
                 continue;
             }
 
             if let Some(candidate) = self.main_fifo.pop_front() {
-                let Some(entry) = self.entries.get_mut(&candidate) else {
+                let Some(entry) = self.entries.get_mut(&candidate.tile_id) else {
                     continue;
                 };
-                if entry.queue != ExtentS3Queue::Main {
+                if entry.queue != ExtentS3Queue::Main || entry.generation != candidate.generation {
+                    continue;
+                }
+                if protected_tile == Some(candidate.tile_id) {
+                    self.main_fifo.push_back(candidate);
                     continue;
                 }
                 if entry.freq > 0 {
                     entry.freq -= 1;
                     self.main_fifo.push_back(candidate);
                 } else {
-                    let _ = self.remove_entry_accounting(candidate);
+                    let _ = self.remove_entry_accounting(candidate.tile_id);
                     self.evictions = self.evictions.saturating_add(1);
                 }
             } else if self.small_fifo.is_empty() {
-                self.entries.clear();
-                self.s_bytes = 0;
-                self.m_bytes = 0;
-                self.resident_bytes = 0;
                 break;
             }
         }
@@ -4416,9 +4481,9 @@ impl ExtentCacheShard {
             if merged_bytes > self.budget_bytes {
                 return;
             }
-            let _ = self.remove_entry_accounting(tile_id);
-            self.evict_to_fit(merged_bytes);
-            if self.resident_bytes.saturating_add(merged_bytes) > self.budget_bytes {
+            let additional_bytes = merged_bytes.saturating_sub(existing.data.len());
+            self.evict_to_fit(additional_bytes, Some(tile_id));
+            if self.resident_bytes.saturating_add(additional_bytes) > self.budget_bytes {
                 return;
             }
             let mut merged = vec![0_u8; merged_bytes];
@@ -4433,10 +4498,14 @@ impl ExtentCacheShard {
             let write_off = usize::from(slot_lo - merged_base) * block_size;
             merged[write_off..write_off + src.len()].copy_from_slice(src);
             match existing.queue {
-                ExtentS3Queue::Small => self.s_bytes = self.s_bytes.saturating_add(merged_bytes),
-                ExtentS3Queue::Main => self.m_bytes = self.m_bytes.saturating_add(merged_bytes),
+                ExtentS3Queue::Small => {
+                    self.s_bytes = self.s_bytes - existing.data.len() + merged_bytes;
+                }
+                ExtentS3Queue::Main => {
+                    self.m_bytes = self.m_bytes - existing.data.len() + merged_bytes;
+                }
             }
-            self.resident_bytes = self.resident_bytes.saturating_add(merged_bytes);
+            self.resident_bytes = self.resident_bytes - existing.data.len() + merged_bytes;
             self.entries.insert(
                 tile_id,
                 ExtentTileEntry {
@@ -4445,6 +4514,7 @@ impl ExtentCacheShard {
                     slot_len: merged_slot_len,
                     valid_mask: combined_mask,
                     queue: existing.queue,
+                    generation: existing.generation,
                     freq: existing.freq,
                     data: Arc::from(merged),
                 },
@@ -4457,17 +4527,20 @@ impl ExtentCacheShard {
         if tile_bytes == 0 || tile_bytes > self.budget_bytes {
             return;
         }
-        self.evict_to_fit(tile_bytes);
+        self.evict_to_fit(tile_bytes, None);
         if self.resident_bytes.saturating_add(tile_bytes) > self.budget_bytes {
             return;
         }
-        let queue = if self.ghost_set.remove(&tile_id) {
+        let Some(queued) = self.next_fifo_entry(tile_id) else {
+            return;
+        };
+        let queue = if self.ghost_generations.remove(&tile_id).is_some() {
             self.m_bytes = self.m_bytes.saturating_add(tile_bytes);
-            self.main_fifo.push_back(tile_id);
+            self.main_fifo.push_back(queued);
             ExtentS3Queue::Main
         } else {
             self.s_bytes = self.s_bytes.saturating_add(tile_bytes);
-            self.small_fifo.push_back(tile_id);
+            self.small_fifo.push_back(queued);
             ExtentS3Queue::Small
         };
         self.resident_bytes = self.resident_bytes.saturating_add(tile_bytes);
@@ -4479,6 +4552,7 @@ impl ExtentCacheShard {
                 slot_len: slot_hi - slot_lo,
                 valid_mask: new_mask,
                 queue,
+                generation: queued.generation,
                 freq: 0,
                 data: Arc::from(src),
             },
@@ -4503,7 +4577,7 @@ impl ExtentCacheShard {
         self.small_fifo.clear();
         self.main_fifo.clear();
         self.ghost_fifo.clear();
-        self.ghost_set.clear();
+        self.ghost_generations.clear();
         self.s_bytes = 0;
         self.m_bytes = 0;
         self.resident_bytes = 0;
@@ -4811,6 +4885,184 @@ mod extent_read_cache_tests {
     use super::*;
     use proptest::prelude::*;
 
+    fn assert_extent_cache_accounting(cache: &ShardedExtentReadCache) {
+        for shard in &cache.shards {
+            let shard = shard.lock();
+            let mut small_bytes = 0;
+            let mut main_bytes = 0;
+            for (&tile_id, entry) in &shard.entries {
+                let fifo = match entry.queue {
+                    ExtentS3Queue::Small => {
+                        small_bytes += entry.data.len();
+                        &shard.small_fifo
+                    }
+                    ExtentS3Queue::Main => {
+                        main_bytes += entry.data.len();
+                        &shard.main_fifo
+                    }
+                };
+                assert_eq!(
+                    fifo.iter()
+                        .filter(|queued| {
+                            queued.tile_id == tile_id && queued.generation == entry.generation
+                        })
+                        .count(),
+                    1,
+                    "resident tile {tile_id} must have exactly one live FIFO token"
+                );
+                assert!(
+                    !shard.ghost_generations.contains_key(&tile_id),
+                    "resident tile {tile_id} retained ghost membership"
+                );
+            }
+            assert_eq!(shard.s_bytes, small_bytes);
+            assert_eq!(shard.m_bytes, main_bytes);
+            assert_eq!(shard.resident_bytes, small_bytes + main_bytes);
+            assert!(shard.resident_bytes <= shard.budget_bytes);
+            let queued = shard.small_fifo.len() + shard.main_fifo.len();
+            assert!(
+                queued <= 2 * shard.entries.len() + 16,
+                "invalidation tombstones grew beyond the live resident bound"
+            );
+            assert!(shard.ghost_fifo.len() <= shard.ghost_cap);
+            for (&tile_id, &generation) in &shard.ghost_generations {
+                assert_eq!(
+                    shard
+                        .ghost_fifo
+                        .iter()
+                        .filter(|queued| {
+                            queued.tile_id == tile_id && queued.generation == generation
+                        })
+                        .count(),
+                    1,
+                    "ghost tile {tile_id} must have exactly one live FIFO token"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn extent_cache_repeated_invalidation_keeps_fifo_metadata_bounded() {
+        let bs = 4096;
+        let cache = ShardedExtentReadCache::new(8 * bs);
+        let keeper = vec![0x71; bs];
+        cache.insert_unconditional(BlockNumber(32), bs, &keeper);
+
+        // The payload never fills the budget, so eviction cannot be relied on
+        // to drain tokens left by alternating reads and writes to one tile.
+        for iteration in 0..1024 {
+            let fill = vec![u8::try_from(iteration % 256).unwrap(); bs];
+            cache.insert_unconditional(BlockNumber(0), bs, &fill);
+            assert_extent_cache_accounting(&cache);
+            cache.invalidate_block(BlockNumber(0));
+            assert_extent_cache_accounting(&cache);
+        }
+        let mut bytes = vec![0; bs];
+        assert!(cache.copy_into(BlockNumber(32), bs, &mut bytes));
+        assert_eq!(bytes, keeper);
+        assert!(!cache.copy_into(BlockNumber(0), bs, &mut bytes));
+        assert_eq!(cache.metrics().evictions, 0);
+    }
+
+    #[test]
+    fn extent_cache_block_size_replacement_keeps_fifo_metadata_bounded() {
+        let cache = ShardedExtentReadCache::new(64 * 1024);
+        for iteration in 0..1024 {
+            let bs = if iteration % 2 == 0 { 4096 } else { 8192 };
+            let fill = vec![u8::try_from(iteration % 256).unwrap(); bs];
+            cache.insert_unconditional(BlockNumber(0), bs, &fill);
+            let mut bytes = vec![0; bs];
+            assert!(cache.copy_into(BlockNumber(0), bs, &mut bytes));
+            assert_eq!(bytes, fill);
+            assert_extent_cache_accounting(&cache);
+        }
+        assert_eq!(cache.metrics().resident_tiles, 1);
+        assert_eq!(cache.metrics().evictions, 0);
+    }
+
+    #[test]
+    fn extent_cache_refill_does_not_inherit_a_retired_fifo_position() {
+        let bs = 4096;
+        let cache = ShardedExtentReadCache::new(3 * bs);
+        for tile in 0..3 {
+            cache.insert_unconditional(BlockNumber(tile * 32), bs, &vec![0x11; bs]);
+        }
+        cache.invalidate_block(BlockNumber(0));
+        cache.insert_unconditional(BlockNumber(0), bs, &vec![0x22; bs]);
+        cache.insert_unconditional(BlockNumber(96), bs, &vec![0x33; bs]);
+
+        // Tile 1 is now the oldest live admission. Its predecessor's retired
+        // token must not evict the fresh incarnation of tile 0.
+        let mut bytes = vec![0; bs];
+        assert!(cache.copy_into(BlockNumber(0), bs, &mut bytes));
+        assert_eq!(bytes, vec![0x22; bs]);
+        assert!(!cache.copy_into(BlockNumber(32), bs, &mut bytes));
+        assert!(cache.copy_into(BlockNumber(64), bs, &mut bytes));
+        assert_eq!(bytes, vec![0x11; bs]);
+        assert!(cache.copy_into(BlockNumber(96), bs, &mut bytes));
+        assert_eq!(bytes, vec![0x33; bs]);
+        assert_eq!(cache.metrics().evictions, 1);
+        assert_extent_cache_accounting(&cache);
+    }
+
+    #[test]
+    fn extent_cache_pressured_merge_keeps_its_fifo_membership() {
+        let bs = 4096;
+        let cache = ShardedExtentReadCache::new(4 * bs);
+        for tile in 0..4 {
+            cache.insert_unconditional(BlockNumber(tile * 32), bs, &vec![0x11; bs]);
+        }
+        cache.insert_unconditional(BlockNumber(1), bs, &vec![0x22; bs]);
+        assert_extent_cache_accounting(&cache);
+        {
+            // Inspect the merge without turning it into a hot cache hit; its
+            // ordinary FIFO age is what the next pressure steps exercise.
+            let shard = cache.shards[0].lock();
+            let merged = &shard.entries[&0].data;
+            assert_eq!(&merged[..bs], &vec![0x11; bs]);
+            assert_eq!(&merged[bs..], &vec![0x22; bs]);
+        }
+        cache.insert_unconditional(BlockNumber(128), bs, &vec![0x44; bs]);
+        cache.insert_unconditional(BlockNumber(160), bs, &vec![0x55; bs]);
+        cache.insert_unconditional(BlockNumber(192), bs, &vec![0x66; 2 * bs]);
+
+        // Extending tile 0 used to consume its sole queue token. That orphan
+        // then forced younger tiles 4/5 out instead of being evicted itself.
+        let mut bytes = vec![0; bs];
+        assert!(!cache.copy_into(BlockNumber(0), bs, &mut bytes));
+        for (block, value) in [(128, 0x44), (160, 0x55), (192, 0x66), (193, 0x66)] {
+            assert!(cache.copy_into(BlockNumber(block), bs, &mut bytes));
+            assert_eq!(bytes, vec![value; bs]);
+        }
+        assert_eq!(cache.metrics().evictions, 4);
+        assert_extent_cache_accounting(&cache);
+    }
+
+    #[test]
+    fn extent_cache_old_ghost_token_cannot_erase_new_ghost_membership() {
+        let bs = 4096;
+        let cache = ShardedExtentReadCache::new(bs);
+        // The first return promotes tile 0 through its ghost into Main. After
+        // eviction from Main it can enter Small and become a ghost again.
+        for tile in [0, 1, 0, 2, 0, 3] {
+            cache.insert_unconditional(BlockNumber(tile * 32), bs, &vec![0x11; bs]);
+        }
+        // Advance exactly past its first, now-stale ghost token while the
+        // newer token still fits inside the 16-entry ghost history.
+        for tile in 4..=16 {
+            cache.insert_unconditional(BlockNumber(tile * 32), bs, &vec![0x22; bs]);
+        }
+        cache.insert_unconditional(BlockNumber(0), bs, &vec![0x33; bs]);
+        assert_eq!(
+            cache.shards[0].lock().entries[&0].queue,
+            ExtentS3Queue::Main
+        );
+        let mut bytes = vec![0; bs];
+        assert!(cache.copy_into(BlockNumber(0), bs, &mut bytes));
+        assert_eq!(bytes, vec![0x33; bs]);
+        assert_extent_cache_accounting(&cache);
+    }
+
     #[test]
     fn extent_cache_s3fifo_resists_streaming_scan_and_preserves_hot_working_set() {
         let bs = 4096_usize;
@@ -4921,6 +5173,7 @@ mod extent_read_cache_tests {
                     }
                 }
                 prop_assert!(cache.metrics().resident_bytes <= budget);
+                assert_extent_cache_accounting(&cache);
             }
         }
     }

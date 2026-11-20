@@ -479,6 +479,28 @@ A crash can leave an ordinary recoverable `.ffs-unlinked-*` file visible after
 reopen: durable orphan replay is not implemented. These capabilities do not
 establish native Windows or mounted interoperability qualification.
 
+## NTFS: positioned writes into large streams
+
+`tx-write-range` and writable FsOps can update ordinary DATA streams larger than
+16 MiB without copying the whole stream. The native writer replaces the touched
+clusters, preserves the existing suffix, and publishes the new mappings through
+the same logged transaction used for smaller writes:
+
+```bash
+ffs-ntfs tx-write-range volume.img /large.bin \
+  --start 33554432 --data-file patch.bin --offline-image --allow-write
+ffs-ntfs tx-write-range volume.img /large.bin --stream audit \
+  --start 33554432 --data updated --offline-image --allow-write
+```
+
+Each write accepts at most 16 MiB of payload. On a non-sparse stream, the newly
+initialized span, including any gap before the payload, must also fit 16 MiB.
+Sparse gaps remain holes; partial initialized clusters are zeroed before their
+new bytes become visible. Both the logical end and cluster-rounded allocation
+must fit the native signed 64-bit size limit. These bounds apply independently of the existing
+stream's logical size, so small overwrites and incremental growth of large
+files are supported. Truncate requests retain their existing 16 MiB size bound.
+
 ## NTFS: create and remove named DATA streams
 
 `tx-create-stream` creates a named stream on an existing ordinary file without

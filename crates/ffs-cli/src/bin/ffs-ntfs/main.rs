@@ -252,10 +252,14 @@ impl PayloadArgs {
     fn load_range(&self, start: u64) -> Result<Vec<u8>> {
         // Bound host-file reads before opening a writable image, including when
         // persistent recovery was requested. Empty writes admit any offset.
-        let maximum = MAX_FILE_EDIT_BYTES.saturating_sub(start);
+        // Positioned writes copy only the touched clusters. The staging limit
+        // applies to the payload, independently of the logical file offset.
+        // Native DATA sizes are signed 64-bit quantities; bound the addition
+        // here as well, before reading a possibly unbounded host-file source.
+        let maximum = MAX_FILE_EDIT_BYTES.min((i64::MAX as u64).saturating_sub(start));
         let too_large = || {
             anyhow::anyhow!(
-                "NTFS payload at byte offset {start} exceeds the {MAX_FILE_EDIT_BYTES}-byte edit limit"
+                "NTFS payload at byte offset {start} exceeds the {MAX_FILE_EDIT_BYTES}-byte payload limit or the native stream size limit"
             )
         };
         if let Some(text) = &self.data
@@ -2888,7 +2892,10 @@ mod tests {
             empty: false,
         };
         assert_eq!(payload.load_range(MAX_FILE_EDIT_BYTES - 4).unwrap(), bytes);
-        assert!(payload.load_range(MAX_FILE_EDIT_BYTES - 3).is_err());
+        assert_eq!(payload.load_range(MAX_FILE_EDIT_BYTES - 3).unwrap(), bytes);
+        assert_eq!(payload.load_range(1_u64 << 40).unwrap(), bytes);
+        assert_eq!(payload.load_range(i64::MAX as u64 - 4).unwrap(), bytes);
+        assert!(payload.load_range(i64::MAX as u64 - 3).is_err());
         assert!(payload.load_range(u64::MAX).is_err());
         assert_eq!(std::fs::read(&source).unwrap(), bytes);
 
@@ -2903,6 +2910,7 @@ mod tests {
             empty: false,
         };
         assert!(payload.load_range(0).is_err());
+        assert!(payload.load_range(1_u64 << 40).is_err());
         let payload = PayloadArgs {
             data: Some("é".into()),
             data_file: None,
@@ -2912,7 +2920,16 @@ mod tests {
             payload.load_range(MAX_FILE_EDIT_BYTES - 2).unwrap(),
             "é".as_bytes()
         );
-        assert!(payload.load_range(MAX_FILE_EDIT_BYTES - 1).is_err());
+        assert_eq!(
+            payload.load_range(MAX_FILE_EDIT_BYTES - 1).unwrap(),
+            "é".as_bytes()
+        );
+        assert_eq!(payload.load_range(1_u64 << 40).unwrap(), "é".as_bytes());
+        assert_eq!(
+            payload.load_range(i64::MAX as u64 - 2).unwrap(),
+            "é".as_bytes()
+        );
+        assert!(payload.load_range(i64::MAX as u64 - 1).is_err());
         let missing = PayloadArgs {
             data: None,
             data_file: None,

@@ -2503,7 +2503,7 @@ fn range_and_truncate_limits_refuse_before_any_backing_write() {
     let max_size = ffs_ntfs::transaction::MAX_FILE_EDIT_BYTES;
     for outcome in [
         engine.write_file_range(&cx, "/keep.bin", u64::MAX, b"xx"),
-        engine.write_file_range(&cx, "/keep.bin", max_size, b"x"),
+        engine.write_file_range(&cx, "/keep.bin", max_size + CLUSTER_BYTES as u64, b"x"),
         engine.truncate_file(&cx, "/keep.bin", max_size + 1),
         engine.truncate_file(&cx, "/keep.bin", u64::MAX),
     ] {
@@ -4415,6 +4415,176 @@ fn plain_data_writes_require_exact_posix_namespace_spelling() {
 }
 
 #[test]
+fn large_file_positioned_writes_stage_only_touched_clusters() {
+    use ffs_core::{FsOps, RequestScope};
+    use ffs_types::InodeNumber;
+    use std::ffi::OsStr;
+
+    let cx = Cx::for_testing();
+    let image = build_clean_ntfs_image(4352, 64, 0xB0A0_0000_0000_0007);
+    let volume_bytes = image.len() as u64 - SECTOR_BYTES as u64;
+    let device = FaultInjectingNtfsDevice::new(image);
+    let mut engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        volume_bytes,
+        write_options_clean(),
+    )
+    .unwrap();
+    let limit = ffs_ntfs::transaction::MAX_FILE_EDIT_BYTES;
+    let length = limit + 2 * CLUSTER_BYTES as u64;
+    let (file, _) = engine
+        .create_file(&cx, "/", "large.bin", &vec![0x63; length as usize])
+        .into_result()
+        .unwrap();
+    let written_before = device.write_bytes_total();
+    engine
+        .write_file_range(
+            &cx,
+            "/large.bin",
+            limit + CLUSTER_BYTES as u64 - 3,
+            b"boundary",
+        )
+        .into_result()
+        .unwrap();
+    engine
+        .write_stream_range(&cx, file, &[], 1, b"prefix")
+        .into_result()
+        .unwrap();
+    assert!(
+        device.write_bytes_total() - written_before < 1024 * 1024,
+        "small edits must not copy a 16 MiB file or require that much free space"
+    );
+    engine.check_clean_consistency(&cx).unwrap();
+    let reopened = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        volume_bytes,
+        write_options_clean(),
+    )
+    .unwrap();
+    let volume = reopened.volume_view(&cx).unwrap();
+    let record = volume
+        .record(&cx, file.record, Some(file.sequence))
+        .unwrap();
+    let stream = volume.data_stream(&cx, &record, &[]).unwrap();
+    assert_eq!(stream.size, length);
+    assert_eq!(volume.read(&cx, &stream, 0, 9).unwrap(), b"cprefixcc");
+    assert_eq!(
+        volume
+            .read(&cx, &stream, limit + CLUSTER_BYTES as u64 - 5, 12)
+            .unwrap(),
+        b"ccboundarycc"
+    );
+    assert_eq!(
+        volume.read(&cx, &stream, length - 16, 16).unwrap(),
+        vec![0x63; 16]
+    );
+    reopened.check_clean_consistency(&cx).unwrap();
+
+    let fs = ffs_ntfs::NtfsFs::from_engine(&cx, reopened, 1000, 1000).unwrap();
+    let mut scope = RequestScope::empty();
+    let entry = fs
+        .lookup(&cx, &mut scope, InodeNumber(1), OsStr::new("large.bin"))
+        .unwrap();
+    fs.write(&cx, &mut scope, entry.ino, length + 7, b"mounted")
+        .unwrap();
+    assert_eq!(
+        fs.read(&cx, &mut scope, entry.ino, length - 1, 32).unwrap(),
+        b"c\0\0\0\0\0\0\0mounted"
+    );
+    assert_eq!(
+        fs.getattr(&cx, &mut scope, entry.ino).unwrap().size,
+        length + 14
+    );
+    fs.flush_on_destroy(&cx).unwrap();
+}
+
+#[test]
+fn large_file_positioned_write_initializes_only_its_exposed_tail() {
+    let cx = Cx::for_testing();
+    let image = build_clean_ntfs_image(4352, 64, 0xB0A0_0000_0000_0008);
+    let volume_bytes = image.len() as u64 - SECTOR_BYTES as u64;
+    let device = FaultInjectingNtfsDevice::new(image);
+    let mut engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        volume_bytes,
+        write_options_clean(),
+    )
+    .unwrap();
+    let limit = ffs_ntfs::transaction::MAX_FILE_EDIT_BYTES;
+    let length = limit + 3 * CLUSTER_BYTES as u64;
+    let initialized = limit + 17;
+    let (file, _) = engine
+        .create_file(&cx, "/", "tail.bin", &vec![0xA6; length as usize])
+        .into_result()
+        .unwrap();
+    let mut image = device.snapshot_durable_only();
+    let record_at = CLUSTER_BYTES + file.record as usize * RECORD_BYTES;
+    let mut attrs = copied_test_record_attributes(&image[record_at..record_at + RECORD_BYTES]);
+    let data = attrs
+        .iter_mut()
+        .find(|attr| u32::from_le_bytes(attr[..4].try_into().unwrap()) == DATA)
+        .unwrap();
+    assert_eq!(data[8], 1);
+    data[56..64].copy_from_slice(&initialized.to_le_bytes());
+    image[record_at..record_at + RECORD_BYTES].copy_from_slice(&build_file_record(
+        file.record as u32,
+        file.sequence,
+        1,
+        false,
+        &attrs,
+    ));
+    let device = FaultInjectingNtfsDevice::new(image);
+    let mut engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        volume_bytes,
+        write_options_clean(),
+    )
+    .unwrap();
+    let before = device.snapshot_durable_only();
+    let writes = device.write_bytes_total();
+    let outcome = engine.write_stream_range(&cx, file, &[], initialized + limit + 1, b"x");
+    let NtfsTxOutcome::NotCommitted(error) = outcome else {
+        panic!("uninitialized spans larger than the staging budget must be refused");
+    };
+    assert_eq!(error.to_errno(), libc::EFBIG);
+    assert_eq!(device.write_bytes_total(), writes);
+    assert_eq!(device.snapshot_durable_only(), before);
+
+    let offset = limit + CLUSTER_BYTES as u64 + 11;
+    engine
+        .write_stream_range(&cx, file, &[], offset, b"visible")
+        .into_result()
+        .unwrap();
+    let volume = engine.volume_view(&cx).unwrap();
+    let record = volume
+        .record(&cx, file.record, Some(file.sequence))
+        .unwrap();
+    let stream = volume.data_stream(&cx, &record, &[]).unwrap();
+    assert_eq!(stream.size, length);
+    assert_eq!(stream.initialized, offset + 7);
+    let mut expected = vec![0; CLUSTER_BYTES * 2];
+    expected[..17].fill(0xA6);
+    expected[CLUSTER_BYTES + 11..CLUSTER_BYTES + 18].copy_from_slice(b"visible");
+    assert_eq!(
+        volume.read(&cx, &stream, limit, expected.len()).unwrap(),
+        expected
+    );
+    assert_eq!(
+        volume.read(&cx, &stream, length - 16, 16).unwrap(),
+        vec![0; 16]
+    );
+    engine.check_clean_consistency(&cx).unwrap();
+}
+
+#[test]
 fn oversized_streams_admit_empty_writes_and_bounded_shrink() {
     let cx = Cx::for_testing();
     let image = build_clean_ntfs_image(4352, 64, 0xB0A0_0000_0000_0006);
@@ -4461,7 +4631,7 @@ fn oversized_streams_admit_empty_writes_and_bounded_shrink() {
 
     let writes = device.write_bytes_total();
     for outcome in [
-        engine.write_file_range(&cx, "/large.bin", 0, b"x"),
+        engine.write_file_range(&cx, "/large.bin", 0, &vec![0x78; limit as usize + 1]),
         engine.truncate_file(&cx, "/large.bin", limit + 1),
     ] {
         let NtfsTxOutcome::NotCommitted(error) = outcome else {
@@ -4485,6 +4655,327 @@ fn oversized_streams_admit_empty_writes_and_bounded_shrink() {
     assert_eq!(stream.size, 16);
     assert_eq!(volume.read(&cx, &stream, 0, 16).unwrap(), vec![0x63; 16]);
     engine.check_clean_consistency(&cx).unwrap();
+}
+
+fn large_sparse_stream_fixture() -> (
+    Arc<FaultInjectingNtfsDevice>,
+    NtfsTransactionEngine,
+    NtfsReference,
+    Vec<u16>,
+) {
+    let cx = Cx::for_testing();
+    let image = build_clean_ntfs_image(128, 50, 0xB0A0_0000_0000_0009);
+    let volume_bytes = image.len() as u64 - SECTOR_BYTES as u64;
+    let device = FaultInjectingNtfsDevice::new(image);
+    let mut engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        volume_bytes,
+        write_options_clean(),
+    )
+    .unwrap();
+    let (file, _) = engine
+        .create_file(&cx, "/", "sparse.bin", b"BASE")
+        .into_result()
+        .unwrap();
+    let name: Vec<_> = "sparse".encode_utf16().collect();
+    engine
+        .create_file_stream(&cx, "/sparse.bin", &name, &vec![0xA6; 3 * CLUSTER_BYTES])
+        .into_result()
+        .unwrap();
+
+    // Construct a native sparse ADS with three allocated but mostly
+    // uninitialized clusters followed by a one-GiB logical hole. This is a
+    // storage-model fixture, not independent native-system evidence.
+    let mut image = device.snapshot_durable_only();
+    let record_at = CLUSTER_BYTES + file.record as usize * RECORD_BYTES;
+    let record = NtfsFileRecord::parse(&image[record_at..record_at + RECORD_BYTES]).unwrap();
+    let parsed = record.attributes().unwrap();
+    let source = parsed
+        .iter()
+        .find(|attr| attr.kind == DATA && attr.name == name)
+        .unwrap();
+    let ffs_ondisk::ntfs::NtfsValue::NonResident(extent) = &source.value else {
+        panic!("fixture requires allocated nonresident DATA");
+    };
+    let mut runs = ffs_ondisk::ntfs::decode_mapping_pairs(
+        extent.mapping_pairs,
+        extent.first_vcn,
+        extent.last_vcn,
+        128,
+    )
+    .unwrap();
+    let logical = 1_u64 << 30;
+    runs.push(NtfsRun {
+        vcn: 3,
+        clusters: logical / CLUSTER_BYTES as u64 - 3,
+        lcn: None,
+    });
+    let (pairs, last_vcn) = encode_mapping_pairs(&runs, 0, 128).unwrap();
+    let mut attrs = copied_test_record_attributes(&image[record_at..record_at + RECORD_BYTES]);
+    let attr = attrs
+        .iter_mut()
+        .find(|raw| {
+            u32::from_le_bytes(raw[..4].try_into().unwrap()) == DATA
+                && u16::from_le_bytes(raw[14..16].try_into().unwrap()) == source.id
+        })
+        .unwrap();
+    let mapping_at = (72 + name.len() * 2).next_multiple_of(8);
+    let total = (mapping_at + pairs.len()).next_multiple_of(8);
+    let mut sparse = vec![0; total];
+    sparse[..64].copy_from_slice(&attr[..64]);
+    sparse[4..8].copy_from_slice(&(total as u32).to_le_bytes());
+    sparse[10..12].copy_from_slice(&72_u16.to_le_bytes());
+    sparse[12..14].copy_from_slice(&ffs_ondisk::ntfs::SPARSE.to_le_bytes());
+    sparse[24..32].copy_from_slice(&last_vcn.to_le_bytes());
+    sparse[32..34].copy_from_slice(&(mapping_at as u16).to_le_bytes());
+    sparse[40..48].copy_from_slice(&logical.to_le_bytes());
+    sparse[48..56].copy_from_slice(&logical.to_le_bytes());
+    sparse[56..64].copy_from_slice(&5_u64.to_le_bytes());
+    sparse[64..72].copy_from_slice(&(3 * CLUSTER_BYTES as u64).to_le_bytes());
+    for (index, unit) in name.iter().enumerate() {
+        sparse[72 + index * 2..74 + index * 2].copy_from_slice(&unit.to_le_bytes());
+    }
+    sparse[mapping_at..mapping_at + pairs.len()].copy_from_slice(&pairs);
+    *attr = sparse;
+    image[record_at..record_at + RECORD_BYTES].copy_from_slice(&build_file_record(
+        file.record as u32,
+        file.sequence,
+        1,
+        false,
+        &attrs,
+    ));
+    let device = FaultInjectingNtfsDevice::new(image);
+    let engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        volume_bytes,
+        write_options_clean(),
+    )
+    .unwrap();
+    (device, engine, file, name)
+}
+
+#[test]
+fn sparse_positioned_write_checks_rounded_native_size_before_publication() {
+    let cx = Cx::for_testing();
+    let (device, mut engine, file, name) = large_sparse_stream_fixture();
+    let before = device.snapshot_durable_only();
+    let writes = device.write_bytes_total();
+    for offset in [i64::MAX as u64 - 1, i64::MAX as u64, u64::MAX] {
+        let outcome = engine.write_stream_range(&cx, file, &name, offset, b"x");
+        let NtfsTxOutcome::NotCommitted(error) = outcome else {
+            panic!("unrepresentable native allocation must be refused before publication");
+        };
+        assert_eq!(error.to_errno(), libc::EFBIG);
+    }
+    assert_eq!(device.write_bytes_total(), writes);
+    assert_eq!(device.snapshot_live(), before);
+    assert_eq!(device.snapshot_durable_only(), before);
+
+    // The last complete cluster representable by native signed byte counts
+    // remains writable, without allocating the enormous preceding hole.
+    let maximum = (i64::MAX as u64 / CLUSTER_BYTES as u64) * CLUSTER_BYTES as u64;
+    let trace_start = engine.persistence_trace().len();
+    engine
+        .write_stream_range(&cx, file, &name, maximum - 1, b"x")
+        .into_result()
+        .unwrap();
+    let payload_bytes: usize = engine.persistence_trace()[trace_start..]
+        .iter()
+        .filter(|event| event.stage == NtfsPersistenceStage::PayloadDataWrite)
+        .map(|event| event.bytes)
+        .sum();
+    assert_eq!(payload_bytes, 2 * CLUSTER_BYTES);
+    let reopened = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        before.len() as u64 - SECTOR_BYTES as u64,
+        write_options_clean(),
+    )
+    .unwrap();
+    let volume = reopened.volume_view(&cx).unwrap();
+    let record = volume
+        .record(&cx, file.record, Some(file.sequence))
+        .unwrap();
+    let stream = volume.data_stream(&cx, &record, &name).unwrap();
+    assert_eq!(stream.size, maximum);
+    assert_eq!(stream.initialized, maximum);
+    assert_eq!(stream.allocated, 2 * CLUSTER_BYTES as u64);
+    assert_eq!(
+        volume.read(&cx, &stream, 0, 8).unwrap(),
+        [0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0, 0, 0]
+    );
+    assert_eq!(volume.read(&cx, &stream, 1_u64 << 40, 8).unwrap(), [0; 8]);
+    assert_eq!(
+        volume.read(&cx, &stream, maximum - 4, 8).unwrap(),
+        b"\0\0\0x"
+    );
+    reopened.check_clean_consistency(&cx).unwrap();
+}
+
+#[test]
+fn sparse_truncate_clips_coalesced_holes_before_regrowth() {
+    let cx = Cx::for_testing();
+    let (device, mut engine, file, name) = large_sparse_stream_fixture();
+    let cluster_bytes = CLUSTER_BYTES as u64;
+    for (size, allocated) in [
+        (5 * cluster_bytes + 17, 3 * cluster_bytes),
+        (cluster_bytes + 7, 2 * cluster_bytes),
+        (8 * cluster_bytes + 11, 2 * cluster_bytes),
+    ] {
+        engine
+            .truncate_stream(&cx, file, &name, size)
+            .into_result()
+            .unwrap();
+        let volume = engine.volume_view(&cx).unwrap();
+        let record = volume
+            .record(&cx, file.record, Some(file.sequence))
+            .unwrap();
+        let attributes = record.attributes().unwrap();
+        let attribute = attributes
+            .iter()
+            .find(|attribute| attribute.kind == DATA && attribute.name == name)
+            .unwrap();
+        let ffs_ondisk::ntfs::NtfsValue::NonResident(extent) = &attribute.value else {
+            panic!("sparse truncation must preserve a nonresident DATA attribute");
+        };
+        let clusters = size.div_ceil(cluster_bytes);
+        assert_eq!(extent.last_vcn + 1, clusters);
+        assert_eq!(extent.allocated_bytes, clusters * cluster_bytes);
+        let stream = volume.data_stream(&cx, &record, &name).unwrap();
+        assert_eq!(stream.size, size);
+        assert_eq!(stream.initialized, 5);
+        assert_eq!(stream.allocated, allocated);
+        let mut expected = vec![0; size as usize];
+        expected[..5].fill(0xA6);
+        assert_eq!(
+            volume.read(&cx, &stream, 0, expected.len()).unwrap(),
+            expected
+        );
+        engine.check_clean_consistency(&cx).unwrap();
+    }
+
+    let offset = 7 * cluster_bytes + 5;
+    engine
+        .write_stream_range(&cx, file, &name, offset, b"tail")
+        .into_result()
+        .unwrap();
+    let reopened = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        device.snapshot_durable_only().len() as u64 - SECTOR_BYTES as u64,
+        write_options_clean(),
+    )
+    .unwrap();
+    let volume = reopened.volume_view(&cx).unwrap();
+    let record = volume
+        .record(&cx, file.record, Some(file.sequence))
+        .unwrap();
+    let stream = volume.data_stream(&cx, &record, &name).unwrap();
+    let mut expected = vec![0; 8 * CLUSTER_BYTES + 11];
+    expected[..5].fill(0xA6);
+    expected[offset as usize..offset as usize + 4].copy_from_slice(b"tail");
+    assert_eq!(stream.size, expected.len() as u64);
+    assert_eq!(stream.initialized, offset + 4);
+    assert_eq!(stream.allocated, 2 * cluster_bytes);
+    assert_eq!(
+        volume.read(&cx, &stream, 0, expected.len()).unwrap(),
+        expected
+    );
+    let base = volume.data_stream(&cx, &record, &[]).unwrap();
+    assert_eq!(volume.read(&cx, &base, 0, 16).unwrap(), b"BASE");
+    reopened.check_clean_consistency(&cx).unwrap();
+}
+
+#[test]
+fn large_sparse_positioned_write_preserves_holes_and_recovers_every_publication_cut() {
+    let cx = Cx::for_testing();
+    let (device, mut engine, file, name) = large_sparse_stream_fixture();
+    let offset = (1_u64 << 27) + CLUSTER_BYTES as u64 - 3;
+    let payload = b"far-range";
+    type Cut = (NtfsPersistenceStage, bool, Vec<u8>, Vec<u8>);
+    let cuts: Arc<Mutex<Vec<Cut>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&cuts);
+    let source = Arc::clone(&device);
+    let mut committed = false;
+    engine.set_stage_hook(Some(Box::new(move |event| {
+        committed |= event.stage == NtfsPersistenceStage::LogCommitBarrier;
+        captured.lock().unwrap().push((
+            event.stage,
+            committed,
+            source.snapshot_durable_only(),
+            source.snapshot_reordered_pending(true),
+        ));
+        Ok(())
+    })));
+    let trace_start = engine.persistence_trace().len();
+    engine
+        .write_stream_range(&cx, file, &name, offset, payload)
+        .into_result()
+        .unwrap();
+    engine.set_stage_hook(None);
+    let payload_bytes: usize = engine.persistence_trace()[trace_start..]
+        .iter()
+        .filter(|event| event.stage == NtfsPersistenceStage::PayloadDataWrite)
+        .map(|event| event.bytes)
+        .sum();
+    assert_eq!(payload_bytes, 3 * CLUSTER_BYTES);
+    engine.check_clean_consistency(&cx).unwrap();
+    let captured = cuts.lock().unwrap();
+    assert!(captured.iter().any(|(_, committed, _, _)| !committed));
+    assert!(captured.iter().any(|(_, committed, _, _)| *committed));
+    for (stage, committed, durable, reordered) in captured.iter() {
+        for (image, may_be_newer) in [(durable, false), (reordered, true)] {
+            let recovered_device = FaultInjectingNtfsDevice::new(image.clone());
+            let recovered = NtfsTransactionEngine::from_device(
+                &cx,
+                Arc::clone(&recovered_device) as Arc<dyn ByteDevice>,
+                0,
+                image.len() as u64 - SECTOR_BYTES as u64,
+                write_options_recover(),
+            )
+            .unwrap();
+            recovered.check_clean_consistency(&cx).unwrap();
+            let volume = recovered.volume_view(&cx).unwrap();
+            let record = volume
+                .record(&cx, file.record, Some(file.sequence))
+                .unwrap();
+            let stream = volume.data_stream(&cx, &record, &name).unwrap();
+            let applied = stream.initialized == offset + payload.len() as u64;
+            assert!(
+                applied || stream.initialized == 5,
+                "mixed metadata at {stage:?}"
+            );
+            if *committed || !may_be_newer {
+                assert_eq!(
+                    applied, *committed,
+                    "wrong acknowledged prefix at {stage:?}"
+                );
+            }
+            assert_eq!(stream.size, 1_u64 << 30);
+            assert_eq!(stream.allocated, 3 * CLUSTER_BYTES as u64);
+            let mut prefix = vec![0; 3 * CLUSTER_BYTES];
+            prefix[..5].fill(0xA6);
+            assert_eq!(volume.read(&cx, &stream, 0, prefix.len()).unwrap(), prefix);
+            let mut expected = vec![0; payload.len() + 8];
+            if applied {
+                expected[4..4 + payload.len()].copy_from_slice(payload);
+            }
+            assert_eq!(
+                volume
+                    .read(&cx, &stream, offset - 4, expected.len())
+                    .unwrap(),
+                expected
+            );
+            let base = volume.data_stream(&cx, &record, &[]).unwrap();
+            assert_eq!(volume.read(&cx, &base, 0, 16).unwrap(), b"BASE");
+        }
+    }
 }
 
 /// Constructed native records intentionally include another large resident ADS.

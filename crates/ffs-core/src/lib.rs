@@ -145329,6 +145329,225 @@ pub(crate) mod scrub;\n";
         <OpenFs as FsOps>::end_request_scope(&fs, &cx, RequestOp::Setattr, s1).expect("end S1");
     }
 
+    fn ssi_read_scope_fixture(sharded: bool, mode: MvccIsolationMode) -> (OpenFs, Cx) {
+        let cx = Cx::for_testing();
+        let mut fs = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(build_ext4_image_with_extents())),
+            &OpenOptions::default(),
+        )
+        .expect("open constructed ext4 fixture");
+        fs.mvcc_store = Arc::new(if sharded {
+            FsMvccStore::sharded()
+        } else {
+            FsMvccStore::single()
+        });
+        fs.set_mvcc_isolation_mode(mode);
+        // The two fixture files occupy independent physical data blocks.
+        // Seed retained before-images so this tests SSI, not a missing-version
+        // snapshot conflict on the first read after an overwrite.
+        let mut seed = fs.begin_transaction();
+        for block in [BlockNumber(13), BlockNumber(15)] {
+            fs.stage_block_write(&mut seed, block, vec![0; 4096]);
+        }
+        fs.commit_transaction(&cx, seed).expect("seed two files");
+        (fs, cx)
+    }
+
+    fn ssi_read_scope_pair(fs: &OpenFs, cx: &Cx, scope: &mut RequestScope) -> (u8, u8) {
+        let x = <OpenFs as FsOps>::read(fs, cx, scope, InodeNumber(11), 0, 1).expect("read x")[0];
+        let y = <OpenFs as FsOps>::read(fs, cx, scope, InodeNumber(12), 0, 1).expect("read y")[0];
+        (x, y)
+    }
+
+    fn ssi_read_scope_pivot(fs: &OpenFs, cx: &Cx) -> RequestScope {
+        let mut pivot = fs.begin_request_scope(cx, RequestOp::Write).unwrap();
+        assert_eq!(
+            <OpenFs as FsOps>::read(fs, cx, &mut pivot, InodeNumber(12), 0, 1).unwrap(),
+            [0]
+        );
+        fs.stage_block_write(
+            pivot.tx.as_mut().expect("writer transaction"),
+            BlockNumber(13),
+            vec![1; 4096],
+        );
+        pivot
+    }
+
+    fn ssi_read_scope_publish_outgoing(fs: &OpenFs, cx: &Cx) {
+        let mut outgoing = fs.begin_transaction();
+        fs.stage_block_write(&mut outgoing, BlockNumber(15), vec![1; 4096]);
+        fs.commit_transaction(cx, outgoing).expect("publish y=1");
+    }
+
+    #[test]
+    fn ssi_read_only_request_prevents_cycle_in_both_commit_orders() {
+        for sharded in [false, true] {
+            for reader_first in [false, true] {
+                let (fs, cx) = ssi_read_scope_fixture(sharded, MvccIsolationMode::Serializable);
+                let mut pivot = ssi_read_scope_pivot(&fs, &cx);
+                ssi_read_scope_publish_outgoing(&fs, &cx);
+                let mut reader = fs.begin_request_scope(&cx, RequestOp::Read).unwrap();
+                assert!(
+                    reader.tx.is_none(),
+                    "observations must not become mutations"
+                );
+                assert_eq!(ssi_read_scope_pair(&fs, &cx, &mut reader), (0, 1));
+
+                let before = fs.current_snapshot();
+                // A write-only commit probe must leave read validation pending,
+                // including the dependencies needed by either commit order.
+                assert_eq!(
+                    reader.commit_if_write(&fs.mvcc_store).unwrap(),
+                    CommitSeq(0)
+                );
+                assert!(reader.requires_read_validation());
+                assert_eq!(fs.current_snapshot(), before);
+
+                // I reads x=0,y=1, P reads y=0/writes x=1, O writes y=1:
+                // I -rw-> P -rw-> O -wr-> I. Whichever of I/P finishes last
+                // must abort; discarding I's read set permits this cycle.
+                let error = if reader_first {
+                    fs.commit_request_scope(&cx, &mut reader)
+                        .expect("reader completes before pivot");
+                    fs.end_request_scope(&cx, RequestOp::Read, reader).unwrap();
+                    fs.prune_mvcc_versions();
+                    let result = fs.commit_request_scope(&cx, &mut pivot);
+                    fs.end_request_scope(&cx, RequestOp::Write, pivot).unwrap();
+                    result.expect_err("completed read must invalidate a later pivot")
+                } else {
+                    fs.commit_request_scope(&cx, &mut pivot)
+                        .expect("pivot has only its outgoing edge so far");
+                    fs.end_request_scope(&cx, RequestOp::Write, pivot).unwrap();
+                    // O itself may be pruned now; P must retain its outgoing
+                    // witness until this reader's validation finishes.
+                    fs.prune_mvcc_versions();
+                    let result = fs.commit_request_scope(&cx, &mut reader);
+                    fs.end_request_scope(&cx, RequestOp::Read, reader).unwrap();
+                    result.expect_err("read must validate against an already committed pivot")
+                };
+                assert!(matches!(error, FfsError::MvccConflict { .. }));
+                assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+                assert_eq!(
+                    fs.read(&cx, InodeNumber(11), 0, 1).unwrap(),
+                    [u8::from(!reader_first)]
+                );
+                assert_eq!(fs.read(&cx, InodeNumber(12), 0, 1).unwrap(), [1]);
+            }
+        }
+    }
+
+    #[test]
+    fn ssi_read_only_request_accepts_safe_snapshot_and_commits_once() {
+        for sharded in [false, true] {
+            for reader_first in [false, true] {
+                let (fs, cx) = ssi_read_scope_fixture(sharded, MvccIsolationMode::Serializable);
+                let mut pivot = ssi_read_scope_pivot(&fs, &cx);
+                let mut reader = fs.begin_request_scope(&cx, RequestOp::Read).unwrap();
+                assert_eq!(ssi_read_scope_pair(&fs, &cx, &mut reader), (0, 0));
+                ssi_read_scope_publish_outgoing(&fs, &cx);
+                if !reader_first {
+                    fs.commit_request_scope(&cx, &mut pivot).unwrap();
+                }
+                let versions = fs.mvcc_version_count();
+                let before = fs.current_snapshot();
+                let read_commit = fs.commit_request_scope(&cx, &mut reader).unwrap();
+                assert!(read_commit > before.high, "read must enter SSI history");
+                assert_eq!(
+                    fs.mvcc_version_count(),
+                    versions,
+                    "read must not write blocks"
+                );
+                assert_eq!(
+                    fs.commit_request_scope(&cx, &mut reader).unwrap(),
+                    CommitSeq(0)
+                );
+                assert_eq!(fs.current_snapshot().high, read_commit);
+                if reader_first {
+                    fs.commit_request_scope(&cx, &mut pivot).unwrap();
+                }
+                fs.end_request_scope(&cx, RequestOp::Read, reader).unwrap();
+                fs.end_request_scope(&cx, RequestOp::Write, pivot).unwrap();
+                assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn ssi_read_only_request_abort_and_cancellation_leave_no_read_history() {
+        for sharded in [false, true] {
+            for cancel in [false, true] {
+                let (fs, cx) = ssi_read_scope_fixture(sharded, MvccIsolationMode::Serializable);
+                let mut pivot = ssi_read_scope_pivot(&fs, &cx);
+                ssi_read_scope_publish_outgoing(&fs, &cx);
+                let read_cx = Cx::for_testing();
+                let mut reader = fs.begin_request_scope(&read_cx, RequestOp::Read).unwrap();
+                assert_eq!(ssi_read_scope_pair(&fs, &read_cx, &mut reader), (0, 1));
+                let before = fs.current_snapshot();
+                if cancel {
+                    read_cx.set_cancel_requested(true);
+                    assert!(matches!(
+                        fs.commit_request_scope(&read_cx, &mut reader),
+                        Err(FfsError::Cancelled)
+                    ));
+                }
+                fs.end_request_scope(&read_cx, RequestOp::Read, reader)
+                    .unwrap();
+                assert_eq!(fs.current_snapshot(), before);
+                fs.commit_request_scope(&cx, &mut pivot)
+                    .expect("an abandoned observation must not create an incoming edge");
+                fs.end_request_scope(&cx, RequestOp::Write, pivot).unwrap();
+                assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn ssi_read_only_request_preserves_snapshot_and_immutable_fast_paths() {
+        for sharded in [false, true] {
+            let (fs, cx) = ssi_read_scope_fixture(sharded, MvccIsolationMode::Snapshot);
+            let before = fs.current_snapshot();
+            let mut reader = fs.begin_request_scope(&cx, RequestOp::Read).unwrap();
+            assert!(reader.tx.is_none());
+            assert_eq!(ssi_read_scope_pair(&fs, &cx, &mut reader), (0, 0));
+            assert_eq!(
+                fs.commit_request_scope(&cx, &mut reader).unwrap(),
+                CommitSeq(0)
+            );
+            fs.end_request_scope(&cx, RequestOp::Read, reader).unwrap();
+            assert_eq!(fs.current_snapshot(), before);
+            assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+
+            let mut immutable = OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(build_ext4_image_with_extents())),
+                &OpenOptions {
+                    mvcc_isolation: MvccIsolationMode::Serializable,
+                    ..OpenOptions::default()
+                },
+            )
+            .unwrap();
+            immutable.write_authority = false;
+            let before = immutable.current_snapshot();
+            let mut reader = immutable.begin_request_scope(&cx, RequestOp::Read).unwrap();
+            assert_eq!(immutable.mvcc_active_snapshot_count(), 0);
+            assert!(reader.tx.is_none() && reader.ssi_reads.is_none());
+            assert_eq!(
+                <OpenFs as FsOps>::read(&immutable, &cx, &mut reader, InodeNumber(11), 0, 5)
+                    .unwrap(),
+                b"Hello"
+            );
+            assert_eq!(
+                immutable.commit_request_scope(&cx, &mut reader).unwrap(),
+                CommitSeq(0)
+            );
+            immutable
+                .end_request_scope(&cx, RequestOp::Read, reader)
+                .unwrap();
+            assert_eq!(immutable.current_snapshot(), before);
+        }
+    }
+
     #[test]
     fn openfs_ssi_prevents_two_file_write_skew_under_lab_runtime_and_logs_pivot() {
         use asupersync::lab::{LabConfig, LabRuntime};

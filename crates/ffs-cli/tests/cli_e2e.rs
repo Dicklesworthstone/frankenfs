@@ -69,11 +69,11 @@ fn native_companion_read_profile_ntfs() {
 }
 
 #[test]
-#[ignore = "requires ntfs-3g mkntfs and ntfscat; executes native NTFS mutations and an independent read oracle"]
+#[ignore = "requires ntfs-3g mkntfs, ntfscp and ntfscat; executes native NTFS mutations and an independent read oracle"]
 fn native_ntfs_range_edit_cli_preserves_bytes_bounds_and_volume_selection() {
     use std::io::Write as _;
 
-    for tool in ["mkntfs", "ntfscat"] {
+    for tool in ["mkntfs", "ntfscp", "ntfscat"] {
         assert!(
             command_available(tool),
             "native NTFS CLI test requires {tool}; install ntfs-3g before explicitly running it"
@@ -291,6 +291,120 @@ fn native_ntfs_range_edit_cli_preserves_bytes_bounds_and_volume_selection() {
             "oversized edit must fail: {args:?}"
         );
         assert_eq!(sha256_file(&embedded_image), unchanged);
+    }
+
+    // Keep large-stream coverage on the existing native interoperability gate.
+    native_ntfs_large_positioned_cli_edits_preserve_native_bytes();
+}
+
+fn native_ntfs_large_positioned_cli_edits_preserve_native_bytes() {
+    for tool in ["mkntfs", "ntfscp", "ntfscat"] {
+        assert!(
+            command_available(tool),
+            "native NTFS large-stream test requires {tool}"
+        );
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let image = directory.path().join("native.img");
+    let source = directory.path().join("source.bin");
+    let patch = directory.path().join("patch.bin");
+    fs::File::create(&image)
+        .unwrap()
+        .set_len(64 * 1024 * 1024)
+        .unwrap();
+    let checked = |binary: &Path, args: &[&str]| {
+        let output = run_cli_binary(binary, args);
+        assert!(
+            output.status.success(),
+            "{} {args:?} failed: {}",
+            binary.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    let image_path = image.to_str().unwrap();
+    checked(
+        Path::new("mkntfs"),
+        &["-F", "-Q", "-s", "512", "-c", "4096", image_path],
+    );
+    let original: Vec<u8> = (0..17 * 1024 * 1024 + 19)
+        .map(|i| (i % 251) as u8)
+        .collect();
+    fs::write(&source, &original).unwrap();
+    checked(
+        Path::new("ntfscp"),
+        &[image_path, source.to_str().unwrap(), "/large.bin"],
+    );
+    checked(
+        Path::new("ntfscp"),
+        &[
+            "-N",
+            "audit",
+            image_path,
+            source.to_str().unwrap(),
+            "/large.bin",
+        ],
+    );
+    let mut unnamed = original.clone();
+    let mut named = original;
+    let binary = Path::new(env!("CARGO_BIN_EXE_ffs-ntfs"));
+    let mut previous_lsn = 0;
+    for (stream, offset, bytes) in [
+        (
+            "",
+            16 * 1024 * 1024 + 4093,
+            &[0x00, 0xFF, 0x80, 0x41, 0x42][..],
+        ),
+        ("", 1, b"prefix".as_slice()),
+        ("audit", 16 * 1024 * 1024 + 8191, b"named".as_slice()),
+        ("", unnamed.len() + 7, b"tail".as_slice()),
+    ] {
+        fs::write(&patch, bytes).unwrap();
+        let start = offset.to_string();
+        let mut args = vec![
+            "tx-write-range",
+            image_path,
+            "/large.bin",
+            "--offline-image",
+            "--allow-write",
+            "--start",
+            &start,
+            "--data-file",
+            patch.to_str().unwrap(),
+        ];
+        if !stream.is_empty() {
+            args.extend(["--stream", stream]);
+        }
+        let output = checked(binary, &args);
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["outcome"], "committed");
+        assert_eq!(report["result"]["start"], offset);
+        assert_eq!(report["result"]["bytes"], bytes.len());
+        let lsn = report["token"]["commit_lsn"].as_u64().unwrap();
+        assert!(lsn > previous_lsn);
+        previous_lsn = lsn;
+        let expected = if stream.is_empty() {
+            &mut unnamed
+        } else {
+            &mut named
+        };
+        expected.resize(expected.len().max(offset + bytes.len()), 0);
+        expected[offset..offset + bytes.len()].copy_from_slice(bytes);
+
+        // A fresh independent native reader checks the entire two streams,
+        // including every untouched byte and the initialized append gap.
+        assert_eq!(
+            checked(Path::new("ntfscat"), &[image_path, "/large.bin"]).stdout,
+            unnamed
+        );
+        assert_eq!(
+            checked(
+                Path::new("ntfscat"),
+                &["-n", "audit", image_path, "/large.bin"]
+            )
+            .stdout,
+            named
+        );
     }
 }
 
