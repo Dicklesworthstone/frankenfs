@@ -743,9 +743,7 @@ fn build_htree_layout(
     // `fs/ext4/hash.c:254-265`), while leaves retain the original-case name.
     let name_hash = |name: &[u8]| -> u32 {
         if casefold {
-            ext4_dx_hash_casefold_bytes(hash_version, name, hash_seed, false)
-                .expect("non-strict casefold dx_hash cannot fail")
-                .0
+            ext4_dx_hash_casefold_bytes(hash_version, name, hash_seed, false).0
         } else {
             dx_hash(hash_version, name, hash_seed).0
         }
@@ -1322,7 +1320,6 @@ where
     // (falling back to opaque raw bytes on invalid UTF-8 in non-strict mode).
     let (hash, _minor) = if casefold {
         ext4_dx_hash_casefold_bytes(hash_version, name, hash_seed, false)
-            .expect("non-strict casefold dx_hash cannot fail")
     } else {
         dx_hash(hash_version, name, hash_seed)
     };
@@ -1529,7 +1526,6 @@ where
     // raw bytes on invalid UTF-8 in non-strict mode).
     let (hash, _minor) = if casefold {
         ext4_dx_hash_casefold_bytes(hash_version, name, hash_seed, false)
-            .expect("non-strict casefold dx_hash cannot fail")
     } else {
         dx_hash(hash_version, name, hash_seed)
     };
@@ -1929,9 +1925,7 @@ pub fn split_htree_leaf_with_casefold(
             continue;
         }
         let hash = if casefold {
-            ext4_dx_hash_casefold_bytes(hash_version, e.name, hash_seed, false)
-                .expect("non-strict casefold dx_hash cannot fail")
-                .0
+            ext4_dx_hash_casefold_bytes(hash_version, e.name, hash_seed, false).0
         } else {
             dx_hash(hash_version, e.name, hash_seed).0
         };
@@ -2101,9 +2095,7 @@ pub fn split_htree_leaf_in_dx_node_with_casefold(
             continue;
         }
         let hash = if casefold {
-            ext4_dx_hash_casefold_bytes(hash_version, e.name, hash_seed, false)
-                .expect("non-strict casefold dx_hash cannot fail")
-                .0
+            ext4_dx_hash_casefold_bytes(hash_version, e.name, hash_seed, false).0
         } else {
             dx_hash(hash_version, e.name, hash_seed).0
         };

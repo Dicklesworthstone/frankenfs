@@ -3758,6 +3758,13 @@ pub struct InMemoryCowBtrfsTree {
     /// Nodes allocated by successful mutations since the last durable baseline.
     /// Includes superseded nodes conservatively; request commits do not clear it.
     pending_allocated_nodes: u64,
+    /// Exact count of currently live nodes allocated since the last durable
+    /// baseline (`block > baseline_max_block_id`). Unlike `pending_allocated_nodes`,
+    /// repeated in-memory CoW updates to the same path cancel out (+1 alloc, -1 retire)
+    /// so default writeback pressure tracks true on-disk dirty metadata footprint.
+    dirty_live_nodes: u64,
+    max_allocated_block_id: u64,
+    baseline_max_block_id: u64,
     staged_deferred_frees: Vec<u64>,
     /// Block ids retired by the PREVIOUS committed batch, retained for exactly
     /// one generation so the immediately-previous version stays readable via
@@ -3786,6 +3793,9 @@ pub struct CowCheckpoint {
     prev_committed_retired: Vec<u64>,
     deferred_frees_len: usize,
     pending_allocated_nodes: u64,
+    dirty_live_nodes: u64,
+    max_allocated_block_id: u64,
+    baseline_max_block_id: u64,
 }
 
 impl InMemoryCowBtrfsTree {
@@ -3820,6 +3830,9 @@ impl InMemoryCowBtrfsTree {
             deferred_frees: Vec::new(),
             staged_allocations: Vec::new(),
             pending_allocated_nodes: 0,
+            dirty_live_nodes: 0,
+            max_allocated_block_id: root,
+            baseline_max_block_id: root,
             staged_deferred_frees: Vec::new(),
             prev_committed_retired: Vec::new(),
             nodes,
@@ -3846,6 +3859,9 @@ impl InMemoryCowBtrfsTree {
             prev_committed_retired: self.prev_committed_retired.clone(),
             deferred_frees_len: self.deferred_frees.len(),
             pending_allocated_nodes: self.pending_allocated_nodes,
+            dirty_live_nodes: self.dirty_live_nodes,
+            max_allocated_block_id: self.max_allocated_block_id,
+            baseline_max_block_id: self.baseline_max_block_id,
         }
     }
 
@@ -3863,6 +3879,9 @@ impl InMemoryCowBtrfsTree {
         self.prev_committed_retired = checkpoint.prev_committed_retired;
         self.deferred_frees.truncate(checkpoint.deferred_frees_len);
         self.pending_allocated_nodes = checkpoint.pending_allocated_nodes;
+        self.dirty_live_nodes = checkpoint.dirty_live_nodes;
+        self.max_allocated_block_id = checkpoint.max_allocated_block_id;
+        self.baseline_max_block_id = checkpoint.baseline_max_block_id;
     }
 
     /// Keep everything done since the checkpoint and resume eviction: the
@@ -3882,12 +3901,20 @@ impl InMemoryCowBtrfsTree {
         self.pending_allocated_nodes
     }
 
+    /// Exact count of currently live uncommitted nodes (`block > baseline_max_block_id`).
+    #[must_use]
+    pub const fn dirty_live_node_count(&self) -> u64 {
+        self.dirty_live_nodes
+    }
+
     /// Establish a baseline after loading already-durable tree contents, or
     /// after the full filesystem commit's final superblock sync succeeds.
     /// A request commit, tree serialization, or failed durability attempt must
     /// not reset this debt. The caller must exclude concurrent tree mutations.
     pub fn reset_pending_allocated_node_count(&mut self) {
         self.pending_allocated_nodes = 0;
+        self.dirty_live_nodes = 0;
+        self.baseline_max_block_id = self.max_allocated_block_id;
     }
 
     /// Set the per-node serialized-byte budget (`nodesize - BTRFS_HEADER_SIZE`)
@@ -4058,15 +4085,21 @@ impl InMemoryCowBtrfsTree {
         self.prev_committed_retired
             .extend_from_slice(&self.staged_deferred_frees);
         for block in self.staged_deferred_frees.drain(..) {
+            if block > self.baseline_max_block_id {
+                self.dirty_live_nodes = self.dirty_live_nodes.saturating_sub(1);
+            }
             self.allocator.defer_free(block);
             self.deferred_frees.push(block);
         }
     }
 
     fn commit_allocated_nodes(&mut self) {
-        self.pending_allocated_nodes = self
-            .pending_allocated_nodes
-            .saturating_add(u64::try_from(self.staged_allocations.len()).unwrap_or(u64::MAX));
+        let count = u64::try_from(self.staged_allocations.len()).unwrap_or(u64::MAX);
+        self.pending_allocated_nodes = self.pending_allocated_nodes.saturating_add(count);
+        self.dirty_live_nodes = self.dirty_live_nodes.saturating_add(count);
+        for &block in &self.staged_allocations {
+            self.max_allocated_block_id = self.max_allocated_block_id.max(block);
+        }
         self.staged_allocations.clear();
     }
 
@@ -15512,21 +15545,28 @@ mod tests {
         )
         .expect("one leaf allocated for the whole batch");
         assert_eq!(tree.pending_allocated_node_count(), 1);
+        assert_eq!(tree.dirty_live_node_count(), 1);
         tree.insert_many(Vec::new(), false).expect("empty batch");
         assert_eq!(tree.pending_allocated_node_count(), 1);
+        assert_eq!(tree.dirty_live_node_count(), 1);
         tree.update(&test_key(1), b"updated").expect("update");
         assert_eq!(tree.pending_allocated_node_count(), 2);
+        // Repeated CoW update on the same already-dirty leaf keeps dirty_live_nodes == 1.
+        assert_eq!(tree.dirty_live_node_count(), 1);
         tree.remove_many(&[test_key(2), test_key(3)])
             .expect("one leaf allocated for both removals");
         assert_eq!(tree.pending_allocated_node_count(), 3);
+        assert_eq!(tree.dirty_live_node_count(), 1);
         assert_eq!(
             tree.find(&test_key(1)).expect("retained item"),
             Some(b"updated".to_vec())
         );
         tree.reset_pending_allocated_node_count();
         assert_eq!(tree.pending_allocated_node_count(), 0);
+        assert_eq!(tree.dirty_live_node_count(), 0);
         tree.update(&test_key(1), b"later").expect("later update");
         assert_eq!(tree.pending_allocated_node_count(), 1);
+        assert_eq!(tree.dirty_live_node_count(), 1);
         tree.validate_invariants().expect("invariants");
     }
 

@@ -62,10 +62,11 @@ pub use ext4::{
     parse_ibody_xattrs_with_inum, parse_inode_extent_tree, parse_xattr_block,
     parse_xattr_block_names, parse_xattr_block_with_inum, split_htree_leaf,
     split_htree_leaf_in_dx_node, split_htree_leaf_in_dx_node_with_casefold,
-    split_htree_leaf_with_casefold, stamp_block_bitmap_checksum, stamp_dir_block_checksum, stamp_dx_block_checksum, stamp_extent_block_checksum,
-    stamp_group_desc_checksum, stamp_inode_bitmap_checksum, stamp_xattr_block_checksum,
-    verify_block_bitmap_checksum, verify_dir_block_checksum, verify_dx_block_checksum,
-    verify_extent_block_checksum, verify_group_desc_checksum, verify_inode_bitmap_checksum,
-    verify_inode_checksum, verify_xattr_block_checksum, write_dx_root,
+    split_htree_leaf_with_casefold, stamp_block_bitmap_checksum, stamp_dir_block_checksum,
+    stamp_dx_block_checksum, stamp_extent_block_checksum, stamp_group_desc_checksum,
+    stamp_inode_bitmap_checksum, stamp_xattr_block_checksum, verify_block_bitmap_checksum,
+    verify_dir_block_checksum, verify_dx_block_checksum, verify_extent_block_checksum,
+    verify_group_desc_checksum, verify_inode_bitmap_checksum, verify_inode_checksum,
+    verify_xattr_block_checksum, write_dx_root,
 };
 pub use ffs_types::{GroupNumber, InodeNumber};

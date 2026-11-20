@@ -5388,7 +5388,10 @@ fn cli_mount_rss_stays_bounded_without_fsync_bd_dj725() {
     // One arm: write 2 GiB without fsync; return the two sampled VmRSS peaks
     // and the kernel's whole-process VmHWM, all in KiB, while recording
     // per-second VmRSS + resident/evicted MVCC block diagnostics (`bd-zxn57`).
-    let arm = |arm_label: &str, extra_args: &[&str], envs: &[(&str, &str)]| -> Option<([u64; 2], u64)> {
+    let arm = |arm_label: &str,
+               extra_args: &[&str],
+               envs: &[(&str, &str)]|
+     -> Option<([u64; 2], u64)> {
         let tmp = tempfile::tempdir().expect("create temp dir");
         let image = tmp.path().join("rss.ext4");
         format_ext4_owned_by_caller(&image, 4 << 30);
@@ -5812,7 +5815,8 @@ fn periodic_commit_sigkill_arm(
 #[test]
 fn cli_mount_per_core_serves_live_requests_and_publishes_lane_distribution_bd_28mw2() {
     let require = std::env::var_os("FFS_REQUIRE_FUSE").is_some_and(|v| v == "1");
-    let available_cpus = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let available_cpus =
+        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
     if !Path::new("/dev/fuse").exists()
         || available_cpus < 2
         || !["mkfs.ext4", "fusermount3"]
@@ -5892,13 +5896,9 @@ fn cli_mount_per_core_serves_live_requests_and_publishes_lane_distribution_bd_28
         "expected published per_core routing object in shutdown summary: {summary_raw}"
     );
     let total_routed = per_core["total_requests"].as_u64().unwrap_or(0);
-    let lane_sum: u64 = per_core["cores"]
-        .as_array()
-        .map_or(0, |arr| {
-            arr.iter()
-                .filter_map(|row| row["requests"].as_u64())
-                .sum()
-        });
+    let lane_sum: u64 = per_core["cores"].as_array().map_or(0, |arr| {
+        arr.iter().filter_map(|row| row["requests"].as_u64()).sum()
+    });
     assert!(
         total_routed >= 200 && lane_sum == total_routed,
         "expected >= 200 routed requests summed across per-core lanes, got total={total_routed}, lane_sum={lane_sum}: {summary_raw}"
@@ -8720,8 +8720,7 @@ fn measure_fuse_dispatch_modes_vs_kernel_incumbent_bd_28mw2_bd_iah1f() {
 
     for r in 0..rounds {
         if r.is_multiple_of(2) {
-            let (ms_s, wc_s, _, _, _) =
-                measure_ffs_arm(&format!("ser_{r}"), "1", "standard");
+            let (ms_s, wc_s, _, _, _) = measure_ffs_arm(&format!("ser_{r}"), "1", "standard");
             serial_workers = wc_s;
             serial_samples.push(ms_s);
 
@@ -8731,8 +8730,7 @@ fn measure_fuse_dispatch_modes_vs_kernel_incumbent_bd_28mw2_bd_iah1f() {
             auto_logged_summary |= logged_a1;
             auto_a1_samples.push(ms_a1);
 
-            let (ms_a2, _, _, _, _) =
-                measure_ffs_arm(&format!("auto2_{r}"), "0", "standard");
+            let (ms_a2, _, _, _, _) = measure_ffs_arm(&format!("auto2_{r}"), "0", "standard");
             auto_a2_samples.push(ms_a2);
 
             let (ms_pc, wc_pc, pc_tot, pc_lanes, _) =
@@ -8755,8 +8753,7 @@ fn measure_fuse_dispatch_modes_vs_kernel_incumbent_bd_28mw2_bd_iah1f() {
             per_core_last_lanes = pc_lanes;
             per_core_samples.push(ms_pc);
 
-            let (ms_a2, _, _, _, _) =
-                measure_ffs_arm(&format!("auto2_{r}"), "0", "standard");
+            let (ms_a2, _, _, _, _) = measure_ffs_arm(&format!("auto2_{r}"), "0", "standard");
             auto_a2_samples.push(ms_a2);
 
             let (ms_a1, wc_a1, _, _, logged_a1) =
@@ -8765,8 +8762,7 @@ fn measure_fuse_dispatch_modes_vs_kernel_incumbent_bd_28mw2_bd_iah1f() {
             auto_logged_summary |= logged_a1;
             auto_a1_samples.push(ms_a1);
 
-            let (ms_s, wc_s, _, _, _) =
-                measure_ffs_arm(&format!("ser_{r}"), "1", "standard");
+            let (ms_s, wc_s, _, _, _) = measure_ffs_arm(&format!("ser_{r}"), "1", "standard");
             serial_workers = wc_s;
             serial_samples.push(ms_s);
         }

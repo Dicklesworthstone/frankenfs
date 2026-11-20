@@ -24013,3 +24013,235 @@ print("GENERIC_310_WORKLOAD_PASS")
         Some("ext4_and_btrfs_4096_entries_plus_sigpipe_dfl"),
     );
 }
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn ext4_casefold_htree_unicode_12_1_matches_kernel_dx_hash_and_e2fsck_bd_vsuni_3() {
+    let scenario_id =
+        "ext4_casefold_htree_unicode_12_1_matches_kernel_dx_hash_and_e2fsck_bd_vsuni_3";
+    if !command_available("mkfs.ext4")
+        || !command_available("debugfs")
+        || !command_available("e2fsck")
+    {
+        require_oracles_or_skip("mkfs.ext4/debugfs/e2fsck required for bd-vsuni.3 E2E");
+        return;
+    }
+
+    let tmp = TempDir::new_in("/tmp")
+        .or_else(|_| TempDir::new())
+        .expect("casefold tmpdir");
+    let img_path = tmp.path().join("ext4_casefold_unicode_12_1.img");
+    let img_file = fs::File::create(&img_path).expect("create image");
+    img_file.set_len(64 * 1024 * 1024).expect("size image");
+    drop(img_file);
+
+    // Format a real ext4 image with Unicode 12.1.0 casefold + dir_index enabled.
+    let mkfs_out = Command::new("mkfs.ext4")
+        .args([
+            "-q",
+            "-F",
+            "-b",
+            "4096",
+            "-O",
+            "casefold,dir_index",
+            "-E",
+            "encoding=utf8-12.1",
+        ])
+        .arg(&img_path)
+        .output()
+        .expect("run mkfs.ext4 -O casefold,dir_index");
+    assert!(
+        mkfs_out.status.success(),
+        "mkfs.ext4 -O casefold,dir_index failed: {}",
+        String::from_utf8_lossy(&mkfs_out.stderr)
+    );
+
+    // Create an empty casefold directory via debugfs before mounting RW so both
+    // kernel/e2fsprogs and FrankenFS agree on the superblock encoding + inode flag.
+    for cmd in [
+        "set_inode_field / mode 040777",
+        "mkdir cf_dir",
+        "set_inode_field cf_dir mode 040777",
+        "set_inode_field cf_dir flags 0x40080000",
+    ] {
+        let debugfs_setup = Command::new("debugfs")
+            .args(["-w", "-R", cmd])
+            .arg(&img_path)
+            .output()
+            .expect("debugfs setup for cf_dir");
+        assert!(
+            debugfs_setup.status.success(),
+            "debugfs -R {cmd:?} failed: {}",
+            String::from_utf8_lossy(&debugfs_setup.stderr)
+        );
+    }
+
+    let mnt = tmp.path().join("mnt_cf");
+    fs::create_dir_all(&mnt).expect("mkdir mnt_cf");
+    let cx = Cx::for_testing();
+    let opts = OpenOptions {
+        skip_validation: false,
+        ext4_journal_replay_mode: Ext4JournalReplayMode::Apply,
+        mvcc_wal_path: Some(img_path.with_extension("wal")),
+        ..OpenOptions::default()
+    };
+    let mut fs_handle = OpenFs::open_read_write(&cx, &img_path, &opts).expect("open ext4 RW");
+    let (hash_seed, hash_version) = {
+        let sb = fs_handle.ext4_superblock().expect("ext4 superblock");
+        assert!(sb.has_casefold(), "superblock must advertise casefold");
+        (
+            sb.hash_seed,
+            sb.effective_dirhash_version(sb.def_hash_version),
+        )
+    };
+    fs_handle.enable_writes(&cx).expect("enable ext4 writes");
+    let mount_opts = MountOptions {
+        read_only: false,
+        auto_unmount: false,
+        ..MountOptions::default()
+    };
+    let session =
+        match mount_background(Box::new(std::sync::Arc::new(fs_handle)), &mnt, &mount_opts) {
+            Ok(s) => {
+                wait_for_fuse_mount_ready(&mnt);
+                ffs_harness::stale_mounts::MountGuard::new(s, &mnt)
+            }
+            Err(e) => {
+                require_fuse_or_skip(&format!("casefold FUSE mount failed: {e}"));
+                return;
+            }
+        };
+
+    let cf_dir = mnt.join("cf_dir");
+    // Seed 260 multi-script Unicode 12.1.0 entries to force htree conversion + leaf splits.
+    let corpus_templates: [(&str, &str); 8] = [
+        ("Straße", "STRAẞE"),
+        ("Café", "CAFE\u{0301}"),
+        ("한글", "\u{1112}\u{1161}\u{11AB}\u{1100}\u{1173}\u{11AF}"),
+        ("Ὀδυσσεύς", "ὀδυσσεύς"),
+        ("İSTANBUL", "i\u{0307}stanbul"),
+        ("A\u{0301}\u{0328}", "a\u{0328}\u{0301}"),
+        (
+            "bar\u{0301}\u{034F}\u{0323}",
+            "BAR\u{0301}\u{034F}\u{034F}\u{0323}",
+        ),
+        ("\u{AB70}ffi", "\u{13A0}ﬃ"),
+    ];
+    let mut expected_entries: Vec<(String, String, Vec<u8>)> = Vec::with_capacity(260);
+    for i in 0..260_usize {
+        let (stored_prefix, query_prefix) = corpus_templates[i % corpus_templates.len()];
+        let stored = format!("{stored_prefix}_{i:04}.txt");
+        let query = format!("{query_prefix}_{i:04}.TXT");
+        let payload = format!("payload-{i:04}\n").into_bytes();
+        fs::write(cf_dir.join(&stored), &payload).expect("write multi-script casefold file");
+        expected_entries.push((stored, query, payload));
+    }
+
+    // Verify case-insensitive lookups across every folded variant through live FUSE.
+    for (stored, query, payload) in &expected_entries {
+        let read_back = fs::read(cf_dir.join(query))
+            .unwrap_or_else(|err| panic!("lookup {query} (stored {stored}) failed: {err}"));
+        assert_eq!(&read_back, payload);
+    }
+
+    // Negative check: Default_Ignorable_Code_Point (U+034F) acts as a CCC=0 STOPPER
+    // barrier in Linux fs/unicode utf8nfdicf, so bar\u{0301}\u{0323}_0006.txt MUST
+    // NOT collide with bar\u{0301}\u{034F}\u{0323}_0006.txt.
+    assert!(
+        fs::metadata(cf_dir.join("bar\u{0301}\u{0323}_0006.txt")).is_err(),
+        "CGJ STOPPER barrier must prevent bar\\u{{0301}}\\u{{0323}} from matching bar\\u{{0301}}\\u{{034F}}\\u{{0323}}"
+    );
+
+    // Rename & unlink using folded spellings on the live htree directory.
+    fs::rename(
+        cf_dir.join("STRASSE_0000.TXT"),
+        cf_dir.join("NeuStraße_0000.txt"),
+    )
+    .expect("rename via folded spelling");
+    assert_eq!(
+        fs::read(cf_dir.join("NEUSTRASSE_0000.TXT")).expect("read renamed via folded spelling"),
+        b"payload-0000\n"
+    );
+    fs::remove_file(cf_dir.join("CAFE\u{0301}_0001.TXT")).expect("unlink via folded spelling");
+    assert!(
+        fs::metadata(cf_dir.join("Café_0001.txt")).is_err(),
+        "unlinked folded file must disappear"
+    );
+
+    session.unmount_and_join();
+    wait_for_fuse_mount_released(&mnt);
+
+    // 1. Offline e2fsck -fn must pass with exit code 0 (verifying DX hashes & csums).
+    let fsck_out = Command::new("e2fsck")
+        .args(["-fn"])
+        .arg(&img_path)
+        .output()
+        .expect("run e2fsck -fn on casefold image");
+    assert!(
+        fsck_out.status.success(),
+        "e2fsck -fn failed on casefold htree image:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&fsck_out.stdout),
+        String::from_utf8_lossy(&fsck_out.stderr)
+    );
+
+    // 2. Cross-check FrankenFS ext4_dx_hash_casefold_bytes against e2fsprogs debugfs htree dump.
+    let htree_out = Command::new("debugfs")
+        .env("PAGER", "cat")
+        .args(["-R", "htree cf_dir"])
+        .arg(&img_path)
+        .output()
+        .expect("run debugfs -R 'htree cf_dir'");
+    assert!(
+        htree_out.status.success(),
+        "debugfs htree cf_dir failed: {}",
+        String::from_utf8_lossy(&htree_out.stderr)
+    );
+    let htree_stdout = String::from_utf8_lossy(&htree_out.stdout);
+    let mut verified_hashes = 0_usize;
+    for line in htree_stdout.lines() {
+        // debugfs prints 1 or 2 leaf entries per line:
+        // "0x12345678-0x9abcdef0 (24) NeuStraße_0000.txt   0x..."
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        let mut idx = 0_usize;
+        while idx + 2 < tokens.len() {
+            if let Some(rest) = tokens[idx].strip_prefix("0x")
+                && let Some((major_hex, minor_hex)) = rest.split_once("-0x")
+                && tokens[idx + 1].starts_with('(')
+                && tokens[idx + 1].ends_with(')')
+                && let (Ok(major), Ok(minor)) = (
+                    u32::from_str_radix(major_hex, 16),
+                    u32::from_str_radix(minor_hex, 16),
+                )
+            {
+                let name = tokens[idx + 2];
+                if name != "." && name != ".." {
+                    let (ffs_major, ffs_minor) = ffs_ondisk::ext4_dx_hash_casefold_bytes(
+                        hash_version,
+                        name.as_bytes(),
+                        &hash_seed,
+                        false,
+                    );
+                    assert_eq!(
+                        (ffs_major, ffs_minor),
+                        (major, minor),
+                        "FrankenFS dx_hash diverged from debugfs/libext2fs for {name:?}"
+                    );
+                    verified_hashes += 1;
+                }
+                idx += 3;
+                continue;
+            }
+            idx += 1;
+        }
+    }
+    assert!(
+        verified_hashes >= 250,
+        "expected >= 250 debugfs htree entries cross-checked, got {verified_hashes}:\n{htree_stdout}"
+    );
+
+    emit_scenario_result(
+        scenario_id,
+        "PASS",
+        Some(&format!("verified_debugfs_htree_hashes={verified_hashes}")),
+    );
+}

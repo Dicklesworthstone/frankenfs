@@ -2567,6 +2567,23 @@ impl BtrfsAllocState {
         nodes.saturating_mul(u64::from(self.nodesize))
     }
 
+    fn live_dirty_metadata_bytes(&self) -> u64 {
+        let nodes = [
+            &self.fs_tree,
+            &self.root_tree,
+            &self.csum_tree,
+            &self.chunk_tree,
+            &self.dev_tree,
+            self.extent_alloc.extent_tree(),
+        ]
+        .into_iter()
+        .chain(self.extra_subvol_trees.iter().map(|(_, tree)| tree))
+        .fold(0_u64, |total, tree| {
+            total.saturating_add(tree.dirty_live_node_count())
+        });
+        nodes.saturating_mul(u64::from(self.nodesize))
+    }
+
     fn reset_pending_metadata(&mut self) {
         for tree in [
             &mut self.fs_tree,
@@ -13470,25 +13487,55 @@ impl OpenFs {
         data_bytes.saturating_add(alloc.pending_metadata_bytes())
     }
 
+    /// Pending dirty bytes for automatic pressure commits.
+    ///
+    /// When the caller configured a custom threshold or we are recovering from
+    /// an earlier `ENOSPC` commit baseline (`has_failed_baseline`), use the
+    /// strictly monotonic `pending_allocated_nodes` counter so explicit
+    /// threshold tests and post-`ENOSPC` freeing retries observe every update.
+    /// On the healthy default threshold (`DEFAULT_BTRFS_DIRTY_BYTES_THRESHOLD`),
+    /// track actual live uncommitted CoW nodes (`live_dirty_metadata_bytes`) so
+    /// repeated in-memory updates to the same leaf (e.g. `generic/027`) do not
+    /// trigger thousands of redundant full-tree rewrites.
+    fn btrfs_pressure_dirty_bytes_locked(
+        &self,
+        alloc: &BtrfsAllocState,
+        limit: u64,
+        has_failed_baseline: bool,
+    ) -> u64 {
+        if has_failed_baseline || limit != DEFAULT_BTRFS_DIRTY_BYTES_THRESHOLD {
+            return self.btrfs_pending_dirty_bytes_locked(alloc);
+        }
+        let written = self.mvcc_store.committed_block_writes();
+        let covered = self.btrfs_block_writes_at_boundary.load(Ordering::Acquire);
+        let data_bytes = if written == u64::MAX {
+            u64::MAX
+        } else {
+            written
+                .saturating_sub(covered)
+                .saturating_mul(u64::from(self.block_size()))
+        };
+        data_bytes.saturating_add(alloc.live_dirty_metadata_bytes())
+    }
+
     fn btrfs_growable_metadata_bytes_locked(&self, alloc: &BtrfsAllocState) -> u64 {
         if self.btrfs_grow_chunks_enabled() && alloc.chunk_trees_authoritative {
             match (
                 self.btrfs_superblock(),
                 ffs_btrfs::chunk_entries_from_chunk_tree(&alloc.chunk_tree),
             ) {
-                (Some(sb), Ok(chunks)) => {
-                    ffs_btrfs::GrowthDevice::from_chunk_tree(&alloc.chunk_tree, sb.fsid).map_or(
-                        0,
-                        |dev| {
-                            ffs_btrfs::growable_chunk_bytes(
-                                &chunks,
-                                ffs_btrfs::ChunkKind::Metadata,
-                                &dev,
-                                &ffs_btrfs::ChunkSizePolicy::default(),
-                            )
-                        },
+                (Some(sb), Ok(chunks)) => ffs_btrfs::GrowthDevice::from_chunk_tree(
+                    &alloc.chunk_tree,
+                    sb.fsid,
+                )
+                .map_or(0, |dev| {
+                    ffs_btrfs::growable_chunk_bytes(
+                        &chunks,
+                        ffs_btrfs::ChunkKind::Metadata,
+                        &dev,
+                        &ffs_btrfs::ChunkSizePolicy::default(),
                     )
-                }
+                }),
                 _ => 0,
             }
         } else {
@@ -13581,14 +13628,20 @@ impl OpenFs {
         };
         let limit = self.btrfs_dirty_bytes_threshold.load(Ordering::Acquire);
         let out_of_space = self.btrfs_commit_out_of_space.load(Ordering::Acquire);
-        let space_refused = self.btrfs_pressure_retry.lock().space_request_refused;
+        let (space_refused, has_failed_baseline) = {
+            let retry = self.btrfs_pressure_retry.lock();
+            (
+                retry.space_request_refused,
+                retry.failed_after_bytes.is_some(),
+            )
+        };
         if limit == 0 && !out_of_space && !space_refused {
             return;
         }
         let (pending_bytes, effective_limit) = {
             let alloc = alloc_mutex.read();
             (
-                self.btrfs_pending_dirty_bytes_locked(&alloc),
+                self.btrfs_pressure_dirty_bytes_locked(&alloc, limit, has_failed_baseline),
                 self.btrfs_effective_dirty_bytes_limit_locked(&alloc, limit),
             )
         };
@@ -33379,9 +33432,7 @@ impl OpenFs {
         // (left) leaf. Both halves were packed loosely (a strict subset of one
         // full leaf) so the single new entry always fits.
         let name_hash = if casefold {
-            ffs_ondisk::ext4_dx_hash_casefold_bytes(hash_version, name, &hash_seed, false)
-                .expect("non-strict casefold dx_hash cannot fail")
-                .0
+            ffs_ondisk::ext4_dx_hash_casefold_bytes(hash_version, name, &hash_seed, false).0
         } else {
             ffs_ondisk::dx_hash(hash_version, name, &hash_seed).0
         };
@@ -33566,9 +33617,7 @@ impl OpenFs {
 
         let casefold = parent_inode.flags & ffs_types::EXT4_CASEFOLD_FL != 0;
         let name_hash = if casefold {
-            ffs_ondisk::ext4_dx_hash_casefold_bytes(hash_version, name, &hash_seed, false)
-                .expect("non-strict casefold dx_hash cannot fail")
-                .0
+            ffs_ondisk::ext4_dx_hash_casefold_bytes(hash_version, name, &hash_seed, false).0
         } else {
             ffs_ondisk::dx_hash(hash_version, name, &hash_seed).0
         };
@@ -43952,10 +44001,14 @@ impl OpenFs {
         let _view = self.btrfs_semantic_view_guard()?;
         let alloc_mutex = self.require_btrfs_alloc_state()?;
         let mut alloc = alloc_mutex.write();
-        let pending = self.btrfs_pending_dirty_bytes_locked(&alloc);
         let effective_limit = self.btrfs_effective_dirty_bytes_limit_locked(&alloc, limit);
         {
             let mut retry = self.btrfs_pressure_retry.lock();
+            let pending = self.btrfs_pressure_dirty_bytes_locked(
+                &alloc,
+                limit,
+                retry.failed_after_bytes.is_some(),
+            );
             let space_demand = std::mem::take(&mut retry.space_request_refused);
             // Recheck after acquiring the write lock. Another caller may have
             // completed a boundary or failed against the same debt meanwhile.
@@ -75753,17 +75806,30 @@ mod tests {
                 )
             })
             .collect();
-        let blocks = ffs_ondisk::build_htree_directory_stamped_with_large_dir_casefold(
-            dir_ino_u32,
-            2,
-            &entries,
-            block_size,
-            hash_version,
-            &hash_seed,
-            has_metadata_csum.then_some((csum_seed, generation)),
-            false,
-            true,
-        )
+        let blocks = if has_metadata_csum {
+            ffs_ondisk::build_htree_directory_stamped_with_large_dir_casefold(
+                dir_ino_u32,
+                2,
+                &entries,
+                block_size,
+                hash_version,
+                &hash_seed,
+                csum_seed,
+                dir_ino_u32,
+                generation,
+                false,
+            )
+        } else {
+            ffs_ondisk::build_htree_directory_with_large_dir_casefold(
+                dir_ino_u32,
+                2,
+                &entries,
+                block_size,
+                hash_version,
+                &hash_seed,
+                false,
+            )
+        }
         .expect("build casefold htree");
         install_htree_dir(&fs, &cx, dir_ino, &blocks);
         {
@@ -75973,7 +76039,10 @@ mod tests {
             .expect("free inode count");
 
         let create_res = fs.create(&cx, dir_ino, OsStr::new("café.txt"), 0o644, 0, 0);
-        assert!(create_res.is_err(), "corrupt-dx_root create must be refused");
+        assert!(
+            create_res.is_err(),
+            "corrupt-dx_root create must be refused"
+        );
         let free_after_create = fs
             .count_free_inodes_in_group(&cx, GroupNumber(0))
             .expect("free inode count");

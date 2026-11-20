@@ -4423,17 +4423,10 @@ pub fn ext4_dx_hash_casefold_bytes(
     )
 }
 
-/// Whether `name`'s casefold key equals an already-folded target key, without
-/// allocating when `name` is ASCII (the common case). For an ASCII `name`,
-/// `ext4_casefold_key(name)` is just its ASCII-lowercased bytes, so comparing
-/// `name` to `folded_target` with ASCII-insensitive equality is bit-for-bit
-/// identical to `ext4_casefold_key(name) == folded_target` — and avoids the
-/// per-call `Vec` allocation. Non-ASCII names (which may fold via Unicode rules,
-/// e.g. `ß`→`ss`) fall back to materialising the key.
-#[must_use]
 /// Lowercase 8 ASCII bytes (high bit clear) branchlessly: add 0x20 to bytes in
 /// `'A'..='Z'`. No cross-byte carry — each cleared 7-bit byte plus the constant
 /// stays below 0x100. Non-ASCII high bits are preserved (callers gate on ASCII).
+#[must_use]
 #[inline]
 fn swar_ascii_to_lower(w: u64) -> u64 {
     const ONES: u64 = 0x0101_0101_0101_0101;
@@ -21479,13 +21472,14 @@ mod dir_csum_incremental_verify {
             ext4_casefold_key_strict(invalid_utf8, true),
             Err(Ext4CasefoldError::InvalidUtf8)
         );
-        assert_eq!(
-            ext4_dx_hash_casefold_bytes(1, invalid_utf8, &seed, true),
-            Err(Ext4CasefoldError::InvalidUtf8)
-        );
         // Non-strict dx_hash hashes opaque raw bytes verbatim (fs/ext4/hash.c:254-265).
         assert_eq!(
-            ext4_dx_hash_casefold_bytes(1, invalid_utf8, &seed, false).unwrap(),
+            ext4_dx_hash_casefold_bytes(1, invalid_utf8, &seed, false),
+            dx_hash(1, invalid_utf8, &seed)
+        );
+        // Strict dx_hash falls back to opaque raw bytes if strict decoding rejects.
+        assert_eq!(
+            ext4_dx_hash_casefold_bytes(1, invalid_utf8, &seed, true),
             dx_hash(1, invalid_utf8, &seed)
         );
 
@@ -21515,7 +21509,9 @@ mod dir_csum_incremental_verify {
             names.push((
                 100 + i,
                 format!("Straße_한글_Ὀδυσσεύς_{i:02}.TXT"),
-                format!("STRASSE_\u{1112}\u{1161}\u{11AB}\u{1100}\u{1173}\u{11AF}_ὀδυσσεύς_{i:02}.txt"),
+                format!(
+                    "STRASSE_\u{1112}\u{1161}\u{11AB}\u{1100}\u{1173}\u{11AF}_ὀδυσσεύς_{i:02}.txt"
+                ),
             ));
         }
         let initial_refs: Vec<(u32, u8, &[u8])> = names[..16]
@@ -21529,42 +21525,38 @@ mod dir_csum_incremental_verify {
             block_size,
             1,
             &seed,
-            Some((csum_seed, generation)),
+            csum_seed,
+            dir_ino,
+            generation,
             false,
-            true,
         )
         .expect("build initial casefold htree");
         assert_eq!(blocks.len(), 2, "16 entries fit in 1 leaf + dx_root");
 
         let split = split_htree_leaf_with_casefold(
-            &blocks[0],
-            &blocks[1],
-            1,
-            2,
-            block_size,
-            1,
-            &seed,
-            true,
-            false,
-            csum_seed,
-            dir_ino,
-            generation,
-            true,
+            &blocks[0], &blocks[1], 1, 2, block_size, 1, &seed, true, false, csum_seed, dir_ino,
+            generation, true,
         )
         .expect("split casefold htree leaf");
 
-        verify_dx_block_checksum(
-            &split.dx_root,
-            csum_seed,
-            dir_ino,
-            generation,
-            DX_ROOT_COUNT_OFFSET,
-        )
-        .expect("dx_root csum");
-        verify_dir_block_checksum(&split.old_leaf, csum_seed, dir_ino, generation)
-            .expect("old_leaf csum");
-        verify_dir_block_checksum(&split.new_leaf, csum_seed, dir_ino, generation)
-            .expect("new_leaf csum");
+        assert!(
+            verify_dx_block_checksum(
+                &split.dx_root,
+                csum_seed,
+                dir_ino,
+                generation,
+                DX_ROOT_COUNT_OFFSET,
+            ),
+            "dx_root csum"
+        );
+        assert!(
+            verify_dir_block_checksum(&split.old_leaf, csum_seed, dir_ino, generation),
+            "old_leaf csum"
+        );
+        assert!(
+            verify_dir_block_checksum(&split.new_leaf, csum_seed, dir_ino, generation),
+            "new_leaf csum"
+        );
 
         let after_blocks = [split.dx_root, split.old_leaf, split.new_leaf];
         for (expected_ino, _, query) in &names[..16] {
@@ -21573,11 +21565,11 @@ mod dir_csum_incremental_verify {
                 &seed,
                 false,
                 query.as_bytes(),
+                |v| v,
                 |logical| after_blocks.get(usize::try_from(logical).ok()?).cloned(),
-            )
-            .expect("casefold htree lookup after split");
+            );
             match found {
-                HtreeFindResult::Found { entry, .. } => assert_eq!(entry.inode, *expected_ino),
+                HtreeFindResult::Found(entry) => assert_eq!(entry.inode, *expected_ino),
                 other => panic!("expected Found for {query}, got {other:?}"),
             }
         }
