@@ -1776,7 +1776,17 @@ pub fn maybe_route_mount_cmd(
             let _ = ctrlc::set_handler(move || {
                 stop_sig.store(true, Ordering::SeqCst);
             });
-            handle.wait()?;
+            if options.runtime.mode == MountRuntimeMode::PerCore {
+                let (_metrics, per_core) = handle.wait_with_per_core_metrics()?;
+                tracing::info!(
+                    target: "ffs::cli::mount",
+                    lanes = per_core.per_core.len(),
+                    total_requests = per_core.total_requests,
+                    "six_format_per_core_shutdown"
+                );
+            } else {
+                handle.wait()?;
+            }
         }
     }
 

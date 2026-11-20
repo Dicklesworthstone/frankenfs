@@ -5386,19 +5386,25 @@ fn cli_mount_rss_stays_bounded_without_fsync_bd_dj725() {
         return;
     }
     // One arm: write 2 GiB without fsync; return the two sampled VmRSS peaks
-    // and the kernel's whole-process VmHWM, all in KiB.
-    let arm = |envs: &[(&str, &str)]| -> Option<([u64; 2], u64)> {
+    // and the kernel's whole-process VmHWM, all in KiB, while recording
+    // per-second VmRSS + resident/evicted MVCC block diagnostics (`bd-zxn57`).
+    let arm = |arm_label: &str, extra_args: &[&str], envs: &[(&str, &str)]| -> Option<([u64; 2], u64)> {
         let tmp = tempfile::tempdir().expect("create temp dir");
         let image = tmp.path().join("rss.ext4");
         format_ext4_owned_by_caller(&image, 4 << 30);
         let mnt = tmp.path().join("mnt");
         fs::create_dir(&mnt).expect("create mountpoint");
+        let log_path = tmp.path().join("mount.log");
+        let mut args = vec!["--rw", "--log-format", "json"];
+        args.extend_from_slice(extra_args);
+        let mut all_envs = vec![("RUST_LOG", "ffs::mvcc=debug,ffs::writeback=info,warn")];
+        all_envs.extend_from_slice(envs);
         let mut child = spawn_cli_mount(
             &image,
             &mnt,
-            &tmp.path().join("mount.log"),
-            &["--rw"],
-            envs,
+            &log_path,
+            &args,
+            &all_envs,
             "cli_mount_rss_bound",
             require,
         )?;
@@ -5412,8 +5418,11 @@ fn cli_mount_rss_stays_bounded_without_fsync_bd_dj725() {
         };
         let pid = child.id();
         let chunk: Vec<u8> = (0..1024 * 1024_u32).map(|i| (i % 253) as u8).collect();
-        // Peak VmRSS over the first and second GiB written.
+        // Peak VmRSS over the first and second GiB written + per-second timeline.
         let mut halves = [0_u64; 2];
+        let mut timeline: Vec<(u64, u32, u64)> = Vec::new();
+        let started = std::time::Instant::now();
+        let mut next_sample_sec = 1_u64;
         {
             let mut file = fs::File::create(mnt.join("big.bin")).unwrap_or_else(|error| {
                 sigkill_cli_mount(&mut child, &mnt);
@@ -5425,13 +5434,36 @@ fn cli_mount_rss_stays_bounded_without_fsync_bd_dj725() {
                     panic!("write MiB {mib}: {error}");
                 });
                 if mib % 16 == 15 {
+                    let cur_rss = status_kib(pid, "VmRSS:");
                     let half = usize::from(mib >= 1024);
-                    halves[half] = halves[half].max(status_kib(pid, "VmRSS:"));
+                    halves[half] = halves[half].max(cur_rss);
+                    let elapsed_s = started.elapsed().as_secs();
+                    if elapsed_s >= next_sample_sec {
+                        timeline.push((elapsed_s, mib + 1, cur_rss));
+                        next_sample_sec = elapsed_s + 1;
+                    }
                 }
             }
         }
         let peak_kib = status_kib(pid, "VmHWM:");
         sigkill_cli_mount(&mut child, &mnt);
+        let evictions: Vec<(u64, u64)> = fs::read_to_string(&log_path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["message"] == "mvcc_durable_chains_evicted")
+            .map(|v| {
+                (
+                    v["resident"].as_u64().unwrap_or(0),
+                    v["evicted"].as_u64().unwrap_or(0),
+                )
+            })
+            .collect();
+        eprintln!(
+            "RSS_TIMELINE|arm={arm_label}|samples={timeline:?}|eviction_events={}|last_eviction={:?}",
+            evictions.len(),
+            evictions.last()
+        );
         assert!(
             halves[0] > 0 && halves[1] > 0 && peak_kib >= halves[0].max(halves[1]),
             "could not measure daemon VmRSS/VmHWM: halves={halves:?}, peak={peak_kib} KiB"
@@ -5439,14 +5471,18 @@ fn cli_mount_rss_stays_bounded_without_fsync_bd_dj725() {
         Some((halves, peak_kib))
     };
 
-    let Some(([bounded_first, bounded_second], bounded_peak)) = arm(&[]) else {
+    let Some(([bounded_first, bounded_second], bounded_peak)) =
+        arm("bounded_cli_128mib", &["--max-dirty-mib", "128"], &[])
+    else {
         return;
     };
     // Control: eviction disabled. It must show the growth the bound prevents,
     // or this test could pass without measuring anything.
-    let Some(([unbounded_first, unbounded_second], unbounded_peak)) =
-        arm(&[("FFS_MVCC_RESIDENT_CAP_BLOCKS", "18446744073709551615")])
-    else {
+    let Some(([unbounded_first, unbounded_second], unbounded_peak)) = arm(
+        "unbounded_control",
+        &[],
+        &[("FFS_MVCC_RESIDENT_CAP_BLOCKS", "18446744073709551615")],
+    ) else {
         return;
     };
     eprintln!(
@@ -5590,6 +5626,15 @@ fn btrfs_commit_sigkill_arm(
                     && event["interval_secs"].as_u64() == Some(interval_secs.unwrap_or(30))),
             "btrfs timer must start with the requested or default interval: {logs}"
         );
+        assert!(
+            logs.lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .any(|event| event["message"] == "periodic_commit_completed"
+                    && event["txn_seq"].as_u64().is_some_and(|seq| seq > 0)
+                    && event["blocks"].as_u64().is_some_and(|b| b > 0)
+                    && event["duration_us"].as_u64().is_some()),
+            "btrfs periodic commit must log txn_seq, blocks, and duration_us: {logs}"
+        );
     }
     let checked = Command::new("btrfs")
         .args(["check", "--readonly"])
@@ -5689,11 +5734,40 @@ fn periodic_commit_sigkill_arm(
             );
             assert!(commit["duration_us"].as_u64().is_some(), "{commit}");
         }
+        assert!(
+            logs.lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .any(|event| event["message"] == "periodic_commit_completed"
+                    && event["txn_seq"].as_u64().is_some()
+                    && event["blocks"].as_u64().is_some_and(|b| b > 0)
+                    && event["duration_us"].as_u64().is_some()),
+            "ext4 periodic commit must also emit unified periodic_commit_completed telemetry: {logs}"
+        );
     }
+
+    // Remount the UNTOUCHED post-SIGKILL image via FrankenFS FUSE first across ALL
+    // arms (exercising FrankenFS's own JBD2 crash recovery before `e2fsck` mutates
+    // the image), then verify independent `e2fsck` + `debugfs` on a pristine copy!
+    let oracle_copy = tmp.path().join("oracle_copy.ext4");
+    fs::copy(&image, &oracle_copy).expect("copy post-SIGKILL ext4 image for e2fsck oracle");
+
+    let Some(mut remounted) = spawn_cli_mount(
+        &image,
+        &mnt,
+        &tmp.path().join("remount.log"),
+        &[],
+        &[],
+        "cli_mount_periodic_commit_sigkill_remount",
+        require,
+    ) else {
+        return SigkillArm::Skipped;
+    };
+    let mounted_bytes = fs::read(mnt.join("durable.bin"));
+    sigkill_cli_mount(&mut remounted, &mnt);
 
     let replay = Command::new("e2fsck")
         .args(["-E", "journal_only", "-y"])
-        .arg(&image)
+        .arg(&oracle_copy)
         .output()
         .expect("run e2fsck journal replay");
     assert!(
@@ -5704,7 +5778,7 @@ fn periodic_commit_sigkill_arm(
     );
     let check = Command::new("e2fsck")
         .arg("-fn")
-        .arg(&image)
+        .arg(&oracle_copy)
         .output()
         .expect("run e2fsck -fn");
     assert!(
@@ -5716,34 +5790,120 @@ fn periodic_commit_sigkill_arm(
 
     let cat = Command::new("debugfs")
         .args(["-R", "cat /durable.bin"])
-        .arg(&image)
+        .arg(&oracle_copy)
         .output()
         .expect("run debugfs cat");
     let stderr = String::from_utf8_lossy(&cat.stderr);
     if stderr.contains("not found") {
+        assert!(
+            matches!(&mounted_bytes, Err(e) if e.kind() == std::io::ErrorKind::NotFound),
+            "FUSE remount on disabled-timer SIGKILL image must agree with debugfs NotFound, got: {mounted_bytes:?}"
+        );
         return SigkillArm::Missing;
     }
-    if interval_secs != Some(0) {
-        let Some(mut remounted) = spawn_cli_mount(
-            &image,
-            &mnt,
-            &tmp.path().join("remount.log"),
-            &[],
-            &[],
-            "cli_mount_periodic_commit_sigkill_remount",
-            require,
-        ) else {
-            return SigkillArm::Skipped;
-        };
-        let mounted_bytes = fs::read(mnt.join("durable.bin"));
-        sigkill_cli_mount(&mut remounted, &mnt);
-        assert_eq!(
-            mounted_bytes.expect("read durable data after FUSE remount"),
-            cat.stdout,
-            "FUSE remount must expose the same durable bytes as native debugfs"
-        );
-    }
+    assert_eq!(
+        mounted_bytes.expect("read durable data after FUSE remount"),
+        cat.stdout,
+        "FUSE remount must expose the same durable bytes as native debugfs"
+    );
     SigkillArm::Bytes(cat.stdout)
+}
+
+#[test]
+fn cli_mount_per_core_serves_live_requests_and_publishes_lane_distribution_bd_28mw2() {
+    let require = std::env::var_os("FFS_REQUIRE_FUSE").is_some_and(|v| v == "1");
+    let available_cpus = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    if !Path::new("/dev/fuse").exists()
+        || available_cpus < 2
+        || !["mkfs.ext4", "fusermount3"]
+            .iter()
+            .all(|tool| command_available(tool))
+    {
+        assert!(
+            !require || available_cpus < 2,
+            "FFS_REQUIRE_FUSE=1 but /dev/fuse or ext4 tools are unavailable"
+        );
+        emit_scenario_result(
+            "cli_mount_per_core_live_routing",
+            "SKIP",
+            Some("fuse_or_smp_unavailable"),
+        );
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let image = tmp.path().join("per_core.ext4");
+    format_ext4_owned_by_caller(&image, 32 << 20);
+    let mnt = tmp.path().join("mnt");
+    fs::create_dir(&mnt).expect("create mountpoint");
+    let summary_json = tmp.path().join("per_core_summary.json");
+    let log_path = tmp.path().join("per_core_mount.log");
+
+    let Some(mut child) = spawn_cli_mount(
+        &image,
+        &mnt,
+        &log_path,
+        &[
+            "--rw",
+            "--runtime-mode",
+            "per-core",
+            "--adaptive-runtime-summary-json",
+            summary_json.to_str().unwrap(),
+            "--no-background-scrub",
+        ],
+        &[],
+        "cli_mount_per_core_live_routing",
+        require,
+    ) else {
+        return;
+    };
+
+    let payload = b"per-core-routed-payload-bd-28mw2";
+    fs::write(mnt.join("routed.txt"), payload).expect("write routed.txt");
+    std::thread::scope(|s| {
+        for _ in 0..4 {
+            let file_path = mnt.join("routed.txt");
+            s.spawn(move || {
+                for _ in 0..50 {
+                    assert_eq!(fs::read(&file_path).unwrap(), payload);
+                }
+            });
+        }
+    });
+
+    let umount = Command::new("fusermount3")
+        .args(["-u", mnt.to_str().unwrap()])
+        .status()
+        .expect("fusermount3 -u");
+    assert!(umount.success(), "fusermount3 -u failed");
+    let exit = child.wait().expect("wait for per-core daemon");
+    assert!(
+        exit.success(),
+        "per-core daemon exited non-zero ({exit}): {}",
+        fs::read_to_string(&log_path).unwrap_or_default()
+    );
+
+    let summary_raw = fs::read_to_string(&summary_json).expect("read per-core summary JSON");
+    let summary: serde_json::Value =
+        serde_json::from_str(&summary_raw).expect("parse per-core summary JSON");
+    let per_core = &summary["per_core"];
+    assert!(
+        per_core.is_object(),
+        "expected published per_core routing object in shutdown summary: {summary_raw}"
+    );
+    let total_routed = per_core["total_requests"].as_u64().unwrap_or(0);
+    let lane_sum: u64 = per_core["cores"]
+        .as_array()
+        .map_or(0, |arr| {
+            arr.iter()
+                .filter_map(|row| row["requests"].as_u64())
+                .sum()
+        });
+    assert!(
+        total_routed >= 200 && lane_sum == total_routed,
+        "expected >= 200 routed requests summed across per-core lanes, got total={total_routed}, lane_sum={lane_sum}: {summary_raw}"
+    );
+    emit_scenario_result("cli_mount_per_core_live_routing", "PASS", None);
 }
 
 #[test]
@@ -7935,7 +8095,7 @@ fn measure_and_verify_section_9_5_performance_baselines_vkibu() {
     fs::create_dir_all(&seed_dir).unwrap();
     let file_len = 32 * 1024 * 1024_usize; // 32 MiB payload file
     let mut payload = vec![0_u8; file_len];
-    for (idx, chunk) in payload.chunks_exact_mut(4096).enumerate() {
+    for (idx, chunk) in payload.as_chunks_mut::<4096>().0.iter_mut().enumerate() {
         chunk.fill(u8::try_from((idx % 251) + 1).unwrap());
     }
     fs::write(seed_dir.join("bench32m.bin"), &payload).unwrap();
@@ -8226,7 +8386,7 @@ fn measure_and_verify_section_9_5_performance_baselines_vkibu() {
     let rq_blocks = 32_768_u32;
     let rq_blocks_usize = usize::try_from(rq_blocks).unwrap();
     let mut rq_bytes = vec![0_u8; rq_blocks_usize * 4096];
-    for (b_idx, blk) in rq_bytes.chunks_exact_mut(4096).enumerate() {
+    for (b_idx, blk) in rq_bytes.as_chunks_mut::<4096>().0.iter_mut().enumerate() {
         blk[0..8].copy_from_slice(&(b_idx as u64).to_le_bytes());
     }
     let orig_1337 = rq_bytes[1337 * 4096..1338 * 4096].to_vec();
@@ -8323,4 +8483,377 @@ fn unsafe_free_clk_tck() -> f64 {
         .and_then(|s| s.trim().parse::<f64>().ok())
         .filter(|&v| v > 0.0)
         .unwrap_or(100.0)
+}
+
+#[test]
+#[ignore = "mounted release-perf FUSE dispatch vs kernel comparator; run explicitly via --ignored"]
+#[allow(
+    clippy::too_many_lines,
+    clippy::cast_precision_loss,
+    clippy::similar_names
+)]
+fn measure_fuse_dispatch_modes_vs_kernel_incumbent_bd_28mw2_bd_iah1f() {
+    use std::os::unix::fs::FileExt;
+
+    assert!(
+        std::path::Path::new("/dev/fuse").exists(),
+        "/dev/fuse required for FUSE dispatch vs kernel comparator"
+    );
+    let sudo_ok = Command::new("sudo")
+        .args(["-n", "true"])
+        .status()
+        .is_ok_and(|s| s.success());
+    assert!(
+        sudo_ok,
+        "passwordless sudo required for live kernel ext4 loop-mount arm"
+    );
+
+    let cli_bin = env!("CARGO_BIN_EXE_ffs-cli");
+    let sha_out = Command::new("sha256sum")
+        .arg(cli_bin)
+        .output()
+        .expect("sha256sum ffs-cli");
+    assert!(sha_out.status.success(), "sha256sum failed");
+    let elf_sha256 = String::from_utf8_lossy(&sha_out.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_owned();
+    assert_eq!(elf_sha256.len(), 64, "expected 64-hex-char ELF SHA-256");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let seed_dir = dir.path().join("seed_dispatch");
+    fs::create_dir_all(&seed_dir).unwrap();
+    for sub in 0..16_u32 {
+        let sub_path = seed_dir.join(format!("sub_{sub:02}"));
+        fs::create_dir_all(&sub_path).unwrap();
+        for f_idx in 0..64_u32 {
+            fs::write(
+                sub_path.join(format!("item_{f_idx:03}.txt")),
+                format!("payload-{sub}-{f_idx}\n"),
+            )
+            .unwrap();
+        }
+    }
+    let mut corpus = vec![0_u8; 8 * 1024 * 1024];
+    for (idx, blk) in corpus.as_chunks_mut::<4096>().0.iter_mut().enumerate() {
+        blk.fill(u8::try_from((idx % 251) + 1).unwrap());
+    }
+    fs::write(seed_dir.join("bench8m.bin"), &corpus).unwrap();
+
+    let img_path = dir.path().join("dispatch_cmp.ext4");
+    {
+        let f = fs::File::create(&img_path).unwrap();
+        f.set_len(64 * 1024 * 1024).unwrap();
+    }
+    let mkfs = Command::new("mkfs.ext4")
+        .args([
+            "-F",
+            "-b",
+            "4096",
+            "-d",
+            seed_dir.to_str().unwrap(),
+            img_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("mkfs.ext4");
+    assert!(mkfs.status.success(), "mkfs.ext4 failed");
+
+    let run_workload = |mnt_root: &std::path::Path| -> f64 {
+        let bench_path = mnt_root.join("bench8m.bin");
+        let warm_file = fs::File::open(&bench_path).expect("open bench8m.bin");
+        let mut warm_buf = vec![0_u8; 256 * 1024];
+        for step in 0..32_u64 {
+            warm_file
+                .read_exact_at(&mut warm_buf, step * 256 * 1024)
+                .unwrap();
+        }
+        for sub in 0..16_u32 {
+            for entry in fs::read_dir(mnt_root.join(format!("sub_{sub:02}"))).unwrap() {
+                let entry = entry.unwrap();
+                let _ = fs::symlink_metadata(entry.path()).unwrap();
+            }
+        }
+        drop(warm_file);
+
+        let shared_file = Arc::new(fs::File::open(&bench_path).unwrap());
+        let t0 = Instant::now();
+        std::thread::scope(|s| {
+            for tid in 0..8_u32 {
+                let fh = Arc::clone(&shared_file);
+                s.spawn(move || {
+                    let mut buf = [0_u8; 4096];
+                    for round_sub in 0..2_u32 {
+                        let sub_id = (tid * 2 + round_sub) % 16;
+                        let sub_dir = mnt_root.join(format!("sub_{sub_id:02}"));
+                        for entry in fs::read_dir(&sub_dir).unwrap() {
+                            let entry = entry.unwrap();
+                            let meta = fs::symlink_metadata(entry.path()).unwrap();
+                            std::hint::black_box(meta.len());
+                        }
+                    }
+                    for op in 0..500_u64 {
+                        let blk = (u64::from(tid).wrapping_mul(131) + op.wrapping_mul(17)) % 2048;
+                        fh.read_exact_at(&mut buf, blk * 4096).unwrap();
+                        std::hint::black_box(buf[0]);
+                    }
+                });
+            }
+        });
+        t0.elapsed().as_secs_f64() * 1_000.0
+    };
+
+    let measure_ffs_arm =
+        |tag: &str, workers_env: &str, runtime_mode: &str| -> (f64, u64, u64, Vec<u64>, bool) {
+            let mnt = dir.path().join(format!("mnt_{tag}"));
+            let _ = fs::create_dir_all(&mnt);
+            let summary_path = dir.path().join(format!("summary_{tag}.json"));
+            let err_path = dir.path().join(format!("stderr_{tag}.log"));
+            let mut cmd = Command::new(cli_bin);
+            cmd.args([
+                "mount",
+                img_path.to_str().unwrap(),
+                mnt.to_str().unwrap(),
+                "--no-background-scrub",
+                "--runtime-mode",
+                runtime_mode,
+                "--adaptive-runtime-summary-json",
+                summary_path.to_str().unwrap(),
+            ])
+            .env("FFS_AUTO_UNMOUNT", "0")
+            .env("RUST_LOG", "info")
+            .stdout(std::process::Stdio::null())
+            .stderr(fs::File::create(&err_path).unwrap());
+            if !workers_env.is_empty() {
+                cmd.env("FFS_FUSE_WORKERS", workers_env);
+            }
+            let mut child = cmd.spawn().expect("spawn ffs-cli mount");
+            let mnt_canon = mnt.canonicalize().unwrap().to_string_lossy().into_owned();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let mut mounted = false;
+            while Instant::now() < deadline {
+                if fs::read_to_string("/proc/self/mountinfo")
+                    .unwrap_or_default()
+                    .lines()
+                    .any(|l| l.split(' ').nth(4) == Some(mnt_canon.as_str()))
+                {
+                    mounted = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(
+                mounted,
+                "mount {tag} timed out: {}",
+                fs::read_to_string(&err_path).unwrap_or_default()
+            );
+            let elapsed_ms = run_workload(&mnt);
+            let _ = Command::new("fusermount3")
+                .args(["-u", mnt.to_str().unwrap()])
+                .status();
+            let _ = child.wait();
+
+            let summary_raw = fs::read_to_string(&summary_path).expect("read summary json");
+            let summary: serde_json::Value =
+                serde_json::from_str(&summary_raw).expect("parse summary json");
+            let worker_count = summary["worker_count"].as_u64().unwrap_or(0);
+            let per_core_total = summary["per_core"]["total_requests"].as_u64().unwrap_or(0);
+            let per_core_lanes: Vec<u64> = summary["per_core"]["lanes"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .map(|row| row["requests_processed"].as_u64().unwrap_or(0))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let stderr_text = fs::read_to_string(&err_path).unwrap_or_default();
+            let logged_worker_summary = stderr_text.contains("FUSE dispatch worker summary");
+            (
+                elapsed_ms,
+                worker_count,
+                per_core_total,
+                per_core_lanes,
+                logged_worker_summary,
+            )
+        };
+
+    let measure_kernel_arm = |tag: &str| -> f64 {
+        let mnt = dir.path().join(format!("mnt_{tag}"));
+        let _ = fs::create_dir_all(&mnt);
+        let mount_status = Command::new("sudo")
+            .args([
+                "-n",
+                "mount",
+                "-t",
+                "ext4",
+                "-o",
+                "loop,ro,noatime",
+                img_path.to_str().unwrap(),
+                mnt.to_str().unwrap(),
+            ])
+            .status()
+            .expect("sudo mount ext4");
+        assert!(mount_status.success(), "kernel loop mount {tag} failed");
+        let elapsed_ms = run_workload(&mnt);
+        let umount_status = Command::new("sudo")
+            .args(["-n", "umount", mnt.to_str().unwrap()])
+            .status()
+            .expect("sudo umount ext4");
+        assert!(umount_status.success(), "kernel umount {tag} failed");
+        elapsed_ms
+    };
+
+    let rounds = 7_usize;
+    let mut serial_samples = Vec::with_capacity(rounds);
+    let mut auto_a1_samples = Vec::with_capacity(rounds);
+    let mut auto_a2_samples = Vec::with_capacity(rounds);
+    let mut per_core_samples = Vec::with_capacity(rounds);
+    let mut kernel_a1_samples = Vec::with_capacity(rounds);
+    let mut kernel_a2_samples = Vec::with_capacity(rounds);
+
+    let mut serial_workers = 0_u64;
+    let mut auto_workers = 0_u64;
+    let mut per_core_workers = 0_u64;
+    let mut per_core_total_reqs = 0_u64;
+    let mut per_core_last_lanes = Vec::new();
+    let mut auto_logged_summary = false;
+
+    for r in 0..rounds {
+        if r.is_multiple_of(2) {
+            let (ms_s, wc_s, _, _, _) =
+                measure_ffs_arm(&format!("ser_{r}"), "1", "standard");
+            serial_workers = wc_s;
+            serial_samples.push(ms_s);
+
+            let (ms_a1, wc_a1, _, _, logged_a1) =
+                measure_ffs_arm(&format!("auto1_{r}"), "0", "standard");
+            auto_workers = wc_a1;
+            auto_logged_summary |= logged_a1;
+            auto_a1_samples.push(ms_a1);
+
+            let (ms_a2, _, _, _, _) =
+                measure_ffs_arm(&format!("auto2_{r}"), "0", "standard");
+            auto_a2_samples.push(ms_a2);
+
+            let (ms_pc, wc_pc, pc_tot, pc_lanes, _) =
+                measure_ffs_arm(&format!("pcore_{r}"), "0", "per-core");
+            per_core_workers = wc_pc;
+            per_core_total_reqs = pc_tot;
+            per_core_last_lanes = pc_lanes;
+            per_core_samples.push(ms_pc);
+
+            kernel_a1_samples.push(measure_kernel_arm(&format!("kern1_{r}")));
+            kernel_a2_samples.push(measure_kernel_arm(&format!("kern2_{r}")));
+        } else {
+            kernel_a2_samples.push(measure_kernel_arm(&format!("kern2_{r}")));
+            kernel_a1_samples.push(measure_kernel_arm(&format!("kern1_{r}")));
+
+            let (ms_pc, wc_pc, pc_tot, pc_lanes, _) =
+                measure_ffs_arm(&format!("pcore_{r}"), "0", "per-core");
+            per_core_workers = wc_pc;
+            per_core_total_reqs = pc_tot;
+            per_core_last_lanes = pc_lanes;
+            per_core_samples.push(ms_pc);
+
+            let (ms_a2, _, _, _, _) =
+                measure_ffs_arm(&format!("auto2_{r}"), "0", "standard");
+            auto_a2_samples.push(ms_a2);
+
+            let (ms_a1, wc_a1, _, _, logged_a1) =
+                measure_ffs_arm(&format!("auto1_{r}"), "0", "standard");
+            auto_workers = wc_a1;
+            auto_logged_summary |= logged_a1;
+            auto_a1_samples.push(ms_a1);
+
+            let (ms_s, wc_s, _, _, _) =
+                measure_ffs_arm(&format!("ser_{r}"), "1", "standard");
+            serial_workers = wc_s;
+            serial_samples.push(ms_s);
+        }
+    }
+
+    let stats_7 = |vals: &[f64]| -> (f64, f64, f64) {
+        let mut sorted = vals.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        (sorted[3], sorted[1], sorted[5])
+    };
+    let (ser_med, ser_lo, ser_hi) = stats_7(&serial_samples);
+    let (a1_med, a1_lo, a1_hi) = stats_7(&auto_a1_samples);
+    let (a2_med, a2_lo, a2_hi) = stats_7(&auto_a2_samples);
+    let (pc_med, pc_lo, pc_hi) = stats_7(&per_core_samples);
+    let (k1_med, k1_lo, k1_hi) = stats_7(&kernel_a1_samples);
+    let (k2_med, k2_lo, k2_hi) = stats_7(&kernel_a2_samples);
+
+    let ffs_aa_null = a1_med / a2_med;
+    let kernel_aa_null = k1_med / k2_med;
+    let scorecard = serde_json::json!({
+        "elf_sha256": elf_sha256,
+        "rounds": rounds,
+        "ffs_serial": {
+            "median_ms": ser_med,
+            "ci_order_stat_low_ms": ser_lo,
+            "ci_order_stat_high_ms": ser_hi,
+            "worker_count": serial_workers,
+        },
+        "ffs_auto_a1": {
+            "median_ms": a1_med,
+            "ci_order_stat_low_ms": a1_lo,
+            "ci_order_stat_high_ms": a1_hi,
+            "worker_count": auto_workers,
+            "logged_worker_summary": auto_logged_summary,
+        },
+        "ffs_auto_a2": {
+            "median_ms": a2_med,
+            "ci_order_stat_low_ms": a2_lo,
+            "ci_order_stat_high_ms": a2_hi,
+        },
+        "ffs_per_core": {
+            "median_ms": pc_med,
+            "ci_order_stat_low_ms": pc_lo,
+            "ci_order_stat_high_ms": pc_hi,
+            "worker_count": per_core_workers,
+            "total_requests": per_core_total_reqs,
+            "lanes": per_core_last_lanes,
+        },
+        "kernel_ext4_a1": {
+            "median_ms": k1_med,
+            "ci_order_stat_low_ms": k1_lo,
+            "ci_order_stat_high_ms": k1_hi,
+        },
+        "kernel_ext4_a2": {
+            "median_ms": k2_med,
+            "ci_order_stat_low_ms": k2_lo,
+            "ci_order_stat_high_ms": k2_hi,
+        },
+        "nulls": {
+            "ffs_auto_aa_ratio": ffs_aa_null,
+            "kernel_ext4_aa_ratio": kernel_aa_null,
+        },
+        "speedups": {
+            "auto_vs_serial": ser_med / a1_med,
+            "per_core_vs_auto": a1_med / pc_med,
+            "auto_vs_kernel": k1_med / a1_med,
+            "per_core_vs_kernel": k1_med / pc_med,
+        }
+    });
+    println!("FUSE_DISPATCH_SCORECARD|{scorecard}");
+
+    assert_eq!(serial_workers, 1, "FFS_FUSE_WORKERS=1 must report 1 worker");
+    assert!(
+        auto_workers >= 2,
+        "default auto FUSE dispatch must resolve >= 2 workers on multi-vCPU host, got {auto_workers}"
+    );
+    assert!(
+        auto_logged_summary,
+        "multi-worker mount must log 'FUSE dispatch worker summary' with per-worker request counts"
+    );
+    assert!(
+        per_core_total_reqs > 0,
+        "per-core mount must route live requests through per-core lanes"
+    );
+    assert_eq!(
+        per_core_last_lanes.iter().copied().sum::<u64>(),
+        per_core_total_reqs,
+        "per-core lane counts must sum to total_requests"
+    );
 }

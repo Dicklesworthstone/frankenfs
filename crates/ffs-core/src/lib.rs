@@ -2303,9 +2303,10 @@ struct BtrfsPressureRetry {
 impl BtrfsPressureRetry {
     fn should_attempt(&self, pending: u64, limit: u64, space_demand: bool) -> bool {
         if space_demand
+            && pending > 0
             && self
                 .failed_after_bytes
-                .is_some_and(|failed| pending == u64::MAX || pending > failed)
+                .is_none_or(|failed| pending == u64::MAX || pending > failed)
         {
             return true;
         }
@@ -11771,17 +11772,7 @@ impl OpenFs {
         file_type: Ext4FileType,
         excluded: &[(u64, u32)],
     ) -> Result<bool, FfsError> {
-        let parent_ino = dentry.parent_ino;
-        // Non-ASCII casefold folds may diverge from the kernel's; the write side
-        // has no linear fallback, so refuse rather than misplace the entry.
         let casefold = parent.flags & ffs_types::EXT4_CASEFOLD_FL != 0;
-        if casefold && !dentry.name.is_ascii() {
-            warn!(
-                parent_ino,
-                "fc_apply: CREAT/LINK skipped — non-ASCII casefold htree dir (bd-owt2r)"
-            );
-            return Ok(false);
-        }
 
         let sb = self
             .ext4_superblock()
@@ -13479,6 +13470,68 @@ impl OpenFs {
         data_bytes.saturating_add(alloc.pending_metadata_bytes())
     }
 
+    fn btrfs_growable_metadata_bytes_locked(&self, alloc: &BtrfsAllocState) -> u64 {
+        if self.btrfs_grow_chunks_enabled() && alloc.chunk_trees_authoritative {
+            match (
+                self.btrfs_superblock(),
+                ffs_btrfs::chunk_entries_from_chunk_tree(&alloc.chunk_tree),
+            ) {
+                (Some(sb), Ok(chunks)) => {
+                    ffs_btrfs::GrowthDevice::from_chunk_tree(&alloc.chunk_tree, sb.fsid).map_or(
+                        0,
+                        |dev| {
+                            ffs_btrfs::growable_chunk_bytes(
+                                &chunks,
+                                ffs_btrfs::ChunkKind::Metadata,
+                                &dev,
+                                &ffs_btrfs::ChunkSizePolicy::default(),
+                            )
+                        },
+                    )
+                }
+                _ => 0,
+            }
+        } else {
+            0
+        }
+    }
+
+    /// Global non-growable `METADATA` reserve (analogous to Linux btrfs
+    /// `fs_info->global_block_rsv`): reserves committable metadata space on
+    /// real filesystems (`total_meta >= 4 MiB`) once the device can no longer
+    /// grow chunks, so `unlink`/`rmdir`/reclaiming CoW commits can always write
+    /// dirty leaves + `extent_tree` + `root_tree` while old blocks stay pinned.
+    fn btrfs_global_metadata_reserve_bytes_locked(alloc: &BtrfsAllocState) -> u64 {
+        const MIN_REAL_META_POOL_BYTES: u64 = 4 * 1024 * 1024;
+        const MAX_GLOBAL_RSV_BYTES: u64 = 4 * 1024 * 1024;
+        let total_meta: u64 = alloc
+            .extent_alloc
+            .space_info()
+            .iter()
+            .filter(|&&(flags, _, _)| flags & BTRFS_BLOCK_GROUP_METADATA != 0)
+            .map(|&(_, size, _)| size)
+            .fold(0_u64, u64::saturating_add);
+        if total_meta < MIN_REAL_META_POOL_BYTES {
+            return 0;
+        }
+        let min_rsv = u64::from(alloc.nodesize).saturating_mul(32);
+        (total_meta / 8).clamp(min_rsv, MAX_GLOBAL_RSV_BYTES)
+    }
+
+    fn btrfs_global_metadata_reserve_exhausted_locked(&self, alloc: &BtrfsAllocState) -> bool {
+        let reserve = Self::btrfs_global_metadata_reserve_bytes_locked(alloc);
+        if reserve == 0 {
+            return false;
+        }
+        let meta_free = alloc
+            .extent_alloc
+            .allocatable_bytes(BTRFS_BLOCK_GROUP_METADATA);
+        if meta_free > reserve {
+            return false;
+        }
+        meta_free.saturating_add(self.btrfs_growable_metadata_bytes_locked(alloc)) <= reserve
+    }
+
     fn btrfs_effective_dirty_bytes_limit_locked(&self, alloc: &BtrfsAllocState, limit: u64) -> u64 {
         const TIGHT_META_WINDOW_BYTES: u64 = 16 * 1024 * 1024;
         if limit != DEFAULT_BTRFS_DIRTY_BYTES_THRESHOLD
@@ -13500,34 +13553,15 @@ impl OpenFs {
         if meta_free >= TIGHT_META_WINDOW_BYTES {
             return limit;
         }
-        let meta_growable = if self.btrfs_grow_chunks_enabled() && alloc.chunk_trees_authoritative {
-            match (
-                self.btrfs_superblock(),
-                ffs_btrfs::chunk_entries_from_chunk_tree(&alloc.chunk_tree),
-            ) {
-                (Some(sb), Ok(chunks)) => ffs_btrfs::GrowthDevice::from_chunk_tree(
-                    &alloc.chunk_tree,
-                    sb.fsid,
-                )
-                .map_or(0, |dev| {
-                    ffs_btrfs::growable_chunk_bytes(
-                        &chunks,
-                        ffs_btrfs::ChunkKind::Metadata,
-                        &dev,
-                        &ffs_btrfs::ChunkSizePolicy::default(),
-                    )
-                }),
-                _ => 0,
-            }
-        } else {
-            0
-        };
+        let meta_growable = self.btrfs_growable_metadata_bytes_locked(alloc);
         let headroom = meta_free.saturating_add(meta_growable);
         if headroom >= TIGHT_META_WINDOW_BYTES {
             return limit;
         }
-        let floor = u64::from(alloc.nodesize).saturating_mul(8);
-        limit.min((headroom / 2).max(floor))
+        let reserve = Self::btrfs_global_metadata_reserve_bytes_locked(alloc);
+        let avail_above_rsv = headroom.saturating_sub(reserve);
+        let floor = u64::from(alloc.nodesize).saturating_mul(4);
+        limit.min((avail_above_rsv / 2).max(floor))
     }
 
     /// Run only after the outermost mutation and its semantic/allocator guards
@@ -13547,7 +13581,8 @@ impl OpenFs {
         };
         let limit = self.btrfs_dirty_bytes_threshold.load(Ordering::Acquire);
         let out_of_space = self.btrfs_commit_out_of_space.load(Ordering::Acquire);
-        if limit == 0 && !out_of_space {
+        let space_refused = self.btrfs_pressure_retry.lock().space_request_refused;
+        if limit == 0 && !out_of_space && !space_refused {
             return;
         }
         let (pending_bytes, effective_limit) = {
@@ -13557,7 +13592,8 @@ impl OpenFs {
                 self.btrfs_effective_dirty_bytes_limit_locked(&alloc, limit),
             )
         };
-        if pending_bytes < effective_limit && !out_of_space {
+        if pending_bytes < effective_limit && !out_of_space && !(space_refused && pending_bytes > 0)
+        {
             return;
         }
         match self.btrfs_pressure_transaction_commit(cx, limit) {
@@ -14085,6 +14121,8 @@ impl OpenFs {
         if !epoch_dirty && !mvcc_dirty {
             return Ok(false);
         }
+        let started = std::time::Instant::now();
+        let tracked_before = u64::try_from(self.mvcc_tracked_block_count()).unwrap_or(u64::MAX);
         match &self.flavor {
             FsFlavor::Ext4(_) => self.fsync(cx, InodeNumber(1), 0, false)?,
             FsFlavor::Btrfs(_) => {
@@ -14093,6 +14131,18 @@ impl OpenFs {
         }
         self.committed_mutation_epoch
             .fetch_max(epoch, Ordering::AcqRel);
+        let txn_seq = match &self.flavor {
+            FsFlavor::Ext4(_) => self.mvcc_store.current_snapshot().high.0,
+            FsFlavor::Btrfs(_) => self.btrfs_superblock().map_or(0, |sb| sb.generation),
+        };
+        let duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        info!(
+            target: "ffs::writeback",
+            txn_seq,
+            blocks = tracked_before.max(1),
+            duration_us,
+            "periodic_commit_completed"
+        );
         Ok(true)
     }
 
@@ -22723,6 +22773,31 @@ impl OpenFs {
             .ok_or_else(|| FfsError::Format("block range overflow".to_owned()))?;
 
         if scope.uses_fixed_snapshot() {
+            if scope.tx.is_none()
+                && scope.ssi_reads.is_none()
+                && self.is_ext4()
+                && let Some(snap) = scope.snapshot
+                && snap == self.mvcc_store.current_snapshot()
+            {
+                match self
+                    .file_data_extent_cache
+                    .copy_or_miss_epochs(start, bs, dst)
+                {
+                    Ok(()) if self.mvcc_store.current_snapshot() == snap => return Ok(()),
+                    Ok(()) => {}
+                    Err(miss_epochs) => {
+                        for (block, chunk) in (start.0..end).zip(dst.chunks_exact_mut(bs)) {
+                            let buf = self.read_block_with_scope(cx, scope, BlockNumber(block))?;
+                            chunk.copy_from_slice(&buf);
+                        }
+                        if self.mvcc_store.current_snapshot() == snap {
+                            self.file_data_extent_cache
+                                .insert_range(start, bs, dst, &miss_epochs);
+                        }
+                        return Ok(());
+                    }
+                }
+            }
             for (block, chunk) in (start.0..end).zip(dst.chunks_exact_mut(bs)) {
                 let buf = self.read_block_with_scope(cx, scope, BlockNumber(block))?;
                 chunk.copy_from_slice(&buf);
@@ -22744,7 +22819,10 @@ impl OpenFs {
         // byte-budgeted S3-FIFO extent cache (`bd-mf9z9`). Concurrent MVCC
         // commits and direct device writes bump per-shard invalidation epochs
         // and clear modified block masks, preventing stale reads or TOCTOU fills.
-        let extent_cacheable = scope.tx.is_none() && scope.snapshot.is_none() && self.is_ext4();
+        let extent_cacheable = scope.tx.is_none()
+            && !scope.uses_fixed_snapshot()
+            && scope.ssi_reads.is_none()
+            && self.is_ext4();
         if extent_cacheable {
             match self
                 .file_data_extent_cache
@@ -31413,12 +31491,31 @@ impl OpenFs {
     /// fold-collide), and linear directories may hold a duplicate in a block
     /// other than the one with free space, so both keep the lookup_name
     /// pre-check.
+    fn ext4_validate_casefold_dir_name(
+        &self,
+        dir_inode: &Ext4Inode,
+        name: &[u8],
+    ) -> ffs_error::Result<()> {
+        if dir_inode.flags & ffs_types::EXT4_CASEFOLD_FL != 0
+            && let Some(sb) = self.ext4_superblock()
+            && sb.has_strict_encoding()
+            && let Err(err) = ffs_ondisk::ext4_casefold_key_strict(name, true)
+        {
+            return Err(FfsError::RequestRejected {
+                errno: libc::EINVAL,
+                detail: format!("strict ext4 casefold directory rejected filename: {err}"),
+            });
+        }
+        Ok(())
+    }
+
     fn ext4_create_duplicate_precheck(
         &self,
         cx: &Cx,
         parent_inode: &Ext4Inode,
         name: &[u8],
     ) -> ffs_error::Result<()> {
+        self.ext4_validate_casefold_dir_name(parent_inode, name)?;
         let htree_dedup_covers = parent_inode.has_htree_index()
             && parent_inode.flags & ffs_types::EXT4_CASEFOLD_FL == 0
             && Self::htree_create_dedup_enabled();
@@ -31607,6 +31704,7 @@ impl OpenFs {
             return Err(FfsError::NotDirectory);
         }
         Self::ext4_reject_immutable(&inode)?;
+        self.ext4_validate_casefold_dir_name(&inode, name)?;
         let insert_checks_duplicate = inode.has_htree_index()
             && inode.flags & ffs_types::EXT4_CASEFOLD_FL == 0
             && Self::htree_create_dedup_enabled();
@@ -32479,15 +32577,10 @@ impl OpenFs {
         if !dir_inode.has_htree_index() {
             return Ok(None);
         }
-        // Casefold htree directories route by the case-folded name; the index may
-        // place an entry under a fold that the verbatim-name descent here would
-        // miss. Leave those to the linear scan (correctness over speed).
-        if dir_inode.flags & ffs_types::EXT4_CASEFOLD_FL != 0 {
-            return Ok(None);
-        }
         let Some(sb) = self.ext4_superblock() else {
             return Ok(None);
         };
+        let casefold = dir_inode.flags & ffs_types::EXT4_CASEFOLD_FL != 0;
 
         let resolve_logical = |logical: u32| -> Option<BlockNumber> {
             let pos = extents.partition_point(|e| e.logical_block <= logical);
@@ -32506,13 +32599,24 @@ impl OpenFs {
                 .map(BlockBuf::into_inner)
         };
 
-        let Some(target_logical) = ffs_ondisk::htree_target_leaf_block(
-            &sb.hash_seed,
-            sb.has_large_dir(),
-            name,
-            |v| sb.effective_dirhash_version(v),
-            read_leaf,
-        ) else {
+        let target_logical = if casefold {
+            ffs_ondisk::htree_target_leaf_block_casefold(
+                &sb.hash_seed,
+                sb.has_large_dir(),
+                name,
+                |v| sb.effective_dirhash_version(v),
+                read_leaf,
+            )
+        } else {
+            ffs_ondisk::htree_target_leaf_block(
+                &sb.hash_seed,
+                sb.has_large_dir(),
+                name,
+                |v| sb.effective_dirhash_version(v),
+                read_leaf,
+            )
+        };
+        let Some(target_logical) = target_logical else {
             return Ok(None);
         };
         let Some(target_phys) = resolve_logical(target_logical) else {
@@ -32520,8 +32624,23 @@ impl OpenFs {
         };
 
         let mut data = dev.read_block(cx, target_phys)?.into_inner();
+        let stored_casefold = if casefold {
+            lookup_in_dir_block_casefold(&data, sb.block_size, name)
+                .map_err(|e| parse_to_ffs_error(&e))?
+                .map(|entry| entry.name)
+        } else {
+            None
+        };
+        let target_name = if casefold {
+            let Some(stored) = stored_casefold.as_deref() else {
+                return Ok(None);
+            };
+            stored
+        } else {
+            name
+        };
         if let Some((_ino, edit)) =
-            ffs_dir::remove_entry_take_inode_tracked(&mut data, name, reserved_tail)?
+            ffs_dir::remove_entry_take_inode_tracked(&mut data, target_name, reserved_tail)?
         {
             let dir_ino_u32 = u32::try_from(dir.0)
                 .map_err(|_| FfsError::Format("inode number exceeds ext4 32-bit limit".into()))?;
@@ -32577,12 +32696,6 @@ impl OpenFs {
         reserved_tail: usize,
     ) -> ffs_error::Result<DirInsertOutcome> {
         let casefold = parent_inode.flags & ffs_types::EXT4_CASEFOLD_FL != 0;
-        if casefold && !name.is_ascii() {
-            return Err(FfsError::UnsupportedFeature(format!(
-                "non-ASCII casefold htree directory inode {} insert is not yet supported (bd-owt2r: needs byte-exact UTF-8 normalization)",
-                parent.0
-            )));
-        }
         let resolve_logical = |logical: u32| -> Option<BlockNumber> {
             let pos = extents.partition_point(|e| e.logical_block <= logical);
             let ext = extents.get(pos.checked_sub(1)?)?;
@@ -32863,25 +32976,23 @@ impl OpenFs {
                 // validity, not shape). casefold falls back because the split
                 // helper hashes the verbatim name (the rebuild re-hashes by the
                 // fold), so a fold-indexed dir must keep using the rebuild.
-                let casefold = parent_inode.flags & ffs_types::EXT4_CASEFOLD_FL != 0;
-                if !casefold
-                    && self.ext4_split_htree_leaf_and_add(
-                        cx,
-                        dev,
-                        &mut *backend,
-                        parent,
-                        parent_inode,
-                        &extents,
-                        target_logical,
-                        target_phys,
-                        &leaf,
-                        name,
-                        child_ino_u32,
-                        file_type,
-                        csum_seed,
-                        tstamp_secs,
-                        tstamp_nanos,
-                    )? == Some(())
+                if self.ext4_split_htree_leaf_and_add(
+                    cx,
+                    dev,
+                    &mut *backend,
+                    parent,
+                    parent_inode,
+                    &extents,
+                    target_logical,
+                    target_phys,
+                    &leaf,
+                    name,
+                    child_ino_u32,
+                    file_type,
+                    csum_seed,
+                    tstamp_secs,
+                    tstamp_nanos,
+                )? == Some(())
                 {
                     return Ok(());
                 }
@@ -33205,8 +33316,10 @@ impl OpenFs {
         };
         let dx_root_block = dev.read_block(cx, dx_root_phys)?.into_inner();
 
+        let casefold = parent_inode.flags & ffs_types::EXT4_CASEFOLD_FL != 0;
+
         // Pure split: repacks both leaves and the dx_root, all checksum-stamped.
-        let split = match ffs_ondisk::split_htree_leaf(
+        let split = match ffs_ondisk::split_htree_leaf_with_casefold(
             &dx_root_block,
             target_leaf,
             target_logical,
@@ -33219,6 +33332,7 @@ impl OpenFs {
             csum_seed,
             parent_ino_u32,
             generation,
+            casefold,
         ) {
             Ok(s) => s,
             Err(ffs_ondisk::HtreeSplitFallback::MultiLevelIndex) => {
@@ -33264,7 +33378,13 @@ impl OpenFs {
         // with hash >= split_hash lives in the new (right) leaf; otherwise the old
         // (left) leaf. Both halves were packed loosely (a strict subset of one
         // full leaf) so the single new entry always fits.
-        let name_hash = ffs_ondisk::dx_hash(hash_version, name, &hash_seed).0;
+        let name_hash = if casefold {
+            ffs_ondisk::ext4_dx_hash_casefold_bytes(hash_version, name, &hash_seed, false)
+                .expect("non-strict casefold dx_hash cannot fail")
+                .0
+        } else {
+            ffs_ondisk::dx_hash(hash_version, name, &hash_seed).0
+        };
         let into_new = name_hash >= split_hash;
         let target_buf = if into_new {
             &mut new_leaf
@@ -33444,7 +33564,14 @@ impl OpenFs {
             return Ok(None);
         }
 
-        let name_hash = ffs_ondisk::dx_hash(hash_version, name, &hash_seed).0;
+        let casefold = parent_inode.flags & ffs_types::EXT4_CASEFOLD_FL != 0;
+        let name_hash = if casefold {
+            ffs_ondisk::ext4_dx_hash_casefold_bytes(hash_version, name, &hash_seed, false)
+                .expect("non-strict casefold dx_hash cannot fail")
+                .0
+        } else {
+            ffs_ondisk::dx_hash(hash_version, name, &hash_seed).0
+        };
         let node_idx = ffs_ondisk::ext4::dx_find_leaf_idx(&dx_root.entries, name_hash);
         let Some(node_logical) = dx_root.entries.get(node_idx).map(|e| e.block) else {
             return Ok(None);
@@ -33473,7 +33600,7 @@ impl OpenFs {
             .unwrap_or(0);
         let new_leaf_logical = logical_end;
 
-        let Ok(split) = ffs_ondisk::ext4::split_htree_leaf_in_dx_node(
+        let Ok(split) = ffs_ondisk::split_htree_leaf_in_dx_node_with_casefold(
             &dx_node_block,
             target_leaf,
             target_logical,
@@ -33485,6 +33612,7 @@ impl OpenFs {
             csum_seed,
             parent_ino_u32,
             generation,
+            casefold,
         ) else {
             return Ok(None);
         };
@@ -33756,19 +33884,9 @@ impl OpenFs {
         }
         collected.push((new_ino, new_file_type.to_raw(), new_name.to_vec()));
 
-        // Casefold directories must be rebuilt with the fold-hashed builder so the
-        // index stays kernel-consistent. The rebuild re-hashes EVERY entry, so it
-        // is only safe when every name folds byte-exactly to the kernel — i.e. all
-        // ASCII. A single non-ASCII entry (created by the kernel) could otherwise
-        // be relocated out of the kernel's reach, with no read-side fallback on a
-        // freshly-written index. Refuse rather than risk that (bd-owt2r).
+        // Casefold directories are rebuilt with Unicode 12.1.0 NFDICF fold-hashing
+        // (`EXT4_ENC_UTF8_12_1`, bd-vsuni.3) so the DX index matches kernel ext4.
         let casefold = parent_inode.flags & ffs_types::EXT4_CASEFOLD_FL != 0;
-        if casefold && !collected.iter().all(|(_, _, n)| n.is_ascii()) {
-            return Err(FfsError::UnsupportedFeature(format!(
-                "casefold htree directory inode {} rebuild with non-ASCII entries is not yet supported (bd-owt2r: needs byte-exact UTF-8 normalization)",
-                parent.0
-            )));
-        }
 
         let entry_refs: Vec<(u32, u8, &[u8])> = collected
             .iter()
@@ -34003,23 +34121,7 @@ impl OpenFs {
         // it already reads, letting rename skip a second htree descent
         // (bd-cc-rename-probe).
         let mut probe = RenameTargetProbe::NotChecked;
-        // Mirror ext4_add_dir_entry's casefold gate up-front: a non-ASCII name in
-        // a casefold htree directory cannot be placed in the fold-correct dx leaf
-        // (bd-owt2r/bd-vsuni), so the real insert will refuse it. Reject here in
-        // the preflight — this runs BEFORE ext4_rename removes the source entry,
-        // so the rename fails atomically instead of unlinking the source and then
-        // failing the target insert, which would orphan the renamed inode (silent
-        // data loss).
-        if parent_inode.has_htree_index()
-            && parent_inode.flags & ffs_types::EXT4_CASEFOLD_FL != 0
-            && !name.is_ascii()
-        {
-            return Err(FfsError::UnsupportedFeature(
-                "non-ASCII casefold htree directory insert is not yet supported \
-                 (bd-owt2r: needs byte-exact UTF-8 normalization)"
-                    .to_owned(),
-            ));
-        }
+        self.ext4_validate_casefold_dir_name(parent_inode, name)?;
 
         let extents = self.ext4_dir_extents_from_device(cx, dev, parent_inode)?;
         let reserved_tail = self.ext4_dir_reserved_tail();
@@ -34244,6 +34346,7 @@ impl OpenFs {
         let parent_ino_u32 = u32::try_from(parent.0)
             .map_err(|_| FfsError::Format("inode number exceeds ext4 32-bit limit".into()))?;
         let dx_root_phys = Self::ext4_htree_dx_root_phys(&parent_inode, &extents);
+        let casefold = parent_inode.flags & ffs_types::EXT4_CASEFOLD_FL != 0;
 
         if parent_inode.has_htree_index()
             && let Some(sb) = self.ext4_superblock()
@@ -34267,7 +34370,6 @@ impl OpenFs {
                         .map(|buf| buf.as_slice().to_vec())
                 })
             };
-            let casefold = parent_inode.flags & ffs_types::EXT4_CASEFOLD_FL != 0;
             let target_logical = if casefold {
                 ffs_ondisk::htree_target_leaf_block_casefold(
                     &sb.hash_seed,
@@ -34289,8 +34391,22 @@ impl OpenFs {
                 && Some(target_phys) != dx_root_phys
             {
                 let mut data = tx_dev.read_block(cx, target_phys)?.as_slice().to_vec();
-                let removal =
-                    ffs_dir::remove_entry_take_inode_tracked(&mut data, name, reserved_tail)?;
+                let stored_casefold = if casefold {
+                    lookup_in_dir_block_casefold(&data, alloc.geo.block_size, name)
+                        .map_err(|e| parse_to_ffs_error(&e))?
+                        .map(|entry| entry.name)
+                } else {
+                    None
+                };
+                let removal = if casefold {
+                    if let Some(stored) = stored_casefold.as_deref() {
+                        ffs_dir::remove_entry_take_inode_tracked(&mut data, stored, reserved_tail)?
+                    } else {
+                        None
+                    }
+                } else {
+                    ffs_dir::remove_entry_take_inode_tracked(&mut data, name, reserved_tail)?
+                };
                 if let Some((ino, edit)) = removal {
                     self.stamp_ext4_dir_block_after_edit(
                         &mut data,
@@ -34311,8 +34427,26 @@ impl OpenFs {
                         continue;
                     }
                     let mut data = tx_dev.read_block(cx, block)?.as_slice().to_vec();
-                    let removal =
-                        ffs_dir::remove_entry_take_inode_tracked(&mut data, name, reserved_tail)?;
+                    let stored_casefold = if casefold {
+                        lookup_in_dir_block_casefold(&data, alloc.geo.block_size, name)
+                            .map_err(|e| parse_to_ffs_error(&e))?
+                            .map(|entry| entry.name)
+                    } else {
+                        None
+                    };
+                    let removal = if casefold {
+                        if let Some(stored) = stored_casefold.as_deref() {
+                            ffs_dir::remove_entry_take_inode_tracked(
+                                &mut data,
+                                stored,
+                                reserved_tail,
+                            )?
+                        } else {
+                            None
+                        }
+                    } else {
+                        ffs_dir::remove_entry_take_inode_tracked(&mut data, name, reserved_tail)?
+                    };
                     if let Some((ino, edit)) = removal {
                         self.stamp_ext4_dir_block_after_edit(
                             &mut data,
@@ -34753,6 +34887,7 @@ impl OpenFs {
         if !new_parent_inode.is_dir() {
             return Err(FfsError::NotDirectory);
         }
+        self.ext4_validate_casefold_dir_name(&new_parent_inode, new_name)?;
         let htree_dedup_covers = new_parent_inode.has_htree_index()
             && new_parent_inode.flags & ffs_types::EXT4_CASEFOLD_FL == 0
             && Self::htree_create_dedup_enabled();
@@ -40161,7 +40296,7 @@ impl OpenFs {
         alloc: &mut BtrfsAllocState,
         num_bytes: u64,
     ) -> ffs_error::Result<ffs_btrfs::ExtentAllocation> {
-        self.require_btrfs_allocation_space()?;
+        self.require_btrfs_allocation_space_locked(alloc)?;
         match alloc.extent_alloc.alloc_data(num_bytes) {
             Ok(allocation) => Ok(allocation),
             Err(nospace) => {
@@ -40950,7 +41085,7 @@ impl OpenFs {
             // Inline copies need fresh data, unlike reference-only shares. Reject
             // a latched allocation refusal before removing destination mappings.
             if !inline_copies.is_empty() {
-                self.require_btrfs_allocation_space()?;
+                self.require_btrfs_allocation_space_locked(&alloc)?;
             }
 
             // Secure every inline copy before carving the destination. Otherwise
@@ -42318,10 +42453,15 @@ impl OpenFs {
         // (bd-73bi2). After that point every write is accumulating into a
         // transaction that will never land, and accepting it would keep telling
         // the application its data is safe while none of it can ever commit.
-        let commit_refused = self
-            .btrfs_alloc_state
-            .as_ref()
-            .is_some_and(|alloc| alloc.read().commit_refused);
+        let (commit_refused, rsv_exhausted) =
+            self.btrfs_alloc_state
+                .as_ref()
+                .map_or((false, false), |alloc| {
+                    let guard = alloc.read();
+                    let rsv = btrfs_operation_consumes_space(operation)
+                        && self.btrfs_global_metadata_reserve_exhausted_locked(&guard);
+                    (guard.commit_refused, rsv)
+                });
         if !btrfs_mutation_permitted(self.is_writable(), commit_refused) && commit_refused {
             warn!(
                 operation,
@@ -42331,6 +42471,10 @@ impl OpenFs {
             return Err(FfsError::ReadOnly);
         }
         if btrfs_operation_consumes_space(operation) {
+            if rsv_exhausted {
+                self.btrfs_pressure_retry.lock().space_request_refused = true;
+                return Err(FfsError::NoSpace);
+            }
             self.require_btrfs_allocation_space()?;
         }
         Ok(())
@@ -42344,6 +42488,18 @@ impl OpenFs {
         if self.btrfs_commit_out_of_space.load(Ordering::Acquire) {
             // The outer completion guard can retry after real freeing work,
             // even if it is below the ordinary pressure budget or disabled.
+            self.btrfs_pressure_retry.lock().space_request_refused = true;
+            return Err(FfsError::NoSpace);
+        }
+        Ok(())
+    }
+
+    fn require_btrfs_allocation_space_locked(
+        &self,
+        alloc: &BtrfsAllocState,
+    ) -> ffs_error::Result<()> {
+        self.require_btrfs_allocation_space()?;
+        if self.btrfs_global_metadata_reserve_exhausted_locked(alloc) {
             self.btrfs_pressure_retry.lock().space_request_refused = true;
             return Err(FfsError::NoSpace);
         }
@@ -46093,7 +46249,7 @@ impl OpenFs {
             }
 
             let nbytes_after_write = if can_be_inline {
-                self.require_btrfs_allocation_space()?;
+                self.require_btrfs_allocation_space_locked(&alloc)?;
                 // Inline extent: store data directly in the tree item.
                 let existing_inline_len = match &existing_inline {
                     Some(BtrfsExtentData::Inline {
@@ -52095,7 +52251,7 @@ impl OpenFs {
                 let mut data = self.read_block_with_scope(cx, scope, block)?;
                 if ffs_dir::retarget_entry(
                     &mut data,
-                    name_bytes,
+                    &src_entry.name,
                     dst_ino,
                     dst_file_type,
                     reserved_tail,
@@ -52136,7 +52292,7 @@ impl OpenFs {
                 let mut data = self.read_block_with_scope(cx, scope, block)?;
                 if ffs_dir::retarget_entry(
                     &mut data,
-                    new_name_bytes,
+                    &dst_entry.name,
                     src_ino,
                     src_file_type,
                     reserved_tail,
@@ -52163,7 +52319,7 @@ impl OpenFs {
                     let mut data = self.read_block_with_scope(cx, scope, block)?;
                     if ffs_dir::retarget_entry(
                         &mut data,
-                        name_bytes,
+                        &src_entry.name,
                         src_ino,
                         src_file_type,
                         reserved_tail,
@@ -67059,13 +67215,26 @@ mod tests {
         let ops: &dyn FsOps = &fs;
 
         // Warm the parsed-node (metadata) cache so the measured read performs no
-        // extent-tree device reads — only the file-data read remains. File data
-        // is never cached, so it always hits the device.
+        // extent-tree device reads — only the file-data read remains. Verify
+        // first that the warm file-data extent cache (`bd-mf9z9`) serves a
+        // repeat read with zero device ops, then clear ONLY the file-data extent
+        // cache (keeping metadata nodes warm) to isolate cold file-data read
+        // coalescing.
         let warm = ops
             .read(&cx, &mut RequestScope::empty(), InodeNumber(257), 0, 16_384)
             .unwrap();
         assert_eq!(warm, expected, "coalesced read must be byte-identical");
 
+        scalar.store(0, AtomicOrdering::SeqCst);
+        vectored.store(0, AtomicOrdering::SeqCst);
+        let cached = ops
+            .read(&cx, &mut RequestScope::empty(), InodeNumber(257), 0, 16_384)
+            .unwrap();
+        assert_eq!(cached, expected);
+        assert_eq!(scalar.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(vectored.load(AtomicOrdering::SeqCst), 0);
+
+        fs.file_data_extent_cache.clear();
         scalar.store(0, AtomicOrdering::SeqCst);
         vectored.store(0, AtomicOrdering::SeqCst);
 
@@ -75540,34 +75709,30 @@ mod tests {
         );
     }
 
-    /// Corruption-critical gate (bd-owt2r / bd-vsuni): inserting a NON-ASCII name
-    /// into a CASEFOLD htree directory must be REFUSED, never silently inserted.
-    /// FrankenFS's non-ASCII fold diverges from the kernel's NFD-normalized
-    /// casefold, so it cannot compute the fold-correct dx leaf — writing the entry
-    /// anyway would place it in the WRONG leaf, where the kernel's own (correct-
-    /// fold) descent would never find it (silent data loss). This pins the refusal
-    /// on every insertion entry point — create / link / rename, all of which route
-    /// through ext4_add_dir_entry — and that a refused op leaves NO partial entry.
-    /// Previously only the ASCII-create success path was covered. Remove these
-    /// asserts when byte-exact UTF-8 normalization lands (bd-vsuni).
+    /// bd-vsuni.3 (replaces the temporary bd-owt2r non-ASCII refusal gate):
+    /// inserting, linking, renaming, splitting, exchanging, and unlinking
+    /// non-ASCII Unicode 12.1.0 names in a CASEFOLD htree directory places
+    /// entries in the kernel-exact `utf8nfdicf` DX leaf and resolves folded
+    /// variants end-to-end.
     #[test]
-    fn casefold_htree_rejects_non_ascii_insert_bd_owt2r() {
+    #[allow(clippy::too_many_lines)]
+    fn casefold_htree_non_ascii_insert_split_lookup_unlink_bd_vsuni_3() {
         let Some((fs, _tmp)) = open_writable_ext4_mkfs(16) else {
             return; // mkfs.ext4 unavailable
         };
         let cx = Cx::for_testing();
         let root = InodeNumber(2);
-        let (csum_seed, hash_seed, hash_version, block_size) = {
+        let (csum_seed, hash_seed, hash_version, block_size, has_metadata_csum) = {
             let sb = fs.ext4_superblock().expect("sb");
             (
                 sb.csum_seed(),
                 sb.hash_seed,
                 sb.effective_dirhash_version(sb.def_hash_version),
                 usize::try_from(sb.block_size).unwrap(),
+                sb.has_metadata_csum(),
             )
         };
 
-        // Build an htree-indexed directory and mark it casefold.
         let dir = fs
             .mkdir(&cx, root, OsStr::new("casedir"), 0o755, 0, 0)
             .expect("mkdir");
@@ -75588,18 +75753,18 @@ mod tests {
                 )
             })
             .collect();
-        let blocks = ffs_ondisk::build_htree_directory_stamped(
+        let blocks = ffs_ondisk::build_htree_directory_stamped_with_large_dir_casefold(
             dir_ino_u32,
             2,
             &entries,
             block_size,
             hash_version,
             &hash_seed,
-            csum_seed,
-            dir_ino_u32,
-            generation,
+            has_metadata_csum.then_some((csum_seed, generation)),
+            false,
+            true,
         )
-        .expect("build htree");
+        .expect("build casefold htree");
         install_htree_dir(&fs, &cx, dir_ino, &blocks);
         {
             let mut inode = fs.read_inode(&cx, dir_ino).expect("read dir inode");
@@ -75610,86 +75775,129 @@ mod tests {
         assert!(
             fs.read_inode(&cx, dir_ino)
                 .expect("re-read")
-                .has_htree_index(),
-            "the casefold test dir must be htree-indexed for the gate to apply"
+                .has_htree_index()
         );
 
-        // café.txt — the 'é' (U+00E9) makes this non-ASCII.
-        let non_ascii = OsStr::new("café.txt");
-
-        // create: refused, with no partial entry left behind.
-        let create_res = fs.create(&cx, dir_ino, non_ascii, 0o644, 0, 0);
-        assert!(
-            create_res.is_err(),
-            "non-ASCII create in a casefold htree dir must be refused, got {create_res:?}"
-        );
-        assert!(
-            fs.lookup(&cx, dir_ino, non_ascii).is_err(),
-            "a refused non-ASCII create must not leave a partial dir entry (silent corruption)"
+        // 1. create + casefold NFD lookup (precomposed vs decomposed + upper).
+        let cafe = fs
+            .create(&cx, dir_ino, OsStr::new("café.txt"), 0o644, 0, 0)
+            .expect("non-ASCII create in casefold htree dir");
+        assert_eq!(
+            fs.lookup(&cx, dir_ino, OsStr::new("CAFE\u{0301}.TXT"))
+                .expect("decomposed uppercase lookup")
+                .ino,
+            cafe.ino
         );
 
-        // link: same gate.
+        // 2. German sharp-s expansion + Hangul Jamo decomposition.
+        let strasse = fs
+            .create(&cx, dir_ino, OsStr::new("Straße.txt"), 0o644, 0, 0)
+            .expect("create Straße.txt");
+        assert_eq!(
+            fs.lookup(&cx, dir_ino, OsStr::new("STRASSE.TXT"))
+                .expect("lookup STRASSE.TXT")
+                .ino,
+            strasse.ino
+        );
+        let hangul = fs
+            .create(&cx, dir_ino, OsStr::new("한글.txt"), 0o644, 0, 0)
+            .expect("create 한글.txt");
+        assert_eq!(
+            fs.lookup(
+                &cx,
+                dir_ino,
+                OsStr::new("\u{1112}\u{1161}\u{11AB}\u{1100}\u{1173}\u{11AF}.TXT"),
+            )
+            .expect("lookup decomposed Jamo")
+            .ino,
+            hangul.ino
+        );
+
+        // 3. link + cross-parent rename + same-parent rename + RENAME_EXCHANGE + unlink via folded spelling.
         let target = fs
             .create(&cx, root, OsStr::new("linktgt.txt"), 0o644, 0, 0)
             .expect("create link target");
-        let link_res = fs.link(&cx, target.ino, dir_ino, OsStr::new("résumé"));
-        assert!(
-            link_res.is_err(),
-            "non-ASCII link into a casefold htree dir must be refused, got {link_res:?}"
+        fs.link(&cx, target.ino, dir_ino, OsStr::new("résumé"))
+            .expect("non-ASCII link into casefold htree dir");
+        assert_eq!(
+            fs.lookup(&cx, dir_ino, OsStr::new("RE\u{0301}SUME\u{0301}"))
+                .expect("lookup résumé via NFD")
+                .ino,
+            target.ino
         );
 
-        // rename: move an ASCII file in root to a non-ASCII name in the casefold dir.
-        fs.create(&cx, root, OsStr::new("mover.txt"), 0o644, 0, 0)
+        let mover = fs
+            .create(&cx, root, OsStr::new("mover.txt"), 0o644, 0, 0)
             .expect("create mover");
-        let rename_res = fs.rename(
+        fs.rename(
             &cx,
             root,
             OsStr::new("mover.txt"),
             dir_ino,
             OsStr::new("naïve.txt"),
-        );
-        assert!(
-            rename_res.is_err(),
-            "non-ASCII rename into a casefold htree dir must be refused, got {rename_res:?}"
-        );
-        // The source name must survive a refused rename (no half-applied move).
-        assert!(
-            fs.lookup(&cx, root, OsStr::new("mover.txt")).is_ok(),
-            "a refused rename must leave the source entry intact"
-        );
-
-        // SAME-PARENT rename to a non-ASCII name (within the casefold dir itself):
-        // an ASCII file already living in the casefold dir, renamed to a non-ASCII
-        // name in place, must also refuse atomically — the gate lives in the shared
-        // preflight, so it fires regardless of whether the parents differ.
-        fs.create(&cx, dir_ino, OsStr::new("inplace.txt"), 0o644, 0, 0)
-            .expect("create ascii file inside casefold dir");
-        let same_parent_res = fs.rename(
+        )
+        .expect("cross-parent non-ASCII rename");
+        fs.rename(
             &cx,
             dir_ino,
-            OsStr::new("inplace.txt"),
+            OsStr::new("NAI\u{0308}VE.TXT"),
             dir_ino,
             OsStr::new("élan.txt"),
+        )
+        .expect("same-parent non-ASCII rename via folded source");
+        assert_eq!(
+            fs.lookup(&cx, dir_ino, OsStr::new("E\u{0301}LAN.TXT"))
+                .expect("lookup élan.txt")
+                .ino,
+            mover.ino
         );
+
+        fs.rename_exchange(
+            &cx,
+            dir_ino,
+            OsStr::new("STRASSE.TXT"),
+            dir_ino,
+            OsStr::new("E\u{0301}LAN.TXT"),
+        )
+        .expect("RENAME_EXCHANGE via folded spellings");
+        assert_eq!(
+            fs.lookup(&cx, dir_ino, OsStr::new("straße.txt"))
+                .unwrap()
+                .ino,
+            mover.ino
+        );
+        assert_eq!(
+            fs.lookup(&cx, dir_ino, OsStr::new("élan.txt")).unwrap().ino,
+            strasse.ino
+        );
+
+        // Force incremental leaf splits with multi-script Unicode names.
+        let splits_before = fs
+            .htree_leaf_splits
+            .load(std::sync::atomic::Ordering::SeqCst);
+        for i in 0..160_u32 {
+            let name = format!("Ὀδυσσεύς_Straße_한글_{i:04}.txt");
+            fs.create(&cx, dir_ino, OsStr::new(&name), 0o644, 0, 0)
+                .expect("bulk non-ASCII casefold create");
+        }
         assert!(
-            same_parent_res.is_err(),
-            "non-ASCII same-parent rename in a casefold htree dir must be refused, got {same_parent_res:?}"
+            fs.htree_leaf_splits
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > splits_before,
+            "casefold htree leaf split path must fire on multi-script growth"
         );
-        assert!(
-            fs.lookup(&cx, dir_ino, OsStr::new("inplace.txt")).is_ok(),
-            "a refused same-parent rename must leave the source entry intact"
-        );
+
+        // Unlink via folded spelling removes the stored entry cleanly.
+        fs.unlink(&cx, dir_ino, OsStr::new("CAFE\u{0301}.TXT"))
+            .expect("unlink via folded spelling");
+        assert!(fs.lookup(&cx, dir_ino, OsStr::new("café.txt")).is_err());
     }
 
-    /// A non-ASCII create/mkdir into a casefold htree dir is refused by the gate
-    /// INSIDE ext4_add_dir_entry — i.e. AFTER the new inode is already allocated.
-    /// The op must then roll back that allocation (ext4_create/ext4_mkdir call
-    /// delete_inode on the add failure) or it leaks an inode. The existing
-    /// rollback test triggers failure via an invalid name, which fails in
-    /// validate_single_path_component BEFORE any allocation, so it never exercises
-    /// this post-allocation rollback path. This pins it: the free-inode count must
-    /// be identical before and after the refused create AND the refused mkdir
-    /// (16 MiB image == one block group, so the group-0 count is the whole fs).
+    /// Post-allocation refusal inside `ext4_try_insert_existing_htree` (e.g. an
+    /// unreadable `dx_root` with invalid `indirect_levels` on a casefold htree
+    /// dir where `ext4_birth_parent` falls back to linear scan) must roll back
+    /// the newly allocated inode (`delete_inode`), leaving `free_inodes_count`
+    /// unchanged across both `create` and `mkdir`.
     #[test]
     fn casefold_htree_refused_insert_rolls_back_inode_alloc_bd_owt2r() {
         let Some((fs, _tmp)) = open_writable_ext4_mkfs(16) else {
@@ -75697,13 +75905,14 @@ mod tests {
         };
         let cx = Cx::for_testing();
         let root = InodeNumber(2);
-        let (csum_seed, hash_seed, hash_version, block_size) = {
+        let (csum_seed, hash_seed, hash_version, block_size, has_metadata_csum) = {
             let sb = fs.ext4_superblock().expect("sb");
             (
                 sb.csum_seed(),
                 sb.hash_seed,
                 sb.effective_dirhash_version(sb.def_hash_version),
                 usize::try_from(sb.block_size).unwrap(),
+                sb.has_metadata_csum(),
             )
         };
         let dir = fs
@@ -75726,7 +75935,7 @@ mod tests {
                 )
             })
             .collect();
-        let blocks = ffs_ondisk::build_htree_directory_stamped(
+        let mut blocks = ffs_ondisk::build_htree_directory_stamped(
             dir_ino_u32,
             2,
             &entries,
@@ -75738,6 +75947,19 @@ mod tests {
             generation,
         )
         .expect("build htree");
+        // Corrupt dx_root indirect_levels (offset 0x1E) so lookup falls back to
+        // linear scan before alloc, while ext4_try_insert_existing_htree refuses
+        // after create_inode has allocated the new inode.
+        blocks[0][0x1E] = 99;
+        if has_metadata_csum {
+            ffs_ondisk::stamp_dx_block_checksum(
+                &mut blocks[0],
+                csum_seed,
+                dir_ino_u32,
+                generation,
+                ffs_ondisk::DX_ROOT_COUNT_OFFSET,
+            );
+        }
         install_htree_dir(&fs, &cx, dir_ino, &blocks);
         {
             let mut inode = fs.read_inode(&cx, dir_ino).expect("read dir inode");
@@ -75750,10 +75972,8 @@ mod tests {
             .count_free_inodes_in_group(&cx, GroupNumber(0))
             .expect("free inode count");
 
-        // Refused non-ASCII create — the gate fires after create_inode allocated
-        // the inode, so the create must delete_inode to roll it back.
         let create_res = fs.create(&cx, dir_ino, OsStr::new("café.txt"), 0o644, 0, 0);
-        assert!(create_res.is_err(), "non-ASCII create must be refused");
+        assert!(create_res.is_err(), "corrupt-dx_root create must be refused");
         let free_after_create = fs
             .count_free_inodes_in_group(&cx, GroupNumber(0))
             .expect("free inode count");
@@ -75762,10 +75982,8 @@ mod tests {
             "a refused casefold create must roll back (free) its allocated inode, not leak it"
         );
 
-        // Refused non-ASCII mkdir — same post-allocation rollback (a directory
-        // inode also charges used_dirs, which delete_inode must release).
         let mkdir_res = fs.mkdir(&cx, dir_ino, OsStr::new("ÜberDir"), 0o755, 0, 0);
-        assert!(mkdir_res.is_err(), "non-ASCII mkdir must be refused");
+        assert!(mkdir_res.is_err(), "corrupt-dx_root mkdir must be refused");
         let free_after_mkdir = fs
             .count_free_inodes_in_group(&cx, GroupNumber(0))
             .expect("free inode count");
@@ -118542,11 +118760,14 @@ pub(crate) mod scrub;\n";
         {
             let mut alloc = fs.require_btrfs_alloc_state().unwrap().write();
             for bytenr in dummy_reserved {
-                alloc
+                let remaining = alloc
                     .extent_alloc
-                    .free_extent(bytenr, nodesize, true)
+                    .remove_tree_block_backref(
+                        bytenr,
+                        ffs_btrfs::backrefs::TreeBlockBackref::Root(BTRFS_ROOT_TREE_OBJECTID),
+                    )
                     .unwrap();
-                alloc.extent_alloc.pin_freed_extent(bytenr, nodesize);
+                assert_eq!(remaining, 0);
             }
             assert!(
                 alloc

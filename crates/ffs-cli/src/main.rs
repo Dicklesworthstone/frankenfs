@@ -62,6 +62,24 @@ fn configure_dirty_decay() -> libc::ssize_t {
         .unwrap_or(requested)
 }
 
+/// Enable prompt dirty/muzzy arena decay when an operator configures an explicit
+/// `--max-dirty-mib` resident ceiling (`bd-dj725` / `bd-zxn57`), unless the caller
+/// explicitly overrode `FFS_JEMALLOC_DIRTY_DECAY_MS`.
+fn configure_bounded_dirty_decay() {
+    use tikv_jemalloc_ctl::{Access, AsName};
+
+    if std::env::var_os("FFS_JEMALLOC_DIRTY_DECAY_MS").is_some() {
+        return;
+    }
+    let decay_ms: libc::ssize_t = 250;
+    let _ = b"arena.4096.dirty_decay_ms\0".name().write(decay_ms);
+    let _ = b"arenas.dirty_decay_ms\0".name().write(decay_ms);
+    let _ = b"arena.4096.muzzy_decay_ms\0".name().write(decay_ms);
+    let _ = b"arenas.muzzy_decay_ms\0".name().write(decay_ms);
+    let effective = b"arenas.dirty_decay_ms\0".name().read().unwrap_or(decay_ms);
+    DIRTY_DECAY_MS_IN_FORCE.store(effective as i64, Ordering::Release);
+}
+
 mod cmd_dump;
 mod cmd_evidence;
 mod cmd_inspect;
@@ -698,6 +716,8 @@ struct MountCmdOptions {
     btrfs_verify_data_on_read: bool,
     /// Periodic commit interval override (bd-dj725); `None` = per-format default.
     commit_interval_secs: Option<u64>,
+    /// Configured dirty-memory / MVCC resident ceiling in MiB (bd-dj725 / bd-zxn57).
+    max_dirty_mib: Option<u64>,
     /// MVCC conflict policy override (bd-7ssc7); `None` = SafeMerge.
     mvcc_policy: Option<MvccPolicyArg>,
     /// MVCC isolation level override; `None` = Snapshot (unless `mvcc_policy == Some(Ssi)`).
@@ -1539,6 +1559,11 @@ enum Command {
         /// values: 5 for ext4 (`commit=5`), 30 for btrfs. `0` disables.
         #[arg(long = "commit-interval-secs", value_name = "SECS")]
         commit_interval_secs: Option<u64>,
+        /// Maximum dirty/resident MVCC writeback memory in MiB on a read-write
+        /// mount (`bd-dj725`). Bounds resident MVCC block chains, btrfs dirty
+        /// writeback pressure, and jemalloc arena retention.
+        #[arg(long = "max-dirty-mib", value_name = "MIB", value_parser = clap::value_parser!(u64).range(1..))]
+        max_dirty_mib: Option<u64>,
         /// MVCC conflict policy for commits (bd-7ssc7): `strict` aborts on any
         /// same-block conflict, `safe-merge` (default) merges when a valid
         /// merge proof exists, `adaptive` chooses per commit from observed
@@ -3011,6 +3036,7 @@ fn execute_command(
             btrfs_verify_data_on_read,
             btrfs_device_paths,
             commit_interval_secs,
+            max_dirty_mib,
             mvcc_policy,
             mvcc_isolation,
             mvcc_evidence_ledger,
@@ -3064,6 +3090,7 @@ fn execute_command(
                 btrfs_rw_ephemeral_ok,
                 btrfs_verify_data_on_read,
                 commit_interval_secs,
+                max_dirty_mib,
                 mvcc_policy,
                 mvcc_isolation,
                 mvcc_evidence_ledger,
@@ -7838,7 +7865,7 @@ fn mount_with_fuse(
     mountpoint: &Path,
     options: &MountCmdOptions,
     auto_unmount: bool,
-) -> Result<ffs_fuse::MetricsSnapshot> {
+) -> Result<(ffs_fuse::MetricsSnapshot, usize)> {
     let opts = MountOptions {
         read_only: !options.read_write,
         allow_other: options.allow_other,
@@ -7853,6 +7880,7 @@ fn mount_with_fuse(
         dev: options.dev,
         suid: options.suid,
     };
+    let resolved_workers = opts.resolved_thread_count();
 
     // bd-bhh0i mounted cutover. `ext4_create` otherwise takes
     // `ext4_alloc_state.write()` for its whole body, so every FUSE worker thread
@@ -7877,14 +7905,15 @@ fn mount_with_fuse(
     }
 
     let fs_ops: Box<dyn FsOps> = Box::new(open_fs);
-    ffs_fuse::mount_with_commit_interval(
+    let metrics = ffs_fuse::mount_with_commit_interval(
         cx,
         fs_ops,
         mountpoint,
         &opts,
         Some(std::time::Duration::ZERO),
     )
-    .with_context(|| format!("FUSE mount failed at {}", mountpoint.display()))
+    .with_context(|| format!("FUSE mount failed at {}", mountpoint.display()))?;
+    Ok((metrics, resolved_workers))
 }
 
 /// Resolve the operational rollback switch for the validated sharded ext4
@@ -9697,6 +9726,17 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
             format!("failed to open MVCC evidence ledger at {}", path.display())
         })?;
     }
+    // bd-dj725 / bd-zxn57: apply explicit CLI `--max-dirty-mib` ceiling before
+    // env overrides so tests/operators can bound resident MVCC blocks, btrfs
+    // dirty pressure, and jemalloc arena retention from the CLI.
+    if let Some(max_mib) = options.max_dirty_mib {
+        let max_bytes = max_mib.saturating_mul(1024 * 1024);
+        let bs = u64::from(open_fs.block_size().max(512));
+        let cap_blocks = usize::try_from((max_bytes / bs).max(1)).unwrap_or(usize::MAX);
+        open_fs.set_mvcc_resident_block_cap(cap_blocks);
+        open_fs.set_btrfs_dirty_bytes_threshold(max_bytes);
+        configure_bounded_dirty_decay();
+    }
     // bd-dj725: resident MVCC blocks above which a journaled boundary evicts
     // what it made durable (default ffs_core::DEFAULT_MVCC_RESIDENT_BLOCK_CAP).
     if let Ok(raw) = std::env::var("FFS_MVCC_RESIDENT_CAP_BLOCKS") {
@@ -9768,7 +9808,7 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
     let mount_result = (|| -> Result<()> {
         match runtime.mode {
             MountRuntimeMode::Standard => {
-                let metrics = mount_with_fuse(
+                let (metrics, resolved_workers) = mount_with_fuse(
                     &background_cx,
                     Arc::clone(&open_fs),
                     mountpoint,
@@ -9805,7 +9845,7 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
                         // discarded the counters at the source on the exact path the
                         // instrument uses.
                         metrics,
-                        worker_count: 0,
+                        worker_count: resolved_workers,
                         per_core: None,
                     },
                 )?;
@@ -12220,6 +12260,7 @@ mod tests {
             btrfs_rw_ephemeral_ok: false,
             btrfs_verify_data_on_read: false,
             commit_interval_secs: None,
+            max_dirty_mib: None,
             mvcc_policy: None,
             mvcc_isolation: None,
             mvcc_evidence_ledger: None,
@@ -17224,6 +17265,7 @@ mod tests {
                         btrfs_rw_ephemeral_ok: false,
                         btrfs_verify_data_on_read: false,
                         commit_interval_secs: None,
+                        max_dirty_mib: None,
                         mvcc_policy: None,
                         mvcc_isolation: None,
                         mvcc_evidence_ledger: None,
@@ -17312,6 +17354,7 @@ mod tests {
                 btrfs_rw_ephemeral_ok: false,
                 btrfs_verify_data_on_read: false,
                 commit_interval_secs: None,
+                max_dirty_mib: None,
                 mvcc_policy: None,
                 mvcc_isolation: None,
                 mvcc_evidence_ledger: None,
@@ -17360,6 +17403,7 @@ mod tests {
                 btrfs_rw_ephemeral_ok: false,
                 btrfs_verify_data_on_read: false,
                 commit_interval_secs: None,
+                max_dirty_mib: None,
                 mvcc_policy: None,
                 mvcc_isolation: None,
                 mvcc_evidence_ledger: None,
@@ -17460,6 +17504,37 @@ mod tests {
     }
 
     #[test]
+    fn cli_mount_max_dirty_mib_parses_and_rejects_zero_bd_dj725() {
+        let cli = Cli::try_parse_from([
+            "ffs",
+            "mount",
+            "test.img",
+            "/mnt/ffs",
+            "--rw",
+            "--max-dirty-mib",
+            "128",
+        ])
+        .unwrap();
+        let Command::Mount { max_dirty_mib, .. } = cli.command else {
+            panic!("expected mount command");
+        };
+        assert_eq!(max_dirty_mib, Some(128));
+        assert!(
+            Cli::try_parse_from([
+                "ffs",
+                "mount",
+                "test.img",
+                "/mnt/ffs",
+                "--rw",
+                "--max-dirty-mib",
+                "0",
+            ])
+            .is_err(),
+            "--max-dirty-mib 0 must be rejected"
+        );
+    }
+
+    #[test]
     fn parse_btrfs_mount_selection_defaults_to_root() {
         let selection =
             parse_btrfs_mount_selection(None, None).expect("default selection should parse");
@@ -17508,6 +17583,7 @@ mod tests {
             btrfs_rw_ephemeral_ok: false,
             btrfs_verify_data_on_read: false,
             commit_interval_secs: None,
+            max_dirty_mib: None,
             mvcc_policy: None,
             mvcc_isolation: None,
             mvcc_evidence_ledger: None,
@@ -17607,6 +17683,7 @@ mod tests {
             btrfs_rw_ephemeral_ok: false,
             btrfs_verify_data_on_read: verify,
             commit_interval_secs: None,
+            max_dirty_mib: None,
             mvcc_policy: None,
             mvcc_isolation: None,
             mvcc_evidence_ledger: None,
@@ -17655,6 +17732,7 @@ mod tests {
             btrfs_rw_ephemeral_ok: false,
             btrfs_verify_data_on_read: false,
             commit_interval_secs: None,
+            max_dirty_mib: None,
             mvcc_policy: None,
             mvcc_isolation: None,
             mvcc_evidence_ledger: None,
@@ -17698,6 +17776,7 @@ mod tests {
             btrfs_rw_ephemeral_ok: false,
             btrfs_verify_data_on_read: false,
             commit_interval_secs: None,
+            max_dirty_mib: None,
             mvcc_policy: None,
             mvcc_isolation: None,
             mvcc_evidence_ledger: None,
@@ -17745,6 +17824,7 @@ mod tests {
                     btrfs_rw_ephemeral_ok: false,
                     btrfs_verify_data_on_read: false,
                     commit_interval_secs: None,
+                    max_dirty_mib: None,
                     mvcc_policy: None,
                     mvcc_isolation: None,
                     mvcc_evidence_ledger: None,
@@ -17801,6 +17881,7 @@ mod tests {
                     btrfs_rw_ephemeral_ok: false,
                     btrfs_verify_data_on_read: false,
                     commit_interval_secs: None,
+                    max_dirty_mib: None,
                     mvcc_policy: None,
                     mvcc_isolation: None,
                     mvcc_evidence_ledger: None,
@@ -17858,6 +17939,7 @@ mod tests {
                     btrfs_rw_ephemeral_ok: false,
                     btrfs_verify_data_on_read: false,
                     commit_interval_secs: None,
+                    max_dirty_mib: None,
                     mvcc_policy: None,
                     mvcc_isolation: None,
                     mvcc_evidence_ledger: None,
@@ -17932,6 +18014,7 @@ mod tests {
                     btrfs_rw_ephemeral_ok: false,
                     btrfs_verify_data_on_read: false,
                     commit_interval_secs: None,
+                    max_dirty_mib: None,
                     mvcc_policy: None,
                     mvcc_isolation: None,
                     mvcc_evidence_ledger: None,
