@@ -742,9 +742,15 @@ impl<FS: Filesystem> Session<FS> {
         self.run_classic_loop_counted(buf).1
     }
 
-    fn run_per_core_loop(&mut self, buf: &mut [u8]) -> io::Result<()> {
-        while self.dispatch_next_per_core(buf)? {}
-        Ok(())
+    fn run_per_core_loop_counted(&mut self, buf: &mut [u8]) -> (u64, io::Result<()>) {
+        let mut served = 0_u64;
+        loop {
+            match self.dispatch_next_per_core(buf) {
+                Ok(true) => served = served.saturating_add(1),
+                Ok(false) => return (served, Ok(())),
+                Err(error) => return (served, Err(error)),
+            }
+        }
     }
 
     /// Run the session loop that receives kernel requests and dispatches them to method
@@ -878,10 +884,12 @@ impl<FS: Filesystem> Session<FS> {
             ));
         }
         let cpus = per_core_cpus(worker_count)?;
+        let mut init_served = 0_u64;
         while !self.initialized {
             if !self.dispatch_next(buf)? {
                 return Ok(());
             }
+            init_served = init_served.saturating_add(1);
         }
 
         let scheduler = Arc::new(PerCoreScheduler::with_metrics(cpus.clone(), metrics));
@@ -889,7 +897,7 @@ impl<FS: Filesystem> Session<FS> {
         self.dispatch_gate = Some(Arc::new(DispatchGate::new(worker_count)));
         self.dispatch_worker = 0;
         info!("FUSE CPU-keyed dispatch workers: {worker_count}");
-        thread::scope(|scope| {
+        let (per_worker_requests, res) = thread::scope(|scope| {
             let readers = self.ch.stop_readers_on_drop();
             let mut workers = Vec::with_capacity(worker_count - 1);
             for (index, &cpu) in cpus.iter().enumerate().skip(1) {
@@ -898,26 +906,43 @@ impl<FS: Filesystem> Session<FS> {
                     .name(format!("fuse-per-core-{index}"))
                     .spawn_scoped(scope, move || {
                         let _readers = worker.ch.stop_readers_on_drop();
-                        pin_current_worker(cpu)?;
+                        if let Err(error) = pin_current_worker(cpu) {
+                            return (0, Err(error));
+                        }
                         let mut worker_buffer = vec![0; BUFFER_SIZE];
                         let worker_buf = aligned_sub_buf(
                             worker_buffer.deref_mut(),
                             std::mem::align_of::<abi::fuse_in_header>(),
                         );
-                        worker.run_per_core_loop(worker_buf)
+                        worker.run_per_core_loop_counted(worker_buf)
                     });
                 match spawned {
                     Ok(worker) => workers.push(worker),
                     Err(error) => {
                         drop(readers);
-                        return join_dispatch_workers(Err(error), workers);
+                        return join_dispatch_workers(Err(error), init_served, workers);
                     }
                 }
             }
-            let primary = pin_current_worker(cpus[0]).and_then(|()| self.run_per_core_loop(buf));
+            let (primary_loop, primary_res) = match pin_current_worker(cpus[0]) {
+                Ok(()) => self.run_per_core_loop_counted(buf),
+                Err(error) => (0, Err(error)),
+            };
             drop(readers);
-            join_dispatch_workers(primary, workers)
-        })
+            join_dispatch_workers(
+                primary_res,
+                init_served.saturating_add(primary_loop),
+                workers,
+            )
+        });
+        let total_requests: u64 = per_worker_requests.iter().copied().sum();
+        info!(
+            worker_count,
+            ?per_worker_requests,
+            total_requests,
+            "FUSE per-core dispatch worker summary"
+        );
+        res
     }
 
     /// A handle onto the same connection and filesystem for a dispatch worker.
@@ -1325,17 +1350,19 @@ mod dispatch_gate_tests {
                             if index == 0
                                 && let Some(errno) = worker_errno
                             {
-                                return Err(std::io::Error::from_raw_os_error(errno));
+                                return (0_u64, Err(std::io::Error::from_raw_os_error(errno)));
                             }
                             assert!(!(panic_worker && index == 1), "worker panic control");
-                            Ok(())
+                            (u64::try_from(index).unwrap_or(0) + 1, Ok(()))
                         })
                     })
                     .collect();
                 let primary = primary_errno.map_or(Ok(()), |errno| {
                     Err(std::io::Error::from_raw_os_error(errno))
                 });
-                let joined = join_dispatch_workers(primary, workers);
+                let (counts, joined) = join_dispatch_workers(primary, 10, workers);
+                assert_eq!(counts.len(), 4, "counts include primary plus 3 workers");
+                assert_eq!(counts[0], 10);
                 assert_eq!(
                     retired.load(Ordering::Acquire),
                     3,

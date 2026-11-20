@@ -11821,7 +11821,7 @@ impl OpenFs {
         };
         let Some(target_logical) = target_logical else {
             warn!(
-                parent_ino,
+                parent_ino = dentry.parent_ino,
                 "fc_apply: CREAT/LINK skipped — htree index unreadable (refusing to mutate)"
             );
             return Ok(false);
@@ -75828,6 +75828,7 @@ mod tests {
                 hash_version,
                 &hash_seed,
                 false,
+                false,
             )
         }
         .expect("build casefold htree");
@@ -75918,12 +75919,16 @@ mod tests {
             mover.ino
         );
 
-        fs.rename_exchange(
+        let mut scope = RequestScope::empty();
+        <OpenFs as FsOps>::rename2(
+            &fs,
             &cx,
+            &mut scope,
             dir_ino,
             OsStr::new("STRASSE.TXT"),
             dir_ino,
             OsStr::new("E\u{0301}LAN.TXT"),
+            libc::RENAME_EXCHANGE,
         )
         .expect("RENAME_EXCHANGE via folded spellings");
         assert_eq!(
