@@ -153,6 +153,29 @@ impl Pointer {
     }
 }
 
+/// Extract an unclaimed head-owned ZIL tail block pointer and its raw DVAs from
+/// a 192-byte serialized `zil_header_t` (bytes `512..704` of an `ObjectSet`),
+/// returning `None` if the ZIL header has no allocated log block or has a
+/// non-zero `claim_txg`.
+pub(crate) fn parse_unclaimed_head_zil_dvas(
+    raw_zil_header: &[u8],
+    order: Endian,
+    dataset_obj: u64,
+    txg: u64,
+) -> Result<Option<(BlockPointer, Vec<Dva>)>> {
+    if raw_zil_header.len() != 192 {
+        return Err(corrupt("ZIL header must contain 192 bytes"));
+    }
+    let header = Header::parse(raw_zil_header, order, txg)?;
+    if header.claim_txg != 0 {
+        return Ok(None);
+    }
+    let Some(ptr) = Pointer::parse(&raw_zil_header[16..144], order, dataset_obj)? else {
+        return Ok(None);
+    };
+    Ok(Some((ptr.bp, ptr.dvas)))
+}
+
 #[derive(Debug, Serialize)]
 pub struct Header {
     pub claim_txg: u64,

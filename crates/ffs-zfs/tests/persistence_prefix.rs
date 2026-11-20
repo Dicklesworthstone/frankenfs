@@ -6,6 +6,8 @@
 
 #[path = "persistence_prefix/writable_fs.rs"]
 mod writable_fs;
+#[path = "persistence_prefix/zvol.rs"]
+mod zvol;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -98,6 +100,7 @@ struct PoolFixtureSpec {
     active_mmp_uberblock: bool,
     dirty_zil: bool,
     zil_tail: ZilTailFixture,
+    additional_read_features: Vec<(&'static [u8], u64)>,
     additional_write_features: Vec<(&'static [u8], u64)>,
     zpl_flags: BTreeMap<u64, u64>,
     root_ids: (u64, u64),
@@ -129,6 +132,7 @@ impl Default for PoolFixtureSpec {
             active_mmp_uberblock: false,
             dirty_zil: false,
             zil_tail: ZilTailFixture::None,
+            additional_read_features: Vec::new(),
             additional_write_features: Vec::new(),
             zpl_flags: BTreeMap::new(),
             root_ids: (0, 0),
@@ -1904,15 +1908,15 @@ fn build_clean_zfs_pool(spec: &PoolFixtureSpec) -> BuiltPool {
     );
 
     // Objects 10, 11, 12: MOS feature catalogs
-    let rf_raw = mzap(
-        &[
-            (b"org.illumos:lz4_compress", 1),
-            (b"com.delphix:hole_birth", 1),
-            (b"com.delphix:extensible_dataset", 0),
-        ],
-        0x108,
-        order,
-    );
+    let mut rf_entries: Vec<(&[u8], u64)> = vec![
+        (b"org.illumos:lz4_compress", 1),
+        (b"com.delphix:hole_birth", 1),
+        (b"com.delphix:extensible_dataset", 0),
+    ];
+    for &(name, count) in &spec.additional_read_features {
+        rf_entries.push((name, count));
+    }
+    let rf_raw = mzap(&rf_entries, 0x108, order);
     let rf_bp = arena.alloc_block(&rf_raw, 196, 0, INITIAL_TXG, order);
     set_mos(
         &mut mos_tables,

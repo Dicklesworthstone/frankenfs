@@ -16,6 +16,7 @@ import secrets
 import shutil
 import subprocess
 import tempfile
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -216,7 +217,13 @@ def digest(path: Path) -> str:
     return result.hexdigest()
 
 
-def snapshot_identities(report: dict, pool_guid: str, dataset: str, txg: int) -> dict:
+def snapshot_identities(
+    report: dict,
+    pool_guid: str,
+    dataset: str,
+    txg: int,
+    expected_kind: int = 2,
+) -> dict:
     require(report["pool_guid"] == pool_guid and report["dataset"] == dataset and report["txg"] == txg,
             "candidate snapshot inventory belongs to another pool view")
     result = {}
@@ -230,7 +237,7 @@ def snapshot_identities(report: dict, pool_guid: str, dataset: str, txg: int) ->
         require(not any(char in name for char in "/@#\0"), "invalid snapshot component")
         require(guid.isdecimal() and int(guid) > 0 and guid not in guids, "invalid or duplicate snapshot GUID")
         require(row["object"] > 0 and row["object"] not in objects, "duplicate snapshot object")
-        require(row["objectset_kind"] == 2 and 0 < row["root_birth"] <= cut <= txg,
+        require(row["objectset_kind"] == expected_kind and 0 < row["root_birth"] <= cut <= txg,
                 "invalid historical root or snapshot TXG")
         result[name] = (guid, cut)
         guids.add(guid)
@@ -266,6 +273,29 @@ def main() -> None:
 
     if args.self_test:
         root = Path(tempfile.mkdtemp(prefix="ffs-snapshots-selftest-"))
+        zvol_snap_ids = snapshot_identities(
+            {
+                "pool_guid": "42",
+                "dataset": "vm/disk0",
+                "txg": 50,
+                "snapshots": [
+                    {
+                        "name": "s1",
+                        "name_bytes": list(b"s1"),
+                        "guid": "9001",
+                        "object": 77,
+                        "objectset_kind": 3,
+                        "root_birth": 45,
+                        "creation_txg": 48,
+                    }
+                ],
+            },
+            "42",
+            "vm/disk0",
+            50,
+            expected_kind=3,
+        )
+        require(zvol_snap_ids == {"s1": ("9001", 48)}, "self-test failed to accept ZVOL snapshot kind=3")
         synthetic = [(f"snap-{idx}", f"snap-payload-{idx}".encode()) for idx in range(4)]
         lookup = dict(synthetic)
         summary = {
@@ -669,6 +699,142 @@ def main() -> None:
                     require([b["name"] for b in bm_doc["bookmarks"]] == ["native_bm1"],
                             "bookmark did not survive deferred origin snapshot auto-destroy")
                     run_ds_tx("data", "tx-destroy-bookmark", writable_img, "native_bm1")
+
+                    # ZVOL snapshot, overwrite, shrink-resize, clone, read-only snapshot NBD, and clean destroy!
+                    run_ds_tx(
+                        "data",
+                        "tx-zvol-create",
+                        writable_img,
+                        "snap_vol",
+                        "--volsize",
+                        "1M",
+                        "--volblocksize",
+                        "16K",
+                        "--sparse",
+                    )
+                    v_pre = b"ZVOL_SNAP_PRE_512___" * 25 + b"0123456789AB"
+                    v_post = b"ZVOL_HEAD_POST_512__" * 25 + b"ZYXWVUTSRQPO"
+                    v_pre_file = directory / "zvol-pre.bin"
+                    v_post_file = directory / "zvol-post.bin"
+                    v_pre_file.write_bytes(v_pre)
+                    v_post_file.write_bytes(v_post)
+                    run_ds_tx(
+                        "data/snap_vol",
+                        "tx-zvol-write",
+                        writable_img,
+                        "--write-offset",
+                        "512",
+                        "--data-file",
+                        v_pre_file,
+                    )
+                    run_ds_tx("data/snap_vol", "tx-snapshot", writable_img, "vsnap1")
+                    run_ds_tx(
+                        "data/snap_vol",
+                        "tx-zvol-write",
+                        writable_img,
+                        "--write-offset",
+                        "512",
+                        "--data-file",
+                        v_post_file,
+                    )
+                    run_ds_tx("data/snap_vol", "tx-zvol-resize", writable_img, "--volsize", "512K")
+                    run_ds_tx(
+                        "data/snap_vol",
+                        "tx-clone",
+                        writable_img,
+                        "vsnap1",
+                        "data/snap_vol_clone",
+                    )
+                    v_snaps = json.loads(
+                        command(
+                            binary,
+                            "snapshots",
+                            writable_img,
+                            "--offline-image",
+                            "--pool-guid",
+                            tx_pool_guid,
+                            "--label",
+                            "0",
+                            "--slot",
+                            str(cur_slot),
+                            "--dataset",
+                            "data/snap_vol",
+                        )
+                    )
+                    v_snap_ids = snapshot_identities(
+                        v_snaps, tx_pool_guid, "data/snap_vol", cur_txg, expected_kind=3
+                    )
+                    require("vsnap1" in v_snap_ids, "ZVOL snapshot @vsnap1 missing from inventory")
+                    # Strictly read-only NBD export of ZVOL snapshot refuses WRITE and serves pre-resize bytes.
+                    ro_sock = directory / "zvol-snap-ro.sock"
+                    ro_log = directory / "zvol-snap-ro.log"
+                    ro_argv = [
+                        str(binary),
+                        "zvol-serve-nbd",
+                        str(writable_img),
+                        "--offline-image",
+                        "--pool-guid",
+                        tx_pool_guid,
+                        "--label",
+                        "0",
+                        "--slot",
+                        str(cur_slot),
+                        "--dataset",
+                        "data/snap_vol",
+                        "--snapshot",
+                        "vsnap1",
+                        "--listen-unix",
+                        str(ro_sock),
+                    ]
+                    with ro_log.open("wb") as rlog:
+                        rproc = subprocess.Popen(ro_argv, stdout=rlog, stderr=subprocess.STDOUT)
+                        try:
+                            deadline = time.monotonic() + 30
+                            while not ro_sock.exists():
+                                require(rproc.poll() is None, f"RO zvol-serve-nbd exited early; see {ro_log}")
+                                require(time.monotonic() < deadline, f"RO zvol-serve-nbd timed out; see {ro_log}")
+                                time.sleep(0.05)
+                            command(
+                                binary,
+                                "zvol-nbd-client",
+                                "--connect-unix",
+                                ro_sock,
+                                "--export",
+                                "data/snap_vol@vsnap1",
+                                "write",
+                                "--offset",
+                                "512",
+                                "--data-file",
+                                v_post_file,
+                                fails=True,
+                            )
+                            require(
+                                command(
+                                    binary,
+                                    "zvol-nbd-client",
+                                    "--connect-unix",
+                                    ro_sock,
+                                    "--export",
+                                    "data/snap_vol@vsnap1",
+                                    "read",
+                                    "--offset",
+                                    "512",
+                                    "--bytes",
+                                    "512",
+                                )
+                                == v_pre,
+                                "RO snapshot NBD readback diverged from pre-overwrite ZVOL bytes",
+                            )
+                            rproc.send_signal(2)
+                            require(rproc.wait(timeout=30) == 0, f"RO zvol-serve-nbd non-zero exit; see {ro_log}")
+                        finally:
+                            if rproc.poll() is None:
+                                rproc.terminate()
+                                rproc.wait(timeout=10)
+                    # Destroy clone, snapshot, and volume so zdb -bccm verifies zero leaked deadlist/ZVOL blocks!
+                    run_ds_tx("data/snap_vol_clone", "tx-zvol-destroy", writable_img)
+                    run_ds_tx("data/snap_vol", "tx-destroy-snapshot", writable_img, "vsnap1")
+                    run_ds_tx("data/snap_vol", "tx-zvol-destroy", writable_img)
 
                 command("zdb", "-lu", writable_img)
                 bccm_text = command("zdb", "-e", "-p", writable_dir, "-bccm", tx_pool).decode("utf-8", errors="replace")

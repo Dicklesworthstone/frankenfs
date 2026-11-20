@@ -486,6 +486,44 @@ impl PoolSpaceAllocator {
         }
         Ok(delta)
     }
+
+    /// Free explicit non-regular DVAs (e.g. an unclaimed head-owned ZIL tail
+    /// block whose checksum algorithm is `ZILOG`/`ZILOG2`).
+    pub fn free_raw_dvas(
+        &mut self,
+        dvas: &[ffs_ondisk::zfs::Dva],
+        birth_txg: u64,
+        new_txg: u64,
+    ) -> Result<()> {
+        let ms_size = 1_u64 << self.metaslab_shift;
+        for dva in dvas {
+            if dva.vdev != 0 || dva.gang {
+                return Err(unsupported("cannot free foreign-vdev or gang DVA"));
+            }
+            let ms_id = usize::try_from(dva.offset / ms_size)
+                .map_err(|_| corrupt("DVA metaslab index overflow"))?;
+            let ms = self
+                .metaslabs
+                .get_mut(ms_id)
+                .ok_or_else(|| corrupt("DVA falls outside metaslab table"))?;
+            let range = dva.offset..(dva.offset + dva.allocated_bytes);
+            if birth_txg == new_txg {
+                ms.allocatable_map
+                    .apply(MapType::Free, range.clone())
+                    .map_err(|e| parse_err(&e))?;
+                ms.final_map
+                    .apply(MapType::Free, range.clone())
+                    .map_err(|e| parse_err(&e))?;
+                remove_range_from_list(&mut ms.txg_allocs, &range);
+            } else {
+                ms.final_map
+                    .apply(MapType::Free, range.clone())
+                    .map_err(|e| parse_err(&e))?;
+                push_coalesced_range(&mut ms.txg_frees, range);
+            }
+        }
+        Ok(())
+    }
 }
 
 fn push_coalesced_range(list: &mut Vec<Range<u64>>, range: Range<u64>) {
@@ -952,6 +990,32 @@ pub(super) fn cow_update_dnode(
                 .entry(parent_idx)
                 .or_default()
                 .push((slot, child_bp));
+        }
+        // On a block-aligned shrink (`spec.max_block < old_node.max_block()`),
+        // `dirty_leaves` can be empty while an existing indirect block straddling
+        // `spec.max_block` still retains non-zero child pointers past `spec.max_block`.
+        // Seed that boundary indirect block so it gets COWed, truncated, and retired
+        // (collapsing to a hole if all surviving slots are holes).
+        if let Some((old_node, old_ceiling)) = spec.existing
+            && spec.max_block < old_node.max_block()
+            && parent_level < old_levels
+        {
+            let parent_span = u128::from(fanout).pow(u32::from(parent_level));
+            let boundary_parent_idx =
+                u64::try_from(u128::from(spec.max_block) / parent_span).unwrap_or(u64::MAX);
+            if !grouped.contains_key(&boundary_parent_idx)
+                && lookup_existing_bp_at_level(
+                    cx,
+                    view,
+                    old_node,
+                    old_ceiling,
+                    parent_level,
+                    boundary_parent_idx,
+                )?
+                .is_some()
+            {
+                grouped.entry(boundary_parent_idx).or_default();
+            }
         }
         let mut next_updates = BTreeMap::new();
         if let Some(seed) = promoted_seed.remove(&parent_level) {

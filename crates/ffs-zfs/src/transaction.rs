@@ -10,6 +10,7 @@
 mod dmu_cow;
 mod dsl_ops;
 mod zpl_ops;
+mod zvol_ops;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -44,6 +45,10 @@ pub use self::zpl_ops::{
     ZfsDataChecksum, ZfsPosixSetAttr, ZfsSetAttr, ZfsUnlinkedObject, ZfsXattrSetMode,
 };
 use self::zpl_ops::{ZplMutation, stage_zpl_mutation};
+pub use self::zvol_ops::{
+    DEFAULT_VOLBLOCKSIZE, MAX_VOLBLOCKSIZE, MAX_ZVOL_IO_BYTES, ZVOL_LOGICAL_SECTOR_BYTES,
+    ZfsCommitReceipt, ZfsZvolCreateOptions, ZfsZvolInfo,
+};
 
 type FaultHook = Box<dyn FnMut(&ZfsPersistenceEvent) -> Result<()> + Send + Sync>;
 
@@ -1647,6 +1652,301 @@ impl ZfsTransactionEngine {
         )
     }
 
+    /// Create a fresh native ZFS volume (`DMU_OST_ZVOL = 3`) under `parent_dataset`.
+    pub fn zvol_create(
+        &mut self,
+        cx: &Cx,
+        parent_dataset: &[Vec<u8>],
+        name: &[u8],
+        opts: &ZfsZvolCreateOptions,
+    ) -> ZfsTxOutcome<ZfsZvolInfo> {
+        let empty_bpobj_id = self.empty_bpobj_id;
+        let order = self.order;
+        self.execute_staged_txg_typed(
+            cx,
+            "zvol_create",
+            |mos, mos_dirty_dnodes, draft_features, draft_alloc, new_txg, base_staged| {
+                zvol_ops::stage_create_zvol(
+                    cx,
+                    mos,
+                    parent_dataset,
+                    name,
+                    opts,
+                    mos_dirty_dnodes,
+                    draft_features,
+                    empty_bpobj_id,
+                    draft_alloc,
+                    order,
+                    new_txg,
+                    base_staged,
+                )
+            },
+        )
+    }
+
+    /// Destroy a native ZFS volume (`DMU_OST_ZVOL = 3`), reclaiming volume blocks,
+    /// head-owned unclaimed ZIL tail blocks, and MOS objects.
+    pub fn zvol_destroy(&mut self, cx: &Cx, dataset: &[Vec<u8>]) -> ZfsTxOutcome<u64> {
+        let empty_bpobj_id = self.empty_bpobj_id;
+        let order = self.order;
+        self.execute_staged_txg(
+            cx,
+            "zvol_destroy",
+            |mos, mos_dirty_dnodes, draft_features, draft_alloc, new_txg, base_staged| {
+                zvol_ops::stage_destroy_zvol(
+                    cx,
+                    mos,
+                    dataset,
+                    mos_dirty_dnodes,
+                    draft_features,
+                    empty_bpobj_id,
+                    draft_alloc,
+                    order,
+                    new_txg,
+                    base_staged,
+                )
+            },
+        )
+    }
+
+    /// Resize a native ZFS volume (`volsize`), retiring truncated tail leaf and indirect
+    /// blocks on shrink and updating Object 2 (`ZVOL_ZAP_OBJ`) `"size"` atomically in one TXG.
+    pub fn zvol_resize(
+        &mut self,
+        cx: &Cx,
+        dataset: &[Vec<u8>],
+        new_volsize: u64,
+    ) -> ZfsTxOutcome<u64> {
+        let empty_bpobj_id = self.empty_bpobj_id;
+        let order = self.order;
+        self.execute_staged_txg(
+            cx,
+            "zvol_resize",
+            |mos, mos_dirty_dnodes, draft_features, draft_alloc, new_txg, base_staged| {
+                zvol_ops::stage_resize_zvol(
+                    cx,
+                    mos,
+                    dataset,
+                    new_volsize,
+                    mos_dirty_dnodes,
+                    draft_features,
+                    empty_bpobj_id,
+                    draft_alloc,
+                    order,
+                    new_txg,
+                    base_staged,
+                )
+            },
+        )
+    }
+
+    /// Create an atomic snapshot on a native ZFS volume (`DMU_OST_ZVOL = 3`).
+    pub fn zvol_snapshot(
+        &mut self,
+        cx: &Cx,
+        dataset: &[Vec<u8>],
+        snap_name: &[u8],
+        timestamp: Timestamp,
+    ) -> ZfsTxOutcome<u64> {
+        let empty_bpobj_id = self.empty_bpobj_id;
+        let order = self.order;
+        self.execute_staged_txg(
+            cx,
+            "zvol_snapshot",
+            |mos, mos_dirty_dnodes, draft_features, draft_alloc, new_txg, base_staged| {
+                zvol_ops::stage_snapshot_zvol(
+                    cx,
+                    mos,
+                    dataset,
+                    snap_name,
+                    timestamp,
+                    mos_dirty_dnodes,
+                    draft_features,
+                    empty_bpobj_id,
+                    draft_alloc,
+                    order,
+                    new_txg,
+                    base_staged,
+                )
+            },
+        )
+    }
+
+    /// Inspect geometry, dataset identity, and effective readonly state of a ZVOL head or snapshot.
+    pub fn zvol_info(
+        &self,
+        cx: &Cx,
+        dataset: &[Vec<u8>],
+        snapshot: Option<&[u8]>,
+    ) -> Result<ZfsZvolInfo> {
+        let mut mos = self.open_read_objects(cx)?;
+        zvol_ops::inspect_zvol_info(cx, &mut mos, dataset, snapshot)
+    }
+
+    /// Sector-aligned (`512` B), bounded (`<= 16 MiB`) read from a ZVOL head or snapshot.
+    /// Preserves `out` untouched on error and zero-fills sparse holes and unallocated tails.
+    pub fn zvol_read_at(
+        &self,
+        cx: &Cx,
+        dataset: &[Vec<u8>],
+        snapshot: Option<&[u8]>,
+        offset: u64,
+        out: &mut [u8],
+    ) -> Result<()> {
+        let mut mos = self.open_read_objects(cx)?;
+        zvol_ops::read_zvol_at(cx, &mut mos, dataset, snapshot, offset, out)
+    }
+
+    /// Sector-aligned (`512` B), bounded (`<= 16 MiB`) COW write to a native ZVOL head.
+    /// Performs sub-`volblocksize` read-modify-write COW and publishes one durable 4-label TXG.
+    pub fn zvol_write_at(
+        &mut self,
+        cx: &Cx,
+        dataset: &[Vec<u8>],
+        offset: u64,
+        data: &[u8],
+        checksum: ZfsDataChecksum,
+    ) -> ZfsTxOutcome<ZfsCommitReceipt> {
+        let empty_bpobj_id = self.empty_bpobj_id;
+        let order = self.order;
+        let outcome = self.execute_staged_txg(
+            cx,
+            "zvol_write_at",
+            |mos, mos_dirty_dnodes, draft_features, draft_alloc, new_txg, base_staged| {
+                zvol_ops::stage_zvol_write_at(
+                    cx,
+                    mos,
+                    dataset,
+                    offset,
+                    data,
+                    checksum,
+                    mos_dirty_dnodes,
+                    draft_features,
+                    empty_bpobj_id,
+                    draft_alloc,
+                    order,
+                    new_txg,
+                    base_staged,
+                )
+            },
+        );
+        self.map_receipt_outcome(outcome)
+    }
+
+    /// Sector-aligned (`512` B) discard/TRIM on a native ZVOL head.
+    /// Full `volblocksize`-aligned allocated blocks punch native holes; partial sub-block spans
+    /// zero covered bytes on allocated blocks without allocating existing holes.
+    pub fn zvol_discard(
+        &mut self,
+        cx: &Cx,
+        dataset: &[Vec<u8>],
+        offset: u64,
+        len: u64,
+        checksum: ZfsDataChecksum,
+    ) -> ZfsTxOutcome<ZfsCommitReceipt> {
+        let empty_bpobj_id = self.empty_bpobj_id;
+        let order = self.order;
+        let outcome = self.execute_staged_txg(
+            cx,
+            "zvol_discard",
+            |mos, mos_dirty_dnodes, draft_features, draft_alloc, new_txg, base_staged| {
+                zvol_ops::stage_zvol_discard(
+                    cx,
+                    mos,
+                    dataset,
+                    offset,
+                    len,
+                    checksum,
+                    mos_dirty_dnodes,
+                    draft_features,
+                    empty_bpobj_id,
+                    draft_alloc,
+                    order,
+                    new_txg,
+                    base_staged,
+                )
+            },
+        );
+        self.map_receipt_outcome(outcome)
+    }
+
+    /// Commit a coalesced set of full `volblocksize` writes (`Some(block)`) and native hole
+    /// punches (`None`) atomically in a single durable 4-label TXG.
+    pub fn zvol_batch_apply(
+        &mut self,
+        cx: &Cx,
+        dataset: &[Vec<u8>],
+        dirty_blocks: &BTreeMap<u64, Option<Vec<u8>>>,
+        checksum: ZfsDataChecksum,
+    ) -> ZfsTxOutcome<ZfsCommitReceipt> {
+        let empty_bpobj_id = self.empty_bpobj_id;
+        let order = self.order;
+        let outcome = self.execute_staged_txg(
+            cx,
+            "zvol_batch_apply",
+            |mos, mos_dirty_dnodes, draft_features, draft_alloc, new_txg, base_staged| {
+                zvol_ops::stage_zvol_batch_apply(
+                    cx,
+                    mos,
+                    dataset,
+                    dirty_blocks,
+                    checksum,
+                    mos_dirty_dnodes,
+                    draft_features,
+                    empty_bpobj_id,
+                    draft_alloc,
+                    order,
+                    new_txg,
+                    base_staged,
+                )
+            },
+        );
+        self.map_receipt_outcome(outcome)
+    }
+
+    /// Issue a member-wide device durability barrier and return a [`ZfsCommitReceipt`]
+    /// pinned to the currently committed TXG (`tx_published = false`).
+    pub fn zvol_flush(&self, cx: &Cx) -> Result<ZfsCommitReceipt> {
+        self.sync_devices(cx)?;
+        Ok(ZfsCommitReceipt {
+            storage: self.storage_identity.clone(),
+            committed_txg: self.committed_txg,
+            published_slot: self.committed_slot,
+            generation: self.generation,
+            token: None,
+            tx_published: false,
+        })
+    }
+
+    fn map_receipt_outcome(&self, outcome: ZfsTxOutcome<u64>) -> ZfsTxOutcome<ZfsCommitReceipt> {
+        match outcome {
+            ZfsTxOutcome::Committed { token, .. } => {
+                let receipt = ZfsCommitReceipt {
+                    storage: self.storage_identity.clone(),
+                    committed_txg: token.committed_txg(),
+                    published_slot: token.published_slot(),
+                    generation: token.generation(),
+                    token: Some(token.clone()),
+                    tx_published: true,
+                };
+                ZfsTxOutcome::Committed {
+                    value: receipt,
+                    token,
+                }
+            }
+            ZfsTxOutcome::NotCommitted(err) => ZfsTxOutcome::NotCommitted(err),
+            ZfsTxOutcome::Uncertain {
+                reason,
+                target_txg,
+                target_slot,
+            } => ZfsTxOutcome::Uncertain {
+                reason,
+                target_txg,
+                target_slot,
+            },
+        }
+    }
+
     fn emit_event(
         &mut self,
         operation: &str,
@@ -1726,7 +2026,6 @@ impl ZfsTransactionEngine {
         )
     }
 
-    #[allow(clippy::too_many_lines)]
     fn execute_staged_txg(
         &mut self,
         cx: &Cx,
@@ -1740,6 +2039,30 @@ impl ZfsTransactionEngine {
             &mut Vec<StagedBlockWrite>,
         ) -> Result<u64>,
     ) -> ZfsTxOutcome<u64> {
+        self.execute_staged_txg_typed(
+            cx,
+            op_name,
+            |mos, mos_dirty, features, alloc, new_txg, staged| {
+                let val = stage_fn(mos, mos_dirty, features, alloc, new_txg, staged)?;
+                Ok((val, val))
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn execute_staged_txg_typed<T>(
+        &mut self,
+        cx: &Cx,
+        op_name: &str,
+        stage_fn: impl FnOnce(
+            &mut Objects,
+            &mut BTreeMap<u64, Vec<u8>>,
+            &mut MosFeatureState,
+            &mut PoolSpaceAllocator,
+            u64,
+            &mut Vec<StagedBlockWrite>,
+        ) -> Result<(T, u64)>,
+    ) -> ZfsTxOutcome<T> {
         if self.poisoned_uncertain {
             return ZfsTxOutcome::NotCommitted(unsupported(
                 "ZFS writer handle experienced an Uncertain Uberblock outcome; reopen fresh engine to reconcile",
@@ -1763,7 +2086,7 @@ impl ZfsTransactionEngine {
         let mut mos_dirty_dnodes = BTreeMap::new();
         let mut base_staged = Vec::new();
 
-        let result_val = match stage_fn(
+        let (result_typed, result_val) = match stage_fn(
             &mut mos,
             &mut mos_dirty_dnodes,
             &mut draft_features,
@@ -2037,7 +2360,7 @@ impl ZfsTransactionEngine {
         );
         let _ = self.emit_event(op_name, ZfsPersistenceStage::AckPublished, new_txg, 0, 0, 0);
         ZfsTxOutcome::Committed {
-            value: result_val,
+            value: result_typed,
             token,
         }
     }

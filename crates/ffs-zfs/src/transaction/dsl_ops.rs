@@ -33,11 +33,11 @@ use super::dmu_cow::{
 };
 use super::{checkpoint, corrupt, parse_err, unsupported};
 
-const DMU_OT_DSL_DIR: u8 = 12;
-const DMU_OT_DSL_DIR_CHILD_MAP: u8 = 13;
-const DMU_OT_DSL_DS_SNAP_MAP: u8 = 14;
-const DMU_OT_DSL_PROPS: u8 = 15;
-const DMU_OT_DSL_DATASET: u8 = 16;
+pub(super) const DMU_OT_DSL_DIR: u8 = 12;
+pub(super) const DMU_OT_DSL_DIR_CHILD_MAP: u8 = 13;
+pub(super) const DMU_OT_DSL_DS_SNAP_MAP: u8 = 14;
+pub(super) const DMU_OT_DSL_PROPS: u8 = 15;
+pub(super) const DMU_OT_DSL_DATASET: u8 = 16;
 const DMU_OT_MASTER_NODE: u8 = 21;
 const DMU_OT_UNLINKED_SET: u8 = 22;
 const DMU_OT_NEXT_CLONES: u8 = 37;
@@ -48,11 +48,11 @@ const DMU_OT_SA_ATTR_REGISTRATION: u8 = 46;
 const DMU_OT_SA_ATTR_LAYOUTS: u8 = 47;
 const DMU_OT_DSL_CLONES: u8 = 52;
 const DMU_OT_BPOBJ_SUBOBJ: u8 = 53;
-const DMU_OTN_ZAP_METADATA: u8 = 196;
+pub(super) const DMU_OTN_ZAP_METADATA: u8 = 196;
 
-const DS_FLAG_UNIQUE_ACCURATE: u64 = 0x4;
+pub(super) const DS_FLAG_UNIQUE_ACCURATE: u64 = 0x4;
 const DS_FLAG_DEFER_DESTROY: u64 = 0x8;
-const DD_FLAG_USED_BREAKDOWN: u64 = 0x1;
+pub(super) const DD_FLAG_USED_BREAKDOWN: u64 = 0x1;
 
 const ZFS_ACL_TRIVIAL: u64 = 0x4;
 const ZFS_NO_EXECS_DENIED: u64 = 0x100;
@@ -178,7 +178,7 @@ fn reject_busy(detail: impl Into<String>) -> FfsError {
     }
 }
 
-fn reject_einval(detail: impl Into<String>) -> FfsError {
+pub(super) fn reject_einval(detail: impl Into<String>) -> FfsError {
     FfsError::RequestRejected {
         errno: libc::EINVAL,
         detail: detail.into(),
@@ -192,7 +192,7 @@ pub(super) fn reject_edquot(detail: impl Into<String>) -> FfsError {
     }
 }
 
-fn validate_dsl_component(name: &[u8], ascii_only: bool) -> Result<()> {
+pub(super) fn validate_dsl_component(name: &[u8], ascii_only: bool) -> Result<()> {
     if name.is_empty()
         || name.len() > 255
         || matches!(name, b"." | b"..")
@@ -216,7 +216,7 @@ fn validate_hold_tag(tag: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn derive_unique_guid(pool_guid: u64, new_txg: u64, obj_id: u64, salt: u64) -> u64 {
+pub(super) fn derive_unique_guid(pool_guid: u64, new_txg: u64, obj_id: u64, salt: u64) -> u64 {
     let mut h = blake3::Hasher::new();
     h.update(b"ffs.zfs.dsl.guid.v1:");
     h.update(&pool_guid.to_le_bytes());
@@ -228,7 +228,7 @@ fn derive_unique_guid(pool_guid: u64, new_txg: u64, obj_id: u64, salt: u64) -> u
     if v == 0 { 1 } else { v }
 }
 
-fn derive_fsid_guid(guid: u64) -> u64 {
+pub(super) fn derive_fsid_guid(guid: u64) -> u64 {
     let masked = guid & 0x00FF_FFFF_FFFF_FFFF;
     if masked == 0 { 1 } else { masked }
 }
@@ -435,7 +435,10 @@ pub(super) fn enforce_pool_reservations_for_growth(
     Ok(())
 }
 
-fn effective_local_numeric_prop(rows: &[RawZapEntry], name: &str) -> Result<Option<u64>> {
+pub(super) fn effective_local_numeric_prop(
+    rows: &[RawZapEntry],
+    name: &str,
+) -> Result<Option<u64>> {
     if let Some(v) = zap_optional_u64(rows, name.as_bytes())? {
         return Ok(Some(v));
     }
@@ -448,7 +451,7 @@ fn effective_local_numeric_prop(rows: &[RawZapEntry], name: &str) -> Result<Opti
 }
 
 #[allow(clippy::too_many_arguments)]
-fn write_zap_dnode_in_mos(
+pub(super) fn write_zap_dnode_in_mos(
     cx: &Cx,
     mos: &mut Objects,
     mos_meta: &Dnode,
@@ -949,7 +952,7 @@ fn free_deadlist_containers(
 /// Allocate and populate a fresh `DMU_OT_DEADLIST (50)` (with sorted `mintxg` keys and
 /// `bps` grouped by greatest `mintxg < bp.birth()`), returning the new MOS object ID.
 #[allow(clippy::too_many_arguments)]
-fn allocate_fresh_deadlist(
+pub(super) fn allocate_fresh_deadlist(
     cx: &Cx,
     mos: &mut Objects,
     mos_meta: &Dnode,
@@ -1427,7 +1430,7 @@ fn walk_meta_bp_above_txg(
 
 /// Propagate signed `(dsize, comp, uncomp)` + breakdown deltas up `dsl_dir` and its ancestors.
 #[allow(clippy::too_many_arguments)]
-fn propagate_dsl_dir_space_delta(
+pub(super) fn propagate_dsl_dir_space_delta(
     cx: &Cx,
     mos: &mut Objects,
     mos_meta: &Dnode,
@@ -1564,7 +1567,7 @@ fn propagate_dsl_dir_space_delta(
 }
 
 /// Resolve a committed dataset path (`components`) to `(directory_object, head_object, pool_guid)`.
-fn resolve_dataset_ids(
+pub(super) fn resolve_dataset_ids(
     cx: &Cx,
     mos: &mut Objects,
     components: &[Vec<u8>],
@@ -1575,6 +1578,26 @@ fn resolve_dataset_ids(
         .find(|d| d.components == components)
         .ok_or_else(|| FfsError::NotFound("ZFS dataset".into()))?;
     Ok((row.directory_object, row.head_object, mos.pool_guid()))
+}
+
+/// Verify that `parent_dataset` is an initialized ZPL filesystem (`objectset_kind == Some(2)`),
+/// rejecting volumes (`OBJSET_TYPE_ZVOL = 3`) and inconsistent datasets with `EINVAL`.
+pub(super) fn require_filesystem_parent(
+    cx: &Cx,
+    mos: &mut Objects,
+    parent_dataset: &[Vec<u8>],
+) -> Result<()> {
+    let row = mos
+        .datasets(cx)?
+        .into_iter()
+        .find(|d| d.components == parent_dataset)
+        .ok_or_else(|| FfsError::NotFound("ZFS parent dataset".into()))?;
+    if row.objectset_kind != Some(2) || row.flags & 0x1_0000 != 0 {
+        return Err(reject_einval(
+            "ZFS parent dataset must be an initialized filesystem (cannot nest under a volume)",
+        ));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -1818,7 +1841,7 @@ pub(super) fn stage_dsl_mutation(
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn stage_create_snapshot(
+pub(super) fn stage_create_snapshot(
     cx: &Cx,
     mos: &mut Objects,
     dataset: &[Vec<u8>],
@@ -1927,33 +1950,68 @@ fn stage_create_snapshot(
         .copy_from_slice(&order.encode((head_flags & 0x1_0006) | DS_FLAG_UNIQUE_ACCURATE));
     snap_bonus[128..256].copy_from_slice(&head_dn.bonus()[128..256]); // identical ObjectSet BP!
 
-    let snap_dn = Dnode::from_spec(DnodeSpec {
-        object_type: DMU_OT_DSL_DATASET,
-        bonus_type: DMU_OT_DSL_DATASET,
-        checksum_type: 0,
-        compress_type: 0,
-        flags: DNODE_FLAG_USED_BYTES,
-        order,
-        levels: 1,
-        indirect_shift: 17,
-        data_bytes: 512,
-        max_block: 0,
-        used_bytes: 0,
-        slots: 1,
-        pointers: vec![BlockPointer::hole_pointer()],
-        bonus: snap_bonus,
-        spill: None,
-    })
-    .map_err(|e| parse_err(&e))?;
-    put_dnode_in_table(
-        cx,
-        mos,
-        &mos_meta,
-        mos_ceiling,
-        mos_dirty_dnodes,
-        snap_ds_obj,
-        &snap_dn,
-    )?;
+    let head_has_large_blocks = head_dn.object_type() == DMU_OTN_ZAP_METADATA
+        && mos
+            .zap_values(cx, head_obj)
+            .ok()
+            .is_some_and(|rows| rows.iter().any(|e| e.name == b"org.open-zfs:large_blocks"));
+    if head_has_large_blocks {
+        features.increment_read("com.delphix:extensible_dataset", new_txg)?;
+        features.increment_read("org.open-zfs:large_blocks", new_txg)?;
+        let lb_entries = [RawZapEntry {
+            name: b"org.open-zfs:large_blocks".to_vec(),
+            integer_bytes: 8,
+            values: vec![0],
+            collision: 0,
+        }];
+        write_zap_dnode_in_mos(
+            cx,
+            mos,
+            &mos_meta,
+            mos_ceiling,
+            mos_dirty_dnodes,
+            alloc,
+            snap_ds_obj,
+            None,
+            DMU_OTN_ZAP_METADATA,
+            DMU_OT_DSL_DATASET,
+            snap_bonus,
+            &lb_entries,
+            0,
+            false,
+            order,
+            new_txg,
+            staged_writes,
+        )?;
+    } else {
+        let snap_dn = Dnode::from_spec(DnodeSpec {
+            object_type: DMU_OT_DSL_DATASET,
+            bonus_type: DMU_OT_DSL_DATASET,
+            checksum_type: 0,
+            compress_type: 0,
+            flags: DNODE_FLAG_USED_BYTES,
+            order,
+            levels: 1,
+            indirect_shift: 17,
+            data_bytes: 512,
+            max_block: 0,
+            used_bytes: 0,
+            slots: 1,
+            pointers: vec![BlockPointer::hole_pointer()],
+            bonus: snap_bonus,
+            spill: None,
+        })
+        .map_err(|e| parse_err(&e))?;
+        put_dnode_in_table(
+            cx,
+            mos,
+            &mos_meta,
+            mos_ceiling,
+            mos_dirty_dnodes,
+            snap_ds_obj,
+            &snap_dn,
+        )?;
+    }
 
     // 2. Relink predecessor snapshot (`ds_next_snap_obj` or clone branch in `ds_next_clones_obj`).
     if old_prev_snap_obj != 0 {
@@ -2136,7 +2194,7 @@ fn stage_create_snapshot(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn bump_filesystem_limits_counter_if_present(
+pub(super) fn bump_filesystem_limits_counter_if_present(
     cx: &Cx,
     mos: &mut Objects,
     mos_meta: &Dnode,
@@ -2653,12 +2711,26 @@ fn stage_destroy_snapshot_by_id(
             new_txg,
         )?;
     }
-    if snap_dn.object_type() == DMU_OTN_ZAP_METADATA
-        && features
+    if snap_dn.object_type() == DMU_OTN_ZAP_METADATA {
+        if let Ok(snap_entries) = mos.zap_values(cx, snap_ds_obj)
+            && snap_entries
+                .iter()
+                .any(|e| e.name == b"org.open-zfs:large_blocks")
+            && features
+                .read_features
+                .get("org.open-zfs:large_blocks")
+                .copied()
+                .unwrap_or(0)
+                > 0
+        {
+            features.decrement_read("org.open-zfs:large_blocks")?;
+        }
+        if features
             .read_features
             .contains_key("com.delphix:extensible_dataset")
-    {
-        features.decrement_read("com.delphix:extensible_dataset")?;
+        {
+            features.decrement_read("com.delphix:extensible_dataset")?;
+        }
     }
     free_mos_object_completely(
         cx,
@@ -3803,7 +3875,7 @@ fn build_fresh_zpl_objectset(
 
 /// Resolve OpenZFS `dp->dp_origin_snap` (`$ORIGIN@$ORIGIN`) as `(origin_dd_obj, origin_head_obj, origin_snap_obj)`
 /// if the pool contains the special `$ORIGIN` directory under MOS Object 1 `"root_dataset"`.
-fn lookup_pool_origin_snapshot(
+pub(super) fn lookup_pool_origin_snapshot(
     cx: &Cx,
     mos: &mut Objects,
     mos_meta: &Dnode,
@@ -3872,7 +3944,7 @@ fn lookup_pool_origin_snapshot(
 /// Write a newly created `dsl_dir` (`DMU_OT_DSL_DIR`), automatically zapifying with
 /// `filesystem_count = 0` and `snapshot_count = 0` when `com.joyent:filesystem_limits` is active.
 #[allow(clippy::too_many_arguments)]
-fn put_new_dsl_dir_in_mos(
+pub(super) fn put_new_dsl_dir_in_mos(
     cx: &Cx,
     mos: &mut Objects,
     mos_meta: &Dnode,
@@ -3962,7 +4034,7 @@ fn put_new_dsl_dir_in_mos(
 /// (`ds_num_children += 1`, `ds_next_clones_obj` with `DMU_OT_NEXT_CLONES`, and `origin_dd.dd_clones`
 /// with `DMU_OT_DSL_CLONES`, matching OpenZFS `dsl_dataset_create_sync_dd`).
 #[allow(clippy::too_many_arguments)]
-fn link_dataset_to_origin_snapshot(
+pub(super) fn link_dataset_to_origin_snapshot(
     cx: &Cx,
     mos: &mut Objects,
     mos_meta: &Dnode,
@@ -4124,6 +4196,7 @@ fn stage_create_dataset(
     staged_writes: &mut Vec<StagedBlockWrite>,
 ) -> Result<u64> {
     validate_dsl_component(child_name, false)?;
+    require_filesystem_parent(cx, mos, parent_dataset)?;
     let (parent_dd_obj, parent_head_obj, pool_guid) = resolve_dataset_ids(cx, mos, parent_dataset)?;
     let mos_meta = mos.meta_dnode().clone();
     let mos_ceiling = mos.root_birth_txg();
@@ -4417,6 +4490,7 @@ fn stage_create_dataset(
         new_head_obj,
         new_props_zap,
         None,
+        false,
         &prop_updates,
         mos_dirty_dnodes,
         features,
@@ -4449,6 +4523,12 @@ fn stage_create_clone(
 ) -> Result<u64> {
     validate_dsl_component(origin_snap, true)?;
     validate_dsl_component(target_name, false)?;
+    require_filesystem_parent(cx, mos, target_parent)?;
+    let origin_is_zvol = mos
+        .datasets(cx)?
+        .into_iter()
+        .find(|d| d.components == origin_dataset)
+        .is_some_and(|d| d.objectset_kind == Some(3));
     let (origin_dd_obj, origin_head_obj, pool_guid) = resolve_dataset_ids(cx, mos, origin_dataset)?;
     let (target_parent_dd, _, _) = resolve_dataset_ids(cx, mos, target_parent)?;
     let mos_meta = mos.meta_dnode().clone();
@@ -4606,33 +4686,68 @@ fn stage_create_clone(
         .copy_from_slice(&order.encode((o_snap_flags & 0x1_0006) | DS_FLAG_UNIQUE_ACCURATE));
     head_bonus[128..256].copy_from_slice(&o_snap_dn.bonus()[128..256]); // zero-copy ObjectSet BP!
 
-    let clone_head_dn = Dnode::from_spec(DnodeSpec {
-        object_type: DMU_OT_DSL_DATASET,
-        bonus_type: DMU_OT_DSL_DATASET,
-        checksum_type: 0,
-        compress_type: 0,
-        flags: DNODE_FLAG_USED_BYTES,
-        order,
-        levels: 1,
-        indirect_shift: 17,
-        data_bytes: 512,
-        max_block: 0,
-        used_bytes: 0,
-        slots: 1,
-        pointers: vec![BlockPointer::hole_pointer()],
-        bonus: head_bonus,
-        spill: None,
-    })
-    .map_err(|e| parse_err(&e))?;
-    put_dnode_in_table(
-        cx,
-        mos,
-        &mos_meta,
-        mos_ceiling,
-        mos_dirty_dnodes,
-        clone_head_obj,
-        &clone_head_dn,
-    )?;
+    let o_snap_has_large_blocks = o_snap_dn.object_type() == DMU_OTN_ZAP_METADATA
+        && mos
+            .zap_values(cx, origin_snap_obj)
+            .ok()
+            .is_some_and(|rows| rows.iter().any(|e| e.name == b"org.open-zfs:large_blocks"));
+    if o_snap_has_large_blocks {
+        features.increment_read("com.delphix:extensible_dataset", new_txg)?;
+        features.increment_read("org.open-zfs:large_blocks", new_txg)?;
+        let lb_entries = [RawZapEntry {
+            name: b"org.open-zfs:large_blocks".to_vec(),
+            integer_bytes: 8,
+            values: vec![0],
+            collision: 0,
+        }];
+        write_zap_dnode_in_mos(
+            cx,
+            mos,
+            &mos_meta,
+            mos_ceiling,
+            mos_dirty_dnodes,
+            alloc,
+            clone_head_obj,
+            None,
+            DMU_OTN_ZAP_METADATA,
+            DMU_OT_DSL_DATASET,
+            head_bonus,
+            &lb_entries,
+            0,
+            false,
+            order,
+            new_txg,
+            staged_writes,
+        )?;
+    } else {
+        let clone_head_dn = Dnode::from_spec(DnodeSpec {
+            object_type: DMU_OT_DSL_DATASET,
+            bonus_type: DMU_OT_DSL_DATASET,
+            checksum_type: 0,
+            compress_type: 0,
+            flags: DNODE_FLAG_USED_BYTES,
+            order,
+            levels: 1,
+            indirect_shift: 17,
+            data_bytes: 512,
+            max_block: 0,
+            used_bytes: 0,
+            slots: 1,
+            pointers: vec![BlockPointer::hole_pointer()],
+            bonus: head_bonus,
+            spill: None,
+        })
+        .map_err(|e| parse_err(&e))?;
+        put_dnode_in_table(
+            cx,
+            mos,
+            &mos_meta,
+            mos_ceiling,
+            mos_dirty_dnodes,
+            clone_head_obj,
+            &clone_head_dn,
+        )?;
+    }
 
     let mut dd_bonus = vec![0_u8; 256];
     dd_bonus[0..8].copy_from_slice(&order.encode(timestamp.seconds.cast_unsigned()));
@@ -4726,6 +4841,7 @@ fn stage_create_clone(
         clone_head_obj,
         clone_props_zap,
         None,
+        origin_is_zvol,
         &prop_updates,
         mos_dirty_dnodes,
         features,
@@ -4756,6 +4872,7 @@ fn stage_rename_dataset(
     let old_leaf = old_dataset.last().expect("nonempty");
     let new_leaf = new_dataset.last().expect("nonempty");
     validate_dsl_component(new_leaf, false)?;
+    require_filesystem_parent(cx, mos, &new_dataset[..new_dataset.len() - 1])?;
 
     let (target_dd_obj, target_head_obj, _) = resolve_dataset_ids(cx, mos, old_dataset)?;
     let (old_parent_dd, _, _) =
@@ -5077,7 +5194,7 @@ fn stage_rename_dataset(
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn stage_destroy_dataset(
+pub(super) fn stage_destroy_dataset(
     cx: &Cx,
     mos: &mut Objects,
     dataset: &[Vec<u8>],
@@ -5143,10 +5260,33 @@ fn stage_destroy_dataset(
         return Err(reject_busy("ZFS dataset has snapshots"));
     }
 
-    // 1. Free ONLY blocks in `head.ds_bp` born strictly after `origin_txg`!
+    // 1. Free ONLY blocks in `head.ds_bp` born strictly after `origin_txg`, plus any
+    // unclaimed head-owned ZIL tail block (`zh_log`) not inherited from an origin/snapshot!
     let origin_txg = if origin_obj == 0 { 0 } else { prev_snap_txg };
     let head_bp =
         BlockPointer::parse(&head_dn.bonus()[128..256], order).map_err(|e| parse_err(&e))?;
+    if !head_bp.hole()
+        && let Some((os_raw, os_order, _)) = mos.checked_raw(
+            cx,
+            &head_bp,
+            DMU_OT_OBJSET,
+            0,
+            head_bp.logical_bytes(),
+            head_ceil,
+        )?
+    {
+        let os = ObjectSet::parse(&os_raw, os_order).map_err(|e| parse_err(&e))?;
+        if let Some((zil_bp, zil_dvas)) = crate::reader::dmu::zil::parse_unclaimed_head_zil_dvas(
+            &os_raw[512..704],
+            os_order,
+            head_obj,
+            mos.root_birth_txg(),
+        )? && !mos.is_inherited_snapshot_zil(cx, &head_dn, &head_bp, &os_raw, os_order, &os)?
+            && zil_bp.birth() > origin_txg
+        {
+            alloc.free_raw_dvas(&zil_dvas, zil_bp.birth(), new_txg)?;
+        }
+    }
     let (_, had_projectused) = walk_objectset_above_txg(
         cx,
         mos,
@@ -5185,6 +5325,7 @@ fn stage_destroy_dataset(
     )?;
 
     // 3. Free any extensible dataset ZAP objects (`com.delphix:bookmarks`) on `head_dn`.
+    let mut decremented_large_blocks = false;
     if head_dn.object_type() == DMU_OTN_ZAP_METADATA {
         let head_entries = mos.zap_values(cx, head_obj)?;
         if let Some(bm_obj) =
@@ -5203,6 +5344,19 @@ fn stage_destroy_dataset(
                 new_txg,
             )?;
         }
+        if head_entries
+            .iter()
+            .any(|e| e.name == b"org.open-zfs:large_blocks")
+            && features
+                .read_features
+                .get("org.open-zfs:large_blocks")
+                .copied()
+                .unwrap_or(0)
+                > 0
+        {
+            features.decrement_read("org.open-zfs:large_blocks")?;
+            decremented_large_blocks = true;
+        }
         if features
             .read_features
             .contains_key("com.delphix:extensible_dataset")
@@ -5212,7 +5366,8 @@ fn stage_destroy_dataset(
     }
 
     // Decrement `org.open-zfs:large_blocks` if this dataset had `recordsize > 131_072`.
-    if props_zap != 0
+    if !decremented_large_blocks
+        && props_zap != 0
         && let Ok(rows) = mos.zap_values(cx, props_zap)
         && effective_local_numeric_prop(&rows, "recordsize")?.unwrap_or(131_072) > 131_072
         && features
@@ -5539,6 +5694,11 @@ fn stage_set_property(
     )?;
     let props_zap = order.u64(dd_dn.bonus(), 80).map_err(|e| parse_err(&e))?;
     let (pz_dn, pz_ceil) = mos.object_with_ceiling(cx, props_zap)?;
+    let is_zvol = mos
+        .datasets(cx)?
+        .into_iter()
+        .find(|d| d.head_object == head_obj)
+        .is_some_and(|d| d.objectset_kind == Some(3));
     let updates = [(name, value)];
     apply_properties_batch_on_ids(
         cx,
@@ -5547,6 +5707,7 @@ fn stage_set_property(
         head_obj,
         props_zap,
         Some((&pz_dn, pz_ceil)),
+        is_zvol,
         &updates,
         mos_dirty_dnodes,
         features,
@@ -5559,13 +5720,14 @@ fn stage_set_property(
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn apply_properties_batch_on_ids(
+pub(super) fn apply_properties_batch_on_ids(
     cx: &Cx,
     mos: &mut Objects,
     dd_obj: u64,
     head_obj: u64,
     props_zap: u64,
     existing_pz: Option<(&Dnode, u64)>,
+    is_zvol: bool,
     updates: &[(&str, Option<&ZfsPropertySetValue>)],
     mos_dirty_dnodes: &mut BTreeMap<u64, Vec<u8>>,
     features: &mut MosFeatureState,
@@ -5627,6 +5789,31 @@ fn apply_properties_batch_on_ids(
         let old_recordsize = effective_local_numeric_prop(&rows, "recordsize")?.unwrap_or(131_072);
 
         let is_user_prop = name.contains(':');
+        if is_zvol
+            && !is_user_prop
+            && matches!(
+                name,
+                "quota"
+                    | "refquota"
+                    | "recordsize"
+                    | "atime"
+                    | "relatime"
+                    | "devices"
+                    | "exec"
+                    | "setuid"
+                    | "volblocksize"
+            )
+        {
+            return Err(reject_einval(format!(
+                "ZFS property {name} is not mutable on a volume dataset"
+            )));
+        }
+        if !is_zvol && !is_user_prop && matches!(name, "snapdev" | "volthreading" | "volblocksize")
+        {
+            return Err(reject_einval(format!(
+                "ZFS volume property {name} is not valid on a filesystem dataset"
+            )));
+        }
         let mut next_dd_quota = old_dd_quota;
         let mut next_dd_reserved = old_dd_reserved;
         let mut refrsrv_delta = 0_i128;
@@ -5743,11 +5930,19 @@ fn apply_properties_batch_on_ids(
                         }
                         refrsrv_delta = i128::from(new_charge) - i128::from(old_charge);
                     }
-                    "readonly" | "atime" | "relatime" | "devices" | "exec" | "setuid" => {
+                    "readonly" | "atime" | "relatime" | "devices" | "exec" | "setuid"
+                    | "snapdev" | "logbias" | "volthreading" => {
                         if num > 1 {
                             return Err(reject_einval(format!(
                                 "boolean ZFS property {name} must be 0 or 1"
                             )));
+                        }
+                    }
+                    "sync" => {
+                        if num > 2 {
+                            return Err(reject_einval(
+                                "ZFS sync property must be 0 (standard), 1 (always), or 2 (disabled)",
+                            ));
                         }
                     }
                     "recordsize" => {

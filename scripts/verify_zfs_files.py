@@ -630,6 +630,216 @@ def main() -> None:
                     cur_slot = int(pf_sel["slot"])
                     cur_txg = int(pf_sel["txg"])
 
+                    # Live native ZVOL + fixed-newstyle NBD block frontend round-trip!
+                    zvol_create_out = run_tx(
+                        "tx-zvol-create",
+                        writable_img,
+                        "nbd_vol",
+                        "--volsize",
+                        "2M",
+                        "--volblocksize",
+                        "16K",
+                        "--sparse",
+                    )
+                    require(
+                        zvol_create_out["zvol"]["volsize"] == 2 * 1024 * 1024
+                        and zvol_create_out["zvol"]["volblocksize"] == 16 * 1024,
+                        "native ZVOL creation geometry mismatch",
+                    )
+                    nbd_sock = directory / "zvol-rw.sock"
+                    nbd_audit = directory / "zvol-rw-audit.json"
+                    nbd_log = directory / "zvol-rw-nbd.log"
+                    nbd_argv = [
+                        str(binary),
+                        "zvol-serve-nbd",
+                        str(writable_img),
+                        "--offline-image",
+                        "--allow-write",
+                        "--pool-guid",
+                        tx_pool_guid,
+                        "--label",
+                        "0",
+                        "--slot",
+                        str(cur_slot),
+                        "--dataset",
+                        "data/nbd_vol",
+                        "--listen-unix",
+                        str(nbd_sock),
+                        "--audit-json",
+                        str(nbd_audit),
+                    ]
+                    nbd_sector = b"NBD_ZVOL_SECTOR_512_" * 25 + b"0123456789AB"
+                    require(len(nbd_sector) == 512, "sector fixture must be 512B")
+                    nbd_fua_payload = (bytes(range(239)) * 90)[: 20 * 1024]
+                    nbd_sector_file = directory / "nbd-sector.bin"
+                    nbd_sector_file.write_bytes(nbd_sector)
+                    nbd_fua_file = directory / "nbd-fua.bin"
+                    nbd_fua_file.write_bytes(nbd_fua_payload)
+                    with nbd_log.open("wb") as nlog:
+                        nproc = subprocess.Popen(nbd_argv, stdout=nlog, stderr=subprocess.STDOUT)
+                        try:
+                            deadline = time.monotonic() + 30
+                            while not nbd_sock.exists():
+                                require(nproc.poll() is None, f"zvol-serve-nbd exited early; see {nbd_log}")
+                                require(time.monotonic() < deadline, f"zvol-serve-nbd timed out; see {nbd_log}")
+                                time.sleep(0.05)
+                            exports = json.loads(
+                                command(
+                                    binary,
+                                    "zvol-nbd-client",
+                                    "--connect-unix",
+                                    nbd_sock,
+                                    "list",
+                                )
+                            )
+                            require(exports["exports"] == ["data/nbd_vol"], "NBD export list mismatch")
+                            info_doc = json.loads(
+                                command(
+                                    binary,
+                                    "zvol-nbd-client",
+                                    "--connect-unix",
+                                    nbd_sock,
+                                    "--export",
+                                    "data/nbd_vol",
+                                    "info",
+                                )
+                            )
+                            require(
+                                info_doc["info"]["size_bytes"] == 2 * 1024 * 1024
+                                and info_doc["info"]["preferred_block_bytes"] == 16 * 1024,
+                                "NBD_OPT_GO geometry mismatch",
+                            )
+                            # Wrong export name and unaligned offset must fail closed!
+                            command(
+                                binary,
+                                "zvol-nbd-client",
+                                "--connect-unix",
+                                nbd_sock,
+                                "--export",
+                                "data/wrong",
+                                "info",
+                                fails=True,
+                            )
+                            command(
+                                binary,
+                                "zvol-nbd-client",
+                                "--connect-unix",
+                                nbd_sock,
+                                "--export",
+                                "data/nbd_vol",
+                                "write",
+                                "--offset",
+                                "13",
+                                "--data-file",
+                                nbd_sector_file,
+                                fails=True,
+                            )
+                            command(
+                                binary,
+                                "zvol-nbd-client",
+                                "--connect-unix",
+                                nbd_sock,
+                                "--export",
+                                "data/nbd_vol",
+                                "write",
+                                "--offset",
+                                "512",
+                                "--data-file",
+                                nbd_sector_file,
+                            )
+                            command(
+                                binary,
+                                "zvol-nbd-client",
+                                "--connect-unix",
+                                nbd_sock,
+                                "--export",
+                                "data/nbd_vol",
+                                "write",
+                                "--offset",
+                                str(16 * 1024),
+                                "--data-file",
+                                nbd_fua_file,
+                                "--fua",
+                            )
+                            command(
+                                binary,
+                                "zvol-nbd-client",
+                                "--connect-unix",
+                                nbd_sock,
+                                "--export",
+                                "data/nbd_vol",
+                                "discard",
+                                "--offset",
+                                str(16 * 1024),
+                                "--bytes",
+                                str(16 * 1024),
+                            )
+                            command(
+                                binary,
+                                "zvol-nbd-client",
+                                "--connect-unix",
+                                nbd_sock,
+                                "--export",
+                                "data/nbd_vol",
+                                "flush",
+                            )
+                            require(
+                                command(
+                                    binary,
+                                    "zvol-nbd-client",
+                                    "--connect-unix",
+                                    nbd_sock,
+                                    "--export",
+                                    "data/nbd_vol",
+                                    "read",
+                                    "--offset",
+                                    "512",
+                                    "--bytes",
+                                    "512",
+                                )
+                                == nbd_sector,
+                                "NBD sub-volblocksize RMW readback mismatch",
+                            )
+                            require(
+                                command(
+                                    binary,
+                                    "zvol-nbd-client",
+                                    "--connect-unix",
+                                    nbd_sock,
+                                    "--export",
+                                    "data/nbd_vol",
+                                    "read",
+                                    "--offset",
+                                    str(16 * 1024),
+                                    "--bytes",
+                                    str(20 * 1024),
+                                )
+                                == b"\x00" * (16 * 1024) + nbd_fua_payload[16 * 1024 :],
+                                "NBD TRIM hole-punch + surviving tail readback mismatch",
+                            )
+                            nproc.send_signal(2)  # SIGINT for clean cancel-aware shutdown + audit write
+                            require(nproc.wait(timeout=30) == 0, f"zvol-serve-nbd non-zero exit; see {nbd_log}")
+                        finally:
+                            if nproc.poll() is None:
+                                nproc.terminate()
+                                nproc.wait(timeout=10)
+                    audit_rows = json.loads(nbd_audit.read_text())
+                    require(
+                        any(
+                            row["cmd"] == "WRITE"
+                            and row["ack_kind"] == "durable_txg"
+                            and row["token"] is not None
+                            for row in audit_rows
+                        ),
+                        "NBD audit log missing durable TXG token for WRITE",
+                    )
+                    post_nbd_inv = json.loads(command(binary, "inspect", writable_img, "--offline-image"))
+                    pn_lbl = next(row for row in post_nbd_inv["labels"] if row["label"] == 0)
+                    pn_sel = max(pn_lbl["candidates"], key=lambda row: (row["txg"], row["timestamp"]))
+                    require(int(pn_sel["txg"]) > cur_txg, "zvol-serve-nbd did not advance Uberblock TXG")
+                    cur_slot = int(pn_sel["slot"])
+                    cur_txg = int(pn_sel["txg"])
+
                 command("zdb", "-lu", writable_img)
                 bccm_text = command("zdb", "-e", "-p", writable_dir, "-bccm", tx_pool).decode("utf-8", errors="replace")
                 require("No leaks (block sum matches space maps exactly)" in bccm_text,
@@ -677,6 +887,35 @@ def main() -> None:
                             "kernel zfs.ko disagreed on FUSE mount-write SA xattr")
                     require(not (tx_mount / "native_tx" / "open_unlinked.bin").exists(),
                             "kernel zfs.ko saw reaped open-unlinked file")
+                    vol_props = command(
+                        "zfs",
+                        "get",
+                        "-Hp",
+                        "-o",
+                        "property,value",
+                        "volsize,volblocksize",
+                        tx_pool + "/data/nbd_vol",
+                    ).decode()
+                    vol_kv = dict(row.split("\t") for row in vol_props.splitlines())
+                    require(
+                        int(vol_kv["volsize"]) == 2 * 1024 * 1024
+                        and int(vol_kv["volblocksize"]) == 16 * 1024,
+                        "kernel zfs.ko disagreed on native-created ZVOL geometry",
+                    )
+                    zvol_dev = Path("/dev/zvol") / tx_pool / "data" / "nbd_vol"
+                    if zvol_dev.exists():
+                        with zvol_dev.open("r+b", buffering=0) as vdev:
+                            vdev.seek(512)
+                            require(
+                                vdev.read(512) == nbd_sector,
+                                "kernel /dev/zvol disagreed on NBD-written 512B sector",
+                            )
+                            vdev.seek(16 * 1024)
+                            require(
+                                vdev.read(20 * 1024)
+                                == b"\x00" * (16 * 1024) + nbd_fua_payload[16 * 1024 :],
+                                "kernel /dev/zvol disagreed on NBD TRIM + FUA tail",
+                            )
                 require(k_moved.read_bytes() == payload and k_moved.stat().st_nlink == 3,
                         "kernel zfs.ko moved hard-link content or st_nlink disagreed")
                 require((tx_mount / long_name).read_bytes() == payload

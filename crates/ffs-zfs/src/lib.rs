@@ -31,14 +31,22 @@ macro_rules! companion_bin_tests {
 pub mod filesystem;
 pub mod reader;
 pub mod transaction;
+pub mod zvol_nbd;
 
 pub use filesystem::{ZfsFs, ZfsMountWriteOptions};
 pub use reader::dmu::Objects;
 pub use reader::dmu::zpl::Zpl;
+pub use reader::dmu::zvol::{VolumeInfo, Zvol};
 pub use reader::{Label, Leaf, Pool, RootBlock};
 pub use transaction::{
-    ZfsAdmissionReport, ZfsBookmarkInfo, ZfsDataChecksum, ZfsDurableToken, ZfsHoldInfo,
-    ZfsPersistenceEvent, ZfsPersistenceStage, ZfsPosixSetAttr, ZfsPropertySetValue, ZfsSetAttr,
-    ZfsStorageIdentity, ZfsTopologyKind, ZfsTransactionEngine, ZfsTxOutcome, ZfsUnlinkedObject,
-    ZfsWriteOptions, ZfsXattrSetMode, list_bookmarks_in_mos, list_holds_in_mos,
+    DEFAULT_VOLBLOCKSIZE, MAX_VOLBLOCKSIZE, MAX_ZVOL_IO_BYTES, ZVOL_LOGICAL_SECTOR_BYTES,
+    ZfsAdmissionReport, ZfsBookmarkInfo, ZfsCommitReceipt, ZfsDataChecksum, ZfsDurableToken,
+    ZfsHoldInfo, ZfsPersistenceEvent, ZfsPersistenceStage, ZfsPosixSetAttr, ZfsPropertySetValue,
+    ZfsSetAttr, ZfsStorageIdentity, ZfsTopologyKind, ZfsTransactionEngine, ZfsTxOutcome,
+    ZfsUnlinkedObject, ZfsWriteOptions, ZfsXattrSetMode, ZfsZvolCreateOptions, ZfsZvolInfo,
+    list_bookmarks_in_mos, list_holds_in_mos,
+};
+pub use zvol_nbd::{
+    NbdExportInfo, NbdServerConfig, ZfsVolumeManager, ZfsZvolNbdClient, ZfsZvolNbdServer,
+    ZfsZvolSession, ZvolAckKind, ZvolSyncPolicy, ZvolTransportAuditEntry,
 };

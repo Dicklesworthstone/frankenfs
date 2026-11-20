@@ -208,10 +208,15 @@ def make_tree_world_readable(root: Path) -> None:
                 target.chmod(0o644)
 
 
-def head_identities(report: dict, pool: str) -> dict[str, str]:
+def head_identities(
+    report: dict,
+    pool: str,
+    expected_volumes: set[str] | None = None,
+) -> dict[str, str]:
     """Do not let duplicate candidate rows disappear in a dict comprehension."""
     result = {}
     seen_origin = False
+    volumes = expected_volumes or set()
     for row in report["datasets"]:
         relative = row["relative_name"]
         require(isinstance(relative, str), "native fixture name was not losslessly represented")
@@ -227,7 +232,11 @@ def head_identities(report: dict, pool: str) -> dict[str, str]:
             continue
         name = pool + ("/" + relative if relative else "")
         require(name not in result, "candidate returned duplicate dataset names")
-        require(row["objectset_kind"] == 2, "native filesystem was reported as another object-set kind")
+        expected_kind = 3 if name in volumes else 2
+        require(
+            row["objectset_kind"] == expected_kind,
+            f"native dataset {name} reported object-set kind {row['objectset_kind']} != {expected_kind}",
+        )
         result[name] = str(row["guid"])
     return result
 
@@ -329,6 +338,33 @@ def main() -> None:
         except RuntimeError:
             bad_origin_rejected = True
         require(bad_origin_rejected, "self-test accepted non-$ORIGIN uninitialized DSL head")
+        vol_identities = head_identities(
+            {
+                "datasets": [
+                    {"relative_name": "", "guid": "101", "objectset_kind": 2, "root_birth": 4},
+                    {"relative_name": "vm/disk0", "guid": "105", "objectset_kind": 3, "root_birth": 11},
+                ]
+            },
+            "pool0",
+            expected_volumes={"pool0/vm/disk0"},
+        )
+        require(
+            vol_identities == {"pool0": "101", "pool0/vm/disk0": "105"},
+            "self-test failed to admit expected ZVOL objectset_kind=3",
+        )
+        unexpected_vol_rejected = False
+        try:
+            head_identities(
+                {
+                    "datasets": [
+                        {"relative_name": "vm/disk0", "guid": "105", "objectset_kind": 3, "root_birth": 11},
+                    ]
+                },
+                "pool0",
+            )
+        except RuntimeError:
+            unexpected_vol_rejected = True
+        require(unexpected_vol_rejected, "self-test accepted unexpected ZVOL when filesystem expected")
         synthetic = [(f"item-{idx}", f"payload-{idx}".encode()) for idx in range(4)]
         lookup = dict(synthetic)
         summary = {
@@ -585,6 +621,59 @@ def main() -> None:
                 adv_root_tx("tx-rename-dataset", writable_img, "data/tx_renamed", "--dataset", "data/tx_child")
                 adv_root_tx("tx-create-dataset", writable_img, "ephemeral", "--dataset", "data")
                 adv_root_tx("tx-destroy-dataset", writable_img, "--dataset", "data/ephemeral")
+                adv_root_tx(
+                    "tx-zvol-create",
+                    writable_img,
+                    "tx_vol",
+                    "--dataset",
+                    "data",
+                    "--volsize",
+                    "1M",
+                    "--volblocksize",
+                    "16K",
+                    "--sparse",
+                    "--prop",
+                    "snapdev=visible",
+                    "--prop",
+                    "org:role=blk",
+                )
+                adv_root_tx("tx-zvol-resize", writable_img, "--dataset", "data/tx_vol", "--volsize", "2M")
+                adv_root_tx("tx-zvol-resize", writable_img, "--dataset", "data/tx_vol", "--volsize", "512K")
+                adv_root_tx(
+                    "tx-zvol-create",
+                    writable_img,
+                    "ephemeral_vol",
+                    "--dataset",
+                    "data",
+                    "--volsize",
+                    "256K",
+                    "--volblocksize",
+                    "8K",
+                    "--sparse",
+                )
+                adv_root_tx("tx-zvol-destroy", writable_img, "--dataset", "data/ephemeral_vol")
+
+                zvol_info = json.loads(
+                    command(
+                        binary,
+                        "zvol-info",
+                        writable_img,
+                        "--offline-image",
+                        "--label",
+                        "0",
+                        "--slot",
+                        str(cur_slot),
+                        "--pool-guid",
+                        tx_guid,
+                        "--dataset",
+                        "data/tx_vol",
+                    )
+                )
+                require(
+                    zvol_info["volume"]["size_bytes"] == 512 * 1024
+                    and zvol_info["volume"]["block_bytes"] == 16 * 1024,
+                    "post-resize ZVOL geometry mismatch in zvol-info",
+                )
 
                 prop_report = json.loads(command(binary, "properties", writable_img, "quota,org:stage",
                                                  "--offline-image", "--label", "0", "--slot", str(cur_slot),
@@ -603,10 +692,17 @@ def main() -> None:
                                                     "--label", "0", "--slot", str(cur_slot), "--pool-guid", tx_guid))
                 renamed_row = next((r for r in post_dsl_heads["datasets"] if r["relative_name"] == "data/tx_renamed"), None)
                 require(renamed_row is not None, "renamed child dataset missing from inventory")
-                require(all(r["relative_name"] not in ("data/tx_child", "data/ephemeral")
+                tx_vol_row = next((r for r in post_dsl_heads["datasets"] if r["relative_name"] == "data/tx_vol"), None)
+                require(
+                    tx_vol_row is not None and tx_vol_row["objectset_kind"] == 3,
+                    "native ZVOL missing or wrong objectset_kind in DSL inventory",
+                )
+                require(all(r["relative_name"] not in ("data/tx_child", "data/ephemeral", "data/ephemeral_vol")
                             for r in post_dsl_heads["datasets"]),
                         "old renamed or destroyed dataset name remained in DSL inventory")
                 tx_native_heads[tx_pool + "/data/tx_renamed"] = str(renamed_row["guid"])
+                tx_native_heads[tx_pool + "/data/tx_vol"] = str(tx_vol_row["guid"])
+                tx_expected_volumes = {tx_pool + "/data/tx_vol"}
 
                 command("zdb", "-lu", writable_img)
                 bccm_text = command("zdb", "-e", "-p", writable_dir, "-bccm", tx_pool).decode("utf-8", errors="replace")
@@ -620,8 +716,11 @@ def main() -> None:
                 require(tx_actual_root == tx_expected_root, "post-TXG root bytes differ from zdb")
                 tx_heads = json.loads(command(binary, "datasets", writable_img, "--offline-image", "--label", "0",
                                               "--slot", str(cur_slot), "--pool-guid", tx_guid))
-                require(head_identities(tx_heads, tx_pool) == tx_native_heads and tx_heads["txg"] == cur_txg,
-                        "post-TXG DSL dataset identities or TXG drifted")
+                require(
+                    head_identities(tx_heads, tx_pool, expected_volumes=tx_expected_volumes) == tx_native_heads
+                    and tx_heads["txg"] == cur_txg,
+                    "post-TXG DSL dataset identities or TXG drifted",
+                )
                 require(command(binary, "read", writable_img, "/tx_root_dir/root_note.bin",
                                 "--offline-image", "--label", "0", "--slot", str(cur_slot),
                                 "--pool-guid", tx_guid) == tx_payload,
@@ -641,7 +740,13 @@ def main() -> None:
                     "root_file_slice": command(binary, "read", writable_img, "/tx_root_dir/root_note.bin",
                                                "--offline-image", "--label", "0", "--slot", str(cur_slot),
                                                "--pool-guid", tx_guid, "--start", "509", "--bytes", "8192"),
-                    "datasets_guid_set": ",".join(sorted(head_identities(tx_heads, tx_pool).values())).encode(),
+                    "datasets_guid_set": ",".join(
+                        sorted(
+                            head_identities(
+                                tx_heads, tx_pool, expected_volumes=tx_expected_volumes
+                            ).values()
+                        )
+                    ).encode(),
                 }
                 verify_oracle_expectations(
                     oracle_expectations,

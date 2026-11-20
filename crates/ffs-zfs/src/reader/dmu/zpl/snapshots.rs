@@ -34,9 +34,9 @@ pub struct Snapshot {
     pub objectset_kind: u64,
 }
 
-pub(in super::super) struct SnapshotRoot {
-    pub(in super::super) info: Snapshot,
-    pub(in super::super) root: BlockPointer,
+pub(crate) struct SnapshotRoot {
+    pub(crate) info: Snapshot,
+    pub(crate) root: BlockPointer,
 }
 
 struct Record {
@@ -350,7 +350,7 @@ impl Objects {
 
     /// Exact stored-name selection, not case-folded alias selection. A missing
     /// snapshot is an error; never fall back to current head bytes or rewind TXG.
-    pub(in super::super) fn named_snapshot_root(
+    pub(crate) fn named_snapshot_root(
         &mut self,
         cx: &Cx,
         components: &[Vec<u8>],

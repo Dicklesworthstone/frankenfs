@@ -167,6 +167,16 @@ impl Zvol {
         &self.info
     }
 
+    /// Scrub the ZVOL object set's metadata and allocated block tree without
+    /// modifying any pool bytes.
+    pub fn scrub(
+        &self,
+        cx: &Cx,
+        limits: super::scrub::ScrubLimits,
+    ) -> Result<super::scrub::ScrubReport> {
+        self.objects.scrub(cx, limits)
+    }
+
     /// Exact, bounded byte range. Arbitrary byte alignment is intentional at
     /// the ByteDevice seam; callers exposing sectors impose their own alignment.
     /// A range crossing capacity is an error, not a short successful read.

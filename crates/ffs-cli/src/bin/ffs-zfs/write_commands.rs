@@ -6,6 +6,7 @@
 //! before mutating pool data.
 
 use std::ffi::OsStr;
+use std::io::Write as _;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
@@ -14,8 +15,9 @@ use asupersync::Cx;
 use clap::{Args, Subcommand};
 use ffs_ondisk::zfs_zpl::Timestamp;
 use ffs_zfs::{
-    Leaf, ZfsDataChecksum, ZfsMountWriteOptions, ZfsPosixSetAttr, ZfsPropertySetValue,
-    ZfsTransactionEngine, ZfsTxOutcome, ZfsWriteOptions, ZfsXattrSetMode,
+    Leaf, NbdServerConfig, Pool, ZfsDataChecksum, ZfsMountWriteOptions, ZfsPosixSetAttr,
+    ZfsPropertySetValue, ZfsTransactionEngine, ZfsTxOutcome, ZfsVolumeManager, ZfsWriteOptions,
+    ZfsXattrSetMode, ZfsZvolCreateOptions, ZfsZvolNbdClient, ZfsZvolNbdServer, ZvolSyncPolicy,
 };
 
 use super::json;
@@ -397,6 +399,158 @@ pub enum WriteCommand {
         /// Extended attribute name (`user.<name>`).
         name: String,
     },
+    /// Create a fresh native ZFS volume (ZVOL) `<dataset>/<child_name>` and publish a TXG.
+    TxZvolCreate {
+        #[command(flatten)]
+        pool: WritePoolArgs,
+        /// Single child volume name component created beneath `--dataset`.
+        child_name: String,
+        /// Logical volume capacity (e.g. `4M`, `1G`, or exact byte count).
+        #[arg(long)]
+        volsize: String,
+        /// Native DMU block size (power of two in `512..=1M`, default `16K`).
+        #[arg(long, default_value = "16K")]
+        volblocksize: String,
+        /// Create a sparse (thin-provisioned) volume without automatic `refreservation=volsize`.
+        #[arg(long)]
+        sparse: bool,
+        /// Initial property assignment `name=value` (repeatable).
+        #[arg(long = "prop")]
+        props: Vec<String>,
+    },
+    /// Destroy a native ZFS volume `--dataset` (reclaiming data blocks and unclaimed ZIL tail).
+    TxZvolDestroy {
+        #[command(flatten)]
+        pool: WritePoolArgs,
+    },
+    /// Resize a native ZFS volume `--dataset` (`volsize`), retiring truncated tail blocks on shrink.
+    TxZvolResize {
+        #[command(flatten)]
+        pool: WritePoolArgs,
+        /// New logical volume capacity (exact multiple of `volblocksize`).
+        #[arg(long)]
+        volsize: String,
+    },
+    /// Write sector-aligned (`512` B) bytes directly to a native ZVOL head in one TXG.
+    TxZvolWrite {
+        #[command(flatten)]
+        pool: WritePoolArgs,
+        /// Byte offset inside the volume (512-byte sector aligned).
+        #[arg(long)]
+        write_offset: u64,
+        /// Inline UTF-8 payload bytes (length must be a multiple of 512 bytes).
+        #[arg(long, conflicts_with_all = ["data_file", "zero_bytes"])]
+        data: Option<String>,
+        /// Host file containing raw sector-aligned payload bytes.
+        #[arg(long, conflicts_with_all = ["data", "zero_bytes"])]
+        data_file: Option<PathBuf>,
+        /// Write this many zero bytes (512-byte aligned, <= 16 MiB).
+        #[arg(long, conflicts_with_all = ["data", "data_file"])]
+        zero_bytes: Option<usize>,
+    },
+    /// Discard / TRIM a sector-aligned (`512` B) range on a native ZVOL head in one TXG.
+    TxZvolDiscard {
+        #[command(flatten)]
+        pool: WritePoolArgs,
+        /// Byte offset inside the volume (512-byte aligned).
+        #[arg(long)]
+        discard_offset: u64,
+        /// Number of bytes to discard (512-byte aligned).
+        #[arg(long)]
+        bytes: u64,
+    },
+    /// Serve one native ZFS volume (writable head or strictly read-only snapshot/head) over NBD.
+    ZvolServeNbd {
+        #[command(flatten)]
+        target: AdmitArgs,
+        /// Pool-relative ZVOL dataset path (e.g. `vm/disk`).
+        #[arg(long)]
+        dataset: String,
+        /// Optional read-only snapshot name on `--dataset` (forbids `--allow-write`).
+        #[arg(long, conflicts_with = "allow_write")]
+        snapshot: Option<String>,
+        /// Explicitly authorize writable NBD block mutations (`WRITE`, `TRIM`, `FUA`, `FLUSH`).
+        #[arg(long)]
+        allow_write: bool,
+        /// Explicitly synchronize torn Uberblock rings before serving writable NBD.
+        #[arg(long, requires = "allow_write")]
+        reconcile_torn_uberblocks: bool,
+        /// Bind a fresh Unix domain socket path for NBD transport.
+        #[arg(long, conflicts_with = "listen_tcp")]
+        listen_unix: Option<PathBuf>,
+        /// Bind a TCP `host:port` listener for NBD transport.
+        #[arg(long, conflicts_with = "listen_unix")]
+        listen_tcp: Option<String>,
+        /// Explicit NBD export name (defaults to `<dataset>` or `<dataset>@<snapshot>`).
+        #[arg(long)]
+        export_name: Option<String>,
+        /// Durability policy for writable NBD (`always` = durable TXG per write, `flush` = stage until FUA/FLUSH).
+        #[arg(long, default_value = "always")]
+        sync_policy: String,
+        /// Disable `NBD_CMD_TRIM` on writable exports.
+        #[arg(long)]
+        no_discard: bool,
+        /// Stamp newly written ZVOL data blocks with `ZIO_CHECKSUM_SHA256`.
+        #[arg(long)]
+        sha256: bool,
+        /// Exit cleanly after serving a single NBD client connection.
+        #[arg(long)]
+        once: bool,
+        /// Optional path to write structured JSON transport audit entries upon shutdown.
+        #[arg(long)]
+        audit_json: Option<PathBuf>,
+    },
+    /// First-party safe-Rust NBD block client for interacting with `zvol-serve-nbd`.
+    ZvolNbdClient {
+        /// Connect to a Unix domain socket NBD server.
+        #[arg(long, conflicts_with = "connect_tcp")]
+        connect_unix: Option<PathBuf>,
+        /// Connect to a TCP `host:port` NBD server.
+        #[arg(long, conflicts_with = "connect_unix")]
+        connect_tcp: Option<String>,
+        /// Exact NBD export name (required for `info`, `read`, `write`, `discard`, `flush`).
+        #[arg(long, default_value = "")]
+        export: String,
+        #[command(subcommand)]
+        op: NbdClientOp,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum NbdClientOp {
+    /// Enumerate available exports via `NBD_OPT_LIST`.
+    List,
+    /// Negotiate `NBD_OPT_GO` and print export size, flags, and block sizes as JSON.
+    Info,
+    /// Issue `NBD_CMD_READ` and emit raw bytes to stdout (or `--out-file`).
+    Read {
+        #[arg(long)]
+        offset: u64,
+        #[arg(long)]
+        bytes: usize,
+        #[arg(long)]
+        out_file: Option<PathBuf>,
+    },
+    /// Issue `NBD_CMD_WRITE` (with optional `--fua`).
+    Write {
+        #[arg(long)]
+        offset: u64,
+        #[arg(long, conflicts_with = "data_file")]
+        data: Option<String>,
+        #[arg(long, conflicts_with = "data")]
+        data_file: Option<PathBuf>,
+        #[arg(long)]
+        fua: bool,
+    },
+    /// Issue `NBD_CMD_TRIM` over `[offset, offset + bytes)`.
+    Discard {
+        #[arg(long)]
+        offset: u64,
+        #[arg(long)]
+        bytes: u64,
+    },
+    /// Issue `NBD_CMD_FLUSH`.
+    Flush,
 }
 
 fn parse_dataset_components(dataset: &str) -> Result<Vec<Vec<u8>>> {
@@ -464,10 +618,28 @@ fn parse_property_set_value(name: &str, raw: &str) -> Result<ZfsPropertySetValue
     }
     let norm = raw.trim().to_ascii_lowercase();
     let num = match name {
-        "readonly" | "atime" => match norm.as_str() {
-            "on" | "1" | "true" => 1,
-            "off" | "0" | "false" => 0,
-            _ => bail!("boolean property `{name}` expects `on` or `off`, got `{raw}`"),
+        "readonly" | "atime" | "relatime" | "devices" | "exec" | "setuid" | "volthreading" => {
+            match norm.as_str() {
+                "on" | "1" | "true" => 1,
+                "off" | "0" | "false" => 0,
+                _ => bail!("boolean property `{name}` expects `on` or `off`, got `{raw}`"),
+            }
+        }
+        "snapdev" => match norm.as_str() {
+            "hidden" | "0" => 0,
+            "visible" | "1" => 1,
+            _ => bail!("snapdev property expects `hidden` or `visible`, got `{raw}`"),
+        },
+        "logbias" => match norm.as_str() {
+            "latency" | "0" => 0,
+            "throughput" | "1" => 1,
+            _ => bail!("logbias property expects `latency` or `throughput`, got `{raw}`"),
+        },
+        "sync" => match norm.as_str() {
+            "standard" | "0" => 0,
+            "always" | "1" => 1,
+            "disabled" | "2" => 2,
+            _ => bail!("sync property expects `standard`, `always`, or `disabled`, got `{raw}`"),
         },
         "checksum" => match norm.as_str() {
             "on" | "1" => 1,
@@ -1069,6 +1241,412 @@ impl WriteCommand {
                     engine.remove_xattr(cx, &components, target_obj, &name, pool.zpl_timestamp());
                 emit_tx_outcome("tx_rmxattr", &pool.dataset, &engine, outcome)
             }
+            Self::TxZvolCreate {
+                pool,
+                child_name,
+                volsize,
+                volblocksize,
+                sparse,
+                props,
+            } => {
+                let size_bytes = parse_size_or_u64(&volsize)?;
+                let block_bytes = u32::try_from(parse_size_or_u64(&volblocksize)?)
+                    .context("volblocksize exceeds u32")?;
+                let parsed_props = parse_prop_assignments(&props)?;
+                let (mut engine, components) = pool.open_engine(cx)?;
+                let opts = ZfsZvolCreateOptions {
+                    volsize: size_bytes,
+                    volblocksize: block_bytes,
+                    sparse,
+                    initial_props: parsed_props,
+                    timestamp: pool.zpl_timestamp(),
+                };
+                match engine.zvol_create(cx, &components, child_name.as_bytes(), &opts) {
+                    ZfsTxOutcome::Committed { value, token } => {
+                        engine
+                            .verify_token(&token)
+                            .context("verifying ZVOL creation durable token")?;
+                        let full_ds = if pool.dataset.is_empty() {
+                            child_name
+                        } else {
+                            format!("{}/{child_name}", pool.dataset)
+                        };
+                        json(&serde_json::json!({
+                            "format": "ZFS",
+                            "operation": "tx_zvol_create",
+                            "outcome": "Committed",
+                            "dataset": full_ds,
+                            "zvol": value,
+                            "committed_txg": engine.committed_txg(),
+                            "published_slot": engine.committed_slot(),
+                            "token": token,
+                        }))
+                    }
+                    ZfsTxOutcome::NotCommitted(err) => {
+                        bail!("ZFS TXG tx_zvol_create NotCommitted: {err}");
+                    }
+                    ZfsTxOutcome::Uncertain {
+                        reason,
+                        target_txg,
+                        target_slot,
+                    } => {
+                        bail!(
+                            "ZFS TXG tx_zvol_create Uncertain at txg={target_txg} slot={target_slot}: {reason}"
+                        );
+                    }
+                }
+            }
+            Self::TxZvolDestroy { pool } => {
+                let (mut engine, components) = pool.open_engine(cx)?;
+                let outcome = engine.zvol_destroy(cx, &components);
+                emit_tx_outcome("tx_zvol_destroy", &pool.dataset, &engine, outcome)
+            }
+            Self::TxZvolResize { pool, volsize } => {
+                let new_size = parse_size_or_u64(&volsize)?;
+                let (mut engine, components) = pool.open_engine(cx)?;
+                let outcome = engine.zvol_resize(cx, &components, new_size);
+                emit_tx_outcome("tx_zvol_resize", &pool.dataset, &engine, outcome)
+            }
+            Self::TxZvolWrite {
+                pool,
+                write_offset,
+                data,
+                data_file,
+                zero_bytes,
+            } => {
+                let payload = match (data, data_file, zero_bytes) {
+                    (Some(text), None, None) => text.into_bytes(),
+                    (None, Some(path), None) => std::fs::read(&path)
+                        .with_context(|| format!("reading --data-file {}", path.display()))?,
+                    (None, None, Some(n)) => vec![0_u8; n],
+                    _ => bail!("specify exactly one of --data, --data-file, or --zero-bytes"),
+                };
+                let (mut engine, components) = pool.open_engine(cx)?;
+                match engine.zvol_write_at(
+                    cx,
+                    &components,
+                    write_offset,
+                    &payload,
+                    pool.data_checksum(),
+                ) {
+                    ZfsTxOutcome::Committed { value, token } => {
+                        engine
+                            .verify_token(&token)
+                            .context("verifying ZVOL write durable token")?;
+                        json(&serde_json::json!({
+                            "format": "ZFS",
+                            "operation": "tx_zvol_write",
+                            "outcome": "Committed",
+                            "dataset": pool.dataset,
+                            "write_offset": write_offset,
+                            "bytes": payload.len(),
+                            "receipt": value,
+                            "committed_txg": engine.committed_txg(),
+                            "published_slot": engine.committed_slot(),
+                            "token": token,
+                        }))
+                    }
+                    ZfsTxOutcome::NotCommitted(err) => {
+                        bail!("ZFS TXG tx_zvol_write NotCommitted: {err}");
+                    }
+                    ZfsTxOutcome::Uncertain {
+                        reason,
+                        target_txg,
+                        target_slot,
+                    } => {
+                        bail!(
+                            "ZFS TXG tx_zvol_write Uncertain at txg={target_txg} slot={target_slot}: {reason}"
+                        );
+                    }
+                }
+            }
+            Self::TxZvolDiscard {
+                pool,
+                discard_offset,
+                bytes,
+            } => {
+                let (mut engine, components) = pool.open_engine(cx)?;
+                match engine.zvol_discard(
+                    cx,
+                    &components,
+                    discard_offset,
+                    bytes,
+                    pool.data_checksum(),
+                ) {
+                    ZfsTxOutcome::Committed { value, token } => {
+                        engine
+                            .verify_token(&token)
+                            .context("verifying ZVOL discard durable token")?;
+                        json(&serde_json::json!({
+                            "format": "ZFS",
+                            "operation": "tx_zvol_discard",
+                            "outcome": "Committed",
+                            "dataset": pool.dataset,
+                            "discard_offset": discard_offset,
+                            "bytes": bytes,
+                            "receipt": value,
+                            "committed_txg": engine.committed_txg(),
+                            "published_slot": engine.committed_slot(),
+                            "token": token,
+                        }))
+                    }
+                    ZfsTxOutcome::NotCommitted(err) => {
+                        bail!("ZFS TXG tx_zvol_discard NotCommitted: {err}");
+                    }
+                    ZfsTxOutcome::Uncertain {
+                        reason,
+                        target_txg,
+                        target_slot,
+                    } => {
+                        bail!(
+                            "ZFS TXG tx_zvol_discard Uncertain at txg={target_txg} slot={target_slot}: {reason}"
+                        );
+                    }
+                }
+            }
+            Self::ZvolServeNbd {
+                target,
+                dataset,
+                snapshot,
+                allow_write,
+                reconcile_torn_uberblocks,
+                listen_unix,
+                listen_tcp,
+                export_name,
+                sync_policy,
+                no_discard,
+                sha256,
+                once,
+                audit_json,
+            } => {
+                if !target.offline_image {
+                    bail!("zvol-serve-nbd requires --offline-image");
+                }
+                if listen_unix.is_none() && listen_tcp.is_none() {
+                    bail!("specify exactly one of --listen-unix or --listen-tcp");
+                }
+                if target.members.len() > 7 {
+                    bail!("at most seven additional member images are supported");
+                }
+                let components = parse_dataset_components(&dataset)?;
+                let export = export_name.unwrap_or_else(|| match snapshot.as_deref() {
+                    Some(snap) => format!("{dataset}@{snap}"),
+                    None => dataset.clone(),
+                });
+                let cfg = NbdServerConfig {
+                    export_name: export.clone(),
+                    once,
+                };
+                let (audit, final_txg, final_slot) = if allow_write {
+                    let policy = match sync_policy.trim().to_ascii_lowercase().as_str() {
+                        "always" => ZvolSyncPolicy::Always,
+                        "flush" | "flush_barrier" => ZvolSyncPolicy::FlushBarrier,
+                        other => {
+                            bail!("invalid --sync-policy `{other}`: expected `always` or `flush`")
+                        }
+                    };
+                    let checksum = if sha256 {
+                        ZfsDataChecksum::Sha256
+                    } else {
+                        ZfsDataChecksum::Fletcher4
+                    };
+                    let mut all_paths: Vec<&Path> = Vec::with_capacity(1 + target.members.len());
+                    all_paths.push(target.image.as_path());
+                    for m in &target.members {
+                        all_paths.push(m.as_path());
+                    }
+                    let opts = ZfsWriteOptions {
+                        offline_image: target.offline_image,
+                        allow_write: true,
+                        pool_guid: target.pool_guid,
+                        label: target.label as usize,
+                        slot: target.slot as usize,
+                        reconcile_torn_uberblocks,
+                    };
+                    let engine = ZfsTransactionEngine::open_files_at(
+                        cx,
+                        &all_paths,
+                        target.offset,
+                        target.length,
+                        opts,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "admitting writable ZVOL NBD writer on {}",
+                            target.image.display()
+                        )
+                    })?;
+                    let mgr = ZfsVolumeManager::new(engine);
+                    let session =
+                        mgr.open_writable_session(cx, &components, policy, !no_discard, checksum)?;
+                    let mut server = match (listen_unix.as_deref(), listen_tcp.as_deref()) {
+                        (Some(sock), None) => {
+                            ZfsZvolNbdServer::bind_session_unix(sock, session, cfg)?
+                        }
+                        (None, Some(addr)) => {
+                            ZfsZvolNbdServer::bind_session_tcp(addr, session, cfg)?
+                        }
+                        _ => bail!("specify exactly one of --listen-unix or --listen-tcp"),
+                    };
+                    let entries = server.serve(cx)?;
+                    let txg = mgr.committed_txg()?;
+                    let slot = mgr.committed_slot()?;
+                    drop(server);
+                    let _ = mgr.into_engine()?;
+                    (entries, Some(txg), Some(slot))
+                } else {
+                    // Strictly read-only path: never opens writable file descriptors!
+                    let mut leaves = Vec::with_capacity(1 + target.members.len());
+                    for path in std::iter::once(&target.image).chain(&target.members) {
+                        leaves.push(
+                            Leaf::open(cx, path, target.offset, target.length).with_context(
+                                || format!("opening read-only ZFS member {}", path.display()),
+                            )?,
+                        );
+                    }
+                    let pool = Pool::from_leaves(leaves)?;
+                    let mut objects = pool.objects(
+                        cx,
+                        target.label as usize,
+                        target.slot as usize,
+                        target.pool_guid,
+                    )?;
+                    let zvol =
+                        objects.zvol(cx, &components, snapshot.as_deref().map(str::as_bytes))?;
+                    let txg = zvol.info().pool_txg;
+                    let mut server = match (listen_unix.as_deref(), listen_tcp.as_deref()) {
+                        (Some(sock), None) => {
+                            ZfsZvolNbdServer::bind_readonly_unix(sock, zvol, cfg)?
+                        }
+                        (None, Some(addr)) => ZfsZvolNbdServer::bind_readonly_tcp(addr, zvol, cfg)?,
+                        _ => bail!("specify exactly one of --listen-unix or --listen-tcp"),
+                    };
+                    let entries = server.serve(cx)?;
+                    (entries, Some(txg), Some(target.slot as usize))
+                };
+
+                if let Some(path) = audit_json {
+                    let rendered = serde_json::to_vec_pretty(&audit)?;
+                    std::fs::write(&path, rendered).with_context(|| {
+                        format!("writing ZVOL NBD audit log {}", path.display())
+                    })?;
+                }
+                json(&serde_json::json!({
+                    "format": "ZFS",
+                    "operation": "zvol_serve_nbd",
+                    "dataset": dataset,
+                    "snapshot": snapshot,
+                    "export_name": export,
+                    "writable": allow_write,
+                    "committed_txg": final_txg,
+                    "published_slot": final_slot,
+                    "commands_served": audit.len(),
+                }))
+            }
+            Self::ZvolNbdClient {
+                connect_unix,
+                connect_tcp,
+                export,
+                op,
+            } => {
+                if connect_unix.is_none() && connect_tcp.is_none() {
+                    bail!("specify exactly one of --connect-unix or --connect-tcp");
+                }
+                if matches!(op, NbdClientOp::List) {
+                    let exports = match (connect_unix.as_deref(), connect_tcp.as_deref()) {
+                        (Some(sock), None) => ZfsZvolNbdClient::list_exports_unix(cx, sock)?,
+                        (None, Some(addr)) => ZfsZvolNbdClient::list_exports_tcp(cx, addr)?,
+                        _ => bail!("specify exactly one of --connect-unix or --connect-tcp"),
+                    };
+                    return json(&serde_json::json!({
+                        "format": "ZFS",
+                        "operation": "zvol_nbd_list",
+                        "exports": exports,
+                    }));
+                }
+                let client = match (connect_unix.as_deref(), connect_tcp.as_deref()) {
+                    (Some(sock), None) => ZfsZvolNbdClient::connect_unix(cx, sock, &export)?,
+                    (None, Some(addr)) => ZfsZvolNbdClient::connect_tcp(cx, addr, &export)?,
+                    _ => bail!("specify exactly one of --connect-unix or --connect-tcp"),
+                };
+                let res = match op {
+                    NbdClientOp::List => unreachable!(),
+                    NbdClientOp::Info => json(&serde_json::json!({
+                        "format": "ZFS",
+                        "operation": "zvol_nbd_info",
+                        "info": client.info(),
+                    })),
+                    NbdClientOp::Read {
+                        offset,
+                        bytes,
+                        out_file,
+                    } => {
+                        let mut buf = vec![0_u8; bytes];
+                        client.read_at(cx, offset, &mut buf)?;
+                        if let Some(path) = out_file {
+                            std::fs::write(&path, &buf).with_context(|| {
+                                format!("writing NBD read output {}", path.display())
+                            })?;
+                            json(&serde_json::json!({
+                                "format": "ZFS",
+                                "operation": "zvol_nbd_read",
+                                "export": export,
+                                "offset": offset,
+                                "bytes": bytes,
+                                "out_file": path,
+                            }))
+                        } else {
+                            let mut stdout = std::io::stdout().lock();
+                            stdout.write_all(&buf)?;
+                            stdout.flush()?;
+                            Ok(())
+                        }
+                    }
+                    NbdClientOp::Write {
+                        offset,
+                        data,
+                        data_file,
+                        fua,
+                    } => {
+                        let payload = match (data, data_file) {
+                            (Some(text), None) => text.into_bytes(),
+                            (None, Some(path)) => std::fs::read(&path).with_context(|| {
+                                format!("reading --data-file {}", path.display())
+                            })?,
+                            _ => bail!("specify exactly one of --data or --data-file"),
+                        };
+                        client.write_at(cx, offset, &payload, fua)?;
+                        json(&serde_json::json!({
+                            "format": "ZFS",
+                            "operation": "zvol_nbd_write",
+                            "export": export,
+                            "offset": offset,
+                            "bytes": payload.len(),
+                            "fua": fua,
+                        }))
+                    }
+                    NbdClientOp::Discard { offset, bytes } => {
+                        client.trim(cx, offset, bytes)?;
+                        json(&serde_json::json!({
+                            "format": "ZFS",
+                            "operation": "zvol_nbd_discard",
+                            "export": export,
+                            "offset": offset,
+                            "bytes": bytes,
+                        }))
+                    }
+                    NbdClientOp::Flush => {
+                        client.flush(cx)?;
+                        json(&serde_json::json!({
+                            "format": "ZFS",
+                            "operation": "zvol_nbd_flush",
+                            "export": export,
+                        }))
+                    }
+                };
+                let _ = client.disconnect(cx);
+                res
+            }
         }
     }
 }
@@ -1443,6 +2021,148 @@ mod tests {
         assert_eq!(
             parse_property_set_value("org:owner", "alice").unwrap(),
             ZfsPropertySetValue::Text(b"alice".to_vec())
+        );
+        assert_eq!(
+            parse_property_set_value("snapdev", "visible").unwrap(),
+            ZfsPropertySetValue::Number(1)
+        );
+        assert_eq!(
+            parse_property_set_value("sync", "always").unwrap(),
+            ZfsPropertySetValue::Number(1)
+        );
+        assert_eq!(
+            parse_property_set_value("logbias", "throughput").unwrap(),
+            ZfsPropertySetValue::Number(1)
+        );
+    }
+
+    #[test]
+    fn cli_zvol_and_nbd_subcommands_require_explicit_authority() {
+        let auth = [
+            "--offline-image",
+            "--allow-write",
+            "--pool-guid",
+            "123",
+            "--label",
+            "0",
+            "--slot",
+            "2",
+            "--dataset",
+            "vm",
+        ];
+        for cmd in [
+            vec![
+                "ffs-zfs",
+                "tx-zvol-create",
+                "leaf.img",
+                "disk0",
+                "--volsize",
+                "4M",
+                "--volblocksize",
+                "16K",
+                "--sparse",
+                "--prop",
+                "snapdev=visible",
+            ],
+            vec!["ffs-zfs", "tx-zvol-destroy", "leaf.img"],
+            vec!["ffs-zfs", "tx-zvol-resize", "leaf.img", "--volsize", "8M"],
+            vec![
+                "ffs-zfs",
+                "tx-zvol-write",
+                "leaf.img",
+                "--write-offset",
+                "512",
+                "--zero-bytes",
+                "1024",
+            ],
+            vec![
+                "ffs-zfs",
+                "tx-zvol-discard",
+                "leaf.img",
+                "--discard-offset",
+                "0",
+                "--bytes",
+                "16384",
+            ],
+        ] {
+            // Without --allow-write must fail clap parsing.
+            assert!(
+                Cli::try_parse_from(cmd.iter().copied().chain([
+                    "--offline-image",
+                    "--pool-guid",
+                    "123",
+                    "--label",
+                    "0",
+                    "--slot",
+                    "2",
+                    "--dataset",
+                    "vm",
+                ]))
+                .is_err()
+            );
+            assert!(Cli::try_parse_from(cmd.into_iter().chain(auth)).is_ok());
+        }
+        // Read-only NBD snapshot export parses without --allow-write, and rejects --allow-write + --snapshot.
+        assert!(
+            Cli::try_parse_from([
+                "ffs-zfs",
+                "zvol-serve-nbd",
+                "leaf.img",
+                "--offline-image",
+                "--pool-guid",
+                "123",
+                "--label",
+                "0",
+                "--slot",
+                "2",
+                "--dataset",
+                "vm/disk0",
+                "--snapshot",
+                "s1",
+                "--listen-unix",
+                "/tmp/zvol.sock",
+                "--once",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "ffs-zfs",
+                "zvol-serve-nbd",
+                "leaf.img",
+                "--offline-image",
+                "--pool-guid",
+                "123",
+                "--label",
+                "0",
+                "--slot",
+                "2",
+                "--dataset",
+                "vm/disk0",
+                "--snapshot",
+                "s1",
+                "--allow-write",
+                "--listen-unix",
+                "/tmp/zvol.sock",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "ffs-zfs",
+                "zvol-nbd-client",
+                "--connect-unix",
+                "/tmp/zvol.sock",
+                "--export",
+                "vm/disk0",
+                "write",
+                "--offset",
+                "0",
+                "--data",
+                "hello",
+                "--fua",
+            ])
+            .is_ok()
         );
     }
 }

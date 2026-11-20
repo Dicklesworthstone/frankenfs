@@ -217,17 +217,32 @@ impl FileCommand {
                 let components = dataset_components(&dataset)?;
                 let mut pool = candidate.objects(cx)?;
                 let pool_txg = pool.txg;
-                let view = match snapshot.as_deref() {
-                    Some(name) => pool.zpl_snapshot(cx, &components, name.as_bytes())?,
-                    None => pool.zpl(cx, &components)?,
-                };
+                let ds_kind = pool
+                    .datasets(cx)?
+                    .into_iter()
+                    .find(|d| d.components == components)
+                    .and_then(|d| d.objectset_kind);
                 let limits = super::reader::dmu::scrub::ScrubLimits {
                     pointers: max_pointers,
                     decoded_bytes: max_bytes,
                     objects: max_objects,
                     copy_bytes: verify_redundancy.then_some(max_copy_bytes.unwrap_or(1 << 40)),
                 };
-                let report = view.scrub(cx, limits)?;
+                let (dataset_guid, report) = if ds_kind == Some(3) {
+                    let zvol =
+                        pool.zvol(cx, &components, snapshot.as_deref().map(OsStrExt::as_bytes))?;
+                    let guid = zvol.info().dataset_guid;
+                    let rep = zvol.scrub(cx, limits)?;
+                    (guid, rep)
+                } else {
+                    let view = match snapshot.as_deref() {
+                        Some(name) => pool.zpl_snapshot(cx, &components, name.as_bytes())?,
+                        None => pool.zpl(cx, &components)?,
+                    };
+                    let guid = view.dataset_guid;
+                    let rep = view.scrub(cx, limits)?;
+                    (guid, rep)
+                };
                 let clean = report.is_clean();
                 cx.checkpoint()
                     .map_err(|_| ffs_error::FfsError::Cancelled)?;
@@ -235,7 +250,7 @@ impl FileCommand {
                     "format": "ZFS", "operation": "scrub", "read_only": true,
                     "scope": "selected_dataset_dmu_blocks",
                     "pool_guid": report.pool_guid.to_string(), "pool_txg": pool_txg,
-                    "dataset": dataset, "dataset_guid": view.dataset_guid.to_string(),
+                    "dataset": dataset, "dataset_guid": dataset_guid.to_string(),
                     "snapshot": snapshot.as_deref().and_then(|name| name.to_str()),
                     "snapshot_name_bytes": snapshot.as_deref().map(OsStrExt::as_bytes),
                     "clean": clean, "repaired_blocks": 0,

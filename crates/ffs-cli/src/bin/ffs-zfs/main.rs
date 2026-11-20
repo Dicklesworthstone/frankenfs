@@ -290,6 +290,17 @@ fn main() -> Result<()> {
         .build()
         .map_err(|err| anyhow::anyhow!("failed to build ffs-zfs runtime: {err}"))?;
     let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+    let is_mount_cmd = matches!(
+        cli.command,
+        Command::File(file_commands::FileCommand::Mount { .. })
+            | Command::Write(write_commands::WriteCommand::MountWrite { .. })
+    );
+    if !is_mount_cmd {
+        let cancel_cx = cx.clone();
+        let _ = ctrlc::set_handler(move || {
+            cancel_cx.cancel_with(asupersync::types::CancelKind::User, Some("SIGINT"));
+        });
+    }
     match cli.command {
         Command::Allocation(command) => command.run(&cx)?,
         Command::File(command) => command.run(&cx)?,
