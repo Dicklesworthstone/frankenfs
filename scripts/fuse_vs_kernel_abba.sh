@@ -398,13 +398,13 @@ PY
 
   for b in $(seq 1 "$BLOCKS"); do
     v_cal "${b}j1"
-    v_ffs "${b}j1" ffs_ser_n "" "$CLIENT_CPU" "$DAEMON_CPU"
-    v_ffs "${b}j1" ffs_ser_w "" "$WCLIENT" "$WIDE"
+    v_ffs "${b}j1" ffs_ser_n "FFS_FUSE_WORKERS=1" "$CLIENT_CPU" "$DAEMON_CPU"
+    v_ffs "${b}j1" ffs_ser_w "FFS_FUSE_WORKERS=1" "$WCLIENT" "$WIDE"
     v_ffs "${b}j1" ffs_work "FFS_FUSE_WORKERS=$WORKERS_N" "$WCLIENT" "$WIDE"
     v_kern "${b}j1"; v_kern "${b}j2"
     v_ffs "${b}j2" ffs_work "FFS_FUSE_WORKERS=$WORKERS_N" "$WCLIENT" "$WIDE"
-    v_ffs "${b}j2" ffs_ser_w "" "$WCLIENT" "$WIDE"
-    v_ffs "${b}j2" ffs_ser_n "" "$CLIENT_CPU" "$DAEMON_CPU"
+    v_ffs "${b}j2" ffs_ser_w "FFS_FUSE_WORKERS=1" "$WCLIENT" "$WIDE"
+    v_ffs "${b}j2" ffs_ser_n "FFS_FUSE_WORKERS=1" "$CLIENT_CPU" "$DAEMON_CPU"
     v_cal "${b}j2"
   done
   fusermount3 -u "$FMNT" 2>/dev/null

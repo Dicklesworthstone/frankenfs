@@ -53,8 +53,8 @@ operational readiness.
 - [x] `bd-rchk1` docs/status reconciliation: keep README, feature parity, spec, conformance notes, discrepancy notes, xfstests notes, and tracker wording explicit about tracked parity versus runtime readiness.
 - [x] `bd-rchk2` btrfs delayed refs: resolve `DISC-004` with executable evidence, or narrow it into accepted/split follow-up work.
 - [ ] `bd-rchk3` xfstests baseline: run a fresh dated baseline, capture commands/artifacts, and turn real failures into beads. 2026-05-01 status: subset/regression gate is documented, but real execution is blocked by unbuilt xfstests helpers and the current dpkg lock blocking `xfslibs-dev`/`libaio-dev` install.
-- [ ] `bd-rchk4` mounted FUSE CI: make critical mounted ext4/btrfs paths run in a permissioned CI or RCH workflow, with visible skip diagnostics when local FUSE permissions are absent.
-- [ ] `bd-rchk5` performance baselines: re-measure representative throughput/latency targets against current code and record environment metadata.
+- [x] `bd-rchk4` mounted FUSE CI: make critical mounted ext4/btrfs paths run in a permissioned CI or RCH workflow, with visible skip diagnostics when local FUSE permissions are absent. Verified in `.github/workflows/ci.yml` (`FUSE E2E` job `135312202623` on `b4b527049`) with `FFS_REQUIRE_FUSE=1`.
+- [x] `bd-rchk5` performance baselines: re-measure representative throughput/latency targets against current code and record environment metadata (`baselines/baseline-20261119-section-9-5-perf-gates.md`, CI job `135312202623` on `b4b527049`).
 - [x] `bd-rchk6` mounted self-healing lifecycle: implemented explicit mounted automatic repair via `--background-repair --background-scrub-ledger <jsonl>`, with read-write repair routed through the mounted MVCC repair-writeback serializer.
 - [ ] `bd-rchk7` fuzz/conformance expansion: replace remaining open-ended corpus expansion notes with completed fixtures or narrow beads.
 - [~] `bd-vuzzq`/`bd-9rutw` namespace correctness continuation: complete births

@@ -42,16 +42,28 @@ pub const MAX_WRITE_SIZE: usize = 16 * 1024 * 1024;
 /// up to MAX_WRITE_SIZE bytes in a write request, we use that value plus some extra space.
 const BUFFER_SIZE: usize = MAX_WRITE_SIZE + 4096;
 
-/// Retire every dispatch worker, retaining the primary or first worker error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DispatchStep {
+    Dispatched,
+    Retry,
+    End,
+}
+
+/// Retire every dispatch worker, retaining the primary or first worker error
+/// and collecting per-worker dispatched request counts (`bd-iah1f`).
 fn join_dispatch_workers(
     mut result: io::Result<()>,
-    workers: Vec<thread::ScopedJoinHandle<'_, io::Result<()>>>,
-) -> io::Result<()> {
+    primary_served: u64,
+    workers: Vec<thread::ScopedJoinHandle<'_, (u64, io::Result<()>)>>,
+) -> (Vec<u64>, io::Result<()>) {
+    let mut counts = Vec::with_capacity(1 + workers.len());
+    counts.push(primary_served);
     for worker in workers {
-        let joined = match worker.join() {
-            Ok(result) => result,
-            Err(_) => Err(io::Error::other("FUSE dispatch worker panicked")),
+        let (served, joined) = match worker.join() {
+            Ok(pair) => pair,
+            Err(_) => (0, Err(io::Error::other("FUSE dispatch worker panicked"))),
         };
+        counts.push(served);
         if let Err(error) = joined {
             warn!("FUSE dispatch worker failed: {error}");
             if result.is_ok() {
@@ -59,7 +71,7 @@ fn join_dispatch_workers(
             }
         }
     }
-    result
+    (counts, result)
 }
 
 /// One dispatch-gate slot, padded to its own cache line.
@@ -619,13 +631,13 @@ impl<FS: Filesystem> Session<FS> {
         }
     }
 
-    fn dispatch_next(&mut self, buf: &mut [u8]) -> io::Result<bool> {
+    fn dispatch_next_step(&mut self, buf: &mut [u8]) -> io::Result<DispatchStep> {
         match self.ch.receive(buf) {
-            Ok(0) => Ok(false),
+            Ok(0) => Ok(DispatchStep::End),
             Ok(size) => match Request::new(self.ch.sender(), &buf[..size]) {
                 Some(req) => {
                     self.dispatch_request(&req);
-                    Ok(true)
+                    Ok(DispatchStep::Dispatched)
                 }
                 None => Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -633,11 +645,15 @@ impl<FS: Filesystem> Session<FS> {
                 )),
             },
             Err(err) => match err.raw_os_error() {
-                Some(ENOENT | EINTR | EAGAIN) => Ok(true),
-                Some(ENODEV) => Ok(false),
+                Some(ENOENT | EINTR | EAGAIN) => Ok(DispatchStep::Retry),
+                Some(ENODEV) => Ok(DispatchStep::End),
                 _ => Err(err),
             },
         }
+    }
+
+    fn dispatch_next(&mut self, buf: &mut [u8]) -> io::Result<bool> {
+        Ok(!matches!(self.dispatch_next_step(buf)?, DispatchStep::End))
     }
 
     fn current_cpu(&self) -> usize {
@@ -710,9 +726,20 @@ impl<FS: Filesystem> Session<FS> {
         }
     }
 
+    pub(crate) fn run_classic_loop_counted(&mut self, buf: &mut [u8]) -> (u64, io::Result<()>) {
+        let mut served = 0_u64;
+        loop {
+            match self.dispatch_next_step(buf) {
+                Ok(DispatchStep::Dispatched) => served = served.saturating_add(1),
+                Ok(DispatchStep::Retry) => {}
+                Ok(DispatchStep::End) => return (served, Ok(())),
+                Err(err) => return (served, Err(err)),
+            }
+        }
+    }
+
     pub(crate) fn run_classic_loop(&mut self, buf: &mut [u8]) -> io::Result<()> {
-        while self.dispatch_next(buf)? {}
-        Ok(())
+        self.run_classic_loop_counted(buf).1
     }
 
     fn run_per_core_loop(&mut self, buf: &mut [u8]) -> io::Result<()> {
@@ -758,18 +785,28 @@ impl<FS: Filesystem> Session<FS> {
             std::mem::align_of::<abi::fuse_in_header>(),
         );
         if worker_count <= 1 {
-            return self.run_classic_loop(buf);
+            let (served, res) = self.run_classic_loop_counted(buf);
+            info!(
+                worker_count = 1,
+                per_worker_requests = ?[served],
+                total_requests = served,
+                "FUSE dispatch worker summary"
+            );
+            return res;
         }
+        let mut init_served = 0_u64;
         while !self.initialized {
-            if !self.dispatch_next(buf)? {
-                return Ok(());
+            match self.dispatch_next_step(buf)? {
+                DispatchStep::Dispatched => init_served = init_served.saturating_add(1),
+                DispatchStep::Retry => {}
+                DispatchStep::End => return Ok(()),
             }
         }
 
         self.dispatch_gate = Some(Arc::new(DispatchGate::new(worker_count)));
         self.dispatch_worker = 0;
         info!("FUSE dispatch workers: {worker_count}");
-        thread::scope(|scope| {
+        let (per_worker_requests, res) = thread::scope(|scope| {
             // This must live inside the scope: a setup error or unwind must
             // stop readers before thread::scope implicitly waits for them.
             let readers = self.ch.stop_readers_on_drop();
@@ -785,20 +822,32 @@ impl<FS: Filesystem> Session<FS> {
                             worker_buffer.deref_mut(),
                             std::mem::align_of::<abi::fuse_in_header>(),
                         );
-                        worker.run_classic_loop(worker_buf)
+                        worker.run_classic_loop_counted(worker_buf)
                     });
                 match spawned {
                     Ok(worker) => workers.push(worker),
                     Err(error) => {
                         drop(readers);
-                        return join_dispatch_workers(Err(error), workers);
+                        return join_dispatch_workers(Err(error), init_served, workers);
                     }
                 }
             }
-            let primary = self.run_classic_loop(buf);
+            let (primary_loop, primary_res) = self.run_classic_loop_counted(buf);
             drop(readers);
-            join_dispatch_workers(primary, workers)
-        })
+            join_dispatch_workers(
+                primary_res,
+                init_served.saturating_add(primary_loop),
+                workers,
+            )
+        });
+        let total_requests: u64 = per_worker_requests.iter().copied().sum();
+        info!(
+            worker_count,
+            ?per_worker_requests,
+            total_requests,
+            "FUSE dispatch worker summary"
+        );
+        res
     }
 
     /// Run an explicit CPU-keyed FUSE dispatch scheduler.

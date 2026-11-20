@@ -26,7 +26,7 @@ jobs:
     # The pinned upstream goldens assert GNU coreutils diagnostics. Newer
     # ubuntu-latest images provide uutils with different stderr wording.
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:

@@ -580,6 +580,18 @@ jobs:
         run: |
           set -euo pipefail
           cargo test --release -p ffs-cli --test cli_e2e measure_and_verify_section_9_5_performance_baselines_vkibu -- --ignored --exact --nocapture
+          cargo test --release -p ffs-cli --test cli_e2e measure_fuse_dispatch_modes_vs_kernel_incumbent_bd_28mw2_bd_iah1f -- --ignored --exact --nocapture
+
+      - name: FUSE multi-worker 60s mixed namespace and fsync storm
+        if: ${{ !cancelled() && steps.native_build.conclusion == 'success' }}
+        timeout-minutes: 5
+        env:
+          FFS_REQUIRE_FUSE: "1"
+          FFS_REQUIRE_ORACLES: "1"
+          FFS_E2E_STORM_SECS: "60"
+        run: |
+          set -euo pipefail
+          cargo test -p ffs-harness --test fuse_e2e fuse_default_dispatch_mixed_namespace_storm_keeps_image_clean_bd_iah1f -- --exact --nocapture
 
       # bd-53dub: a mounted test that cannot mount fails here instead of
       # passing vacuously (FUSE, fuse3, e2fsprogs and btrfs-progs are installed
