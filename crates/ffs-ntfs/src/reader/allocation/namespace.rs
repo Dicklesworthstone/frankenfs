@@ -668,9 +668,18 @@ impl NtfsVolume {
     /// index, then derive reachability only after complete bounded inspection.
     /// This does not read ordinary file payloads, replay a log or write bytes.
     pub fn check_namespace(&self, cx: &Cx, limits: NamespaceLimits) -> Result<NamespaceReport> {
+        self.check_namespace_internal(cx, limits, false)
+    }
+
+    pub(crate) fn check_namespace_internal(
+        &self,
+        cx: &Cx,
+        limits: NamespaceLimits,
+        allow_dirty_flags: bool,
+    ) -> Result<NamespaceReport> {
         checkpoint(cx)?;
         limits.validate()?;
-        if self.volume_flags != 0
+        if (!allow_dirty_flags && self.volume_flags != 0)
             || self.logfile_recovery.is_some()
             || !self.source.overlay.is_empty()
         {

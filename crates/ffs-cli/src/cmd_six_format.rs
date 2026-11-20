@@ -1930,8 +1930,55 @@ pub fn format_cmd(
             }
             Ok(())
         }
-        "ntfs" | "zfs" => bail!(
-            "ffs format --filesystem {fs_norm} is refused: FrankenFS provides read-only native inspection/extraction for {fs_norm} and does not format {fs_norm} volumes"
+        "ntfs" | "ntfs31" | "ntfs30" => {
+            let version = if fs_norm == "ntfs30" {
+                ffs_ntfs::NtfsFormatVersion::V3_0
+            } else {
+                ffs_ntfs::NtfsFormatVersion::V3_1
+            };
+            let sector_bytes = block_size.unwrap_or(512);
+            let cluster_bytes = sectors_per_cluster.map(|spc| u32::from(spc) * sector_bytes);
+            let opts = ffs_ntfs::NtfsFormatOptions {
+                image: output.to_path_buf(),
+                allow_existing_target: false,
+                offline_image: false,
+                size_bytes: None,
+                size_mib: Some(size_mib),
+                sector_bytes,
+                cluster_bytes,
+                version,
+                label: label.map(str::to_owned),
+                serial: None,
+                logfile_bytes: None,
+                timestamp_100ns: None,
+            };
+            let report = ffs_ntfs::format_image_file(&cx, &opts, None).with_context(|| {
+                format!("failed to format native {fs_norm} at {}", output.display())
+            })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "Formatted native {} ({}) image at {} ({} MiB)",
+                    fs_norm,
+                    version.as_str(),
+                    output.display(),
+                    size_mib
+                );
+            }
+            info!(
+                target: "ffs::cli::router",
+                command = "format",
+                format = %fs_norm,
+                partition_id = "whole_image",
+                capability_admitted = true,
+                native_rust_formatter = true,
+                "six_format_router_complete"
+            );
+            Ok(())
+        }
+        "zfs" => bail!(
+            "ffs format --filesystem {fs_norm} is refused: FrankenFS does not create new standalone ZFS pools from scratch"
         ),
         other => bail!(
             "unsupported --filesystem {other:?}; expected one of: fat16, fat32, ext4, btrfs, ntfs, zfs"
@@ -3244,6 +3291,32 @@ mod tests {
         let fat16 = dir.path().join("native_fat16.img");
         format_cmd(&fat16, "fat16", 8, Some("TEST16"), None, None, false, true)
             .expect("native fat16 format");
+
+        let ntfs31 = dir.path().join("native_ntfs31.img");
+        format_cmd(
+            &ntfs31,
+            "ntfs",
+            8,
+            Some("TESTNTFS"),
+            None,
+            None,
+            false,
+            true,
+        )
+        .expect("native ntfs31 format");
+        let chk = ffs_ntfs::check_image_file(
+            &cli_cx(),
+            &ntfs31,
+            0,
+            None,
+            ffs_ntfs::NtfsCheckLimits::default(),
+        )
+        .expect("check native formatted ntfs31");
+        assert!(
+            chk.clean,
+            "formatted ntfs31 must pass check: {:?}",
+            chk.issues
+        );
 
         let ext4 = dir.path().join("refused_ext4.img");
         let err = format_cmd(

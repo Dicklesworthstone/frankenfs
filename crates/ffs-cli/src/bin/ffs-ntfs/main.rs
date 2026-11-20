@@ -3,6 +3,7 @@
 
 mod allocation_commands;
 mod ea_name;
+mod maintenance_commands;
 
 #[cfg(test)]
 mod indexed_tests;
@@ -282,6 +283,22 @@ impl PayloadArgs {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Run the unified non-mutating NTFS 3.0/3.1 structural consistency checker
+    /// (optional `--repair-plan` / explicit `--apply-repair --allow-write`).
+    Check {
+        #[command(flatten)]
+        options: maintenance_commands::CheckArgs,
+    },
+    /// Format a brand-new (or explicitly authorized offline) native NTFS 3.1 or 3.0 image.
+    Format {
+        #[command(flatten)]
+        options: maintenance_commands::FormatArgs,
+    },
+    /// Non-destructively resize an offline NTFS image into a standalone output image.
+    Resize {
+        #[command(flatten)]
+        options: maintenance_commands::ResizeArgs,
+    },
     /// Reconcile both $Secure indexes and verify every indexed security descriptor pair.
     CheckSecurity {
         #[command(flatten)]
@@ -892,7 +909,23 @@ fn main() -> Result<()> {
         .build()
         .map_err(|err| anyhow::anyhow!("failed to build ffs-ntfs runtime: {err}"))?;
     let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+    if !matches!(
+        &cli.command,
+        Command::Mount { .. } | Command::MountWrite { .. }
+    ) {
+        let signal = cx.clone();
+        ctrlc::set_handler(move || {
+            signal.cancel_with(
+                asupersync::types::CancelKind::User,
+                Some("NTFS command interrupted by Ctrl+C"),
+            );
+        })
+        .context("installing NTFS cancellation handler; no image mutation started")?;
+    }
     match cli.command {
+        Command::Check { options } => maintenance_commands::run_check(&cx, &options)?,
+        Command::Format { options } => maintenance_commands::run_format(&cx, &options)?,
+        Command::Resize { options } => maintenance_commands::run_resize_cmd(&cx, &options)?,
         Command::CheckSecurity {
             image,
             max_entries,
@@ -921,8 +954,9 @@ fn main() -> Result<()> {
         Command::Inspect { image } => {
             let volume = image.open(&cx)?;
             let g = &volume.geometry;
+            let v = volume.version();
             json(&serde_json::json!({
-                "format": "NTFS", "version": "3.1", "read_only": true,
+                "format": "NTFS", "version": format!("{}.{}", v[0], v[1]), "read_only": true,
                 "volume_offset": image.offset, "volume_bytes": g.volume_bytes(),
                 "sector_bytes": g.sector_bytes(), "cluster_bytes": g.cluster_bytes(),
                 "record_bytes": g.record_bytes(), "index_bytes": g.index_bytes(),

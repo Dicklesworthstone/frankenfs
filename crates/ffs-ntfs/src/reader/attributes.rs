@@ -23,7 +23,7 @@ const BASE_REFERENCE: NtfsReference = NtfsReference {
     sequence: 0,
 };
 
-pub(super) struct AttributeSet<'a> {
+pub(crate) struct AttributeSet<'a> {
     base: &'a NtfsFileRecord,
     extensions: BTreeMap<u64, NtfsFileRecord>,
 }
@@ -112,7 +112,7 @@ impl NtfsVolume {
         Ok(result)
     }
 
-    pub(super) fn attributes<'a>(
+    pub(crate) fn attributes<'a>(
         &self,
         cx: &Cx,
         base: &'a NtfsFileRecord,
@@ -123,7 +123,7 @@ impl NtfsVolume {
         })
     }
 
-    pub(super) fn select_stream(
+    pub(crate) fn select_stream(
         &self,
         cx: &Cx,
         base: &NtfsFileRecord,
@@ -681,8 +681,8 @@ fn bootstrap_record(
         start,
         geometry.record_bytes() as usize,
     )?;
-    let record = NtfsFileRecord::parse(&raw).map_err(|error| parse(&error))?;
-    validate_identity(&record, reference.record, Some(reference.sequence))?;
+    let mut record = NtfsFileRecord::parse(&raw).map_err(|error| parse(&error))?;
+    super::validate_identity_provisional(&mut record, reference.record, Some(reference.sequence))?;
     checkpoint(cx)?;
     Ok(Some(record))
 }

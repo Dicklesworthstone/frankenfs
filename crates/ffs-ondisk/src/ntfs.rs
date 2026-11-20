@@ -199,6 +199,123 @@ impl NtfsGeometry {
     }
 }
 
+/// Specification for encoding a native NTFS 3.x Volume Boot Record (`VBR`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NtfsBootSectorSpec {
+    pub sector_bytes: u32,
+    pub sectors_per_cluster: u32,
+    /// Addressable volume sector count (`backing_sectors - 1` when a trailing
+    /// backup boot sector is reserved).
+    pub total_sectors: u64,
+    pub mft_cluster: u64,
+    pub mirror_cluster: u64,
+    pub record_bytes: u32,
+    pub index_bytes: u32,
+    pub serial: u64,
+    pub hidden_sectors: u32,
+}
+
+fn encode_ntfs_size_field(size_bytes: u32, cluster_bytes: u32) -> Result<u8, ParseError> {
+    if !(512..=65_536).contains(&size_bytes) || !size_bytes.is_power_of_two() {
+        return Err(invalid("ntfs.record_size", "unsupported record size"));
+    }
+    if size_bytes < cluster_bytes {
+        let shift = i8::try_from(size_bytes.trailing_zeros())
+            .map_err(|_| invalid("ntfs.record_size", "shift overflow"))?;
+        Ok((-shift).to_ne_bytes()[0])
+    } else {
+        let clusters = size_bytes / cluster_bytes;
+        if clusters == 0 || clusters > 127 {
+            return Err(invalid("ntfs.record_size", "cluster count out of range"));
+        }
+        u8::try_from(clusters).map_err(|_| invalid("ntfs.record_size", "cluster count overflow"))
+    }
+}
+
+/// Encode a canonical NTFS 3.x Volume Boot Record (`VBR`) sector and verify it
+/// through [`NtfsGeometry::parse`].
+///
+/// # Errors
+/// Returns [`ParseError`] if geometry parameters are invalid or fail round-trip
+/// parsing.
+pub fn encode_ntfs_boot_sector(spec: &NtfsBootSectorSpec) -> Result<Vec<u8>, ParseError> {
+    if !matches!(spec.sector_bytes, 512 | 1024 | 2048 | 4096) {
+        return Err(invalid("ntfs.sector_bytes", "unsupported sector size"));
+    }
+    if !spec.sectors_per_cluster.is_power_of_two() || spec.sectors_per_cluster > 128 {
+        return Err(invalid("ntfs.cluster", "unsupported cluster encoding"));
+    }
+    let cluster_bytes = spec
+        .sector_bytes
+        .checked_mul(spec.sectors_per_cluster)
+        .filter(|&cb| cb <= 65_536)
+        .ok_or_else(|| invalid("ntfs.cluster", "cluster size exceeds 64 KiB"))?;
+    let volume_bytes = spec
+        .total_sectors
+        .checked_mul(u64::from(spec.sector_bytes))
+        .ok_or_else(|| invalid("ntfs.volume", "byte length overflow"))?;
+    let sector_len = usize::try_from(spec.sector_bytes)
+        .map_err(|_| invalid("ntfs.sector_bytes", "sector length overflow"))?;
+    let sector_u16 = u16::try_from(spec.sector_bytes)
+        .map_err(|_| invalid("ntfs.sector_bytes", "sector bytes overflow"))?;
+    let spc_u8 = u8::try_from(spec.sectors_per_cluster)
+        .map_err(|_| invalid("ntfs.cluster", "sectors_per_cluster overflow"))?;
+
+    let mut boot = vec![0_u8; sector_len];
+    boot[0..3].copy_from_slice(&[0xEB, 0x52, 0x90]);
+    boot[3..11].copy_from_slice(b"NTFS    ");
+    boot[11..13].copy_from_slice(&sector_u16.to_le_bytes());
+    boot[13] = spc_u8;
+    boot[21] = 0xF8;
+    boot[24..26].copy_from_slice(&63_u16.to_le_bytes());
+    boot[26..28].copy_from_slice(&255_u16.to_le_bytes());
+    boot[28..32].copy_from_slice(&spec.hidden_sectors.to_le_bytes());
+    boot[36] = 0x80;
+    boot[38] = 0x80;
+    boot[40..48].copy_from_slice(&spec.total_sectors.to_le_bytes());
+    boot[48..56].copy_from_slice(&spec.mft_cluster.to_le_bytes());
+    boot[56..64].copy_from_slice(&spec.mirror_cluster.to_le_bytes());
+    boot[64] = encode_ntfs_size_field(spec.record_bytes, cluster_bytes)?;
+    boot[68] = encode_ntfs_size_field(spec.index_bytes, cluster_bytes)?;
+    boot[72..80].copy_from_slice(&spec.serial.to_le_bytes());
+    // Standard 32-bit VBR header checksum over 0x00..0x50 (stored at 0x50..0x54).
+    let checksum = ntfs_boot_sector_checksum(&boot)?;
+    boot[80..84].copy_from_slice(&checksum.to_le_bytes());
+    boot[510..512].copy_from_slice(&[0x55, 0xAA]);
+
+    // Round-trip verification against the reader's own BPB parser.
+    let parsed = NtfsGeometry::parse(&boot, volume_bytes)?;
+    if parsed.sector_bytes() != spec.sector_bytes
+        || parsed.cluster_bytes() != cluster_bytes
+        || parsed.mft_cluster() != spec.mft_cluster
+        || parsed.mirror_cluster() != spec.mirror_cluster
+        || parsed.record_bytes() != spec.record_bytes
+        || parsed.index_bytes() != spec.index_bytes
+        || parsed.serial() != spec.serial
+    {
+        return Err(invalid("ntfs.boot", "encoded VBR round-trip mismatch"));
+    }
+    Ok(boot)
+}
+
+/// Compute the 32-bit additive checksum of bytes `0x00..0x50` in an NTFS VBR.
+///
+/// # Errors
+/// Returns [`ParseError`] if `boot` is shorter than 84 bytes.
+pub fn ntfs_boot_sector_checksum(boot: &[u8]) -> Result<u32, ParseError> {
+    if boot.len() < 84 {
+        return Err(invalid("ntfs.boot", "boot sector shorter than 84 bytes"));
+    }
+    let sum = boot[..80]
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .fold(0_u32, |acc, word| {
+            acc.wrapping_add(u32::from_le_bytes(*word))
+        });
+    Ok(sum)
+}
+
 /// Validate every protected trailer before copying or restoring any byte.
 /// The input is never modified, including on a late torn-sector failure.
 pub fn restore_record(raw: &[u8], signature: &[u8; 4]) -> Result<Vec<u8>, ParseError> {
@@ -263,10 +380,15 @@ impl NtfsReference {
 pub struct NtfsFileRecord {
     data: Vec<u8>,
     first_attribute: usize,
+    /// Offset of the Update Sequence Array (`>= 48` on NTFS 3.1, `>= 42` on NTFS 3.0).
+    pub usa_offset: u16,
     pub sequence: u16,
     pub flags: u16,
     pub hard_links: u16,
     pub base: NtfsReference,
+    /// On-disk self MFT record number (offset 44), present only on NTFS 3.1 (`usa_offset >= 48`).
+    pub self_number: Option<u32>,
+    /// Legacy alias for `self_number.unwrap_or(0)`.
     pub number: u32,
 }
 
@@ -277,9 +399,10 @@ impl NtfsFileRecord {
             .map_err(|_| invalid("ntfs.file_record", "used length overflow"))?;
         let allocated = u64::from(le32(&data, 28)?);
         let first_attribute = usize::from(le16(&data, 20)?);
-        let usa = usize::from(le16(&data, 4)?);
+        let usa_offset = le16(&data, 4)?;
+        let usa = usize::from(usa_offset);
         let usa_end = usa + usize::from(le16(&data, 6)?) * 2;
-        if usa < 48
+        if usa < 42
             || first_attribute < usa_end
             || !first_attribute.is_multiple_of(8)
             || used > data.len()
@@ -298,15 +421,22 @@ impl NtfsFileRecord {
             return Err(invalid("ntfs.file_record", "unknown record flags"));
         }
         let base = NtfsReference::decode(le64(&data, 32)?);
-        let number = le32(&data, 44)?;
+        let self_number = if usa >= 48 {
+            Some(le32(&data, 44)?)
+        } else {
+            None
+        };
+        let number = self_number.unwrap_or(0);
         data.truncate(used);
         let record = Self {
             data,
             first_attribute,
+            usa_offset,
             sequence,
             flags,
             hard_links,
             base,
+            self_number,
             number,
         };
         record.attributes()?;
@@ -1245,6 +1375,42 @@ pub struct NtfsAttrDef {
     pub max_size: u64,
 }
 
+impl NtfsAttrDef {
+    /// True if `$AttrDef` permits a resident instance of this attribute.
+    #[must_use]
+    pub const fn allows_resident(&self) -> bool {
+        // Attributes marked NON_RESIDENT_LOG without RESIDENT may still be resident
+        // unless they are inherently non-resident (e.g. $INDEX_ALLOCATION 0xA0).
+        self.type_code != 0xA0
+    }
+
+    /// True if `$AttrDef` permits a non-resident instance of this attribute.
+    #[must_use]
+    pub const fn allows_non_resident(&self) -> bool {
+        self.flags & ATTR_DEF_RESIDENT == 0
+    }
+
+    /// Validate `byte_len` against the row's declared `[min_size, max_size]` bounds.
+    ///
+    /// # Errors
+    /// Returns [`ParseError`] if `byte_len` falls outside the row's declared bounds.
+    pub fn validate_value_size(&self, byte_len: u64) -> Result<(), ParseError> {
+        if byte_len < self.min_size {
+            return Err(invalid(
+                "ntfs.attr_def",
+                "attribute value length below $AttrDef min_size",
+            ));
+        }
+        if self.max_size != 0 && self.max_size != u64::MAX && byte_len > self.max_size {
+            return Err(invalid(
+                "ntfs.attr_def",
+                "attribute value length exceeds $AttrDef max_size",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Parse a raw `$AttrDef` `$DATA` stream into validated attribute definitions.
 ///
 /// Requires whole 160-byte rows, unique 16-aligned `type_code`s, NUL-terminated
@@ -1421,6 +1587,103 @@ pub fn validate_ntfs31_attr_def_table(defs: &[NtfsAttrDef]) -> Result<(), ParseE
     }
 
     Ok(())
+}
+
+/// Encode the canonical 15-entry + terminator (`2,560`-byte) NTFS 3.x `$AttrDef`
+/// attribute definition table (`$STANDARD_INFORMATION` through
+/// `$LOGGED_UTILITY_STREAM`), guaranteed to satisfy [`parse_attr_def_table`] and
+/// [`validate_ntfs31_attr_def_table`].
+#[must_use]
+pub fn encode_standard_ntfs_attr_def_table() -> Vec<u8> {
+    const ROWS: [(&str, u32, u32, u32, u64, u64); 15] = [
+        ("$STANDARD_INFORMATION", 0x10, 0, ATTR_DEF_RESIDENT, 48, 72),
+        (
+            "$ATTRIBUTE_LIST",
+            ATTRIBUTE_LIST,
+            0,
+            ATTR_DEF_NON_RESIDENT_LOG,
+            0,
+            u64::MAX,
+        ),
+        (
+            "$FILE_NAME",
+            0x30,
+            0,
+            ATTR_DEF_INDEXABLE | ATTR_DEF_RESIDENT,
+            68,
+            578,
+        ),
+        ("$OBJECT_ID", 0x40, 0, ATTR_DEF_RESIDENT, 0, 256),
+        (
+            "$SECURITY_DESCRIPTOR",
+            0x50,
+            0,
+            ATTR_DEF_NON_RESIDENT_LOG,
+            0,
+            u64::MAX,
+        ),
+        ("$VOLUME_NAME", 0x60, 0, ATTR_DEF_RESIDENT, 2, 256),
+        (
+            "$VOLUME_INFORMATION",
+            VOLUME_INFORMATION,
+            0,
+            ATTR_DEF_RESIDENT,
+            12,
+            12,
+        ),
+        ("$DATA", DATA, 0, 0, 0, u64::MAX),
+        ("$INDEX_ROOT", 0x90, 0, ATTR_DEF_RESIDENT, 0, u64::MAX),
+        (
+            "$INDEX_ALLOCATION",
+            0xA0,
+            0,
+            ATTR_DEF_NON_RESIDENT_LOG,
+            0,
+            u64::MAX,
+        ),
+        ("$BITMAP", 0xB0, 0, 0, 0, u64::MAX),
+        (
+            "$REPARSE_POINT",
+            REPARSE_POINT,
+            0,
+            ATTR_DEF_NON_RESIDENT_LOG,
+            0,
+            16_384,
+        ),
+        (
+            "$EA_INFORMATION",
+            EA_INFORMATION,
+            0,
+            ATTR_DEF_RESIDENT,
+            8,
+            8,
+        ),
+        ("$EA", EA, 0, 0, 0, 65_536),
+        (
+            "$LOGGED_UTILITY_STREAM",
+            0x100,
+            0,
+            ATTR_DEF_NON_RESIDENT_LOG,
+            0,
+            65_536,
+        ),
+    ];
+
+    let mut out = vec![0_u8; (ROWS.len() + 1) * ATTR_DEF_ENTRY_BYTES];
+    for (idx, &(name, type_code, collation_rule, flags, min_size, max_size)) in
+        ROWS.iter().enumerate()
+    {
+        let row = &mut out[idx * ATTR_DEF_ENTRY_BYTES..(idx + 1) * ATTR_DEF_ENTRY_BYTES];
+        for (i, unit) in name.encode_utf16().enumerate() {
+            row[i * 2..i * 2 + 2].copy_from_slice(&unit.to_le_bytes());
+        }
+        row[128..132].copy_from_slice(&type_code.to_le_bytes());
+        row[136..140].copy_from_slice(&collation_rule.to_le_bytes());
+        row[140..144].copy_from_slice(&flags.to_le_bytes());
+        row[144..152].copy_from_slice(&min_size.to_le_bytes());
+        row[152..160].copy_from_slice(&max_size.to_le_bytes());
+    }
+    out
 }
 
 #[cfg(test)]

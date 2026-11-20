@@ -9,7 +9,7 @@ use super::{
     AllocationIssue, Cx, FfsError, MAX_ISSUES, NtfsVolume, RecordOwnershipLimits, Result, Storage,
     Stream, bit, checkpoint, corrupt, parse, read_bitmap, unsupported,
 };
-use crate::reader::{DATA, NtfsFileRecord, validate_identity};
+use crate::reader::{DATA, NtfsFileRecord, validate_identity_for_version};
 
 const REQUIRED_RECORDS: u64 = 4;
 
@@ -202,11 +202,11 @@ fn record_pair(
     if left.len() != record_bytes || right.len() != record_bytes {
         return Err(corrupt(offset, "short MFT mirror record pair"));
     }
-    let primary = NtfsFileRecord::parse(&left).map_err(|error| parse(&error))?;
-    let mirror = NtfsFileRecord::parse(&right).map_err(|error| parse(&error))?;
+    let mut primary = NtfsFileRecord::parse(&left).map_err(|error| parse(&error))?;
+    let mut mirror = NtfsFileRecord::parse(&right).map_err(|error| parse(&error))?;
     if number < REQUIRED_RECORDS {
-        validate_identity(&primary, number, None)?;
-        validate_identity(&mirror, number, None)?;
+        validate_identity_for_version(&mut primary, number, None, volume.version)?;
+        validate_identity_for_version(&mut mirror, number, None, volume.version)?;
     }
     Ok((primary, mirror))
 }
@@ -222,9 +222,18 @@ impl NtfsVolume {
         cx: &Cx,
         limits: RecordOwnershipLimits,
     ) -> Result<MftMirrorReport> {
+        self.check_mft_mirror_internal(cx, limits, false)
+    }
+
+    pub(crate) fn check_mft_mirror_internal(
+        &self,
+        cx: &Cx,
+        limits: RecordOwnershipLimits,
+        allow_dirty_flags: bool,
+    ) -> Result<MftMirrorReport> {
         checkpoint(cx)?;
         limits.validate()?;
-        if self.volume_flags != 0
+        if (!allow_dirty_flags && self.volume_flags != 0)
             || self.logfile_recovery.is_some()
             || !self.source.overlay.is_empty()
         {

@@ -544,5 +544,206 @@ fn index_entries(
     }
 }
 
+/// Build a canonical MS-DTYP self-relative security descriptor for freshly
+/// formatted NTFS volumes (Owner `S-1-5-32-544` Administrators, Group `S-1-5-18`
+/// SYSTEM, DACL granting full control `0x001F_01FF` to SYSTEM and Administrators).
+#[must_use]
+pub fn build_default_ntfs_security_descriptor() -> Vec<u8> {
+    // S-1-5-32-544 (BUILTIN\Administrators): 16 bytes
+    const OWNER_SID: [u8; 16] = [
+        0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x20, 0x00, 0x00, 0x00, 0x20, 0x02, 0x00,
+        0x00,
+    ];
+    // S-1-5-18 (NT AUTHORITY\SYSTEM): 12 bytes
+    const GROUP_SID: [u8; 12] = [
+        0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x12, 0x00, 0x00, 0x00,
+    ];
+    // DACL: 8B header + 20B SYSTEM ACE + 24B Administrators ACE = 52 bytes
+    let mut dacl = Vec::with_capacity(52);
+    dacl.extend_from_slice(&[0x02, 0x00]); // revision 2, sbz1
+    dacl.extend_from_slice(&52_u16.to_le_bytes()); // AclSize
+    dacl.extend_from_slice(&2_u16.to_le_bytes()); // AceCount
+    dacl.extend_from_slice(&0_u16.to_le_bytes()); // sbz2
+    // ACE 1: ACCESS_ALLOWED (0), flags OBJECT_INHERIT | CONTAINER_INHERIT (0x03), size 20
+    dacl.extend_from_slice(&[0x00, 0x03]);
+    dacl.extend_from_slice(&20_u16.to_le_bytes());
+    dacl.extend_from_slice(&0x001F_01FF_u32.to_le_bytes());
+    dacl.extend_from_slice(&GROUP_SID);
+    // ACE 2: ACCESS_ALLOWED (0), flags OBJECT_INHERIT | CONTAINER_INHERIT (0x03), size 24
+    dacl.extend_from_slice(&[0x00, 0x03]);
+    dacl.extend_from_slice(&24_u16.to_le_bytes());
+    dacl.extend_from_slice(&0x001F_01FF_u32.to_le_bytes());
+    dacl.extend_from_slice(&OWNER_SID);
+
+    // Self-relative header (20B) + DACL (52B @ 20) + Owner SID (16B @ 72) + Group SID (12B @ 88) = 100B
+    let mut sd = Vec::with_capacity(100);
+    sd.extend_from_slice(&[0x01, 0x00]); // revision 1, sbz1
+    // SE_SELF_RELATIVE (0x8000) | SE_DACL_PRESENT (0x0004)
+    sd.extend_from_slice(&0x8004_u16.to_le_bytes());
+    sd.extend_from_slice(&72_u32.to_le_bytes()); // owner_offset
+    sd.extend_from_slice(&88_u32.to_le_bytes()); // group_offset
+    sd.extend_from_slice(&0_u32.to_le_bytes()); // sacl_offset
+    sd.extend_from_slice(&20_u32.to_le_bytes()); // dacl_offset
+    sd.extend_from_slice(&dacl);
+    sd.extend_from_slice(&OWNER_SID);
+    sd.extend_from_slice(&GROUP_SID);
+    sd
+}
+
+/// Encode primary and `+256 KiB` mirror copies of a `$Secure:$SDS` stream along
+/// with their validated [`NtfsSecurityHeader`] descriptors.
+///
+/// # Errors
+/// Returns [`ParseError`] if any descriptor fails validation, has `security_id == 0`,
+/// or overflows the single `256 KiB` `$SDS` stripe window.
+pub fn encode_sds_stream(
+    entries: &[(u32, &[u8])],
+) -> Result<(Vec<u8>, Vec<NtfsSecurityHeader>), ParseError> {
+    if entries.is_empty() {
+        return Err(invalid("SDS stream requires at least one descriptor"));
+    }
+    let mut primary = Vec::new();
+    let mut headers = Vec::with_capacity(entries.len());
+    for &(security_id, desc) in entries {
+        if security_id == 0 {
+            return Err(invalid("SDS security_id must be nonzero"));
+        }
+        NtfsSecurityDescriptor::parse(desc)?;
+        let padded_desc_len = desc.len().next_multiple_of(4);
+        let mut padded_desc = desc.to_vec();
+        padded_desc.resize(padded_desc_len, 0);
+        let total_len = SDS_HEADER_BYTES
+            .checked_add(padded_desc_len)
+            .ok_or_else(|| invalid("SDS entry length overflow"))?;
+        let offset = u64::try_from(primary.len()).map_err(|_| invalid("SDS offset overflow"))?;
+        let length =
+            u32::try_from(total_len).map_err(|_| invalid("SDS entry length exceeds u32"))?;
+        let hash = security_hash(&padded_desc);
+        let header = NtfsSecurityHeader {
+            hash,
+            security_id,
+            offset,
+            length,
+        };
+        let mut encoded = Vec::with_capacity(total_len);
+        encoded.extend_from_slice(&hash.to_le_bytes());
+        encoded.extend_from_slice(&security_id.to_le_bytes());
+        encoded.extend_from_slice(&offset.to_le_bytes());
+        encoded.extend_from_slice(&length.to_le_bytes());
+        encoded.extend_from_slice(&padded_desc);
+        header.descriptor(&encoded)?;
+        primary.extend_from_slice(&encoded);
+        let aligned = primary.len().next_multiple_of(16);
+        primary.resize(aligned, 0);
+        if u64::try_from(primary.len()).is_ok_and(|len| len > SDS_COPY_DISTANCE) {
+            return Err(invalid("SDS entries exceed single 256 KiB mirror stripe"));
+        }
+        headers.push(header);
+    }
+
+    let copy_dist =
+        usize::try_from(SDS_COPY_DISTANCE).map_err(|_| invalid("SDS copy distance overflow"))?;
+    let mut full = vec![0_u8; copy_dist + primary.len()];
+    full[..primary.len()].copy_from_slice(&primary);
+    full[copy_dist..copy_dist + primary.len()].copy_from_slice(&primary);
+    Ok((full, headers))
+}
+
+/// Encode a resident `$SII` or `$SDH` `INDEX_ROOT` payload sorted by native key
+/// order and verify it via [`NtfsSecurityIndexRoot::parse_with_kind`].
+///
+/// # Errors
+/// Returns [`ParseError`] if geometry is invalid, headers contain duplicate keys,
+/// or round-trip parsing fails.
+pub fn encode_security_index_root(
+    kind: NtfsSecurityIndexKind,
+    headers: &[NtfsSecurityHeader],
+    index_bytes: u32,
+    cluster_bytes: u32,
+) -> Result<Vec<u8>, ParseError> {
+    if !(512..=65_536).contains(&index_bytes)
+        || !index_bytes.is_power_of_two()
+        || !(512..=65_536).contains(&cluster_bytes)
+        || !cluster_bytes.is_power_of_two()
+    {
+        return Err(invalid("invalid security index geometry"));
+    }
+    let vcn_bytes = if index_bytes < cluster_bytes {
+        512
+    } else {
+        cluster_bytes
+    };
+    let blocks_per_index = u8::try_from(index_bytes / vcn_bytes)
+        .map_err(|_| invalid("security index VBN unit count overflow"))?;
+    let collation: u32 = match kind {
+        NtfsSecurityIndexKind::SecurityId => 0x10,
+        NtfsSecurityIndexKind::SecurityHash => 0x12,
+    };
+
+    let mut sorted = headers.to_vec();
+    sorted.sort_by_key(|h| kind.key(*h));
+
+    let mut entries_bytes = Vec::new();
+    for h in &sorted {
+        let (key_bytes, data_offset, entry_len): (Vec<u8>, u16, u16) = match kind {
+            NtfsSecurityIndexKind::SecurityId => {
+                // 16B header + 4B key = 20, data at 20 (20B SDS header) => 40B (8-aligned)
+                (h.security_id.to_le_bytes().to_vec(), 20, 40)
+            }
+            NtfsSecurityIndexKind::SecurityHash => {
+                // 16B header + 8B key = 24, data at 24 (20B SDS header) => 44B -> 48B (8-aligned)
+                let mut key = Vec::with_capacity(8);
+                key.extend_from_slice(&h.hash.to_le_bytes());
+                key.extend_from_slice(&h.security_id.to_le_bytes());
+                (key, 24, 48)
+            }
+        };
+        let key_len = u16::try_from(key_bytes.len())
+            .map_err(|_| invalid("security index key length overflow"))?;
+        let sds_len =
+            u16::try_from(SDS_HEADER_BYTES).map_err(|_| invalid("SDS header length overflow"))?;
+        let mut entry = vec![0_u8; usize::from(entry_len)];
+        entry[0..2].copy_from_slice(&data_offset.to_le_bytes());
+        entry[2..4].copy_from_slice(&sds_len.to_le_bytes());
+        entry[8..10].copy_from_slice(&entry_len.to_le_bytes());
+        entry[10..12].copy_from_slice(&key_len.to_le_bytes());
+        entry[12..14].copy_from_slice(&0_u16.to_le_bytes()); // leaf entry flags = 0
+        entry[16..16 + key_bytes.len()].copy_from_slice(&key_bytes);
+        let d_off = usize::from(data_offset);
+        entry[d_off..d_off + 4].copy_from_slice(&h.hash.to_le_bytes());
+        entry[d_off + 4..d_off + 8].copy_from_slice(&h.security_id.to_le_bytes());
+        entry[d_off + 8..d_off + 16].copy_from_slice(&h.offset.to_le_bytes());
+        entry[d_off + 16..d_off + 20].copy_from_slice(&h.length.to_le_bytes());
+        entries_bytes.extend_from_slice(&entry);
+    }
+    // Terminal leaf entry: 16 bytes, length=16, key_len=0, flags=2 (END).
+    let mut term = [0_u8; 16];
+    term[8..10].copy_from_slice(&16_u16.to_le_bytes());
+    term[12..14].copy_from_slice(&2_u16.to_le_bytes());
+    entries_bytes.extend_from_slice(&term);
+
+    let used = u32::try_from(16 + entries_bytes.len())
+        .map_err(|_| invalid("security index root size overflow"))?;
+    let mut root = Vec::with_capacity(16 + usize::try_from(used).unwrap_or(0));
+    root.extend_from_slice(&0_u32.to_le_bytes()); // attribute_type = 0 (view index)
+    root.extend_from_slice(&collation.to_le_bytes());
+    root.extend_from_slice(&index_bytes.to_le_bytes());
+    root.push(blocks_per_index);
+    root.extend_from_slice(&[0_u8; 3]);
+    // INDEX_HEADER at offset 16: entries_offset=16, used, allocated=used, flags=0 (small)
+    root.extend_from_slice(&16_u32.to_le_bytes());
+    root.extend_from_slice(&used.to_le_bytes());
+    root.extend_from_slice(&used.to_le_bytes());
+    root.extend_from_slice(&0_u32.to_le_bytes());
+    root.extend_from_slice(&entries_bytes);
+
+    // Round-trip verify with the crate's own parser.
+    let parsed = NtfsSecurityIndexRoot::parse_with_kind(&root, cluster_bytes, kind)?;
+    if parsed.entries.len() != sorted.len() + 1 {
+        return Err(invalid("encoded security index root round-trip mismatch"));
+    }
+    Ok(root)
+}
+
 #[cfg(test)]
 mod tests;

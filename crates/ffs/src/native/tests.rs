@@ -1560,3 +1560,59 @@ fn open_read_only_device_enforces_zero_write_sync_authority_and_rejects_path_com
     assert_eq!(writes.load(Ordering::SeqCst), 0);
     assert_eq!(blake3::hash(&backing.bytes), before_digest);
 }
+
+#[test]
+fn facade_opens_natively_formatted_ntfs_31_30_and_relocated_resized_images_read_only() {
+    let cx = Cx::for_testing();
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    for (name, version) in [
+        ("fmt31.img", ffs_ntfs::NtfsFormatVersion::V3_1),
+        ("fmt30.img", ffs_ntfs::NtfsFormatVersion::V3_0),
+    ] {
+        let img = dir.path().join(name);
+        let mut opts = ffs_ntfs::NtfsFormatOptions::new_image(img.clone(), 12);
+        opts.version = version;
+        opts.label = Some(format!("FACADE_{name}"));
+        let rep = ffs_ntfs::format_image_file(&cx, &opts, None).expect("format NTFS");
+        assert!(rep.boot_published && rep.check_clean);
+
+        let opened = open_read_only(&cx, &img, &ReadOnlyOpenOptions::default())
+            .unwrap_or_else(|e| panic!("open_read_only {name} failed: {e}"));
+        assert_eq!(opened.format, FsFormatKind::Ntfs);
+        assert_eq!(
+            opened.ntfs_volume().expect("ntfs volume").version(),
+            version.pair()
+        );
+        let mut scope = RequestScope::empty();
+        let root = opened
+            .filesystem
+            .getattr(&cx, &mut scope, InodeNumber(1))
+            .expect("getattr root");
+        assert_eq!(root.kind, FileType::Directory);
+    }
+
+    // Also open a relocated-shrunk NTFS 3.1 image through the public read-only facade!
+    let src = dir.path().join("fmt31.img");
+    let shrunk = dir.path().join("fmt31_shrunk_8m.img");
+    let resize_rep = ffs_ntfs::run_resize(
+        &cx,
+        &ffs_ntfs::NtfsResizeOptions {
+            source_image: src,
+            source_offset: 0,
+            source_length: None,
+            output: shrunk.clone(),
+            size_bytes: None,
+            size_mib: Some(8),
+            relocate: true,
+            offline_image: true,
+            dry_run: false,
+        },
+        None,
+    )
+    .expect("relocating shrink 12 MiB -> 8 MiB");
+    assert!(resize_rep.boot_published && resize_rep.check_clean);
+    let opened = open_read_only(&cx, &shrunk, &ReadOnlyOpenOptions::default())
+        .expect("open resized NTFS image read-only");
+    assert_eq!(opened.format, FsFormatKind::Ntfs);
+}

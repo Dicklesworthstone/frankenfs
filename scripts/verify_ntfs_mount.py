@@ -551,8 +551,63 @@ def main() -> None:
         report["mounts"].append(run.mount_probe(rw_image, ro_recheck_path, 0, rw_image.stat().st_size))
         require(digest(rw_image) == rw_after_ntfscp_sha, "post-ntfscp read-only FUSE mount altered rw-mounted.img")
 
+        # Native `ffs-ntfs format` -> `mount-write` -> `ffs-ntfs resize --relocate` -> `ffs-ntfs check` + ntfs-3g oracle!
+        fmt_rw_img = root / "native-formatted-rw.img"
+        run.command(binary, "format", fmt_rw_img, "--size-mib", "32", "--label", "FFS_FMT_RW")
+        run.command(binary, "tx-grow-mft", fmt_rw_img, "--offline-image", "--allow-write", "--records", "128")
+        seed_fmt_src = root / "fmt-rw-seed.bin"
+        seed_fmt_src.write_bytes(b"initial-ntfscp-seed\n")
+        run.command("ntfscp", fmt_rw_img, seed_fmt_src, "/seeded.bin")
+        fmt_rw_summary = root / "fmt-rw-summary.json"
+        report["mounts"].append(run.mount_write_probe(fmt_rw_img, fmt_rw_summary))
+        fmt_chk = json.loads(run.command(binary, "check", fmt_rw_img, "--offline-image"))
+        require(fmt_chk["clean"] is True, "ffs-ntfs check failed after mount-write on natively formatted image")
+
+        # Relocating shrink of the mounted-written native-formatted image (32 MiB -> 16 MiB) + re-check!
+        shrunk_rw_img = root / "native-formatted-shrunk-16m.img"
+        shrink_rep = json.loads(run.command(
+            binary, "resize", fmt_rw_img,
+            "--output", shrunk_rw_img,
+            "--size-mib", "16",
+            "--relocate",
+            "--offline-image",
+        ))
+        require(shrink_rep["check_clean"] is True and shrink_rep["plan"]["relocated_clusters"] > 0,
+                "relocating shrink after mount-write failed or did not relocate $MFTMirr")
+        fmt_summary_obj = json.loads(fmt_rw_summary.read_text())
+        for rel_path, key in [("/seeded.bin", "seeded_sha256"), ("/doc.txt", "doc_sha256")]:
+            oracle_bytes = run.command("ntfscat", shrunk_rw_img, rel_path)
+            require(hashlib.sha256(oracle_bytes).hexdigest() == fmt_summary_obj[key],
+                    f"ntfscat mismatch on shrunk native-formatted image for {rel_path}")
+        if shutil.which("ntfsfix") is not None:
+            run.command("ntfsfix", "-n", shrunk_rw_img)
+
+        # Conditional Linux kernel `ntfs3` loop-mount probe (never pretends FUSE/ntfsfix is kernel ntfs3).
+        ntfs3_probe = "skipped_unprivileged"
+        if os.geteuid() == 0 and Path("/proc/filesystems").read_text().find("ntfs3") >= 0:
+            kmnt = root / "kernel-ntfs3-mnt"
+            kmnt.mkdir()
+            mnt_proc = subprocess.run(
+                ["mount", "-t", "ntfs3", "-o", "loop,ro", str(shrunk_rw_img), str(kmnt)],
+                capture_output=True,
+                check=False,
+            )
+            if mnt_proc.returncode == 0:
+                try:
+                    k_bytes = (kmnt / "doc.txt").read_bytes()
+                    require(hashlib.sha256(k_bytes).hexdigest() == fmt_summary_obj["doc_sha256"],
+                            "kernel ntfs3 loop mount read mismatched doc.txt")
+                    ntfs3_probe = "passed_kernel_ntfs3_loop_ro"
+                finally:
+                    subprocess.run(["umount", str(kmnt)], check=False)
+            else:
+                ntfs3_probe = f"skipped_mount_error:{mnt_proc.stderr.decode(errors='replace').strip()[:120]}"
+
         report.update(status="passed", native_sha256=before, partitioned_sha256=disk_before,
-                      tx_mounted_sha256=tx_before, rw_mounted_sha256=rw_after_ntfscp_sha)
+                      tx_mounted_sha256=tx_before, rw_mounted_sha256=rw_after_ntfscp_sha,
+                      native_formatted_and_resized_mount_checked=True,
+                      ntfs3_kernel_mount=ntfs3_probe,
+                      oracle_honesty_note="ntfsfix -n is Linux ntfs-3g probe; Windows chkdsk is not executed on Linux")
         print(json.dumps(report, indent=2))
     except Exception as error:
         report.update(status="failed", error=str(error))

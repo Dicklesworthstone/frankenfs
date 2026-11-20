@@ -324,7 +324,7 @@ impl NtfsVolume {
         limits: SecurityCheckLimits,
     ) -> Result<SecurityCheckReport> {
         let mut budget = SecurityBudget::new(limits);
-        self.security_store(cx, &mut budget)
+        self.security_store(cx, &mut budget, false)
             .map(|(report, _)| report)
     }
 
@@ -344,6 +344,16 @@ impl NtfsVolume {
         limits: SecurityCheckLimits,
         max_records: u64,
     ) -> Result<SecurityReferenceReport> {
+        self.check_security_references_internal(cx, limits, max_records, false)
+    }
+
+    pub(crate) fn check_security_references_internal(
+        &self,
+        cx: &Cx,
+        limits: SecurityCheckLimits,
+        max_records: u64,
+        allow_dirty_flags: bool,
+    ) -> Result<SecurityReferenceReport> {
         checkpoint(cx)?;
         limits.validate()?;
         RecordOwnershipLimits {
@@ -352,7 +362,7 @@ impl NtfsVolume {
         }
         .validate()?;
         let mut budget = SecurityBudget::new(limits);
-        let (store, headers) = self.security_store(cx, &mut budget)?;
+        let (store, headers) = self.security_store(cx, &mut budget, allow_dirty_flags)?;
         let record_bytes = u64::from(self.geometry.record_bytes());
         let records = self.mft.size / record_bytes;
         let mut report = SecurityReferenceReport {
@@ -545,10 +555,11 @@ impl NtfsVolume {
         &self,
         cx: &Cx,
         budget: &mut SecurityBudget,
+        allow_dirty_flags: bool,
     ) -> Result<(SecurityCheckReport, BTreeMap<u32, NtfsSecurityHeader>)> {
         checkpoint(cx)?;
         budget.limits.validate()?;
-        if self.volume_flags != 0
+        if (!allow_dirty_flags && self.volume_flags != 0)
             || self.logfile_recovery.is_some()
             || !self.source.overlay.is_empty()
         {

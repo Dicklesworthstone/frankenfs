@@ -2,6 +2,7 @@
 
 pub mod allocation;
 mod attributes;
+pub mod check;
 mod compression;
 pub mod ea;
 pub mod filesystem;
@@ -214,6 +215,7 @@ struct RecoveredViewIdentity {
 pub struct NtfsVolume {
     source: Source,
     pub geometry: NtfsGeometry,
+    pub version: [u8; 2],
     mft: Stream,
     pub volume_flags: u16,
     pub logfile_recovery: Option<ffs_ondisk::ntfs::NtfsLogFilePlan>,
@@ -271,6 +273,26 @@ impl NtfsVolume {
         length: u64,
         recover_logfile: bool,
     ) -> Result<Self> {
+        Self::from_device_internal(cx, device, base, length, recover_logfile, false)
+    }
+
+    pub(crate) fn from_device_for_check(
+        cx: &Cx,
+        device: Box<dyn ByteDevice>,
+        base: u64,
+        length: u64,
+    ) -> Result<Self> {
+        Self::from_device_internal(cx, device, base, length, false, true)
+    }
+
+    fn from_device_internal(
+        cx: &Cx,
+        device: Box<dyn ByteDevice>,
+        base: u64,
+        length: u64,
+        recover_logfile: bool,
+        allow_dirty_for_check: bool,
+    ) -> Result<Self> {
         checkpoint(cx)?;
         if length < 512
             || base
@@ -294,8 +316,8 @@ impl NtfsVolume {
                 .map_err(|error| parse(&error))?,
             &mut raw,
         )?;
-        let primary = NtfsFileRecord::parse(&raw).map_err(|error| parse(&error))?;
-        validate_identity(&primary, 0, None)?;
+        let mut primary = NtfsFileRecord::parse(&raw).map_err(|error| parse(&error))?;
+        validate_identity_provisional(&mut primary, 0, None)?;
         source.read(
             cx,
             geometry
@@ -303,9 +325,9 @@ impl NtfsVolume {
                 .map_err(|error| parse(&error))?,
             &mut raw,
         )?;
-        let mirror = NtfsFileRecord::parse(&raw).map_err(|error| parse(&error))?;
-        validate_identity(&mirror, 0, None)?;
-        if primary.used_bytes() != mirror.used_bytes() {
+        let mut mirror = NtfsFileRecord::parse(&raw).map_err(|error| parse(&error))?;
+        validate_identity_provisional(&mut mirror, 0, None)?;
+        if primary.used_bytes() != mirror.used_bytes() && !allow_dirty_for_check {
             return Err(corrupt(
                 0,
                 "NTFS MFT bootstrap and MFTMirr disagree; no automatic recovery",
@@ -316,6 +338,7 @@ impl NtfsVolume {
         let mut volume = Self {
             source,
             geometry,
+            version: [3, 0],
             mft,
             volume_flags: 0,
             logfile_recovery: None,
@@ -328,18 +351,30 @@ impl NtfsVolume {
                 "MFT mapping does not reproduce the bootstrap record",
             ));
         }
-        let record = volume.record(cx, 3, None)?;
-        let info = volume.select_stream(cx, &record, VOLUME_INFORMATION, &[])?;
+        let mut record3 = volume.record(cx, 3, None)?;
+        let info = volume.select_stream(cx, &record3, VOLUME_INFORMATION, &[])?;
         if !info.resident() || info.size < 12 || info.size > 4096 {
             return Err(corrupt(0, "invalid resident VOLUME_INFORMATION"));
         }
         let info = volume.read(cx, &info, 0, info.size as usize)?;
-        if info[8..10] != [3, 1] {
-            return Err(unsupported("NTFS reader currently admits version 3.1 only"));
+        let version = [info[8], info[9]];
+        if !matches!(version, [3, 0] | [3, 1]) {
+            return Err(unsupported(format!(
+                "NTFS reader admits versions 3.0 and 3.1 only (found {}.{})",
+                version[0], version[1]
+            )));
         }
+        volume.version = version;
+        // Re-validate bootstrap records against the discovered volume version:
+        // NTFS 3.1 strictly requires 48-byte FILE headers carrying self_number.
+        validate_identity_for_version(&mut primary, 0, None, version)?;
+        if !allow_dirty_for_check {
+            validate_identity_for_version(&mut mirror, 0, None, version)?;
+        }
+        validate_identity_for_version(&mut record3, 3, None, version)?;
         let flags = u16::from_le_bytes([info[10], info[11]]);
         volume.volume_flags = flags;
-        if flags != 0 && !recover_logfile {
+        if flags != 0 && !recover_logfile && !allow_dirty_for_check {
             return Err(unsupported(format!(
                 "NTFS volume flags {flags:#06x} require native investigation; pass --recover-logfile to replay $LogFile into a read-only overlay"
             )));
@@ -360,6 +395,39 @@ impl NtfsVolume {
         }
         checkpoint(cx)?;
         Ok(volume)
+    }
+
+    #[must_use]
+    pub const fn version(&self) -> [u8; 2] {
+        self.version
+    }
+
+    pub(crate) fn mft_stream(&self) -> &Stream {
+        &self.mft
+    }
+
+    pub(crate) fn read_mft_record_raw(&self, cx: &Cx, number: u64) -> Result<Vec<u8>> {
+        checkpoint(cx)?;
+        if number >= self.record_count() || number > u64::from(u32::MAX) {
+            return Err(FfsError::NotFound(format!(
+                "NTFS MFT record {number} is outside the initialized record range"
+            )));
+        }
+        let offset = number * u64::from(self.geometry.record_bytes());
+        let raw = self.read(cx, &self.mft, offset, self.geometry.record_bytes() as usize)?;
+        if raw.len() != self.geometry.record_bytes() as usize {
+            return Err(corrupt(offset, "short MFT record"));
+        }
+        Ok(raw)
+    }
+
+    pub(crate) fn read_raw_volume_bytes(
+        &self,
+        cx: &Cx,
+        offset: u64,
+        data: &mut [u8],
+    ) -> Result<()> {
+        self.source.read(cx, offset, data)
     }
 
     fn has_verified_recovered_view(&self) -> bool {
@@ -401,9 +469,9 @@ impl NtfsVolume {
         if raw.len() != self.geometry.record_bytes() as usize {
             return Err(corrupt(offset, "short MFT record"));
         }
-        let record =
+        let mut record =
             NtfsFileRecord::parse(&raw).map_err(|error| corrupt(offset, error.to_string()))?;
-        validate_identity(&record, number, sequence)?;
+        validate_identity_for_version(&mut record, number, sequence, self.version)?;
         checkpoint(cx)?;
         Ok(record)
     }
@@ -579,7 +647,7 @@ fn data_read_admission(record: &NtfsFileRecord, attributes: &[NtfsAttribute<'_>]
     Ok(())
 }
 
-fn standard_flags(attributes: &[NtfsAttribute<'_>]) -> Result<Option<u32>> {
+pub(crate) fn standard_flags(attributes: &[NtfsAttribute<'_>]) -> Result<Option<u32>> {
     let mut flags = None;
     for attribute in attributes.iter().filter(|attribute| attribute.kind == 0x10) {
         let NtfsValue::Resident(value) = attribute.value else {
@@ -640,6 +708,64 @@ fn validate_identity(record: &NtfsFileRecord, number: u64, sequence: Option<u16>
         || record.sequence == 0
         || sequence.is_some_and(|expected| expected != record.sequence)
     {
+        return Err(corrupt(0, "stale or mismatched NTFS file reference"));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_identity_provisional(
+    record: &mut NtfsFileRecord,
+    number: u64,
+    sequence: Option<u16>,
+) -> Result<()> {
+    if !record.in_use() {
+        return Err(FfsError::NotFound(format!(
+            "NTFS MFT record {number} is not in use"
+        )));
+    }
+    let slot =
+        u32::try_from(number).map_err(|_| corrupt(0, "NTFS MFT record number exceeds u32"))?;
+    if let Some(self_num) = record.self_number {
+        if self_num != slot {
+            return Err(corrupt(0, "stale or mismatched NTFS file reference"));
+        }
+    } else {
+        record.number = slot;
+    }
+    if record.sequence == 0 || sequence.is_some_and(|expected| expected != record.sequence) {
+        return Err(corrupt(0, "stale or mismatched NTFS file reference"));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_identity_for_version(
+    record: &mut NtfsFileRecord,
+    number: u64,
+    sequence: Option<u16>,
+    version: [u8; 2],
+) -> Result<()> {
+    if !record.in_use() {
+        return Err(FfsError::NotFound(format!(
+            "NTFS MFT record {number} is not in use"
+        )));
+    }
+    let slot =
+        u32::try_from(number).map_err(|_| corrupt(0, "NTFS MFT record number exceeds u32"))?;
+    if version == [3, 1] {
+        if record.usa_offset < 48 || record.self_number != Some(slot) {
+            return Err(corrupt(
+                0,
+                "NTFS 3.1 FILE record missing 48-byte header or mismatched self record number",
+            ));
+        }
+    } else if let Some(self_num) = record.self_number {
+        if self_num != slot {
+            return Err(corrupt(0, "stale or mismatched NTFS file reference"));
+        }
+    } else {
+        record.number = slot;
+    }
+    if record.sequence == 0 || sequence.is_some_and(|expected| expected != record.sequence) {
         return Err(corrupt(0, "stale or mismatched NTFS file reference"));
     }
     Ok(())

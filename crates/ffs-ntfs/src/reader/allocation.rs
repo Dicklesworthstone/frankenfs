@@ -81,6 +81,8 @@ pub struct AllocationReport {
     pub attributes_examined: u64,
     pub runs_examined: u64,
     pub sparse_clusters: u64,
+    /// Physical clusters claimed by `$BadClus:$Bad` (non-sparse runs on record 8).
+    pub bad_clusters: u64,
     /// Unique physical clusters, not a sum that double-counts cross-links.
     pub referenced_clusters: u64,
     pub bitmap_allocated_clusters: u64,
@@ -206,9 +208,18 @@ impl NtfsVolume {
     /// Errors in the authority bitmaps fail the call; errors in individual FILE
     /// records produce an incomplete report and suppress absence conclusions.
     pub fn check_allocations(&self, cx: &Cx, limits: AllocationLimits) -> Result<AllocationReport> {
+        self.check_allocations_internal(cx, limits, false)
+    }
+
+    pub(crate) fn check_allocations_internal(
+        &self,
+        cx: &Cx,
+        limits: AllocationLimits,
+        allow_dirty_flags: bool,
+    ) -> Result<AllocationReport> {
         checkpoint(cx)?;
         limits.validate()?;
-        if self.volume_flags != 0
+        if (!allow_dirty_flags && self.volume_flags != 0)
             || self.logfile_recovery.is_some()
             || !self.source.overlay.is_empty()
         {
@@ -313,6 +324,9 @@ impl NtfsVolume {
                 claims
                     .try_reserve(runs.len())
                     .map_err(|error| FfsError::Io(std::io::Error::other(error)))?;
+                let is_bad_stream = number == 8
+                    && attr.kind == super::DATA
+                    && attr.name == [b'$' as u16, b'B' as u16, b'a' as u16, b'd' as u16];
                 for run in runs {
                     checkpoint(cx)?;
                     if let Some(first) = run.lcn {
@@ -320,6 +334,12 @@ impl NtfsVolume {
                             .checked_add(run.clusters)
                             .filter(|end| *end <= clusters)
                             .ok_or_else(|| corrupt(0, "allocation claim exceeds volume"))?;
+                        if is_bad_stream {
+                            report.bad_clusters = report
+                                .bad_clusters
+                                .checked_add(run.clusters)
+                                .ok_or_else(|| corrupt(0, "bad-cluster accounting overflows"))?;
+                        }
                         claims.push(Claim {
                             first,
                             end,

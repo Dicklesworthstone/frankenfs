@@ -402,3 +402,77 @@ fn attr_def_table_validates_ntfs31_schema_and_rejects_corrupt_or_custom_rows() {
     assert!(validate_ntfs31_attr_def_table(&resident_only_data).is_err());
     assert!(validate_ntfs31_attr_def_table(&defs[..defs.len() - 1]).is_err());
 }
+
+#[test]
+fn boot_sector_encoder_standard_attrdef_and_ntfs30_record_header_roundtrip() {
+    let spec = NtfsBootSectorSpec {
+        sector_bytes: 512,
+        sectors_per_cluster: 8,
+        total_sectors: 32_767,
+        mft_cluster: 4,
+        mirror_cluster: 2_048,
+        record_bytes: 1_024,
+        index_bytes: 4_096,
+        serial: 0x0123_4567_89AB_CDEF,
+        hidden_sectors: 0,
+    };
+    let boot = encode_ntfs_boot_sector(&spec).expect("encode NTFS boot sector");
+    assert_eq!(boot.len(), 512);
+    let parsed = NtfsGeometry::parse(&boot, 32_767 * 512).expect("parse encoded boot sector");
+    assert_eq!(parsed.sector_bytes(), 512);
+    assert_eq!(parsed.cluster_bytes(), 4096);
+    assert_eq!(parsed.mft_cluster(), 4);
+    assert_eq!(parsed.mirror_cluster(), 2_048);
+    assert_eq!(parsed.record_bytes(), 1_024);
+    assert_eq!(parsed.index_bytes(), 4_096);
+    assert_eq!(parsed.serial(), 0x0123_4567_89AB_CDEF);
+    let csum = ntfs_boot_sector_checksum(&boot).expect("vbr checksum");
+    assert_eq!(u32::from_le_bytes(boot[80..84].try_into().unwrap()), csum);
+
+    // Standard $AttrDef table passes NTFS 3.x validation.
+    let std_attrdef = encode_standard_ntfs_attr_def_table();
+    let std_defs = parse_attr_def_table(&std_attrdef).expect("parse standard $AttrDef");
+    validate_ntfs31_attr_def_table(&std_defs).expect("validate standard $AttrDef");
+
+    // NTFS 3.0 42-byte FILE header (usa_offset == 42) parses with self_number = None.
+    let mut raw30 = vec![0_u8; 1024];
+    raw30[0..4].copy_from_slice(b"FILE");
+    raw30[4..6].copy_from_slice(&42_u16.to_le_bytes()); // usa_offset = 42 (NTFS 3.0)
+    raw30[6..8].copy_from_slice(&3_u16.to_le_bytes()); // usa_count = 3
+    raw30[16..18].copy_from_slice(&7_u16.to_le_bytes()); // sequence
+    raw30[18..20].copy_from_slice(&1_u16.to_le_bytes()); // hard_links
+    raw30[20..22].copy_from_slice(&48_u16.to_le_bytes()); // first_attr = (42+6) = 48
+    raw30[22..24].copy_from_slice(&1_u16.to_le_bytes()); // flags = IN_USE
+    raw30[24..28].copy_from_slice(&56_u32.to_le_bytes()); // used = 48 + 8
+    raw30[28..32].copy_from_slice(&1024_u32.to_le_bytes()); // allocated
+    raw30[42..44].copy_from_slice(&1_u16.to_le_bytes()); // USA token
+    raw30[48..52].copy_from_slice(&u32::MAX.to_le_bytes()); // end terminator
+    let protected30 = protect_record(&raw30).expect("protect NTFS 3.0 record");
+    let rec30 = NtfsFileRecord::parse(&protected30).expect("parse NTFS 3.0 record");
+    assert_eq!(rec30.usa_offset, 42);
+    assert_eq!(rec30.self_number, None);
+    assert_eq!(rec30.sequence, 7);
+    assert!(rec30.in_use());
+
+    // Security descriptor, SDS stream (primary + 256 KiB mirror), and $SII/$SDH roots round-trip.
+    let sd = crate::ntfs_security::build_default_ntfs_security_descriptor();
+    let (sds, headers) =
+        crate::ntfs_security::encode_sds_stream(&[(256, &sd), (257, &sd)]).expect("encode SDS");
+    assert_eq!(headers.len(), 2);
+    assert!(sds.len() > crate::ntfs_security::SDS_COPY_DISTANCE as usize);
+    let sii = crate::ntfs_security::encode_security_index_root(
+        crate::ntfs_security::NtfsSecurityIndexKind::SecurityId,
+        &headers,
+        4096,
+        4096,
+    )
+    .expect("encode $SII");
+    let sdh = crate::ntfs_security::encode_security_index_root(
+        crate::ntfs_security::NtfsSecurityIndexKind::SecurityHash,
+        &headers,
+        4096,
+        4096,
+    )
+    .expect("encode $SDH");
+    assert!(!sii.is_empty() && !sdh.is_empty());
+}

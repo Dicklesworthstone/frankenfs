@@ -915,17 +915,200 @@ def main() -> None:
         require(digest(disk) == disk_before, "candidate modified image or adjacent partition bytes")
         compression = compressed_cases(command, binary, root)
         native_tx = native_transaction_cases(command, binary, facade, root)
+        format_resize = native_format_and_resize_cases(command, binary, root)
         report.update(status="passed", image_sha256=before, partitioned_sha256=disk_before,
                       named_stream_checked=True, directory_and_path_reads_checked=True,
                       attribute_list_sha256=hashlib.sha256(raw_list).hexdigest(),
                       native_extension_records=extension_records, extension_streams_checked=len(extension_streams),
-                      compression=compression, native_transactions=native_tx)
+                      compression=compression, native_transactions=native_tx,
+                      native_format_and_resize=format_resize)
         print(json.dumps(report, indent=2))
     except Exception as error:
         report.update(status="failed", error=str(error))
         raise
     finally:
         (root / "result.json").write_text(json.dumps(report, indent=2) + "\n")
+
+
+def native_format_and_resize_cases(
+    command: Callable[..., bytes],
+    binary: Path,
+    root: Path,
+) -> dict[str, object]:
+    """Cross-verify native ffs-ntfs format, check, bounded repair, and offline resize
+    against independent ntfs-3g tools (`ntfsinfo`, `ntfsls`, `ntfscat`, `ntfscp`, `ntfsfix -n`).
+
+    NOTE: `ntfsfix -n` is explicitly labeled as a Linux ntfs-3g consistency probe,
+    NOT Microsoft Windows chkdsk.
+    """
+    has_ntfsinfo = shutil.which("ntfsinfo") is not None
+    has_ntfsfix = shutil.which("ntfsfix") is not None
+    formatted_profiles: list[dict[str, object]] = []
+
+    matrix = [
+        ("ntfs31_4k", "3.1", "16", "4096", "FFS31_4K", "0x1122334455667788"),
+        ("ntfs31_512", "3.1", "8", "512", "FFS31_512", "0x2233445566778899"),
+        ("ntfs31_64k", "3.1", "16", "65536", "FFS31_64K", "0x33445566778899aa"),
+        ("ntfs30_4k", "3.0", "12", "4096", "FFS30_4K", "0x445566778899aabb"),
+    ]
+    for tag, ver, mib, cluster_bytes, label, serial in matrix:
+        img = root / f"fmt-{tag}.img"
+        fmt_json = json.loads(
+            command(
+                binary,
+                "format",
+                img,
+                "--size-mib",
+                mib,
+                "--cluster-bytes",
+                cluster_bytes,
+                "--ntfs-version",
+                ver,
+                "--label",
+                label,
+                "--serial",
+                serial,
+            )
+        )
+        require(fmt_json["boot_published"] is True and fmt_json["check_clean"] is True,
+                f"ffs-ntfs format {tag} did not report clean published volume")
+        before_chk = digest(img)
+        chk_json = json.loads(command(binary, "check", img, "--offline-image"))
+        require(chk_json["clean"] is True and chk_json["write_calls"] == 0 and chk_json["sync_calls"] == 0,
+                f"ffs-ntfs check {tag} was not clean/non-mutating")
+        require(digest(img) == before_chk, f"ffs-ntfs check mutated {tag}")
+
+        # Cross-verify formatted image with independent ntfs-3g tools.
+        ls_out = command("ntfsls", "-a", img).decode("utf-8", errors="strict")
+        require("$MFT" in ls_out and "$Extend" in ls_out, f"ntfsls missing system files on {tag}")
+        if has_ntfsinfo:
+            info_out = command("ntfsinfo", "-m", img).decode("utf-8", errors="replace")
+            require(f"Cluster Size: {cluster_bytes}" in info_out,
+                    f"ntfsinfo cluster size mismatch on {tag}: {info_out[:200]}")
+        ntfsfix_probe = "tool_unavailable"
+        if has_ntfsfix:
+            command("ntfsfix", "-n", img)
+            ntfsfix_probe = "passed_ntfs3g_probe_not_windows_chkdsk"
+
+        # Mutate the natively formatted image via external ntfscp -> verify via ntfscat & ffs-ntfs!
+        probe_payload = f"oracle-write-into-{tag}-volume\n".encode()
+        probe_src = root / f"probe-{tag}.txt"
+        probe_src.write_bytes(probe_payload)
+        command("ntfscp", img, probe_src, "/oracle_probe.txt")
+        require(command("ntfscat", img, "/oracle_probe.txt") == probe_payload,
+                f"ntfscat mismatch after ntfscp into {tag}")
+        require(command(binary, "read", img, "/oracle_probe.txt", "--offline-image") == probe_payload,
+                f"ffs-ntfs read mismatch after ntfscp into {tag}")
+        post_cp_chk = json.loads(command(binary, "check", img, "--offline-image"))
+        require(post_cp_chk["clean"] is True, f"ffs-ntfs check failed after ntfscp on {tag}")
+        formatted_profiles.append({
+            "profile": tag,
+            "version": ver,
+            "cluster_bytes": int(cluster_bytes),
+            "ntfsfix_probe": ntfsfix_probe,
+        })
+
+    # Planted negative check control: corrupt trailing backup boot sector -> non-mutating check failure -> bounded repair!
+    neg_img = root / "fmt-ntfs31_4k.img"
+    raw_neg = bytearray(neg_img.read_bytes())
+    raw_neg[-512] ^= 0xFF
+    corrupt_img = root / "neg-corrupt-backup-boot.img"
+    corrupt_img.write_bytes(raw_neg)
+    corrupt_before = digest(corrupt_img)
+    chk_proc = subprocess.run(
+        [str(binary), "check", str(corrupt_img), "--offline-image", "--repair-plan"],
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    require(chk_proc.returncode != 0, "ffs-ntfs check must fail non-zero on corrupt backup boot sector")
+    require(digest(corrupt_img) == corrupt_before, "failed ffs-ntfs check mutated corrupt image")
+    plan_payload = json.loads(chk_proc.stdout)
+    require(plan_payload["check"]["backup_boot_matches"] is False
+            and plan_payload["repair_plan"]["eligible"] is True,
+            "expected repair-eligible backup_boot_mismatch plan")
+    repaired = json.loads(command(
+        binary, "check", corrupt_img, "--offline-image", "--apply-repair", "--allow-write"
+    ))
+    require(repaired["post_repair_check"]["clean"] is True,
+            "bounded backup-boot repair did not restore clean check")
+
+    # Offline resize matrix: Grow -> Free-tail shrink -> Refused shrink without --relocate -> Partition-slice --relocate shrink!
+    resize_src = root / "resize-src-24m.img"
+    command(binary, "format", resize_src, "--size-mib", "24", "--label", "RESIZE_SRC")
+    big_data = (b"NTFS-RESIZE-VERIFY-PAYLOAD-0123456789-" * 3000)[:131072]
+    big_src = root / "resize-big.bin"
+    big_src.write_bytes(big_data)
+    command("ntfscp", resize_src, big_src, "/big.bin")
+    ads_data = b"resize-ads-stream-bytes"
+    ads_src = root / "resize-ads.bin"
+    ads_src.write_bytes(ads_data)
+    command("ntfscp", "-N", "tag", resize_src, ads_src, "/big.bin")
+
+    grown = root / "resize-grown-40m.img"
+    grow_res = json.loads(command(
+        binary, "resize", resize_src, "--output", grown, "--size-mib", "40", "--offline-image"
+    ))
+    require(grow_res["plan"]["direction"] == "grow" and grow_res["check_clean"] is True,
+            "grow resize report invalid")
+
+    # Embed grown 40 MiB image inside a container with sentinels and shrink to 12 MiB with --relocate!
+    prefix = b"\x5A" * 65536
+    suffix = b"\xA5" * 65536
+    part_container = root / "resize-partition-container.img"
+    grown_bytes = grown.read_bytes()
+    part_container.write_bytes(prefix + grown_bytes + suffix)
+    container_sha = digest(part_container)
+
+    # Without --relocate crossing $MFTMirr must refuse cleanly without creating output.
+    refused_shrink = root / "resize-refused-12m.img"
+    command(
+        binary, "resize", part_container,
+        "--offset", str(len(prefix)), "--length", str(len(grown_bytes)),
+        "--output", refused_shrink, "--size-mib", "12", "--offline-image",
+        failure="--relocate",
+    )
+    require(not refused_shrink.exists(), "refused shrink created output file")
+
+    reloc_out = root / "resize-reloc-12m.img"
+    reloc_res = json.loads(command(
+        binary, "resize", part_container,
+        "--offset", str(len(prefix)), "--length", str(len(grown_bytes)),
+        "--output", reloc_out, "--size-mib", "12", "--relocate", "--offline-image",
+    ))
+    require(reloc_res["plan"]["direction"] == "shrink"
+            and reloc_res["plan"]["relocated_clusters"] > 0
+            and reloc_res["check_clean"] is True,
+            "relocating shrink did not relocate clusters or failed check")
+    require(digest(part_container) == container_sha,
+            "offline resize modified source partition container or sentinels")
+
+    # Independent ntfs-3g verification of relocated shrunk image!
+    require(command("ntfscat", reloc_out, "/big.bin") == big_data,
+            "ntfscat /big.bin mismatch after relocating shrink")
+    ls_reloc = command("ntfsls", "-a", "-i", reloc_out).decode("utf-8", errors="strict")
+    big_rec = None
+    for line in ls_reloc.splitlines():
+        m = re.fullmatch(r"\s*(\d+)\s+big\.bin\s*", line)
+        if m:
+            big_rec = m[1]
+            break
+    require(big_rec is not None, "ntfsls did not find big.bin after relocating shrink")
+    require(command("ntfscat", "-i", big_rec, "-n", "tag", reloc_out) == ads_data,
+            "ntfscat ADS /big.bin:tag mismatch after relocating shrink")
+    if has_ntfsfix:
+        command("ntfsfix", "-n", reloc_out)
+    final_chk = json.loads(command(binary, "check", reloc_out, "--offline-image"))
+    require(final_chk["clean"] is True, "ffs-ntfs check failed on relocated shrunk image")
+
+    return {
+        "formatted_profiles": formatted_profiles,
+        "backup_boot_bounded_repair": True,
+        "resize_grow_40m": True,
+        "resize_relocate_shrink_12m_from_slice": True,
+        "relocated_clusters": reloc_res["plan"]["relocated_clusters"],
+        "ntfsfix_probe_note": "ntfsfix -n is Linux ntfs-3g consistency probe, not Windows chkdsk",
+    }
 
 
 if __name__ == "__main__":

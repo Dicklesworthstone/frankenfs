@@ -199,9 +199,18 @@ impl NtfsVolume {
         cx: &Cx,
         limits: RecordOwnershipLimits,
     ) -> Result<RecordOwnershipReport> {
+        self.check_record_ownership_internal(cx, limits, false)
+    }
+
+    pub(crate) fn check_record_ownership_internal(
+        &self,
+        cx: &Cx,
+        limits: RecordOwnershipLimits,
+        allow_dirty_flags: bool,
+    ) -> Result<RecordOwnershipReport> {
         checkpoint(cx)?;
         limits.validate()?;
-        if self.volume_flags != 0
+        if (!allow_dirty_flags && self.volume_flags != 0)
             || self.logfile_recovery.is_some()
             || !self.source.overlay.is_empty()
         {
