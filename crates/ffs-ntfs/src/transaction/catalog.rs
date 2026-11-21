@@ -626,20 +626,21 @@ impl EditableCatalog {
             && rp.len() >= 4
         {
             u32::from_le_bytes([rp[0], rp[1], rp[2], rp[3]])
-        } else if let Some(packed_ea) = self.preserved.iter().find_map(|p| {
-            if p.kind == EA_INFORMATION
-                && p.name.is_empty()
-                && let PreservedValue::Resident { bytes, .. } = &p.raw_without_id
-                && bytes.len() >= 2
-            {
-                Some(u32::from(u16::from_le_bytes([bytes[0], bytes[1]])))
-            } else {
-                None
-            }
-        }) {
-            packed_ea
         } else {
-            0
+            self.preserved
+                .iter()
+                .find_map(|p| {
+                    if p.kind == EA_INFORMATION
+                        && p.name.is_empty()
+                        && let PreservedValue::Resident { bytes, .. } = &p.raw_without_id
+                        && bytes.len() >= 2
+                    {
+                        Some(u32::from(u16::from_le_bytes([bytes[0], bytes[1]])))
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default()
         };
         let (alloc_sz, data_sz) = if self.is_directory {
             (0_u64, 0_u64)
