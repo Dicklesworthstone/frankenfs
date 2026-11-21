@@ -308,7 +308,7 @@ pub fn apply_file_edit(
     edit: &FileEdit<'_>,
 ) -> Result<FileEditResult, ParseError> {
     let record = NtfsFileRecord::parse(raw)?;
-    if record.number != expected_record || !record.in_use() {
+    if record.self_number.is_some_and(|n| n != expected_record) || !record.in_use() {
         return Err(bad(
             "recovery target is a different or unallocated FILE record",
         ));
@@ -328,7 +328,10 @@ pub fn apply_file_edit(
     }
     protect(&mut result)?;
     let checked = NtfsFileRecord::parse(&result)?;
-    if checked.number != expected_record || !checked.in_use() {
+    if checked.self_number != record.self_number
+        || checked.self_number.is_some_and(|n| n != expected_record)
+        || !checked.in_use()
+    {
         return Err(bad("recovery edit changed FILE record identity"));
     }
     Ok(FileEditResult::Applied(result))
@@ -393,7 +396,10 @@ pub fn initialize_file_record_slot(
     }
     protect(&mut result)?;
     let checked = NtfsFileRecord::parse(&result)?;
-    if checked.number != expected_record || !checked.in_use() || checked.sequence == 0 {
+    if checked.self_number.is_some_and(|n| n != expected_record)
+        || !checked.in_use()
+        || checked.sequence == 0
+    {
         return Err(bad(
             "InitializeFileRecordSegment produced invalid identity or inactive record",
         ));
@@ -421,7 +427,7 @@ pub fn deallocate_file_record_slot(
     }
     let mut result = restore_record(raw_existing, b"FILE")?;
     let parsed = NtfsFileRecord::parse(raw_existing)?;
-    if parsed.number != expected_record {
+    if parsed.self_number.is_some_and(|n| n != expected_record) {
         return Err(bad("DeallocateFileRecordSegment record number mismatch"));
     }
     if matches!(pass, RecoveryPass::Undo) && !parsed.in_use() {
@@ -446,7 +452,11 @@ pub fn deallocate_file_record_slot(
     }
     protect(&mut result)?;
     let checked = NtfsFileRecord::parse(&result)?;
-    if checked.number != expected_record || checked.in_use() || checked.sequence != next_seq {
+    if checked.self_number != parsed.self_number
+        || checked.self_number.is_some_and(|n| n != expected_record)
+        || checked.in_use()
+        || checked.sequence != next_seq
+    {
         return Err(bad(
             "DeallocateFileRecordSegment left record active or wrong sequence",
         ));
