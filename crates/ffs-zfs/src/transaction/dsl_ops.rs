@@ -1953,8 +1953,7 @@ pub(super) fn stage_create_snapshot(
     let head_has_large_blocks = head_dn.object_type() == DMU_OTN_ZAP_METADATA
         && mos
             .zap_values(cx, head_obj)
-            .ok()
-            .is_some_and(|rows| rows.iter().any(|e| e.name == b"org.open-zfs:large_blocks"));
+            .is_ok_and(|rows| rows.iter().any(|e| e.name == b"org.open-zfs:large_blocks"));
     if head_has_large_blocks {
         features.increment_read("com.delphix:extensible_dataset", new_txg)?;
         features.increment_read("org.open-zfs:large_blocks", new_txg)?;
@@ -4689,8 +4688,7 @@ fn stage_create_clone(
     let o_snap_has_large_blocks = o_snap_dn.object_type() == DMU_OTN_ZAP_METADATA
         && mos
             .zap_values(cx, origin_snap_obj)
-            .ok()
-            .is_some_and(|rows| rows.iter().any(|e| e.name == b"org.open-zfs:large_blocks"));
+            .is_ok_and(|rows| rows.iter().any(|e| e.name == b"org.open-zfs:large_blocks"));
     if o_snap_has_large_blocks {
         features.increment_read("com.delphix:extensible_dataset", new_txg)?;
         features.increment_read("org.open-zfs:large_blocks", new_txg)?;

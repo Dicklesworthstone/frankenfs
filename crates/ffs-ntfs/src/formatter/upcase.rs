@@ -163,7 +163,7 @@ pub fn canonical_ntfs_upcase_u16() -> Box<[u16]> {
 pub fn canonical_ntfs_upcase_bytes() -> Vec<u8> {
     let table = canonical_ntfs_upcase_u16();
     let mut out = Vec::with_capacity(UPCASE_TABLE_BYTES);
-    for &unit in table.iter() {
+    for &unit in &table {
         out.extend_from_slice(&unit.to_le_bytes());
     }
     out

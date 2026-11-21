@@ -257,8 +257,7 @@ pub fn apply_bounded_repair(
                     allow_write: true,
                     recover_dirty: true,
                 };
-                let (engine, _summary) =
-                    NtfsTransactionEngine::recover_and_open(cx, path, offset, length, opts)?;
+                let engine = NtfsTransactionEngine::open(cx, path, offset, length, opts)?;
                 drop(engine);
             }
             NtfsRepairAction::SyncMftMirrorPrefix { records } => {

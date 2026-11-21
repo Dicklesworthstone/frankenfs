@@ -818,7 +818,7 @@ pub struct NbdServerConfig {
 
 enum NbdBackend {
     Session(ZfsZvolSession),
-    ReadOnlyZvol(Zvol),
+    ReadOnlyZvol(Box<Zvol>),
 }
 
 impl NbdBackend {
@@ -981,7 +981,7 @@ impl Read for NbdStream {
 }
 
 impl Write for NbdStream {
-    fn write(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self {
             Self::Unix(s) => s.write(buf),
             Self::Tcp(s) => s.write(buf),
@@ -1156,7 +1156,7 @@ impl ZfsZvolNbdServer {
         listener.set_nonblocking(true)?;
         Ok(Self {
             listener: NbdListener::Unix(listener),
-            backend: NbdBackend::ReadOnlyZvol(zvol),
+            backend: NbdBackend::ReadOnlyZvol(Box::new(zvol)),
             config,
             audit: Vec::new(),
             seq: 0,
@@ -1173,7 +1173,7 @@ impl ZfsZvolNbdServer {
         listener.set_nonblocking(true)?;
         Ok(Self {
             listener: NbdListener::Tcp(listener),
-            backend: NbdBackend::ReadOnlyZvol(zvol),
+            backend: NbdBackend::ReadOnlyZvol(Box::new(zvol)),
             config,
             audit: Vec::new(),
             seq: 0,
@@ -1194,6 +1194,7 @@ impl ZfsZvolNbdServer {
         &self.audit
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_audit(
         &mut self,
         cmd: &str,

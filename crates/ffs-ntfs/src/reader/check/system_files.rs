@@ -488,7 +488,7 @@ fn audit_system_slots(
                     for attr in &all {
                         if attr.kind == DATA && attr.name == BAD_NAME {
                             saw_bad_stream = true;
-                            if let NtfsValue::NonResident(nr) = attr.value {
+                            if let NtfsValue::NonResident(ref nr) = attr.value {
                                 if nr.data_bytes != expected_bytes {
                                     report.push_issue(
                                         NtfsCheckCategory::SystemMetadata,
@@ -762,18 +762,15 @@ fn validate_view_index_root_attr(
         );
         return Ok(());
     };
-    let stream = match catalog.select(&volume.geometry, 0x90, index_name) {
-        Ok(s) => s,
-        Err(_) => {
-            report.push_issue(
-                NtfsCheckCategory::SecondaryIndex,
-                "secondary_index_root_missing",
-                Some(u64::from(record.number)),
-                None,
-                format!("{label}: missing resident INDEX_ROOT"),
-            );
-            return Ok(());
-        }
+    let Ok(stream) = catalog.select(&volume.geometry, 0x90, index_name) else {
+        report.push_issue(
+            NtfsCheckCategory::SecondaryIndex,
+            "secondary_index_root_missing",
+            Some(u64::from(record.number)),
+            None,
+            format!("{label}: missing resident INDEX_ROOT"),
+        );
+        return Ok(());
     };
     if !stream.resident() || stream.size < 48 || stream.size > 65_536 {
         report.push_issue(
@@ -930,7 +927,7 @@ fn audit_single_record_attributes(
                         );
                     }
                 }
-                NtfsValue::NonResident(nr) => {
+                NtfsValue::NonResident(ref nr) => {
                     if !def.allows_non_resident() {
                         report.push_issue(
                             NtfsCheckCategory::StreamBounds,
@@ -960,7 +957,7 @@ fn audit_single_record_attributes(
         }
 
         // Non-resident stream size / VCN / cluster-multiple bounds.
-        if let NtfsValue::NonResident(nr) = attr.value {
+        if let NtfsValue::NonResident(ref nr) = attr.value {
             let is_compressed = attr.flags & COMPRESSED != 0 || nr.compression_unit != 0;
             let is_sparse = attr.flags & SPARSE != 0;
             if nr.first_vcn == 0 {

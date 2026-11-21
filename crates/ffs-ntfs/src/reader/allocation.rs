@@ -162,11 +162,11 @@ struct Claim {
     attribute: u16,
 }
 
-pub(super) fn bit(bytes: &[u8], index: u64) -> bool {
+pub(crate) fn bit(bytes: &[u8], index: u64) -> bool {
     bytes[index as usize / 8] & (1 << (index % 8)) != 0
 }
 
-pub(super) fn read_bitmap(
+pub(crate) fn read_bitmap(
     cx: &Cx,
     volume: &NtfsVolume,
     stream: &Stream,
@@ -326,7 +326,13 @@ impl NtfsVolume {
                     .map_err(|error| FfsError::Io(std::io::Error::other(error)))?;
                 let is_bad_stream = number == 8
                     && attr.kind == super::DATA
-                    && attr.name == [b'$' as u16, b'B' as u16, b'a' as u16, b'd' as u16];
+                    && attr.name
+                        == [
+                            u16::from(b'$'),
+                            u16::from(b'B'),
+                            u16::from(b'a'),
+                            u16::from(b'd'),
+                        ];
                 for run in runs {
                     checkpoint(cx)?;
                     if let Some(first) = run.lcn {

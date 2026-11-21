@@ -27,7 +27,7 @@ use std::path::Path;
 
 const MAX_READ: usize = 16 * 1024 * 1024;
 
-fn checkpoint(cx: &Cx) -> Result<()> {
+pub(crate) fn checkpoint(cx: &Cx) -> Result<()> {
     cx.checkpoint().map_err(|_| FfsError::Cancelled)
 }
 fn corrupt(offset: u64, detail: impl Into<String>) -> FfsError {
@@ -358,7 +358,7 @@ impl NtfsVolume {
         }
         let info = volume.read(cx, &info, 0, info.size as usize)?;
         let version = [info[8], info[9]];
-        if !matches!(version, [3, 0] | [3, 1]) {
+        if !matches!(version, [3, 0 | 1]) {
             return Err(unsupported(format!(
                 "NTFS reader admits versions 3.0 and 3.1 only (found {}.{})",
                 version[0], version[1]

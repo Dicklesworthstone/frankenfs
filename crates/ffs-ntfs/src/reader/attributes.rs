@@ -23,7 +23,7 @@ const BASE_REFERENCE: NtfsReference = NtfsReference {
     sequence: 0,
 };
 
-pub(crate) struct AttributeSet<'a> {
+pub struct AttributeSet<'a> {
     base: &'a NtfsFileRecord,
     extensions: BTreeMap<u64, NtfsFileRecord>,
 }

@@ -249,11 +249,10 @@ pub fn plan_format(opts: &NtfsFormatOptions) -> Result<NtfsFormatLayout> {
         )));
     }
 
-    if let Some(label) = &opts.label {
-        let units: Vec<u16> = label.encode_utf16().collect();
-        if units.len() > 127 {
-            return Err(FfsError::NameTooLong);
-        }
+    if let Some(label) = &opts.label
+        && label.encode_utf16().count() > 127
+    {
+        return Err(FfsError::NameTooLong);
     }
 
     // Reserve the trailing sector for the mandatory backup boot sector.
@@ -291,8 +290,7 @@ pub fn plan_format(opts: &NtfsFormatOptions) -> Result<NtfsFormatLayout> {
         MIN_LOGFILE_BYTES
     };
     let logfile_bytes = opts.logfile_bytes.unwrap_or(default_log);
-    if logfile_bytes < MIN_LOGFILE_BYTES
-        || logfile_bytes > 64 * 1024 * 1024
+    if !(MIN_LOGFILE_BYTES..=64 * 1024 * 1024).contains(&logfile_bytes)
         || !logfile_bytes.is_multiple_of(LOG_PAGE_BYTES)
     {
         return Err(FfsError::InvalidGeometry(format!(
@@ -514,7 +512,7 @@ impl ByteDevice for CandidateBootOverlayDevice {
 /// failure, hook fault injection, cancellation, or pre-publication check failure.
 pub fn format_device(
     cx: &Cx,
-    device: Arc<dyn ByteDevice>,
+    device: &Arc<dyn ByteDevice>,
     opts: &NtfsFormatOptions,
     hook: Option<&NtfsFormatStageHook>,
 ) -> Result<NtfsFormatReport> {
@@ -586,7 +584,7 @@ pub fn format_device(
 
     // Stage 4: Pre-publication verification via read-only VBR overlay + full readback hash.
     let overlay: Arc<dyn ByteDevice> = Arc::new(CandidateBootOverlayDevice::new(
-        Arc::clone(&device),
+        Arc::clone(device),
         built.vbr_sector.clone(),
     ));
     let check = check_volume_device(
@@ -681,7 +679,7 @@ impl ByteDevice for WritableTargetFile {
     }
 }
 
-pub(crate) fn sync_parent_dir(path: &Path) -> Result<()> {
+pub(crate) fn sync_parent_dir(path: &Path) {
     if let Some(parent) = path.parent() {
         let dir_path = if parent.as_os_str().is_empty() {
             Path::new(".")
@@ -692,7 +690,6 @@ pub(crate) fn sync_parent_dir(path: &Path) -> Result<()> {
             let _ = dir.sync_all();
         }
     }
-    Ok(())
 }
 
 /// Format a new (or explicitly authorized existing offline) regular image file
@@ -748,7 +745,7 @@ pub fn format_image_file(
         file,
         len: layout.backing_bytes,
     });
-    let report = format_device(cx, dev, opts, hook)?;
-    sync_parent_dir(&opts.image)?;
+    let report = format_device(cx, &dev, opts, hook)?;
+    sync_parent_dir(&opts.image);
     Ok(report)
 }

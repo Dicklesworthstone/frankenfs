@@ -268,9 +268,9 @@ fn verify_source_unchanged(
     Ok(())
 }
 
-fn open_source_slice(
-    opts: &NtfsResizeOptions,
-) -> Result<(File, SourceStamp, u64, String, Arc<dyn ByteDevice>)> {
+type OpenedSourceSlice = (File, SourceStamp, u64, String, Arc<dyn ByteDevice>);
+
+fn open_source_slice(opts: &NtfsResizeOptions) -> Result<OpenedSourceSlice> {
     if !opts.offline_image {
         return Err(FfsError::UnsupportedFeature(
             "NTFS resize requires explicit --offline-image confirmation".into(),
@@ -318,7 +318,7 @@ fn open_source_slice(
 pub fn plan_resize(cx: &Cx, opts: &NtfsResizeOptions) -> Result<NtfsResizePlan> {
     checkpoint(cx)?;
     let (_file, _stamp, slice_len, _digest, dev) = open_source_slice(opts)?;
-    let internal = planner::build_resize_plan(cx, dev, slice_len, opts)?;
+    let internal = planner::build_resize_plan(cx, &dev, slice_len, opts)?;
     Ok(internal.public)
 }
 
@@ -356,7 +356,7 @@ pub fn run_resize(
         }
     }
 
-    let plan = planner::build_resize_plan(cx, Arc::clone(&src_dev), slice_len, opts)?;
+    let plan = planner::build_resize_plan(cx, &src_dev, slice_len, opts)?;
     verify_source_unchanged(
         &src_file,
         &opts.source_image,
@@ -507,7 +507,7 @@ pub fn run_resize(
     out_dev.write_all_at(cx, ByteOffset(0), &new_vbr)?;
     invoke_hook(hook, NtfsResizeStage::PrimaryBootPublished)?;
     out_dev.sync(cx)?;
-    sync_parent_dir(&opts.output)?;
+    sync_parent_dir(&opts.output);
     invoke_hook(hook, NtfsResizeStage::Synced)?;
 
     Ok(NtfsResizeReport {

@@ -168,12 +168,17 @@ impl NtfsCheckReport {
         detail: String,
     ) {
         if self.issues.len() < MAX_CHECK_ISSUES {
+            let truncated = if detail.chars().count() <= 512 {
+                detail
+            } else {
+                detail.chars().take(512).collect()
+            };
             self.issues.push(NtfsCheckIssue {
                 category,
                 code: code.into(),
                 record,
                 cluster,
-                detail: detail.chars().take(512).collect(),
+                detail: truncated,
             });
         } else {
             self.omitted_issues += 1;

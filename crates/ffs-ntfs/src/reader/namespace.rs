@@ -65,7 +65,7 @@ fn catalog<'a>(
     })
 }
 
-pub(crate) fn parse_file_name(attribute: &NtfsAttribute<'_>) -> Result<NtfsFileName> {
+pub fn parse_file_name(attribute: &NtfsAttribute<'_>) -> Result<NtfsFileName> {
     if attribute.kind != 0x30 || attribute.flags != 0 || !attribute.name.is_empty() {
         return Err(corrupt(0, "invalid FILE_NAME storage or attribute name"));
     }

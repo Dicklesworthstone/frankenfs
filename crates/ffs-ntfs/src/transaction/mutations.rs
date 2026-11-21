@@ -2125,7 +2125,7 @@ impl NtfsTransactionEngine {
 
         let end_offset = offset
             .checked_add(data.len() as u64)
-            .filter(|&end| end <= i64::MAX as u64)
+            .filter(|&end| i64::try_from(end).is_ok())
             .ok_or_else(too_large_edit)?;
 
         let (old_sparse, old_comp_unit, old_init, old_runs) = match &cur_stream.storage {

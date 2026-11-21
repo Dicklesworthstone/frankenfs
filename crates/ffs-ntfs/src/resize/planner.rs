@@ -19,7 +19,6 @@ const BAD_NAME: [u16; 4] = [b'$' as u16, b'B' as u16, b'a' as u16, b'd' as u16];
 /// One non-resident attribute's complete remapping instruction for `relocator`.
 #[derive(Debug, Clone)]
 pub(super) struct AttrRemapPlan {
-    pub(super) record: u64,
     pub(super) attr_kind: u32,
     pub(super) attr_id: u16,
     pub(super) new_runs: Vec<NtfsRun>,
@@ -153,7 +152,7 @@ fn coalesce_runs(runs: Vec<NtfsRun>) -> Vec<NtfsRun> {
 #[allow(clippy::too_many_lines)]
 pub(super) fn build_resize_plan(
     cx: &Cx,
-    source: Arc<dyn ByteDevice>,
+    source: &Arc<dyn ByteDevice>,
     slice_len: u64,
     opts: &NtfsResizeOptions,
 ) -> Result<InternalResizePlan> {
@@ -176,7 +175,7 @@ pub(super) fn build_resize_plan(
     // 1. Full non-mutating structural check on source: refuse dirty, hibernated, or corrupt volumes!
     let check = check_volume_device(
         cx,
-        Arc::clone(&source),
+        Arc::clone(source),
         0,
         slice_len,
         NtfsCheckLimits::default(),
@@ -192,7 +191,7 @@ pub(super) fn build_resize_plan(
     }
 
     let volume =
-        NtfsVolume::from_device(cx, Box::new(ArcDevice(Arc::clone(&source))), 0, slice_len)?;
+        NtfsVolume::from_device(cx, Box::new(ArcDevice(Arc::clone(source))), 0, slice_len)?;
     let geom = &volume.geometry;
     let sector_bytes = geom.sector_bytes();
     let cluster_bytes = geom.cluster_bytes();
@@ -264,7 +263,6 @@ pub(super) fn build_resize_plan(
         attr_kind: u32,
         attr_id: u16,
         name: Vec<u16>,
-        flags: u16,
         first_vcn: u64,
         last_vcn: u64,
         allocated_bytes: u64,
@@ -304,7 +302,7 @@ pub(super) fn build_resize_plan(
                     let end = lcn + r.clusters;
                     if end > new_clusters {
                         if is_bad_stream {
-                            bad_tail_lcn.get_or_insert(lcn.max(new_clusters));
+                            bad_tail_lcn.get_or_insert_with(|| lcn.max(new_clusters));
                         } else {
                             let tail_start = lcn.max(new_clusters);
                             tail_clusters_total += end - tail_start;
@@ -331,7 +329,6 @@ pub(super) fn build_resize_plan(
                 attr_kind: attr.kind,
                 attr_id: attr.id,
                 name: attr.name,
-                flags: attr.flags,
                 first_vcn: nr.first_vcn,
                 last_vcn: nr.last_vcn,
                 allocated_bytes: nr.allocated_bytes,
@@ -413,7 +410,6 @@ pub(super) fn build_resize_plan(
             let coalesced = coalesce_runs(bad_runs);
             let bad_bytes = new_clusters * cb;
             record_remaps.entry(8).or_default().push(AttrRemapPlan {
-                record: 8,
                 attr_kind: DATA,
                 attr_id: attr.attr_id,
                 new_runs: coalesced,
@@ -532,7 +528,6 @@ pub(super) fn build_resize_plan(
             new_bitmap_runs.clone_from(&bm_runs);
             old_bitmap_allocated_bytes = new_bm_alloc;
             record_remaps.entry(6).or_default().push(AttrRemapPlan {
-                record: 6,
                 attr_kind: DATA,
                 attr_id: old_bitmap_attr_id,
                 new_runs: bm_runs,
@@ -564,7 +559,6 @@ pub(super) fn build_resize_plan(
                 .entry(attr.record)
                 .or_default()
                 .push(AttrRemapPlan {
-                    record: attr.record,
                     attr_kind: attr.attr_kind,
                     attr_id: attr.attr_id,
                     new_runs: coalesced,
