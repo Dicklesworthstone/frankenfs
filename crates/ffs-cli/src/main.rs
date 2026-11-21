@@ -384,6 +384,22 @@ struct MountAdaptiveRuntimeCoreRequestSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct MountAdaptiveRuntimePerCoreLaneSummary {
+    core_id: u32,
+    requests_processed: u64,
+    cache_hits: u64,
+    cache_misses: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct MountAdaptiveRuntimePerCoreSummary {
+    total_requests: u64,
+    imbalance_ratio: f64,
+    cores: Vec<MountAdaptiveRuntimeCoreRequestSummary>,
+    lanes: Vec<MountAdaptiveRuntimePerCoreLaneSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct MountAdaptiveRuntimeDegradationTransitionLedger {
     current_level: String,
     transition_count: u64,
@@ -416,6 +432,8 @@ struct MountAdaptiveRuntimeShutdownSummary {
     cache_misses: Option<u64>,
     per_core_request_distribution: Vec<MountAdaptiveRuntimeCoreRequestSummary>,
     per_core_imbalance_ratio: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    per_core: Option<MountAdaptiveRuntimePerCoreSummary>,
     worker_count: u32,
     artifact_paths: Vec<String>,
     raw_stdout_path: Option<String>,
@@ -7457,6 +7475,29 @@ fn build_mount_adaptive_runtime_shutdown_summary(
         per_core_request_distribution: per_core
             .map_or_else(Vec::new, |metrics| metrics.per_core_distribution.clone()),
         per_core_imbalance_ratio: per_core.map(|metrics| metrics.imbalance_ratio),
+        per_core: per_core.map(|metrics| {
+            let total_requests: u64 = metrics
+                .per_core_distribution
+                .iter()
+                .map(|core| core.requests)
+                .sum();
+            let lanes = metrics
+                .per_core_distribution
+                .iter()
+                .map(|core| MountAdaptiveRuntimePerCoreLaneSummary {
+                    core_id: core.core_id,
+                    requests_processed: core.requests,
+                    cache_hits: core.cache_hits,
+                    cache_misses: core.cache_misses,
+                })
+                .collect();
+            MountAdaptiveRuntimePerCoreSummary {
+                total_requests,
+                imbalance_ratio: metrics.imbalance_ratio,
+                cores: metrics.per_core_distribution.clone(),
+                lanes,
+            }
+        }),
         worker_count: observation.worker_count,
         artifact_paths: collect_mount_adaptive_runtime_artifact_paths(
             context.plan,
@@ -7865,7 +7906,7 @@ fn mount_with_fuse(
     mountpoint: &Path,
     options: &MountCmdOptions,
     auto_unmount: bool,
-) -> Result<(ffs_fuse::MetricsSnapshot, usize)> {
+) -> Result<ffs_fuse::MetricsSnapshot> {
     let opts = MountOptions {
         read_only: !options.read_write,
         allow_other: options.allow_other,
@@ -7880,7 +7921,6 @@ fn mount_with_fuse(
         dev: options.dev,
         suid: options.suid,
     };
-    let resolved_workers = opts.resolved_thread_count();
 
     // bd-bhh0i mounted cutover. `ext4_create` otherwise takes
     // `ext4_alloc_state.write()` for its whole body, so every FUSE worker thread
@@ -7905,15 +7945,14 @@ fn mount_with_fuse(
     }
 
     let fs_ops: Box<dyn FsOps> = Box::new(open_fs);
-    let metrics = ffs_fuse::mount_with_commit_interval(
+    ffs_fuse::mount_with_commit_interval(
         cx,
         fs_ops,
         mountpoint,
         &opts,
         Some(std::time::Duration::ZERO),
     )
-    .with_context(|| format!("FUSE mount failed at {}", mountpoint.display()))?;
-    Ok((metrics, resolved_workers))
+    .with_context(|| format!("FUSE mount failed at {}", mountpoint.display()))
 }
 
 /// Resolve the operational rollback switch for the validated sharded ext4
@@ -9808,7 +9847,12 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
     let mount_result = (|| -> Result<()> {
         match runtime.mode {
             MountRuntimeMode::Standard => {
-                let (metrics, resolved_workers) = mount_with_fuse(
+                let resolved_workers = MountOptions {
+                    worker_threads: fuse_dispatch_workers_from_env()?,
+                    ..MountOptions::default()
+                }
+                .resolved_thread_count();
+                let metrics = mount_with_fuse(
                     &background_cx,
                     Arc::clone(&open_fs),
                     mountpoint,
@@ -12911,6 +12955,15 @@ mod tests {
                 json["per_core_request_distribution"][1]["requests"],
                 serde_json::json!(8)
             );
+            assert_eq!(json["per_core"]["total_requests"], serde_json::json!(13));
+            assert_eq!(
+                json["per_core"]["cores"][1]["requests"],
+                serde_json::json!(8)
+            );
+            assert_eq!(
+                json["per_core"]["lanes"][1]["requests_processed"],
+                serde_json::json!(8)
+            );
             assert_eq!(
                 json["raw_log_paths"][0],
                 serde_json::json!("artifacts/adaptive-runtime/structured.jsonl")
@@ -12955,6 +13008,7 @@ mod tests {
                 },
             ],
             per_core_imbalance_ratio: Some(1.6),
+            per_core: None,
             worker_count: 2,
             artifact_paths: vec![
                 "artifacts/adaptive-runtime/report.json".to_owned(),
