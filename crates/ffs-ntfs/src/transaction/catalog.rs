@@ -476,6 +476,8 @@ pub(super) struct EditableCatalog {
     pub(super) old_base_raw: Vec<u8>,
     pub(super) old_extensions: Vec<(u32, u16, Vec<u8>)>,
     pub(super) old_nonres_attrlist_runs: Vec<NtfsRun>,
+    // Keep original bitmap ownership even when rebalancing replaces dir_index.
+    pub(super) old_nonres_i30_bitmap_runs: Vec<NtfsRun>,
 }
 
 impl EditableCatalog {
@@ -1208,6 +1210,7 @@ impl NtfsTransactionEngine {
         let mut i30_root: Option<Vec<u8>> = None;
         let mut i30_alloc_extents: Vec<NtfsAttribute<'_>> = Vec::new();
         let mut i30_bitmap: Option<Vec<u8>> = None;
+        let mut old_nonres_i30_bitmap_runs = Vec::new();
         let mut preserved: Vec<PreservedAttribute> = Vec::new();
 
         for attr in all_attrs {
@@ -1306,6 +1309,7 @@ impl NtfsTransactionEngine {
                             0,
                             nr.data_bytes as usize,
                         )?);
+                        old_nonres_i30_bitmap_runs.extend(runs);
                     }
                 },
                 other => {
@@ -1458,6 +1462,7 @@ impl NtfsTransactionEngine {
             old_base_raw,
             old_extensions,
             old_nonres_attrlist_runs,
+            old_nonres_i30_bitmap_runs,
         })
     }
 
@@ -1843,7 +1848,8 @@ impl NtfsTransactionEngine {
                 .then_with(|| a.first_vcn.cmp(&b.first_vcn))
         });
 
-        let freed_clusters = physical_spans_of_runs(&catalog.old_nonres_attrlist_runs);
+        let mut freed_clusters = physical_spans_of_runs(&catalog.old_nonres_attrlist_runs);
+        freed_clusters.extend(physical_spans_of_runs(&catalog.old_nonres_i30_bitmap_runs));
         let mut freed_mft_slots = Vec::new();
         let mut mft_record_writes = Vec::new();
         let mut log_specs = Vec::new();

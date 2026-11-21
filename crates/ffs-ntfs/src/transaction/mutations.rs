@@ -491,6 +491,7 @@ impl TxWorkspace {
             let pres_runs = cat.preserved_nonresident_runs(engine.geometry.cluster_count())?;
             self.verify_and_register_runs(&pres_runs)?;
             self.verify_and_register_runs(&cat.old_nonres_attrlist_runs)?;
+            self.verify_and_register_runs(&cat.old_nonres_i30_bitmap_runs)?;
             self.catalogs.insert(target_ref.record, cat);
         }
         let cat = self
@@ -791,6 +792,7 @@ impl TxWorkspace {
         let pres_runs = cat.preserved_nonresident_runs(engine.geometry.cluster_count())?;
         self.free_clusters_deferred(&physical_spans_of_runs(&pres_runs));
         self.free_clusters_deferred(&physical_spans_of_runs(&cat.old_nonres_attrlist_runs));
+        self.free_clusters_deferred(&physical_spans_of_runs(&cat.old_nonres_i30_bitmap_runs));
 
         for &(ext_slot, _, ref old_ext_raw) in &cat.old_extensions {
             let protected_dealloc = engine.emit_mft_slot_dealloc_spec(
@@ -1783,6 +1785,7 @@ impl NtfsTransactionEngine {
                 old_base_raw: existing_raw.clone(),
                 old_extensions: Vec::new(),
                 old_nonres_attrlist_runs: Vec::new(),
+                old_nonres_i30_bitmap_runs: Vec::new(),
             };
             child_cat.sync_filename_duplicated_fields(self.geometry.cluster_bytes());
             let raw_fn_bytes = child_cat.file_names[0].encode()?;
