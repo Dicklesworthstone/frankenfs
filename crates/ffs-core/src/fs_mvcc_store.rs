@@ -129,6 +129,12 @@ impl FsMvccStore {
         }
     }
 
+    pub(super) fn ensure_extent_read_cache(&self, cache: &Arc<ffs_block::ShardedExtentReadCache>) {
+        if self.extent_cache().is_none() {
+            self.attach_extent_read_cache(Arc::clone(cache));
+        }
+    }
+
     fn extent_cache(&self) -> Option<&Arc<ffs_block::ShardedExtentReadCache>> {
         match self {
             Self::Single { extent_cache, .. } | Self::Sharded { extent_cache, .. } => {

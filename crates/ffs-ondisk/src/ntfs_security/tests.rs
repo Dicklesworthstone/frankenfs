@@ -549,3 +549,84 @@ fn selected_descriptor_lengths_cannot_hide_unhashed_partial_words() {
             .is_err()
     );
 }
+
+#[test]
+fn security_descriptor_encode_inheritance_dacl_and_multistripe_sds_roundtrip() {
+    // 1. Round-trip self-relative SD including DENY-before-ALLOW ACEs.
+    let parsed = NtfsSecurityDescriptor::parse(&DESCRIPTOR).unwrap();
+    let encoded = parsed.encode().unwrap();
+    let reparsed = NtfsSecurityDescriptor::parse(&encoded).unwrap();
+    assert_eq!(reparsed.owner, parsed.owner);
+    assert_eq!(reparsed.group, parsed.group);
+    assert_eq!(reparsed.dacl.aces, parsed.dacl.aces);
+    assert_eq!(reparsed.sacl.present, parsed.sacl.present);
+
+    // 2. SID string parsing + encoding round-trip.
+    let admin = NtfsSid::parse_str("S-1-5-32-544").unwrap();
+    assert_eq!(admin.to_string(), "S-1-5-32-544");
+    let custom_auth = NtfsSid::parse_str("S-1-0x000001000001-7").unwrap();
+    assert_eq!(custom_auth.authority, 0x0000_0100_0001);
+    assert_eq!(custom_auth.subauthorities, vec![7]);
+    assert!(NtfsSid::parse_str("S-2-5-18").is_err());
+
+    // 3. DACL evaluation: DENY before ALLOW denies S-1-5-18 write (bit 2 denied for Everyone).
+    let sys_sid = NtfsSid::parse_str("S-1-5-18").unwrap();
+    let tok = NtfsAccessToken {
+        user: sys_sid.clone(),
+        groups: Vec::new(),
+    };
+    assert!(
+        !evaluate_dacl_access(&reparsed, &tok, FILE_WRITE_DATA).unwrap(),
+        "Everyone DENY ACE precedes SYSTEM ALLOW ACE"
+    );
+    assert!(evaluate_dacl_access(&reparsed, &tok, FILE_READ_DATA).unwrap());
+
+    // 4. Inheritance: OI+CI ACE propagates to both files and dirs; CREATOR_OWNER substitutes owner.
+    let user_sid = NtfsSid::parse_str("S-1-5-88-1-1000").unwrap();
+    let group_sid = NtfsSid::parse_str("S-1-5-88-2-1000").unwrap();
+    let mut parent = reparsed;
+    parent.dacl.aces.push(NtfsAce {
+        kind: ACE_TYPE_ACCESS_ALLOWED,
+        flags: ACE_FLAG_OBJECT_INHERIT | ACE_FLAG_CONTAINER_INHERIT | ACE_FLAG_INHERIT_ONLY,
+        size: 0,
+        mask: Some(FILE_ALL_ACCESS),
+        sid: Some(NtfsSid::creator_owner()),
+        object_flags: None,
+        object_type: None,
+        inherited_object_type: None,
+        opaque: Vec::new(),
+    });
+    let file_sd = inherit_security_descriptor(&parent, false, &user_sid, &group_sid).unwrap();
+    assert!(
+        file_sd
+            .dacl
+            .aces
+            .iter()
+            .any(|a| a.sid.as_ref() == Some(&user_sid) && (a.flags & ACE_FLAG_INHERITED) != 0)
+    );
+    let dir_sd = inherit_security_descriptor(&parent, true, &user_sid, &group_sid).unwrap();
+    assert!(
+        dir_sd
+            .dacl
+            .aces
+            .iter()
+            .any(|a| a.sid.as_ref() == Some(&NtfsSid::creator_owner())
+                && (a.flags & ACE_FLAG_INHERIT_ONLY) != 0)
+    );
+
+    // 5. Multi-stripe $SDS primary placement crosses 0x4_0000 -> 0x8_0000.
+    let off0 = next_sds_primary_offset(0, 120).unwrap();
+    assert_eq!(off0, 0);
+    let near_end = SDS_COPY_DISTANCE - 64;
+    let off_next_stripe = next_sds_primary_offset(near_end, 120).unwrap();
+    assert_eq!(off_next_stripe, 2 * SDS_COPY_DISTANCE);
+    assert_eq!(off_next_stripe & SDS_COPY_DISTANCE, 0);
+    let hdr = NtfsSecurityHeader {
+        hash: security_hash(&encoded),
+        security_id: 0x101,
+        offset: off_next_stripe,
+        length: (SDS_HEADER_BYTES + encoded.len()) as u32,
+    };
+    let sds_entry = encode_sds_entry(hdr, &encoded).unwrap();
+    assert!(sds_entry.len().is_multiple_of(16));
+}

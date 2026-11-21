@@ -189,11 +189,16 @@ pub fn encode_extended_attributes(
         let used = 8 + entry.name.len() + 1 + entry.value.len();
         let padded = used.next_multiple_of(4);
         if out.len() + padded > MAX_EA_BYTES {
-            return Err(invalid("ntfs.ea", "encoded EA stream exceeds 64 KiB budget"));
+            return Err(invalid(
+                "ntfs.ea",
+                "encoded EA stream exceeds 64 KiB budget",
+            ));
         }
+        let padded_u32 = u32::try_from(padded)
+            .map_err(|_| invalid("ntfs.ea", "encoded EA entry size exceeds u32"))?;
         let start = out.len();
         out.resize(start + padded, 0);
-        out[start..start + 4].copy_from_slice(&(padded as u32).to_le_bytes());
+        out[start..start + 4].copy_from_slice(&padded_u32.to_le_bytes());
         out[start + 4] = entry.flags;
         out[start + 5] = name_len;
         out[start + 6..start + 8].copy_from_slice(&value_len.to_le_bytes());

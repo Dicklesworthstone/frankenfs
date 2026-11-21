@@ -10,12 +10,7 @@ use sha2::{Digest, Sha256};
 use super::{invalid, le32};
 use ffs_types::ParseError;
 
-pub const EFS_STREAM_NAME: [u16; 4] = [
-    b'$' as u16,
-    b'E' as u16,
-    b'F' as u16,
-    b'S' as u16,
-];
+pub const EFS_STREAM_NAME: [u16; 4] = [b'$' as u16, b'E' as u16, b'F' as u16, b'S' as u16];
 pub const EFS_SECTOR_BYTES: usize = 512;
 pub const EFS_ALG_AES_256: u32 = 0x6610;
 pub const EFS_HEADER_VERSION: u32 = 2;
@@ -45,7 +40,11 @@ pub struct NtfsEfsMetadata {
 
 /// Derive a deterministic 32-byte key commitment binding `(fek, key_id, volume_serial)`.
 #[must_use]
-pub fn compute_efs_key_commitment(fek: &[u8; 32], key_id: &[u8; 32], volume_serial: u64) -> [u8; 32] {
+pub fn compute_efs_key_commitment(
+    fek: &[u8; 32],
+    key_id: &[u8; 32],
+    volume_serial: u64,
+) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(b"ffs-ntfs-efs-commit-v1:");
     h.update(fek);
@@ -129,7 +128,10 @@ impl NtfsEfsMetadata {
             key_commitment.copy_from_slice(&ddf[40..72]);
             let ddf_count = le32(ddf, 72)?;
             if ddf_count == 0 {
-                return Err(invalid("ntfs.efs", "$EFS explicit DDF count must be nonzero"));
+                return Err(invalid(
+                    "ntfs.efs",
+                    "$EFS explicit DDF count must be nonzero",
+                ));
             }
             return Ok(Self {
                 version,
@@ -202,7 +204,7 @@ const INV_SBOX: [u8; 256] = [
 const RCON: [u8; 8] = [0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40];
 
 #[inline]
-fn xtime(x: u8) -> u8 {
+const fn xtime(x: u8) -> u8 {
     (x << 1) ^ if x & 0x80 != 0 { 0x1b } else { 0 }
 }
 
@@ -226,7 +228,7 @@ fn expand_key_256(key: &[u8; 32]) -> [[u8; 16]; 15] {
     }
     for i in 8..60 {
         let mut temp = words[i - 1];
-        if i % 8 == 0 {
+        if i.is_multiple_of(8) {
             temp = [
                 SBOX[usize::from(temp[1])] ^ RCON[i / 8],
                 SBOX[usize::from(temp[2])],
@@ -394,7 +396,9 @@ pub fn efs_encrypt_sector(
     logical_sector_offset: u64,
     sector: &mut [u8],
 ) -> Result<(), ParseError> {
-    if sector.len() != EFS_SECTOR_BYTES || !logical_sector_offset.is_multiple_of(EFS_SECTOR_BYTES as u64) {
+    if sector.len() != EFS_SECTOR_BYTES
+        || !logical_sector_offset.is_multiple_of(EFS_SECTOR_BYTES as u64)
+    {
         return Err(invalid(
             "ntfs.efs",
             "EFS sector encryption requires 512-byte aligned 512-byte buffer",
@@ -448,7 +452,7 @@ mod tests {
     fn fips_197_appendix_c3_aes256_known_answer_vector() {
         let mut key = [0_u8; 32];
         for (i, b) in key.iter_mut().enumerate() {
-            *b = i as u8;
+            *b = u8::try_from(i).unwrap();
         }
         let pt: [u8; 16] = [
             0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
@@ -477,13 +481,18 @@ mod tests {
         assert!(!meta.raw_bytes.windows(32).any(|w| w == key));
         assert_eq!(NtfsEfsMetadata::parse(&meta.raw_bytes).unwrap(), meta);
 
-        let orig: Vec<u8> = (0..512).map(|i| ((i * 7) % 251) as u8).collect();
+        let orig: Vec<u8> = (0..512)
+            .map(|i| u8::try_from((i * 7) % 251).unwrap())
+            .collect();
         let mut s0 = orig.clone();
         let mut s1 = orig.clone();
         efs_encrypt_sector(&key, 0, &mut s0).unwrap();
         efs_encrypt_sector(&key, 512, &mut s1).unwrap();
         assert_ne!(s0, orig);
-        assert_ne!(s0, s1, "distinct sector offsets must produce distinct ciphertext");
+        assert_ne!(
+            s0, s1,
+            "distinct sector offsets must produce distinct ciphertext"
+        );
 
         efs_decrypt_sector(&key, 0, &mut s0).unwrap();
         efs_decrypt_sector(&key, 512, &mut s1).unwrap();

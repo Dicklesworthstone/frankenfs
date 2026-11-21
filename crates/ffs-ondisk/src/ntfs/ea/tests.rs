@@ -149,3 +149,26 @@ fn exact_duplicates_are_refused_without_case_folding_distinct_native_names() {
     bytes.extend(entry(b"user.Name", b"again", 0));
     assert!(parse_extended_attributes(&information(57, 0, bytes.len()), &bytes).is_err());
 }
+
+#[test]
+fn encode_extended_attributes_roundtrips_and_rejects_duplicates() {
+    let items = vec![
+        NtfsEa {
+            name: b"user.alpha".to_vec(),
+            flags: 0,
+            value: b"one".to_vec(),
+        },
+        NtfsEa {
+            name: b"user.beta".to_vec(),
+            flags: FILE_NEED_EA,
+            value: vec![0, 1, 2, 0xFF],
+        },
+    ];
+    let (info, raw) = encode_extended_attributes(&items).unwrap();
+    assert_eq!(info.need_ea_count, 1);
+    assert_eq!(NtfsEaInformation::parse(&info.encode()).unwrap(), info);
+    assert_eq!(parse_extended_attributes(&info, &raw).unwrap(), items);
+
+    let dup = vec![items[0].clone(), items[0].clone()];
+    assert!(encode_extended_attributes(&dup).is_err());
+}

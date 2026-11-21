@@ -596,7 +596,8 @@ fn zvol_persistence_prefix_fault_cuts_across_all_stages() {
     };
     let base_snapshot = base_dev.durable_snapshot();
 
-    let stages: Vec<(&str, fn(&ZfsPersistenceStage) -> bool, bool)> = vec![
+    type ZvolStageSpec = (&'static str, fn(&ZfsPersistenceStage) -> bool, bool);
+    let stages: Vec<ZvolStageSpec> = vec![
         (
             "ChildBlocksWrite",
             |s| matches!(s, ZfsPersistenceStage::ChildBlocksWrite { .. }),

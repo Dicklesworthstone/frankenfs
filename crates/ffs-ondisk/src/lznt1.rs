@@ -152,11 +152,15 @@ pub fn compress_unit(input: &[u8]) -> Result<Vec<u8>, ParseError> {
     for chunk in input.chunks(CHUNK_BYTES) {
         let compressed = encode_chunk(chunk);
         if compressed.len() < chunk.len() && compressed.len() <= CHUNK_BYTES {
-            let hdr = 0xB000_u16 | u16::try_from(compressed.len() - 1).map_err(|_| invalid("chunk header overflow"))?;
+            let hdr = 0xB000_u16
+                | u16::try_from(compressed.len() - 1)
+                    .map_err(|_| invalid("chunk header overflow"))?;
             out.extend_from_slice(&hdr.to_le_bytes());
             out.extend_from_slice(&compressed);
         } else {
-            let hdr = 0x3000_u16 | u16::try_from(chunk.len() - 1).map_err(|_| invalid("raw chunk header overflow"))?;
+            let hdr = 0x3000_u16
+                | u16::try_from(chunk.len() - 1)
+                    .map_err(|_| invalid("raw chunk header overflow"))?;
             out.extend_from_slice(&hdr.to_le_bytes());
             out.extend_from_slice(chunk);
         }
@@ -217,8 +221,8 @@ fn encode_chunk(chunk: &[u8]) -> Vec<u8> {
             }
             if best_len >= 3 {
                 flags |= 1_u8 << bit;
-                let word = u16::try_from(((best_dist - 1) << length_bits) | (best_len - 3))
-                    .unwrap_or(0);
+                let word =
+                    u16::try_from(((best_dist - 1) << length_bits) | (best_len - 3)).unwrap_or(0);
                 out.extend_from_slice(&word.to_le_bytes());
                 pos += best_len;
             } else {
@@ -361,7 +365,11 @@ mod tests {
         // 1. Highly compressible 64 KiB unit (all 'A's)
         let zeros = vec![b'A'; MAX_UNIT_BYTES];
         let packed = compress_unit(&zeros).unwrap();
-        assert!(packed.len() < 512, "expected high compression ratio, got {}", packed.len());
+        assert!(
+            packed.len() < 512,
+            "expected high compression ratio, got {}",
+            packed.len()
+        );
         assert_eq!(decompress_unit(&packed, MAX_UNIT_BYTES).unwrap(), zeros);
 
         // 2. Multi-chunk mixed patterns crossing 16/17/32/33/2048/2049 boundaries

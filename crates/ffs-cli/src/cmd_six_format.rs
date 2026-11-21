@@ -1778,10 +1778,14 @@ pub fn maybe_route_mount_cmd(
             });
             if options.runtime.mode == MountRuntimeMode::PerCore {
                 let (_metrics, per_core) = handle.wait_with_per_core_metrics()?;
+                let lanes = per_core.as_ref().map_or(0, |m| m.cpus.len());
+                let total_requests: u64 = per_core
+                    .as_ref()
+                    .map_or(0, |m| m.requests.iter().copied().sum());
                 tracing::info!(
                     target: "ffs::cli::mount",
-                    lanes = per_core.per_core.len(),
-                    total_requests = per_core.total_requests,
+                    lanes,
+                    total_requests,
                     "six_format_per_core_shutdown"
                 );
             } else {

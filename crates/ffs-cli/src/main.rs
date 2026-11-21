@@ -77,7 +77,7 @@ fn configure_bounded_dirty_decay() {
     let _ = b"arena.4096.muzzy_decay_ms\0".name().write(decay_ms);
     let _ = b"arenas.muzzy_decay_ms\0".name().write(decay_ms);
     let effective = b"arenas.dirty_decay_ms\0".name().read().unwrap_or(decay_ms);
-    DIRTY_DECAY_MS_IN_FORCE.store(effective as i64, Ordering::Release);
+    DIRTY_DECAY_MS_IN_FORCE.store(effective as i64, std::sync::atomic::Ordering::Release);
 }
 
 mod cmd_dump;
@@ -9845,7 +9845,7 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
                         // discarded the counters at the source on the exact path the
                         // instrument uses.
                         metrics,
-                        worker_count: resolved_workers,
+                        worker_count: u32::try_from(resolved_workers).unwrap_or(u32::MAX),
                         per_core: None,
                     },
                 )?;

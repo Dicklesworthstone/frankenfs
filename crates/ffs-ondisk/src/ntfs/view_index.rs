@@ -40,7 +40,10 @@ impl ViewCollation {
             COLLATION_RAW_BYTES => Ok(Self::RawBytes),
             COLLATION_U32_PAIR => Ok(Self::U32Pair),
             COLLATION_U32_SLICE => Ok(Self::U32Slice),
-            _ => Err(invalid("ntfs.view_index", "unsupported view-index collation rule")),
+            _ => Err(invalid(
+                "ntfs.view_index",
+                "unsupported view-index collation rule",
+            )),
         }
     }
 
@@ -56,15 +59,20 @@ impl ViewCollation {
 
     pub fn validate_key(self, key: &[u8]) -> Result<(), ParseError> {
         if key.is_empty() || key.len() > 4096 {
-            return Err(invalid("ntfs.view_index", "view-index key length out of bounds"));
+            return Err(invalid(
+                "ntfs.view_index",
+                "view-index key length out of bounds",
+            ));
         }
         match self {
-            Self::U32 if key.len() != 4 => {
-                Err(invalid("ntfs.view_index", "u32 collation requires 4-byte key"))
-            }
-            Self::U32Pair if key.len() != 8 => {
-                Err(invalid("ntfs.view_index", "u32-pair collation requires 8-byte key"))
-            }
+            Self::U32 if key.len() != 4 => Err(invalid(
+                "ntfs.view_index",
+                "u32 collation requires 4-byte key",
+            )),
+            Self::U32Pair if key.len() != 8 => Err(invalid(
+                "ntfs.view_index",
+                "u32-pair collation requires 8-byte key",
+            )),
             Self::U32Slice if !key.len().is_multiple_of(4) => Err(invalid(
                 "ntfs.view_index",
                 "u32-slice collation requires 4-byte-aligned key",
@@ -248,7 +256,10 @@ fn parse_view_entries(
 
     loop {
         if at + 16 > end {
-            return Err(invalid("ntfs.view_index", "missing view-index terminal entry"));
+            return Err(invalid(
+                "ntfs.view_index",
+                "missing view-index terminal entry",
+            ));
         }
         let length = usize::from(le16(raw, at + 8)?);
         let key_length = usize::from(le16(raw, at + 10)?);
@@ -292,7 +303,8 @@ fn parse_view_entries(
         if le32(raw, at + 4)? != 0
             || 16 + key_length > length - child_bytes
             || (data_length > 0
-                && (data_offset < 16 + key_length || data_offset + data_length > length - child_bytes))
+                && (data_offset < 16 + key_length
+                    || data_offset + data_length > length - child_bytes))
         {
             return Err(invalid(
                 "ntfs.view_index",
@@ -389,8 +401,8 @@ pub fn encode_view_index_root(
     let units = u8::try_from(block_bytes / vcn_bytes)
         .map_err(|_| invalid("ntfs.view_index", "view-index VBN units overflow"))?;
     let payload_len: usize = encoded_entries.iter().map(Vec::len).sum();
-    let term_len: usize = if terminal_child_vcn.is_some() { 24 } else { 16 };
-    let hdr_used = 16 + payload_len + term_len;
+    let term_len: u16 = if terminal_child_vcn.is_some() { 24 } else { 16 };
+    let hdr_used = 16 + payload_len + usize::from(term_len);
     let used_u32 = u32::try_from(hdr_used)
         .map_err(|_| invalid("ntfs.view_index", "view-index root size overflow"))?;
     let mut root = vec![0_u8; 16 + hdr_used];
@@ -408,7 +420,7 @@ pub fn encode_view_index_root(
         root[pos..pos + ent.len()].copy_from_slice(ent);
         pos += ent.len();
     }
-    root[pos + 8..pos + 10].copy_from_slice(&(term_len as u16).to_le_bytes());
+    root[pos + 8..pos + 10].copy_from_slice(&term_len.to_le_bytes());
     let term_flags: u16 = if terminal_child_vcn.is_some() { 3 } else { 2 };
     root[pos + 12..pos + 14].copy_from_slice(&term_flags.to_le_bytes());
     if let Some(vcn) = terminal_child_vcn {
@@ -440,22 +452,28 @@ pub fn encode_view_index_block(
     let rel_entries_off = raw_entries_off - 24;
     let allocated = len - 24;
     let payload_len: usize = encoded_entries.iter().map(Vec::len).sum();
-    let term_len: usize = if terminal_child_vcn.is_some() { 24 } else { 16 };
-    let used = rel_entries_off + payload_len + term_len;
+    let term_len: u16 = if terminal_child_vcn.is_some() { 24 } else { 16 };
+    let used = rel_entries_off + payload_len + usize::from(term_len);
     if used > allocated {
         return Err(invalid(
             "ntfs.view_index",
             "view-index entries overflow INDX block capacity",
         ));
     }
+    let rel_entries_u32 = u32::try_from(rel_entries_off)
+        .map_err(|_| invalid("ntfs.view_index", "INDX entries offset overflow"))?;
+    let used_u32 =
+        u32::try_from(used).map_err(|_| invalid("ntfs.view_index", "INDX used size overflow"))?;
+    let allocated_u32 = u32::try_from(allocated)
+        .map_err(|_| invalid("ntfs.view_index", "INDX allocated size overflow"))?;
     let mut buf = vec![0_u8; len];
     buf[0..4].copy_from_slice(b"INDX");
     buf[4..6].copy_from_slice(&usa_offset.to_le_bytes());
     buf[6..8].copy_from_slice(&usa_count.to_le_bytes());
     buf[16..24].copy_from_slice(&vcn.to_le_bytes());
-    buf[24..28].copy_from_slice(&(rel_entries_off as u32).to_le_bytes());
-    buf[28..32].copy_from_slice(&(used as u32).to_le_bytes());
-    buf[32..36].copy_from_slice(&(allocated as u32).to_le_bytes());
+    buf[24..28].copy_from_slice(&rel_entries_u32.to_le_bytes());
+    buf[28..32].copy_from_slice(&used_u32.to_le_bytes());
+    buf[32..36].copy_from_slice(&allocated_u32.to_le_bytes());
     let node_flags: u32 = u32::from(terminal_child_vcn.is_some());
     buf[36..40].copy_from_slice(&node_flags.to_le_bytes());
 
@@ -464,7 +482,7 @@ pub fn encode_view_index_block(
         buf[pos..pos + ent.len()].copy_from_slice(ent);
         pos += ent.len();
     }
-    buf[pos + 8..pos + 10].copy_from_slice(&(term_len as u16).to_le_bytes());
+    buf[pos + 8..pos + 10].copy_from_slice(&term_len.to_le_bytes());
     let term_flags: u16 = if terminal_child_vcn.is_some() { 3 } else { 2 };
     buf[pos + 12..pos + 14].copy_from_slice(&term_flags.to_le_bytes());
     if let Some(child_vcn) = terminal_child_vcn {
@@ -492,9 +510,14 @@ mod tests {
         k2.extend_from_slice(&0x0001_0000_0000_0025_u64.to_le_bytes());
         let e1 = encode_view_index_entry(&k1, &[], None, ViewCollation::U32Slice).unwrap();
         let e2 = encode_view_index_entry(&k2, &[], None, ViewCollation::U32Slice).unwrap();
-        let root =
-            encode_view_index_root(ViewCollation::U32Slice, 4096, 4096, &[e1.clone(), e2.clone()], None)
-                .unwrap();
+        let root = encode_view_index_root(
+            ViewCollation::U32Slice,
+            4096,
+            4096,
+            &[e1.clone(), e2.clone()],
+            None,
+        )
+        .unwrap();
         let parsed = parse_view_index_root(&root, 4096, Some(ViewCollation::U32Slice)).unwrap();
         assert!(!parsed.has_external);
         assert_eq!(parsed.entries.len(), 3);
@@ -504,7 +527,9 @@ mod tests {
         assert!(parsed.entries[2].is_terminal);
 
         // Misordered keys fail validation.
-        assert!(encode_view_index_root(ViewCollation::U32Slice, 4096, 4096, &[e2, e1], None).is_err());
+        assert!(
+            encode_view_index_root(ViewCollation::U32Slice, 4096, 4096, &[e2, e1], None).is_err()
+        );
 
         // 2. External INDX block with $ObjId::$O (0x11 RawBytes, 16B key, 56B data).
         let oid_a = [0x11_u8; 16];
@@ -513,7 +538,8 @@ mod tests {
         let data_b = [0xBB_u8; 56];
         let oe1 = encode_view_index_entry(&oid_a, &data_a, None, ViewCollation::RawBytes).unwrap();
         let oe2 = encode_view_index_entry(&oid_b, &data_b, None, ViewCollation::RawBytes).unwrap();
-        let block = encode_view_index_block(ViewCollation::RawBytes, 4096, 0, &[oe1, oe2], None).unwrap();
+        let block =
+            encode_view_index_block(ViewCollation::RawBytes, 4096, 0, &[oe1, oe2], None).unwrap();
         let (has_children, parsed_blk) =
             parse_view_index_block(&block, 0, ViewCollation::RawBytes).unwrap();
         assert!(!has_children);
@@ -535,6 +561,9 @@ mod tests {
         let mut p2 = Vec::new();
         p2.extend_from_slice(&0x0000_0010_u32.to_le_bytes());
         p2.extend_from_slice(&257_u32.to_le_bytes());
-        assert_eq!(ViewCollation::U32Pair.compare_keys(&p1, &p2), Ordering::Less);
+        assert_eq!(
+            ViewCollation::U32Pair.compare_keys(&p1, &p2),
+            Ordering::Less
+        );
     }
 }

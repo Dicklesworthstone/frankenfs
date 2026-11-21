@@ -123,8 +123,12 @@ impl UsnRecordV2 {
         let parent_ref_raw = self.parent_ref.encode()?;
         let name_bytes = u16::try_from(self.name.len() * 2)
             .map_err(|_| invalid("ntfs.usn", "USN name byte length overflow"))?;
+        let total_u32 = u32::try_from(total)
+            .map_err(|_| invalid("ntfs.usn", "USN record length exceeds u32"))?;
+        let fixed_u16 = u16::try_from(USN_RECORD_V2_FIXED_BYTES)
+            .map_err(|_| invalid("ntfs.usn", "USN header size exceeds u16"))?;
         let mut out = vec![0_u8; total];
-        out[0..4].copy_from_slice(&(total as u32).to_le_bytes());
+        out[0..4].copy_from_slice(&total_u32.to_le_bytes());
         out[4..6].copy_from_slice(&2_u16.to_le_bytes()); // major_version = 2
         out[6..8].copy_from_slice(&0_u16.to_le_bytes()); // minor_version = 0
         out[8..16].copy_from_slice(&file_ref_raw.to_le_bytes());
@@ -136,7 +140,7 @@ impl UsnRecordV2 {
         out[48..52].copy_from_slice(&self.security_id.to_le_bytes());
         out[52..56].copy_from_slice(&self.file_attributes.to_le_bytes());
         out[56..58].copy_from_slice(&name_bytes.to_le_bytes());
-        out[58..60].copy_from_slice(&(USN_RECORD_V2_FIXED_BYTES as u16).to_le_bytes());
+        out[58..60].copy_from_slice(&fixed_u16.to_le_bytes());
         for (i, &unit) in self.name.iter().enumerate() {
             out[USN_RECORD_V2_FIXED_BYTES + i * 2..USN_RECORD_V2_FIXED_BYTES + 2 + i * 2]
                 .copy_from_slice(&unit.to_le_bytes());
@@ -153,7 +157,10 @@ impl UsnRecordV2 {
         let major = le16(raw, 4)?;
         let minor = le16(raw, 6)?;
         if major != 2 || minor != 0 {
-            return Err(invalid("ntfs.usn", "unsupported USN record version (only v2.0 admitted)"));
+            return Err(invalid(
+                "ntfs.usn",
+                "unsupported USN record version (only v2.0 admitted)",
+            ));
         }
         if rec_len < USN_RECORD_V2_FIXED_BYTES
             || !rec_len.is_multiple_of(8)
@@ -226,17 +233,26 @@ pub fn parse_usn_journal_slice(
         if rec_len == 0 {
             let skip = rem_in_page.min(bytes.len() - pos);
             if bytes[pos..pos + skip].iter().any(|&b| b != 0) {
-                return Err(invalid("ntfs.usn", "non-zero bytes inside $J zero-pad tail"));
+                return Err(invalid(
+                    "ntfs.usn",
+                    "non-zero bytes inside $J zero-pad tail",
+                ));
             }
             pos += skip;
             continue;
         }
         if usize::try_from(rec_len).is_ok_and(|n| n > rem_in_page) {
-            return Err(invalid("ntfs.usn", "USN record crosses 4 KiB page boundary"));
+            return Err(invalid(
+                "ntfs.usn",
+                "USN record crosses 4 KiB page boundary",
+            ));
         }
         let (record, consumed) = UsnRecordV2::parse(&bytes[pos..])?;
         if record.usn != abs_off {
-            return Err(invalid("ntfs.usn", "USN record offset disagrees with record.usn"));
+            return Err(invalid(
+                "ntfs.usn",
+                "USN record offset disagrees with record.usn",
+            ));
         }
         records.push(record);
         pos += consumed;

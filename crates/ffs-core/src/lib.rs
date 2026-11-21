@@ -8037,6 +8037,8 @@ impl OpenFs {
         }
         self.mvcc_store = Arc::new(FsMvccStore::sharded_with_publication_mode(mode));
         self.mvcc_store
+            .attach_extent_read_cache(Arc::clone(&self.file_data_extent_cache));
+        self.mvcc_store
             .set_conflict_policy(*self.mvcc_conflict_policy.lock());
         self.mvcc_store
             .set_ssi_enabled(*self.mvcc_isolation_mode.lock() == MvccIsolationMode::Serializable);
@@ -13085,6 +13087,8 @@ impl OpenFs {
         // the two clock reads when the mvcc INFO target is disabled (the default).
         let start = tracing::enabled!(target: "ffs::mvcc", tracing::Level::INFO)
             .then(std::time::Instant::now);
+        self.mvcc_store
+            .ensure_extent_read_cache(&self.file_data_extent_cache);
         let result = self.mvcc_store.commit(txn);
         if result.is_ok()
             && let Some(stale) = view.as_mut()
@@ -13233,6 +13237,8 @@ impl OpenFs {
         // clock reads when the mvcc INFO target is disabled (the default).
         let start = tracing::enabled!(target: "ffs::mvcc", tracing::Level::INFO)
             .then(std::time::Instant::now);
+        self.mvcc_store
+            .ensure_extent_read_cache(&self.file_data_extent_cache);
         let result = self.mvcc_store.commit_ssi(txn);
         if result.is_ok()
             && let Some(stale) = view.as_mut()
@@ -13319,6 +13325,8 @@ impl OpenFs {
             && self.mvcc_store.active_snapshot_count() == 0
         {
             self.mvcc_store = Arc::new(FsMvccStore::single());
+            self.mvcc_store
+                .attach_extent_read_cache(Arc::clone(&self.file_data_extent_cache));
             self.mvcc_store
                 .set_conflict_policy(*self.mvcc_conflict_policy.lock());
             self.mvcc_store.set_ssi_enabled(
@@ -15806,7 +15814,12 @@ impl OpenFs {
             ))));
         }
 
-        // Phase 3: make preflighted writes visible in MVCC.
+        // Phase 3: make preflighted writes visible in MVCC, invalidating the
+        // file-data extent cache before and after publication so concurrent
+        // readers never observe or admit pre-commit bytes.
+        if !write_blocks.is_empty() {
+            self.file_data_extent_cache.invalidate_blocks(&write_blocks);
+        }
         let commit_seq = mvcc_guard.commit_fcw_prechecked(txn).map_err(|e| {
             Self::map_journal_commit_error(
                 txn_id.0,
@@ -15815,6 +15828,9 @@ impl OpenFs {
                 "after JBD2 visibility phase",
             )
         })?;
+        if !write_blocks.is_empty() {
+            self.file_data_extent_cache.invalidate_blocks(&write_blocks);
+        }
         drop(mvcc_guard);
         drop(view);
         drop(mutation);
@@ -27536,6 +27552,8 @@ impl OpenFs {
         // while it waited for this guard. Recheck before publishing staged data;
         // require_alloc_state only checks authority and does not take the lock.
         self.require_alloc_state()?;
+        self.mvcc_store
+            .ensure_extent_read_cache(&self.file_data_extent_cache);
         if !scope.has_ext4_staged_effects() {
             return scope.commit_if_write(&self.mvcc_store);
         }

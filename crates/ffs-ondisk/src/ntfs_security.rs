@@ -44,8 +44,11 @@ pub const STANDARD_READ_CONTROL: u32 = 0x0002_0000;
 pub const STANDARD_WRITE_DAC: u32 = 0x0004_0000;
 pub const STANDARD_WRITE_OWNER: u32 = 0x0008_0000;
 pub const STANDARD_SYNCHRONIZE: u32 = 0x0010_0000;
-pub const FILE_GENERIC_READ: u32 =
-    STANDARD_READ_CONTROL | FILE_READ_DATA | FILE_READ_ATTRIBUTES | FILE_READ_EA | STANDARD_SYNCHRONIZE;
+pub const FILE_GENERIC_READ: u32 = STANDARD_READ_CONTROL
+    | FILE_READ_DATA
+    | FILE_READ_ATTRIBUTES
+    | FILE_READ_EA
+    | STANDARD_SYNCHRONIZE;
 pub const FILE_GENERIC_WRITE: u32 = STANDARD_READ_CONTROL
     | FILE_WRITE_DATA
     | FILE_WRITE_ATTRIBUTES
@@ -127,7 +130,9 @@ impl NtfsSid {
         if parts.next() != Some("S") || parts.next() != Some("1") {
             return Err(invalid("SID string must begin with S-1-"));
         }
-        let auth_str = parts.next().ok_or_else(|| invalid("missing SID authority"))?;
+        let auth_str = parts
+            .next()
+            .ok_or_else(|| invalid("missing SID authority"))?;
         let authority = if let Some(hex) = auth_str
             .strip_prefix("0x")
             .or_else(|| auth_str.strip_prefix("0X"))
@@ -162,9 +167,11 @@ impl NtfsSid {
         if self.authority > 0x0000_FFFF_FFFF_FFFF || self.subauthorities.len() > 15 {
             return Err(invalid("SID authority or subauthority count out of range"));
         }
+        let sub_count = u8::try_from(self.subauthorities.len())
+            .map_err(|_| invalid("SID subauthority count exceeds u8"))?;
         let mut out = Vec::with_capacity(8 + self.subauthorities.len() * 4);
         out.push(1); // revision 1
-        out.push(self.subauthorities.len() as u8);
+        out.push(sub_count);
         let auth_be = self.authority.to_be_bytes();
         out.extend_from_slice(&auth_be[2..8]);
         for &sub in &self.subauthorities {
@@ -357,8 +364,8 @@ impl NtfsAcl {
         if !matches!(revision, 2 | 4) || (has_object && revision != 4) {
             return Err(invalid("invalid ACL revision for contained ACEs"));
         }
-        let ace_count = u16::try_from(self.aces.len())
-            .map_err(|_| invalid("ACL ACE count exceeds u16"))?;
+        let ace_count =
+            u16::try_from(self.aces.len()).map_err(|_| invalid("ACL ACE count exceeds u16"))?;
         let mut payload = Vec::new();
         for ace in &self.aces {
             payload.extend_from_slice(&ace.encode()?);
@@ -441,14 +448,8 @@ impl NtfsSecurityDescriptor {
 
         let sacl_bytes = self.sacl.encode()?;
         let dacl_bytes = self.dacl.encode()?;
-        let owner_bytes = match &self.owner {
-            Some(sid) => Some(sid.encode()?),
-            None => None,
-        };
-        let group_bytes = match &self.group {
-            Some(sid) => Some(sid.encode()?),
-            None => None,
-        };
+        let owner_bytes = self.owner.as_ref().map(NtfsSid::encode).transpose()?;
+        let group_bytes = self.group.as_ref().map(NtfsSid::encode).transpose()?;
 
         let mut out = vec![0_u8; 20];
         let mut append_part = |part: Option<Vec<u8>>| -> Result<u32, ParseError> {
@@ -619,7 +620,6 @@ pub fn inherit_security_descriptor(
             let oi = ace.flags & ACE_FLAG_OBJECT_INHERIT != 0;
             let ci = ace.flags & ACE_FLAG_CONTAINER_INHERIT != 0;
             let np = ace.flags & ACE_FLAG_NO_PROPAGATE_INHERIT != 0;
-            let io = ace.flags & ACE_FLAG_INHERIT_ONLY != 0;
 
             let applies_to_child = if is_directory { ci } else { oi };
             let propagates_further = is_directory && !np && (oi || ci);
@@ -665,19 +665,18 @@ pub fn inherit_security_descriptor(
                 let mut template = ace.clone();
                 template.flags = prop_flags;
                 child_aces.push(template);
-            } else if !is_directory && io && !oi {
-                // Container-only template does not propagate to non-directory child.
             }
         }
         let has_obj = child_aces
             .iter()
             .any(|a| matches!(a.kind, 5 | 6 | 7 | 11 | 12 | 15));
         let rev = parent_acl.revision.unwrap_or(if has_obj { 4 } else { 2 });
+        let ace_count = u16::try_from(child_aces.len()).unwrap_or(u16::MAX);
         NtfsAcl {
             present: true,
             offset: 0,
             revision: Some(if has_obj { 4 } else { rev }),
-            ace_count: Some(child_aces.len() as u16),
+            ace_count: Some(ace_count),
             size: None,
             aces: child_aces,
             padding: Vec::new(),
