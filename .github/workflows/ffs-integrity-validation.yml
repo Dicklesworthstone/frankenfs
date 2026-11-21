@@ -114,3 +114,12 @@ jobs:
       - name: Native NTFS extended-attribute catalog and reclamation
         if: ${{ !cancelled() }}
         run: cargo test --locked -p ffs-cli --test cli_e2e ntfs_ea::native_ntfs_ea_cli_preserves_data_allocation_and_volume_bounds -- --ignored --exact --nocapture
+
+      - name: Native NTFS sparse hole punching and reclamation
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          test_name=ntfs_sparse::native_ntfs_hole_punch_cli_preserves_streams_allocation_and_volume_bounds
+          cargo test --locked -p ffs-cli --test cli_e2e "$test_name" -- --ignored --exact --list | tee "$RUNNER_TEMP/ntfs-hole-punch-tests.txt"
+          grep -Fx "$test_name: test" "$RUNNER_TEMP/ntfs-hole-punch-tests.txt"
+          cargo test --locked -p ffs-cli --test cli_e2e "$test_name" -- --ignored --exact --nocapture --test-threads=1

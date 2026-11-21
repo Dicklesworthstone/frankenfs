@@ -1,5 +1,19 @@
 # FEATURE_PARITY
 
+> **NTFS logged hole punching (2026-11-20):**
+> `NtfsTransactionEngine::punch_hole_at`, writable FsOps
+> `PUNCH_HOLE | KEEP_SIZE`, and `ffs-ntfs tx-punch-hole` edit unnamed DATA or an
+> exact UTF-16 named stream without changing EOF or initialized length.
+> Full clusters become native sparse holes; at most two partial initialized
+> boundary clusters are copied, so large logical ranges do not require a
+> range-sized buffer. Allocation, unnamed-DATA sparse flags, hard-link metadata
+> copies and mounted caches publish through the existing WAL transaction.
+> Authored regressions cover native allocation, ADS isolation, uninitialized
+> tails, large ranges, rejected operations, ENOSPC, committed cancellation,
+> failed barriers and durable/reordered persistence cuts. Compiler, runtime
+> and independent native-image qualification for this increment are pending;
+> no Windows-interchange or mounted-syscall qualification is claimed.
+
 > **Extent read-cache lifetime bounds (2026-11-20):**
 > The S3-FIFO cache bounds invalidation tombstones relative to live residents,
 > even when payload pressure never triggers eviction. Generation-tagged resident

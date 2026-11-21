@@ -516,6 +516,34 @@ ffs-ntfs tx-truncate volume.img /large.bin --stream audit --size 33554432 \
   --offline-image --allow-write
 ```
 
+## NTFS: reclaim file ranges without changing their size
+
+`tx-punch-hole` and writable FsOps `PUNCH_HOLE | KEEP_SIZE` zero a selected
+DATA range while retaining the stream's logical size and initialized length:
+
+```bash
+ffs-ntfs tx-punch-hole volume.img /large.bin --start 4096 --bytes 33554432 \
+  --offline-image --allow-write
+ffs-ntfs tx-punch-hole volume.img /large.bin --stream audit \
+  --start 4096 --bytes 8192 --offline-image --allow-write
+```
+
+Fully covered nonresident clusters become native sparse holes and their old
+allocation is reclaimed through the logged transaction. At most two partial
+boundary clusters need replacement; surrounding bytes are preserved. The
+range may exceed 16 MiB because untouched data and logical holes are not staged.
+Resident DATA remains resident and the affected bytes become zero.
+
+An empty selector addresses unnamed DATA; `--stream` or `--stream-utf16` selects
+one exact named stream. Unnamed DATA changes update the native sparse flag and
+every hard-link size/allocation copy. A named-stream edit preserves the unnamed
+stream's flags and allocation. Mounted publication refreshes cached data maps,
+attributes and free-space information after the durable commit. Zero-length
+requests, signed-size overflow, unsupported fallocate modes, read-only targets
+and transformed streams are refused through the existing admission rules.
+`--start` and `--bytes` describe the stream range; volume `--offset` and `--length`
+retain their partition-selection meaning.
+
 ## NTFS: native extended-attribute updates
 
 `tx-set-ea` and `tx-remove-ea` update the native `$EA` / `$EA_INFORMATION`

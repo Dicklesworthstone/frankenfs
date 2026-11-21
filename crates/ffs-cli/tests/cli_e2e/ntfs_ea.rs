@@ -41,7 +41,7 @@ fn data_stream_metadata(record: &serde_json::Value) -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn native_attribute_clusters(
+pub fn native_attribute_clusters(
     information: &[u8],
     attribute_type: &str,
     cluster_limit: u64,
@@ -85,7 +85,11 @@ fn native_attribute_clusters(
     clusters
 }
 
-fn replace_owned_clusters(bitmap: &mut [u8], removed: &BTreeSet<u64>, replacement: &BTreeSet<u64>) {
+pub fn replace_owned_clusters(
+    bitmap: &mut [u8],
+    removed: &BTreeSet<u64>,
+    replacement: &BTreeSet<u64>,
+) {
     for cluster in removed {
         let index = usize::try_from(cluster / 8).unwrap();
         let mask = 1_u8 << (cluster % 8);

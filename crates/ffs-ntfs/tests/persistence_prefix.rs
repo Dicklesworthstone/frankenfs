@@ -5,6 +5,10 @@
 
 #[path = "persistence_prefix/ea.rs"]
 mod ea;
+#[path = "persistence_prefix/punch.rs"]
+mod punch;
+#[path = "persistence_prefix/sparse_fsops.rs"]
+mod sparse_fsops;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
