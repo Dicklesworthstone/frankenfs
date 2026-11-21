@@ -13,7 +13,7 @@ use super::catalog::{
     physical_spans_of_runs, stage_runs_writes,
 };
 use super::dir_index::DirPrePayloadWrite;
-use super::view_index::{EditableViewIndex, ViewRawEntry, rebalance_view_index_tree};
+use super::view_index::{ViewRawEntry, rebalance_view_index_tree};
 use super::{NtfsTransactionEngine, checkpoint, corrupt, parse_err, unsupported};
 
 pub(super) const REPARSE_R_NAME: [u16; 2] = [b'$' as u16, b'R' as u16];

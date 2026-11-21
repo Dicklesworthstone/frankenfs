@@ -17,6 +17,9 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+#[path = "cli_e2e/ntfs_ea.rs"]
+mod ntfs_ea;
+
 fn run_native_companion_read_profile(profile: &str, binary: &str) {
     let root = tempfile::Builder::new()
         .prefix("ffs-companion-profile-")

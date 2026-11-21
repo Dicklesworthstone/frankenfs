@@ -11,8 +11,10 @@ use super::{
     reference, unsupported,
 };
 use crate::security_policy::{NtfsSecurityPatch, NtfsSidPolicy};
-use crate::transaction::{DEFAULT_NTFS_FILETIME, NtfsTxOutcome, validate_ntfs_component_utf16};
-use ffs_ondisk::ntfs::ea::MAX_EA_NAME_BYTES;
+use crate::transaction::{
+    DEFAULT_NTFS_FILETIME, NtfsEaSetMode, NtfsTxOutcome, validate_ntfs_component_utf16,
+};
+use ffs_ondisk::ntfs::ea::{MAX_EA_NAME_BYTES, NtfsEa};
 use ffs_ondisk::ntfs_security::{
     FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_DELETE_CHILD, FILE_READ_DATA, FILE_WRITE_DATA,
     STANDARD_DELETE, STANDARD_WRITE_DAC, STANDARD_WRITE_OWNER,
@@ -553,6 +555,97 @@ impl NtfsFs {
         Ok(size)
     }
 
+    fn user_ea_name(name: &str) -> Result<()> {
+        if name.len() > MAX_EA_NAME_BYTES {
+            return Err(FfsError::NameTooLong);
+        }
+        let suffix = name
+            .strip_prefix("user.")
+            .ok_or_else(|| unsupported("only native NTFS user.* EAs are exposed as host xattrs"))?;
+        if suffix.is_empty() || name.as_bytes().contains(&0) {
+            return Err(invalid_argument());
+        }
+        Ok(())
+    }
+
+    pub(super) fn setxattr_locked(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        name: &str,
+        value: &[u8],
+        mode: XattrSetMode,
+    ) -> Result<()> {
+        self.ensure_writable()?;
+        Self::user_ea_name(name)?;
+        if value.len() > usize::from(u16::MAX) {
+            return Err(FfsError::RequestRejected {
+                errno: libc::E2BIG,
+                detail: "native NTFS EA value is too large".into(),
+            });
+        }
+        if is_ads_ino(ino) {
+            self.describe(cx, ino)?;
+            return Err(unsupported(
+                "NTFS EAs belong to FILE records, not DATA streams",
+            ));
+        }
+        let record = self.record(cx, ino)?;
+        self.enforce_dacl(cx, &record, FILE_WRITE_DATA)?;
+        let flags = self
+            .active_volume()?
+            .extended_attributes(cx, &record)?
+            .find(name.as_bytes())
+            .map_or(0, |entry| entry.flags);
+        let entry = NtfsEa {
+            name: name.as_bytes().to_vec(),
+            flags,
+            value: value.to_vec(),
+        };
+        let mode = match mode {
+            XattrSetMode::Set => NtfsEaSetMode::Set,
+            XattrSetMode::Create => NtfsEaSetMode::Create,
+            XattrSetMode::Replace => NtfsEaSetMode::Replace,
+        };
+        let now = system_time_to_filetime(SystemTime::now())?;
+        self.transact(cx, |engine| {
+            engine.set_extended_attribute(cx, reference(&record), &entry, mode, now)
+        })
+    }
+
+    pub(super) fn removexattr_locked(&self, cx: &Cx, ino: InodeNumber, name: &str) -> Result<bool> {
+        self.ensure_writable()?;
+        if name.len() > MAX_EA_NAME_BYTES {
+            return Err(FfsError::NameTooLong);
+        }
+        if is_ads_ino(ino) {
+            self.describe(cx, ino)?;
+            return Ok(false);
+        }
+        let record = self.record(cx, ino)?;
+        if !name.starts_with("user.") {
+            // Kernel privilege removal probes security.capability on writes.
+            // This frontend does not expose that native namespace as a host
+            // capability, and must not reinterpret or remove unrelated EAs.
+            return Ok(false);
+        }
+        Self::user_ea_name(name)?;
+        self.enforce_dacl(cx, &record, FILE_WRITE_DATA)?;
+        if self
+            .active_volume()?
+            .extended_attributes(cx, &record)?
+            .find(name.as_bytes())
+            .is_none()
+        {
+            return Ok(false);
+        }
+        let now = system_time_to_filetime(SystemTime::now())?;
+        self.transact(cx, |engine| {
+            engine.remove_extended_attribute(cx, reference(&record), name.as_bytes(), now)
+        })?;
+        Ok(true)
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(super) fn setattr_locked(
         &self,
@@ -645,21 +738,17 @@ impl NtfsFs {
             }
             NtfsSidPolicy::Mapped { map, .. } => {
                 let mut patch = NtfsSecurityPatch::default();
-                let mut touched_sec = if let Some(uid) = attrs.uid
+                if let Some(uid) = attrs.uid
                     && uid != current.uid
                 {
                     self.enforce_dacl(cx, &target_rec, STANDARD_WRITE_OWNER)?;
                     patch.owner = Some(map.sid_for_uid(uid)?);
-                    true
-                } else {
-                    false
-                };
+                }
                 if let Some(gid) = attrs.gid
                     && gid != current.gid
                 {
                     self.enforce_dacl(cx, &target_rec, STANDARD_WRITE_OWNER)?;
                     patch.group = Some(map.sid_for_gid(gid)?);
-                    touched_sec = true;
                 }
                 if let Some(raw_mode) = attrs.mode {
                     let ftype = u32::from(raw_mode) & libc::S_IFMT;
@@ -678,13 +767,12 @@ impl NtfsFs {
                     if perm != (current.perm & 0o777) {
                         self.enforce_dacl(cx, &target_rec, STANDARD_WRITE_DAC)?;
                         patch.posix_mode = Some((perm, current.kind == FileType::Directory));
-                        touched_sec = true;
                         if ino != ROOT {
                             new_read_only = Some((perm & 0o222) == 0);
                         }
                     }
                 }
-                if touched_sec {
+                if patch.owner.is_some() || patch.group.is_some() || patch.posix_mode.is_some() {
                     security_patch = Some(patch);
                 }
             }
@@ -1197,81 +1285,5 @@ impl NtfsFs {
         Err(unsupported(format!(
             "NTFS fallocate mode {mode:#x} is not supported (admits 0 or PUNCH_HOLE|KEEP_SIZE)"
         )))
-    }
-
-    pub(super) fn setxattr_locked(
-        &self,
-        cx: &Cx,
-        ino: InodeNumber,
-        name: &str,
-        value: &[u8],
-        mode: XattrSetMode,
-    ) -> Result<()> {
-        self.ensure_writable()?;
-        if name.len() > MAX_EA_NAME_BYTES {
-            return Err(FfsError::NameTooLong);
-        }
-        let Some(suffix) = name.strip_prefix("user.") else {
-            return Err(unsupported(
-                "only native NTFS user.* extended attributes may be mutated via xattr",
-            ));
-        };
-        if suffix.is_empty() || suffix.as_bytes().contains(&0) {
-            return Err(FfsError::Format("invalid user xattr name".into()));
-        }
-        if is_ads_ino(ino) {
-            return Err(unsupported(
-                "NTFS alternate data streams do not carry independent $EA attributes",
-            ));
-        }
-        let record = self.record(cx, ino)?;
-        self.enforce_dacl(cx, &record, FILE_WRITE_DATA)?;
-        let exists = self.user_eas(cx, &record)?.contains_key(name);
-        match mode {
-            XattrSetMode::Create if exists => return Err(FfsError::Exists),
-            XattrSetMode::Replace if !exists => {
-                return Err(FfsError::Io(std::io::Error::from_raw_os_error(
-                    libc::ENODATA,
-                )));
-            }
-            _ => {}
-        }
-        let target_ref = reference(&record);
-        self.transact(cx, |engine| {
-            engine.set_ea_at(
-                cx,
-                target_ref,
-                name.as_bytes(),
-                value,
-                0,
-                DEFAULT_NTFS_FILETIME,
-            )
-        })?;
-        Ok(())
-    }
-
-    pub(super) fn removexattr_locked(&self, cx: &Cx, ino: InodeNumber, name: &str) -> Result<bool> {
-        self.ensure_writable()?;
-        if name.len() > MAX_EA_NAME_BYTES {
-            return Err(FfsError::NameTooLong);
-        }
-        let Some(suffix) = name.strip_prefix("user.") else {
-            return Err(unsupported(
-                "only native NTFS user.* extended attributes may be removed via xattr",
-            ));
-        };
-        if suffix.is_empty() || suffix.as_bytes().contains(&0) {
-            return Err(FfsError::Format("invalid user xattr name".into()));
-        }
-        if is_ads_ino(ino) {
-            self.describe(cx, ino)?;
-            return Ok(false);
-        }
-        let record = self.record(cx, ino)?;
-        self.enforce_dacl(cx, &record, FILE_WRITE_DATA)?;
-        let target_ref = reference(&record);
-        self.transact(cx, |engine| {
-            engine.remove_ea_at(cx, target_ref, name.as_bytes(), DEFAULT_NTFS_FILETIME)
-        })
     }
 }

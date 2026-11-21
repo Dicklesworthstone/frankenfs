@@ -5,9 +5,7 @@
 
 use asupersync::Cx;
 use ffs_error::{FfsError, Result};
-use ffs_ondisk::ntfs::ea::{
-    NtfsEa, NtfsEaInformation, encode_extended_attributes, parse_extended_attributes,
-};
+use ffs_ondisk::ntfs::ea::NtfsEa;
 use ffs_ondisk::ntfs::efs::{
     EFS_ALG_AES_256, EFS_SECTOR_BYTES, NtfsEfsMetadata, compute_efs_key_commitment,
     derive_efs_key_id, efs_decrypt_sector, efs_encrypt_sector,
@@ -16,9 +14,9 @@ use ffs_ondisk::ntfs::index::NtfsFileName;
 use ffs_ondisk::ntfs::reparse::{NtfsReparseData, NtfsReparsePoint, SYMLINK_TAG};
 use ffs_ondisk::ntfs::usn::{
     USN_REASON_BASIC_INFO_CHANGE, USN_REASON_CLOSE, USN_REASON_COMPRESSION_CHANGE,
-    USN_REASON_DATA_OVERWRITE, USN_REASON_EA_CHANGE, USN_REASON_ENCRYPTION_CHANGE,
-    USN_REASON_FILE_CREATE, USN_REASON_OBJECT_ID_CHANGE, USN_REASON_REPARSE_POINT_CHANGE,
-    USN_REASON_SECURITY_CHANGE, UsnMaxData,
+    USN_REASON_DATA_OVERWRITE, USN_REASON_ENCRYPTION_CHANGE, USN_REASON_FILE_CREATE,
+    USN_REASON_OBJECT_ID_CHANGE, USN_REASON_REPARSE_POINT_CHANGE, USN_REASON_SECURITY_CHANGE,
+    UsnMaxData,
 };
 use ffs_ondisk::ntfs::{NtfsReference, NtfsRun};
 use ffs_ondisk::ntfs_security::{
@@ -1015,7 +1013,6 @@ impl NtfsTransactionEngine {
                 dir_index,
                 view_indexes: Vec::new(),
                 reparse_point: Some(encoded_rp),
-                ea_pair: None,
                 efs_stream: None,
                 preserved: Vec::new(),
                 old_base_raw: existing_raw.clone(),
@@ -1451,7 +1448,6 @@ impl NtfsTransactionEngine {
                 dir_index: None,
                 view_indexes: Vec::new(),
                 reparse_point: None,
-                ea_pair: None,
                 efs_stream: None,
                 preserved: Vec::new(),
                 old_base_raw: existing_raw.clone(),
@@ -1489,66 +1485,13 @@ impl NtfsTransactionEngine {
         flags: u8,
         now_ticks: u64,
     ) -> NtfsTxOutcome<()> {
-        if let Err(err) = checkpoint(cx) {
-            return NtfsTxOutcome::NotCommitted(err);
-        }
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"ntfs.set_ea_at:");
-        hasher.update(&target_ref.record.to_le_bytes());
-        hasher.update(name);
-        hasher.update(blake3::hash(value).as_bytes());
-        let digest = *hasher.finalize().as_bytes();
-
         let _ = self.ensure_mft_headroom(cx, 1, 2);
-
-        let plan_res = (|| -> Result<PreparedTxPlan<()>> {
-            if target_ref.record < MIN_USER_MFT_SLOT {
-                return Err(FfsError::PermissionDenied);
-            }
-            let mut ws = TxWorkspace::load(self, cx)?;
-            let cat_ro = ws.load_catalog(self, cx, target_ref)?.clone();
-            let mut entries = if let Some((ref info, ref data)) = cat_ro.ea_pair {
-                let parsed_info = NtfsEaInformation::parse(info).map_err(|err| parse_err(&err))?;
-                parse_extended_attributes(&parsed_info, data).map_err(|err| parse_err(&err))?
-            } else {
-                Vec::new()
-            };
-            if let Some(existing) = entries
-                .iter_mut()
-                .find(|e| e.name.eq_ignore_ascii_case(name))
-            {
-                existing.name = name.to_vec();
-                existing.value = value.to_vec();
-                existing.flags = flags;
-            } else {
-                entries.push(NtfsEa {
-                    flags,
-                    name: name.to_vec(),
-                    value: value.to_vec(),
-                });
-            }
-            let (ea_info, ea_data_bytes) =
-                encode_extended_attributes(&entries).map_err(|err| parse_err(&err))?;
-
-            let usn_snap = {
-                let cat = ws.catalog_mut(self, cx, target_ref)?;
-                cat.ea_pair = Some((ea_info.encode().to_vec(), ea_data_bytes));
-                cat.set_std_times(None, None, Some(now_ticks), None);
-                cat.clone()
-            };
-            ws.push_usn_event_for_catalog(
-                &usn_snap,
-                USN_REASON_EA_CHANGE | USN_REASON_CLOSE,
-                now_ticks,
-            );
-            ws.sync_target_into_parent_dirs(self, cx, target_ref)?;
-            ws.finalize(self, cx, "set_ea_at", digest, ())
-        })();
-
-        match plan_res {
-            Ok(plan) => self.execute_logged_tx(cx, plan),
-            Err(err) => NtfsTxOutcome::NotCommitted(err),
-        }
+        let entry = NtfsEa {
+            name: name.to_vec(),
+            flags,
+            value: value.to_vec(),
+        };
+        self.set_extended_attribute(cx, target_ref, &entry, super::NtfsEaSetMode::Set, now_ticks)
     }
 
     /// Remove a native NTFS Extended Attribute by name from `target_ref`. Returns `true`
@@ -1563,53 +1506,40 @@ impl NtfsTransactionEngine {
         if let Err(err) = checkpoint(cx) {
             return NtfsTxOutcome::NotCommitted(err);
         }
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"ntfs.remove_ea_at:");
-        hasher.update(&target_ref.record.to_le_bytes());
-        hasher.update(name);
-        let digest = *hasher.finalize().as_bytes();
-
-        let plan_res = (|| -> Result<PreparedTxPlan<bool>> {
-            if target_ref.record < MIN_USER_MFT_SLOT {
-                return Err(FfsError::PermissionDenied);
-            }
-            let mut ws = TxWorkspace::load(self, cx)?;
-            let cat_ro = ws.load_catalog(self, cx, target_ref)?.clone();
-            let Some((ref info, ref data)) = cat_ro.ea_pair else {
-                return ws.finalize(self, cx, "remove_ea_at", digest, false);
-            };
-            let parsed_info = NtfsEaInformation::parse(info).map_err(|err| parse_err(&err))?;
-            let mut entries =
-                parse_extended_attributes(&parsed_info, data).map_err(|err| parse_err(&err))?;
-            let before = entries.len();
-            entries.retain(|e| !e.name.eq_ignore_ascii_case(name));
-            if entries.len() == before {
-                return ws.finalize(self, cx, "remove_ea_at", digest, false);
-            }
-            let next_pair = if entries.is_empty() {
-                None
-            } else {
-                let (ea_info, ea_data_bytes) =
-                    encode_extended_attributes(&entries).map_err(|err| parse_err(&err))?;
-                Some((ea_info.encode().to_vec(), ea_data_bytes))
-            };
-            let usn_snap = {
-                let cat = ws.catalog_mut(self, cx, target_ref)?;
-                cat.ea_pair = next_pair;
-                cat.set_std_times(None, None, Some(now_ticks), None);
-                cat.clone()
-            };
-            ws.push_usn_event_for_catalog(
-                &usn_snap,
-                USN_REASON_EA_CHANGE | USN_REASON_CLOSE,
-                now_ticks,
-            );
-            ws.sync_target_into_parent_dirs(self, cx, target_ref)?;
-            ws.finalize(self, cx, "remove_ea_at", digest, true)
+        let present = (|| -> Result<bool> {
+            let vol = self.volume_view(cx)?;
+            let rec = vol.record(cx, target_ref.record, Some(target_ref.sequence))?;
+            Ok(vol.extended_attributes(cx, &rec)?.find(name).is_some())
         })();
-
-        match plan_res {
-            Ok(plan) => self.execute_logged_tx(cx, plan),
+        match present {
+            Ok(false) => {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(b"ntfs.remove_ea_at:");
+                hasher.update(&target_ref.record.to_le_bytes());
+                hasher.update(name);
+                let digest = *hasher.finalize().as_bytes();
+                let plan = TxWorkspace::load(self, cx)
+                    .and_then(|ws| ws.finalize(self, cx, "remove_ea_at", digest, false));
+                match plan {
+                    Ok(plan) => self.execute_logged_tx(cx, plan),
+                    Err(err) => NtfsTxOutcome::NotCommitted(err),
+                }
+            }
+            Ok(true) => match self.remove_extended_attribute(cx, target_ref, name, now_ticks) {
+                NtfsTxOutcome::Committed { token, .. } => {
+                    NtfsTxOutcome::Committed { value: true, token }
+                }
+                NtfsTxOutcome::NotCommitted(err) => NtfsTxOutcome::NotCommitted(err),
+                NtfsTxOutcome::Uncertain {
+                    reason,
+                    transaction_id,
+                    commit_lsn,
+                } => NtfsTxOutcome::Uncertain {
+                    reason,
+                    transaction_id,
+                    commit_lsn,
+                },
+            },
             Err(err) => NtfsTxOutcome::NotCommitted(err),
         }
     }

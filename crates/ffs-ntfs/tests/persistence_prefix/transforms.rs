@@ -491,7 +491,7 @@ fn ntfs_wof_decompression_on_write_materializes_plaintext_and_cleans_reparse() {
     assert!(vol.reparse_point(&cx, &rec).unwrap().is_none());
     let streams = vol.data_streams(&cx, &rec).unwrap();
     assert_eq!(streams.len(), 1);
-    assert!(streams[0].name.is_empty());
+    assert_eq!(streams[0].name, [] as [u16; 0]);
     engine.check_clean_consistency(&cx).unwrap();
 }
 

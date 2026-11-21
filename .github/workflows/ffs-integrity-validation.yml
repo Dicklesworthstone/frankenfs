@@ -50,6 +50,11 @@ jobs:
       - name: Native NTFS journal reservation tests
         if: ${{ !cancelled() }}
         run: cargo test --locked -p ffs-ondisk ntfs::logfile_writer::tests
+      - name: Native NTFS security descriptor and change journal regression tests
+        if: ${{ !cancelled() }}
+        run: |
+          cargo test --locked -p ffs-ondisk --lib ntfs_security -- --nocapture
+          cargo test --locked -p ffs-ondisk --lib ntfs::usn -- --nocapture
       - name: Complete MVCC tests
         if: ${{ !cancelled() }}
         run: cargo test --locked -p ffs-mvcc
@@ -106,3 +111,6 @@ jobs:
           cargo test --locked -p ffs-cli --test cli_e2e "$test_name" -- --ignored --exact --list | tee "$RUNNER_TEMP/ntfs-replacement-tests.txt"
           grep -Fx "$test_name: test" "$RUNNER_TEMP/ntfs-replacement-tests.txt"
           cargo test --locked -p ffs-cli --test cli_e2e "$test_name" -- --ignored --exact --nocapture
+      - name: Native NTFS extended-attribute catalog and reclamation
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p ffs-cli --test cli_e2e ntfs_ea::native_ntfs_ea_cli_preserves_data_allocation_and_volume_bounds -- --ignored --exact --nocapture

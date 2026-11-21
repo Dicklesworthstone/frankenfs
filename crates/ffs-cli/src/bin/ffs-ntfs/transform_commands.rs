@@ -304,28 +304,6 @@ pub struct UsnSummaryArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct TxSetEaArgs {
-    #[command(flatten)]
-    pub target: TxWriteArgs,
-    pub path: String,
-    #[arg(long)]
-    pub name: String,
-    #[command(flatten)]
-    pub payload: PayloadArgs,
-    #[arg(long, default_value_t = 0)]
-    pub flags: u8,
-}
-
-#[derive(Debug, Args)]
-pub struct TxRemoveEaArgs {
-    #[command(flatten)]
-    pub target: TxWriteArgs,
-    pub path: String,
-    #[arg(long)]
-    pub name: String,
-}
-
-#[derive(Debug, Args)]
 pub struct EfsInfoArgs {
     #[command(flatten)]
     pub image: ImageArgs,
@@ -666,44 +644,6 @@ pub fn run_usn_summary(cx: &Cx, args: &UsnSummaryArgs) -> Result<()> {
         "active": summary.is_some(),
         "summary": summary,
     }))
-}
-
-pub fn run_tx_set_ea(cx: &Cx, args: &TxSetEaArgs) -> Result<()> {
-    let value = args.payload.load(false)?;
-    let mut engine = args.target.open(cx, false)?;
-    let outcome = match engine.resolve_path_reference(cx, &args.path) {
-        Ok(r) => engine.set_ea_at(
-            cx,
-            r,
-            args.name.as_bytes(),
-            &value,
-            args.flags,
-            DEFAULT_NTFS_FILETIME,
-        ),
-        Err(err) => NtfsTxOutcome::NotCommitted(err),
-    };
-    emit_tx_outcome("tx_set_ea", &engine, outcome, |()| {
-        serde_json::json!({
-            "path": args.path,
-            "name": args.name,
-            "value_bytes": value.len(),
-        })
-    })
-}
-
-pub fn run_tx_remove_ea(cx: &Cx, args: &TxRemoveEaArgs) -> Result<()> {
-    let mut engine = args.target.open(cx, false)?;
-    let outcome = match engine.resolve_path_reference(cx, &args.path) {
-        Ok(r) => engine.remove_ea_at(cx, r, args.name.as_bytes(), DEFAULT_NTFS_FILETIME),
-        Err(err) => NtfsTxOutcome::NotCommitted(err),
-    };
-    emit_tx_outcome("tx_remove_ea", &engine, outcome, |removed| {
-        serde_json::json!({
-            "path": args.path,
-            "name": args.name,
-            "removed": removed,
-        })
-    })
 }
 
 pub fn run_efs_info(cx: &Cx, args: &EfsInfoArgs) -> Result<()> {

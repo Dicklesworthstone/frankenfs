@@ -17,7 +17,7 @@ mod transforms;
 mod view_index;
 
 pub use mutations::{
-    NtfsExtendedRenameOutcome, NtfsRenameOutcome, validate_ntfs_component_utf16,
+    NtfsEaSetMode, NtfsExtendedRenameOutcome, NtfsRenameOutcome, validate_ntfs_component_utf16,
     validate_ntfs_stream_name_utf16,
 };
 pub use ops::DEFAULT_NTFS_FILETIME;
@@ -53,12 +53,12 @@ use crate::reader::security::SecurityCheckLimits;
 pub(super) const LOG_PAGE_BYTES: u32 = 4096;
 pub(super) const SECTOR_BYTES: usize = 512;
 const UPCASE_BYTES: usize = 131_072;
-/// Maximum positioned-write payload and newly initialized non-sparse byte span,
-/// and maximum requested truncate length. Positioned writes into larger streams
-/// stage only touched clusters, with at most two cluster edges of rounding and
-/// one partial initialized-tail cluster for sparse streams. The logical stream
-/// size and write offset are not staging budgets. Empty writes validate the
-/// target but preserve larger streams without staging data.
+/// Maximum positioned-write payload and newly initialized non-sparse byte span.
+/// Positioned writes and truncate growth into larger streams stage only touched
+/// clusters, with at most two cluster edges of rounding and one partial
+/// initialized-tail cluster for sparse writes. The logical stream size and
+/// write offset are not staging budgets. Shrink and sparse growth edit mappings;
+/// empty writes and unchanged lengths validate the target without staging data.
 pub const MAX_FILE_EDIT_BYTES: u64 = 16 * 1024 * 1024;
 pub(super) const MAX_ERASED_LOG_BYTES: u64 = 64 * 1024 * 1024;
 const USNJRNL_UPPER: [u16; 8] = [

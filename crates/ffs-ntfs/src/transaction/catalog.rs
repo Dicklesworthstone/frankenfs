@@ -499,7 +499,6 @@ pub(super) struct EditableCatalog {
     pub(super) dir_index: Option<EditableDirIndex>,
     pub(super) view_indexes: Vec<EditableViewIndex>,
     pub(super) reparse_point: Option<Vec<u8>>,
-    pub(super) ea_pair: Option<(Vec<u8>, Vec<u8>)>,
     pub(super) efs_stream: Option<Vec<u8>>,
     pub(super) preserved: Vec<PreservedAttribute>,
     pub(super) old_base_raw: Vec<u8>,
@@ -623,10 +622,18 @@ impl EditableCatalog {
             && rp.len() >= 4
         {
             u32::from_le_bytes([rp[0], rp[1], rp[2], rp[3]])
-        } else if let Some((ref ea_info, _)) = self.ea_pair
-            && ea_info.len() >= 2
-        {
-            u32::from(u16::from_le_bytes([ea_info[0], ea_info[1]]))
+        } else if let Some(packed_ea) = self.preserved.iter().find_map(|p| {
+            if p.kind == EA_INFORMATION
+                && p.name.is_empty()
+                && let PreservedValue::Resident { bytes, .. } = &p.raw_without_id
+                && bytes.len() >= 2
+            {
+                Some(u32::from(u16::from_le_bytes([bytes[0], bytes[1]])))
+            } else {
+                None
+            }
+        }) {
+            packed_ea
         } else {
             0
         };
@@ -1326,8 +1333,6 @@ impl NtfsTransactionEngine {
         let mut view_allocs: BTreeMap<Vec<u16>, Vec<NtfsAttribute<'_>>> = BTreeMap::new();
         let mut view_bitmaps: BTreeMap<Vec<u16>, Vec<u8>> = BTreeMap::new();
         let mut reparse_point: Option<Vec<u8>> = None;
-        let mut ea_info_bytes: Option<Vec<u8>> = None;
-        let mut ea_bytes: Option<Vec<u8>> = None;
         let mut efs_stream: Option<Vec<u8>> = None;
         let mut preserved: Vec<PreservedAttribute> = Vec::new();
         let mut old_owned_extra_runs: Vec<NtfsRun> = Vec::new();
@@ -1484,36 +1489,6 @@ impl NtfsTransactionEngine {
                         old_owned_extra_runs.extend(runs);
                     }
                 },
-                EA_INFORMATION if attr.name.is_empty() => {
-                    let NtfsValue::Resident(bytes) = attr.value else {
-                        return Err(corrupt(0, "nonresident $EA_INFORMATION"));
-                    };
-                    ea_info_bytes = Some(bytes.to_vec());
-                }
-                EA if attr.name.is_empty() => match attr.value {
-                    NtfsValue::Resident(bytes) => {
-                        ea_bytes = Some(bytes.to_vec());
-                    }
-                    NtfsValue::NonResident(nr) => {
-                        let runs = decode_mapping_pairs(
-                            nr.mapping_pairs,
-                            nr.first_vcn,
-                            nr.last_vcn,
-                            self.geometry.cluster_count(),
-                        )
-                        .map_err(|err| parse_err(&err))?;
-                        let bytes = read_mapped_runs(
-                            &self.device,
-                            cx,
-                            &self.geometry,
-                            &runs,
-                            0,
-                            nr.data_bytes as usize,
-                        )?;
-                        ea_bytes = Some(bytes);
-                        old_owned_extra_runs.extend(runs);
-                    }
-                },
                 LOGGED_UTILITY_STREAM if attr.name == EFS_STREAM_NAME => match attr.value {
                     NtfsValue::Resident(bytes) => {
                         efs_stream = Some(bytes.to_vec());
@@ -1566,12 +1541,6 @@ impl NtfsTransactionEngine {
 
         let std_info =
             std_info.ok_or_else(|| corrupt(0, "missing STANDARD_INFORMATION on base record"))?;
-
-        let ea_pair = match (ea_info_bytes, ea_bytes) {
-            (Some(info), Some(data)) => Some((info, data)),
-            (None, None) => None,
-            _ => return Err(corrupt(0, "mismatched $EA_INFORMATION and $EA attributes")),
-        };
 
         let mut data_streams = Vec::new();
         for (_folded, (orig_name, mut extents)) in data_groups {
@@ -1741,7 +1710,6 @@ impl NtfsTransactionEngine {
             dir_index,
             view_indexes,
             reparse_point,
-            ea_pair,
             efs_stream,
             preserved,
             old_base_raw,
@@ -2181,10 +2149,6 @@ impl NtfsTransactionEngine {
         if let Some(ref rp) = catalog.reparse_point {
             push_blob_attr(REPARSE_POINT, &[], rp)?;
         }
-        if let Some((ref ea_info, ref ea_data)) = catalog.ea_pair {
-            push_blob_attr(EA_INFORMATION, &[], ea_info)?;
-            push_blob_attr(EA, &[], ea_data)?;
-        }
         if let Some(ref efs_raw) = catalog.efs_stream {
             push_blob_attr(LOGGED_UTILITY_STREAM, &EFS_STREAM_NAME, efs_raw)?;
         }
@@ -2200,6 +2164,41 @@ impl NtfsTransactionEngine {
                     let b_cl = bytes.clone();
                     let idx_flag = *indexed;
                     let est = encode_resident_attribute(kind, 0, &nm, idx_flag, &b_cl)?.len();
+                    if kind == EA && est > max_ext_attr_bytes {
+                        // EA_INFORMATION stays resident, while the bounded EA
+                        // value may need several clusters or mapping extents.
+                        // Initialize fresh storage before publishing any FILE
+                        // record that references it, just like DATA and SDs.
+                        let cb = u64::from(self.geometry.cluster_bytes());
+                        let need_cl = (bytes.len() as u64).div_ceil(cb);
+                        let spans = allocate_clusters(need_cl)?;
+                        let mut runs = Vec::with_capacity(spans.len());
+                        let mut vcn = 0;
+                        for (lcn, clusters) in spans {
+                            runs.push(NtfsRun {
+                                vcn,
+                                clusters,
+                                lcn: Some(lcn),
+                            });
+                            vcn += clusters;
+                        }
+                        let mut padded = vec![0; (need_cl * cb) as usize];
+                        padded[..bytes.len()].copy_from_slice(bytes);
+                        stage_runs_writes(&self.geometry, &runs, &padded, &mut pre_payload_writes)?;
+                        candidates.extend(split_nonresident_stream_extents(
+                            &self.geometry,
+                            kind,
+                            &nm,
+                            &folded,
+                            &runs,
+                            0,
+                            0,
+                            bytes.len() as u64,
+                            bytes.len() as u64,
+                            max_ext_attr_bytes,
+                        )?);
+                        continue;
+                    }
                     candidates.push(CandidateAttr {
                         kind,
                         name: nm,

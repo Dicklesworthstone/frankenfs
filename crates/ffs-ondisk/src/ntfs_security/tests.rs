@@ -630,3 +630,193 @@ fn security_descriptor_encode_inheritance_dacl_and_multistripe_sds_roundtrip() {
     let sds_entry = encode_sds_entry(hdr, &encoded).unwrap();
     assert!(sds_entry.len().is_multiple_of(16));
 }
+
+#[test]
+fn generic_file_mapping_preserves_non_generic_access_bits() {
+    // ACCESS_SYSTEM_SECURITY and MAXIMUM_ALLOWED are distinct from the four
+    // generic rights; mapping must never turn either request into zero access.
+    for special in [0x0100_0000, 0x0200_0000, 0x0400_0000, 0x0800_0000] {
+        assert_eq!(map_generic_file_rights(special), special);
+        assert_eq!(
+            map_generic_file_rights(GENERIC_READ | special),
+            FILE_GENERIC_READ | special
+        );
+    }
+    assert_eq!(map_generic_file_rights(GENERIC_ALL), FILE_ALL_ACCESS);
+    assert_eq!(
+        map_generic_file_rights(GENERIC_WRITE | FILE_READ_DATA),
+        FILE_GENERIC_WRITE | FILE_READ_DATA
+    );
+}
+
+#[test]
+fn dacl_rejects_special_requests_instead_of_granting_zeroed_masks() {
+    let mut sd = NtfsSecurityDescriptor::parse(&DESCRIPTOR).unwrap();
+    let token = NtfsAccessToken {
+        user: NtfsSid::parse_str("S-1-5-21-1000").unwrap(),
+        groups: Vec::new(),
+    };
+    sd.dacl.aces.clear();
+    for acl_state in 0..3 {
+        // Empty, NULL and absent DACLs must all reject requests outside this
+        // evaluator's token/return-value contract, before any grant fast path.
+        if acl_state == 1 {
+            sd.dacl.revision = None;
+        } else if acl_state == 2 {
+            sd.dacl.present = false;
+        }
+        for special in [0x0100_0000, 0x0200_0000, 0x0400_0000, 0x0800_0000] {
+            for request in [special, special | GENERIC_READ] {
+                assert!(
+                    evaluate_dacl_access(&sd, &token, request).is_err(),
+                    "ACL state {acl_state}, mask {request:#x}"
+                );
+            }
+        }
+        assert!(evaluate_dacl_access(&sd, &token, 0).unwrap());
+    }
+}
+
+#[test]
+fn dacl_evaluation_does_not_expand_unmapped_generic_ace_masks() {
+    let mut sd = NtfsSecurityDescriptor::parse(&DESCRIPTOR).unwrap();
+    let token = NtfsAccessToken {
+        user: NtfsSid::parse_str("S-1-5-21-1000").unwrap(),
+        groups: Vec::new(),
+    };
+    let mut allow = sd.dacl.aces[1].clone();
+    allow.sid = Some(token.user.clone());
+    allow.mask = Some(GENERIC_ALL);
+    allow.flags = 0;
+    sd.dacl.aces = vec![allow];
+    // MS-DTYP 2.4.3 maps requested generic rights, but not generic bits left
+    // in already attached ACEs. They cannot manufacture a concrete grant.
+    assert!(!evaluate_dacl_access(&sd, &token, FILE_READ_DATA).unwrap());
+    sd.dacl.aces[0].mask = Some(GENERIC_ALL | FILE_READ_DATA);
+    assert!(evaluate_dacl_access(&sd, &token, FILE_READ_DATA).unwrap());
+    assert!(!evaluate_dacl_access(&sd, &token, FILE_WRITE_DATA).unwrap());
+}
+
+#[test]
+fn dacl_owner_rights_are_not_revoked_by_ordinary_deny_aces() {
+    let mut sd = NtfsSecurityDescriptor::parse(&DESCRIPTOR).unwrap();
+    let token = NtfsAccessToken {
+        user: sd.owner.clone().unwrap(),
+        groups: Vec::new(),
+    };
+    let mut deny = sd.dacl.aces[0].clone();
+    deny.sid = Some(NtfsSid::world_everyone());
+    deny.mask = Some(STANDARD_READ_CONTROL | STANDARD_WRITE_DAC | FILE_READ_DATA);
+    deny.flags = 0;
+    sd.dacl.aces = vec![deny.clone()];
+    let owner_access = STANDARD_READ_CONTROL | STANDARD_WRITE_DAC;
+    assert!(evaluate_dacl_access(&sd, &token, owner_access).unwrap());
+    assert!(!evaluate_dacl_access(&sd, &token, owner_access | FILE_READ_DATA).unwrap());
+
+    // The special OWNER RIGHTS SID is the native mechanism that replaces the
+    // owner's implicit rights, and must resolve dynamically to this owner.
+    deny.sid = Some(NtfsSid::parse_str("S-1-3-4").unwrap());
+    deny.mask = Some(STANDARD_WRITE_DAC);
+    sd.dacl.aces = vec![deny.clone()];
+    assert!(!evaluate_dacl_access(&sd, &token, STANDARD_WRITE_DAC).unwrap());
+    assert!(!evaluate_dacl_access(&sd, &token, STANDARD_READ_CONTROL).unwrap());
+
+    deny.kind = ACE_TYPE_ACCESS_ALLOWED;
+    deny.mask = Some(STANDARD_READ_CONTROL);
+    sd.dacl.aces = vec![deny.clone()];
+    assert!(evaluate_dacl_access(&sd, &token, STANDARD_READ_CONTROL).unwrap());
+    assert!(!evaluate_dacl_access(&sd, &token, STANDARD_WRITE_DAC).unwrap());
+    let stranger = NtfsAccessToken {
+        user: NtfsSid::parse_str("S-1-5-21-1000").unwrap(),
+        groups: Vec::new(),
+    };
+    assert!(!evaluate_dacl_access(&sd, &stranger, STANDARD_READ_CONTROL).unwrap());
+
+    // An inherit-only OWNER RIGHTS entry does not control this object.
+    deny.flags = ACE_FLAG_INHERIT_ONLY | ACE_FLAG_OBJECT_INHERIT;
+    sd.dacl.aces = vec![deny];
+    assert!(evaluate_dacl_access(&sd, &token, owner_access).unwrap());
+}
+
+#[test]
+fn inherited_audit_aces_retain_success_failure_flags_and_creator_templates() {
+    let mut parent = NtfsSecurityDescriptor::parse(&DESCRIPTOR).unwrap();
+    let owner = NtfsSid::parse_str("S-1-5-21-1000").unwrap();
+    let group = NtfsSid::parse_str("S-1-5-21-1001").unwrap();
+    let mut audit = parent.dacl.aces[0].clone();
+    audit.kind = 2; // SYSTEM_AUDIT_ACE
+    audit.mask = Some(FILE_READ_DATA);
+    audit.sid = Some(NtfsSid::creator_owner());
+    parent.sacl = parent.dacl.clone();
+    for audit_flags in [0x40, 0x80, 0xC0] {
+        audit.flags = audit_flags | ACE_FLAG_OBJECT_INHERIT | ACE_FLAG_CONTAINER_INHERIT;
+        parent.sacl.aces = vec![audit.clone()];
+        let file = inherit_security_descriptor(&parent, false, &owner, &group).unwrap();
+        assert_eq!(file.sacl.aces.len(), 1);
+        assert_eq!(file.sacl.aces[0].flags, audit_flags | ACE_FLAG_INHERITED);
+        assert_eq!(file.sacl.aces[0].sid.as_ref(), Some(&owner));
+
+        let directory = inherit_security_descriptor(&parent, true, &owner, &group).unwrap();
+        assert_eq!(directory.sacl.aces.len(), 2);
+        assert_eq!(
+            directory.sacl.aces[0].flags,
+            audit_flags | ACE_FLAG_INHERITED
+        );
+        assert_eq!(
+            directory.sacl.aces[1].flags,
+            audit_flags
+                | ACE_FLAG_INHERITED
+                | ACE_FLAG_INHERIT_ONLY
+                | ACE_FLAG_OBJECT_INHERIT
+                | ACE_FLAG_CONTAINER_INHERIT
+        );
+        assert_eq!(directory.sacl.aces[1].sid, Some(NtfsSid::creator_owner()));
+
+        let next_owner = NtfsSid::parse_str("S-1-5-21-1002").unwrap();
+        let grandchild =
+            inherit_security_descriptor(&directory, false, &next_owner, &group).unwrap();
+        assert_eq!(grandchild.sacl.aces.len(), 1);
+        assert_eq!(grandchild.sacl.aces[0].sid.as_ref(), Some(&next_owner));
+        assert_eq!(
+            grandchild.sacl.aces[0].flags,
+            audit_flags | ACE_FLAG_INHERITED
+        );
+
+        parent.sacl.aces[0].flags |= ACE_FLAG_NO_PROPAGATE_INHERIT;
+        let terminal = inherit_security_descriptor(&parent, true, &owner, &group).unwrap();
+        assert_eq!(terminal.sacl.aces.len(), 1);
+        assert_eq!(
+            terminal.sacl.aces[0].flags,
+            audit_flags | ACE_FLAG_INHERITED
+        );
+        let descendant =
+            inherit_security_descriptor(&terminal, false, &next_owner, &group).unwrap();
+        assert_eq!(descendant.sacl.aces, [] as [NtfsAce; 0]);
+    }
+}
+
+#[test]
+fn inherited_generic_access_maps_effective_aces_but_preserves_templates() {
+    let mut parent = NtfsSecurityDescriptor::parse(&DESCRIPTOR).unwrap();
+    let owner = NtfsSid::parse_str("S-1-5-21-1000").unwrap();
+    let group = NtfsSid::parse_str("S-1-5-21-1001").unwrap();
+    let mut allow = parent.dacl.aces[1].clone();
+    allow.flags = ACE_FLAG_OBJECT_INHERIT | ACE_FLAG_CONTAINER_INHERIT;
+    allow.mask = Some(GENERIC_READ);
+    parent.dacl.aces = vec![allow];
+    let file = inherit_security_descriptor(&parent, false, &owner, &group).unwrap();
+    assert_eq!(file.dacl.aces[0].mask, Some(FILE_GENERIC_READ));
+    assert_eq!(file.dacl.aces[0].flags, ACE_FLAG_INHERITED);
+    let directory = inherit_security_descriptor(&parent, true, &owner, &group).unwrap();
+    assert_eq!(directory.dacl.aces.len(), 2);
+    assert_eq!(directory.dacl.aces[0].mask, Some(FILE_GENERIC_READ));
+    assert_eq!(directory.dacl.aces[0].flags, ACE_FLAG_INHERITED);
+    assert_eq!(directory.dacl.aces[1].mask, Some(GENERIC_READ));
+    assert_eq!(
+        directory.dacl.aces[1].flags,
+        ACE_FLAG_INHERITED
+            | ACE_FLAG_INHERIT_ONLY
+            | ACE_FLAG_OBJECT_INHERIT
+            | ACE_FLAG_CONTAINER_INHERIT
+    );
+}
