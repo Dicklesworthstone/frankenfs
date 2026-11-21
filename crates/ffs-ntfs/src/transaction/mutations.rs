@@ -2,6 +2,10 @@
 //! hard-link, rename-overwrite, truncate, and metadata transactions for [`NtfsFs`]
 //! and companion CLI operations.
 
+mod ea;
+
+pub use ea::NtfsEaSetMode;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use asupersync::Cx;
@@ -2336,7 +2340,8 @@ impl NtfsTransactionEngine {
     }
 
     /// Truncate or extend unnamed `$DATA` (`stream_utf16 == &[]`) or a named ADS (`stream_utf16 != &[]`).
-    #[allow(clippy::too_many_lines)]
+    /// The staging budget bounds newly initialized bytes, not the logical size:
+    /// shrinking and sparse growth preserve untouched extents without reading them.
     pub fn truncate_stream_at(
         &mut self,
         cx: &Cx,
@@ -2351,9 +2356,6 @@ impl NtfsTransactionEngine {
         if let Err(err) = validate_ntfs_stream_name_utf16(stream_utf16) {
             return NtfsTxOutcome::NotCommitted(err);
         }
-        if new_size > MAX_FILE_EDIT_BYTES {
-            return NtfsTxOutcome::NotCommitted(too_large_edit());
-        }
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"ntfs.truncate_stream_at:");
         hasher.update(&target_ref.record.to_le_bytes());
@@ -2364,194 +2366,244 @@ impl NtfsTransactionEngine {
         hasher.update(&new_size.to_le_bytes());
         let digest = *hasher.finalize().as_bytes();
 
-        let plan_res = (|| -> Result<PreparedTxPlan<()>> {
-            let mut ws = TxWorkspace::load(self, cx)?;
-            let cat_ro = ws.load_catalog(self, cx, target_ref)?.clone();
-            if cat_ro.is_directory {
-                return Err(FfsError::IsDirectory);
-            }
-            if target_ref.record < MIN_USER_MFT_SLOT {
-                return Err(FfsError::PermissionDenied);
-            }
-            let target_folded = self.fold_upcase(stream_utf16);
-            let stream_idx = cat_ro
-                .data_streams
-                .iter()
-                .position(|s| self.fold_upcase(&s.name) == target_folded)
-                .ok_or_else(|| FfsError::NotFound("NTFS data stream not found".into()))?;
-            if !stream_utf16.is_empty() && cat_ro.data_streams[stream_idx].name != stream_utf16 {
-                return Err(FfsError::NotFound(
-                    "NTFS exact named stream not found".into(),
-                ));
-            }
-            let cur_stream = cat_ro.data_streams[stream_idx].clone();
-            let cb = u64::from(self.geometry.cluster_bytes());
+        match self.plan_stream_truncate(cx, target_ref, stream_utf16, new_size, now_ticks, digest) {
+            Ok(plan) => self.execute_logged_tx(cx, plan),
+            Err(err) => NtfsTxOutcome::NotCommitted(err),
+        }
+    }
 
-            let updated_storage = match cur_stream.storage {
-                EditableStreamStorage::Resident(ref old_bytes) => {
-                    if new_size <= MAX_RESIDENT_DATA_PAYLOAD as u64 {
-                        let mut next = old_bytes.clone();
-                        next.resize(new_size as usize, 0);
-                        EditableStreamStorage::Resident(next)
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+    pub(super) fn plan_stream_truncate(
+        &self,
+        cx: &Cx,
+        target_ref: NtfsReference,
+        stream_utf16: &[u16],
+        new_size: u64,
+        now_ticks: u64,
+        digest: [u8; 32],
+    ) -> Result<PreparedTxPlan<()>> {
+        checkpoint(cx)?;
+        let cb = u64::from(self.geometry.cluster_bytes());
+        // Both native byte counts and the cluster-rounded virtual allocation
+        // are signed. Sparse holes must obey the same representability limit
+        // even though they require no physical allocation or payload staging.
+        if new_size > i64::MAX as u64 || new_size.div_ceil(cb) > i64::MAX as u64 / cb {
+            return Err(FfsError::RequestRejected {
+                errno: libc::EFBIG,
+                detail: "NTFS stream length or rounded allocation exceeds the signed 64-bit native limit".into(),
+            });
+        }
+        let mut ws = TxWorkspace::load(self, cx)?;
+        let cat_ro = ws.load_catalog(self, cx, target_ref)?.clone();
+        if cat_ro.is_directory {
+            return Err(FfsError::IsDirectory);
+        }
+        if target_ref.record < MIN_USER_MFT_SLOT {
+            return Err(FfsError::PermissionDenied);
+        }
+        let target_folded = self.fold_upcase(stream_utf16);
+        let stream_idx = cat_ro
+            .data_streams
+            .iter()
+            .position(|s| self.fold_upcase(&s.name) == target_folded)
+            .ok_or_else(|| FfsError::NotFound("NTFS data stream not found".into()))?;
+        if !stream_utf16.is_empty() && cat_ro.data_streams[stream_idx].name != stream_utf16 {
+            return Err(FfsError::NotFound(
+                "NTFS exact named stream not found".into(),
+            ));
+        }
+        let cur_stream = cat_ro.data_streams[stream_idx].clone();
+        let old_size = cur_stream.logical_size();
+        if new_size == old_size {
+            // Preserve the FILE record and allocation on a size no-op,
+            // including full volumes, while retaining the native WAL token.
+            return Ok(PreparedTxPlan {
+                operation: "truncate_stream_at",
+                operation_digest: digest,
+                result_value: (),
+                pre_payload_writes: Vec::new(),
+                mft_zero_writes: Vec::new(),
+                open_attr_registrations: Vec::new(),
+                mutation_specs: Vec::new(),
+                target_writes: Vec::new(),
+            });
+        }
+        let (sparse, initialized) = match &cur_stream.storage {
+            EditableStreamStorage::Resident(bytes) => (false, bytes.len() as u64),
+            EditableStreamStorage::NonResident {
+                sparse,
+                initialized_bytes,
+                ..
+            } => (*sparse, *initialized_bytes),
+        };
+        // An ordinary extension must initialize the whole exposed tail,
+        // including pre-existing allocation beyond ValidDataLength. Bound
+        // that span before allocation or payload reads. Sparse extension
+        // preserves ValidDataLength and adds only mapping-pair holes.
+        if !sparse
+            && new_size > old_size
+            && new_size.saturating_sub(initialized) > MAX_FILE_EDIT_BYTES
+        {
+            return Err(too_large_edit());
+        }
+
+        let updated_storage = match cur_stream.storage {
+            EditableStreamStorage::Resident(ref old_bytes) => {
+                if new_size <= MAX_RESIDENT_DATA_PAYLOAD as u64 {
+                    let mut next = old_bytes.clone();
+                    next.resize(new_size as usize, 0);
+                    EditableStreamStorage::Resident(next)
+                } else {
+                    let need_vcns = new_size.div_ceil(cb);
+                    let spans = ws.alloc_clusters(need_vcns, 1)?;
+                    let mut runs = Vec::new();
+                    let mut v = 0_u64;
+                    for &(lcn, cnt) in &spans {
+                        runs.push(NtfsRun {
+                            vcn: v,
+                            clusters: cnt,
+                            lcn: Some(lcn),
+                        });
+                        v += cnt;
+                    }
+                    let staged_bytes =
+                        usize::try_from(need_vcns * cb).map_err(|_| too_large_edit())?;
+                    let mut full_zeroed = vec![0_u8; staged_bytes];
+                    let retained = old_bytes.len().min(new_size as usize);
+                    full_zeroed[..retained].copy_from_slice(&old_bytes[..retained]);
+                    stage_runs_writes(
+                        &self.geometry,
+                        &runs,
+                        &full_zeroed,
+                        &mut ws.pre_payload_writes,
+                    )?;
+                    EditableStreamStorage::NonResident {
+                        runs: normalize_ntfs_runs(runs),
+                        sparse: false,
+                        compression_unit: 0,
+                        data_bytes: new_size,
+                        initialized_bytes: new_size,
+                    }
+                }
+            }
+            EditableStreamStorage::NonResident {
+                ref runs,
+                sparse,
+                compression_unit,
+                data_bytes: old_size,
+                initialized_bytes: old_init,
+            } => {
+                if !sparse && new_size <= MAX_RESIDENT_DATA_PAYLOAD as u64 {
+                    let prefix =
+                        read_editable_stream_prefix(self, cx, &cur_stream, 0, new_size as usize)?;
+                    ws.free_clusters_deferred(&physical_spans_of_runs(runs));
+                    EditableStreamStorage::Resident(prefix)
+                } else if new_size == 0 && sparse {
+                    ws.free_clusters_deferred(&physical_spans_of_runs(runs));
+                    EditableStreamStorage::NonResident {
+                        runs: Vec::new(),
+                        sparse: true,
+                        compression_unit,
+                        data_bytes: 0,
+                        initialized_bytes: 0,
+                    }
+                } else {
+                    let need_vcns = new_size.div_ceil(cb);
+                    let old_vcns: u64 = runs.iter().map(|r| r.clusters).sum();
+                    if new_size <= old_size {
+                        let (mut kept, disp) = splice_vcn_interval(
+                            runs,
+                            need_vcns,
+                            old_vcns.max(need_vcns),
+                            &[],
+                            sparse,
+                        )?;
+                        ws.free_clusters_deferred(&disp);
+                        // Splicing a sparse hole can coalesce it with the
+                        // retained prefix hole. Clip that merged run as well
+                        // as dropping runs wholly beyond the new EOF.
+                        kept.retain_mut(|run| {
+                            if run.vcn >= need_vcns {
+                                return false;
+                            }
+                            run.clusters = run.clusters.min(need_vcns - run.vcn);
+                            true
+                        });
+                        EditableStreamStorage::NonResident {
+                            runs: normalize_ntfs_runs(kept),
+                            sparse,
+                            compression_unit,
+                            data_bytes: new_size,
+                            initialized_bytes: old_init.min(new_size),
+                        }
+                    } else if sparse {
+                        let mut next_runs = runs.clone();
+                        if need_vcns > old_vcns {
+                            next_runs.push(NtfsRun {
+                                vcn: old_vcns,
+                                clusters: need_vcns - old_vcns,
+                                lcn: None,
+                            });
+                        }
+                        EditableStreamStorage::NonResident {
+                            runs: normalize_ntfs_runs(next_runs),
+                            sparse: true,
+                            compression_unit,
+                            data_bytes: new_size,
+                            initialized_bytes: old_init,
+                        }
                     } else {
-                        let need_vcns = new_size.div_ceil(cb);
-                        let spans = ws.alloc_clusters(need_vcns, 1)?;
-                        let mut runs = Vec::new();
-                        let mut v = 0_u64;
+                        let cow_start_vcn = old_init / cb;
+                        let cow_clusters = need_vcns - cow_start_vcn;
+                        let cow_byte_start = cow_start_vcn * cb;
+                        let merged_buf = read_editable_stream_prefix(
+                            self,
+                            cx,
+                            &cur_stream,
+                            cow_byte_start,
+                            usize::try_from(cow_clusters * cb).map_err(|_| too_large_edit())?,
+                        )?;
+                        let spans = ws.alloc_clusters(cow_clusters, 1)?;
+                        let mut stage_runs = Vec::with_capacity(spans.len());
+                        let mut sv = 0_u64;
                         for &(lcn, cnt) in &spans {
-                            runs.push(NtfsRun {
-                                vcn: v,
+                            stage_runs.push(NtfsRun {
+                                vcn: sv,
                                 clusters: cnt,
                                 lcn: Some(lcn),
                             });
-                            v += cnt;
+                            sv += cnt;
                         }
-                        let mut full_zeroed = vec![0_u8; (need_vcns * cb) as usize];
-                        full_zeroed[..old_bytes.len()].copy_from_slice(old_bytes);
                         stage_runs_writes(
                             &self.geometry,
-                            &runs,
-                            &full_zeroed,
+                            &stage_runs,
+                            &merged_buf,
                             &mut ws.pre_payload_writes,
                         )?;
+                        let (working_runs, disp) =
+                            splice_vcn_interval(runs, cow_start_vcn, need_vcns, &spans, false)?;
+                        ws.free_clusters_deferred(&disp);
                         EditableStreamStorage::NonResident {
-                            runs: normalize_ntfs_runs(runs),
+                            runs: working_runs,
                             sparse: false,
-                            compression_unit: 0,
+                            compression_unit,
                             data_bytes: new_size,
                             initialized_bytes: new_size,
                         }
                     }
                 }
-                EditableStreamStorage::NonResident {
-                    ref runs,
-                    sparse,
-                    compression_unit,
-                    data_bytes: old_size,
-                    initialized_bytes: old_init,
-                } => {
-                    if !sparse && new_size <= MAX_RESIDENT_DATA_PAYLOAD as u64 {
-                        let prefix = read_editable_stream_prefix(
-                            self,
-                            cx,
-                            &cur_stream,
-                            0,
-                            new_size as usize,
-                        )?;
-                        ws.free_clusters_deferred(&physical_spans_of_runs(runs));
-                        EditableStreamStorage::Resident(prefix)
-                    } else if new_size == 0 && sparse {
-                        ws.free_clusters_deferred(&physical_spans_of_runs(runs));
-                        EditableStreamStorage::NonResident {
-                            runs: Vec::new(),
-                            sparse: true,
-                            compression_unit,
-                            data_bytes: 0,
-                            initialized_bytes: 0,
-                        }
-                    } else {
-                        let need_vcns = new_size.div_ceil(cb);
-                        let old_vcns: u64 = runs.iter().map(|r| r.clusters).sum();
-                        if new_size <= old_size {
-                            let (mut kept, disp) = splice_vcn_interval(
-                                runs,
-                                need_vcns,
-                                old_vcns.max(need_vcns),
-                                &[],
-                                sparse,
-                            )?;
-                            ws.free_clusters_deferred(&disp);
-                            // Splicing a sparse hole can coalesce it with the
-                            // retained prefix hole. Clip that merged run as well
-                            // as dropping runs wholly beyond the new EOF.
-                            kept.retain_mut(|run| {
-                                if run.vcn >= need_vcns {
-                                    return false;
-                                }
-                                run.clusters = run.clusters.min(need_vcns - run.vcn);
-                                true
-                            });
-                            EditableStreamStorage::NonResident {
-                                runs: normalize_ntfs_runs(kept),
-                                sparse,
-                                compression_unit,
-                                data_bytes: new_size,
-                                initialized_bytes: old_init.min(new_size),
-                            }
-                        } else if sparse {
-                            let mut next_runs = runs.clone();
-                            if need_vcns > old_vcns {
-                                next_runs.push(NtfsRun {
-                                    vcn: old_vcns,
-                                    clusters: need_vcns - old_vcns,
-                                    lcn: None,
-                                });
-                            }
-                            EditableStreamStorage::NonResident {
-                                runs: normalize_ntfs_runs(next_runs),
-                                sparse: true,
-                                compression_unit,
-                                data_bytes: new_size,
-                                initialized_bytes: old_init,
-                            }
-                        } else {
-                            let cow_start_vcn = old_init / cb;
-                            let cow_clusters = need_vcns - cow_start_vcn;
-                            let cow_byte_start = cow_start_vcn * cb;
-                            let merged_buf = read_editable_stream_prefix(
-                                self,
-                                cx,
-                                &cur_stream,
-                                cow_byte_start,
-                                (cow_clusters * cb) as usize,
-                            )?;
-                            let spans = ws.alloc_clusters(cow_clusters, 1)?;
-                            let mut stage_runs = Vec::with_capacity(spans.len());
-                            let mut sv = 0_u64;
-                            for &(lcn, cnt) in &spans {
-                                stage_runs.push(NtfsRun {
-                                    vcn: sv,
-                                    clusters: cnt,
-                                    lcn: Some(lcn),
-                                });
-                                sv += cnt;
-                            }
-                            stage_runs_writes(
-                                &self.geometry,
-                                &stage_runs,
-                                &merged_buf,
-                                &mut ws.pre_payload_writes,
-                            )?;
-                            let (working_runs, disp) =
-                                splice_vcn_interval(runs, cow_start_vcn, need_vcns, &spans, false)?;
-                            ws.free_clusters_deferred(&disp);
-                            EditableStreamStorage::NonResident {
-                                runs: working_runs,
-                                sparse: false,
-                                compression_unit,
-                                data_bytes: new_size,
-                                initialized_bytes: new_size,
-                            }
-                        }
-                    }
-                }
-            };
-
-            {
-                let cat = ws.catalog_mut(self, cx, target_ref)?;
-                cat.data_streams[stream_idx].storage = updated_storage;
-                cat.set_std_times(None, Some(now_ticks), Some(now_ticks), None);
             }
-            if stream_utf16.is_empty() {
-                ws.sync_target_into_parent_dirs(self, cx, target_ref)?;
-            }
-            ws.finalize(self, cx, "truncate_stream_at", digest, ())
-        })();
+        };
 
-        match plan_res {
-            Ok(plan) => self.execute_logged_tx(cx, plan),
-            Err(err) => NtfsTxOutcome::NotCommitted(err),
+        {
+            let cat = ws.catalog_mut(self, cx, target_ref)?;
+            cat.data_streams[stream_idx].storage = updated_storage;
+            cat.set_std_times(None, Some(now_ticks), Some(now_ticks), None);
         }
+        if stream_utf16.is_empty() {
+            ws.sync_target_into_parent_dirs(self, cx, target_ref)?;
+        }
+        ws.finalize(self, cx, "truncate_stream_at", digest, ())
     }
 
     /// Delete a named Alternate Data Stream (`stream_utf16` must be non-empty) from `target_ref`,

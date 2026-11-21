@@ -1873,8 +1873,9 @@ impl NtfsTransactionEngine {
     /// transaction. Growth initializes every newly exposed byte to zero; shrink
     /// retires old allocation only with the recoverable metadata transaction.
     ///
-    /// The requested size must fit [`super::MAX_FILE_EDIT_BYTES`]. A larger
-    /// existing stream can be shrunk without reading its discarded suffix.
+    /// [`super::MAX_FILE_EDIT_BYTES`] bounds newly initialized bytes during
+    /// growth, not the requested length. Larger streams can be shrunk or
+    /// incrementally extended without copying their untouched prefix.
     pub fn truncate_file(
         &mut self,
         cx: &Cx,
@@ -2283,7 +2284,7 @@ impl NtfsTransactionEngine {
         };
         let exceeds_edit_budget = match edit {
             FileDataEdit::Write { data, .. } => data.len() as u64 > super::MAX_FILE_EDIT_BYTES,
-            FileDataEdit::Truncate { size } => size > super::MAX_FILE_EDIT_BYTES,
+            FileDataEdit::Truncate { .. } => false,
         };
         if exceeds_edit_budget || requested_end > i64::MAX as u64 {
             return Err(too_large());
@@ -2346,6 +2347,31 @@ impl NtfsTransactionEngine {
             FileDataEdit::Write { .. } => stream.size.max(requested_end),
             FileDataEdit::Truncate { size } => size,
         };
+        if let FileDataEdit::Truncate { size } = edit
+            && new_size > super::MAX_FILE_EDIT_BYTES
+        {
+            // Keep the path, exact stream, and parent-index preflight above.
+            // The catalog planner trims mappings or initializes only the new
+            // tail, retaining the existing logged publication and reclamation.
+            let plan = self.plan_stream_truncate(
+                cx,
+                reference,
+                stream_name,
+                size,
+                DEFAULT_NTFS_FILETIME,
+                digest,
+            )?;
+            return Ok(PreparedTxPlan {
+                operation,
+                operation_digest: plan.operation_digest,
+                result_value: reference,
+                pre_payload_writes: plan.pre_payload_writes,
+                mft_zero_writes: plan.mft_zero_writes,
+                open_attr_registrations: plan.open_attr_registrations,
+                mutation_specs: plan.mutation_specs,
+                target_writes: plan.target_writes,
+            });
+        }
         if new_size > super::MAX_FILE_EDIT_BYTES {
             let FileDataEdit::Write { offset, data } = edit else {
                 return Err(too_large());

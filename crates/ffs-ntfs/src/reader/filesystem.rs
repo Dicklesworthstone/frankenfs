@@ -15,7 +15,7 @@ use super::{
     checkpoint, corrupt, parse, relative_link_target, unsupported,
 };
 use crate::transaction::NtfsTransactionEngine;
-use ffs_core::vfs::{OpenHandleOracle, ReleaseRequest};
+use ffs_core::vfs::{OpenHandleOracle, ReleaseRequest, XattrSetMode};
 use ffs_core::{
     DirEntry, FileType, FsOps, FsStat, InodeAttr, ReaddirPage, RequestScope, SeekWhence,
     SetAttrRequest,
@@ -1129,6 +1129,20 @@ impl FsOps for NtfsFs {
         Ok(result)
     }
 
+    fn setxattr(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        ino: InodeNumber,
+        name: &str,
+        value: &[u8],
+        mode: XattrSetMode,
+    ) -> Result<()> {
+        let op = self.operation(cx, true)?;
+        self.setxattr_locked(cx, ino, name, value, mode)?;
+        op.complete(())
+    }
+
     fn removexattr(
         &self,
         cx: &Cx,
@@ -1136,19 +1150,9 @@ impl FsOps for NtfsFs {
         ino: InodeNumber,
         name: &str,
     ) -> Result<bool> {
-        let _op = self.operation(cx, false)?;
-        self.ensure_writable()?;
-        if is_ads_ino(ino) {
-            self.describe(cx, ino)?;
-            return Ok(false);
-        }
-        let record = self.record(cx, ino)?;
-        if name.starts_with("user.") && self.user_eas(cx, &record)?.contains_key(name) {
-            return Err(unsupported(
-                "removing existing native NTFS user.* extended attributes is not supported",
-            ));
-        }
-        Ok(false)
+        let op = self.operation(cx, true)?;
+        let removed = self.removexattr_locked(cx, ino, name)?;
+        op.complete(removed)
     }
 
     fn statfs(&self, cx: &Cx, _scope: &mut RequestScope, ino: InodeNumber) -> Result<FsStat> {

@@ -9,7 +9,10 @@ use super::{
     NtfsTransactionEngine, OsStr, ROOT, Result, SetAttrRequest, SystemTime, TICKS_PER_SECOND,
     UNIX_EPOCH, UNIX_FILETIME, checkpoint, is_ads_ino, parse_ads_component, reference, unsupported,
 };
+use crate::transaction::NtfsEaSetMode;
 use crate::transaction::{DEFAULT_NTFS_FILETIME, NtfsTxOutcome, validate_ntfs_component_utf16};
+use ffs_core::vfs::XattrSetMode;
+use ffs_ondisk::ntfs::ea::{MAX_EA_NAME_BYTES, NtfsEa};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -444,6 +447,95 @@ impl NtfsFs {
             engine.write_stream_range(cx, target, &stream, offset, data)
         })?;
         Ok(size)
+    }
+
+    fn user_ea_name(name: &str) -> Result<()> {
+        if name.len() > MAX_EA_NAME_BYTES {
+            return Err(FfsError::NameTooLong);
+        }
+        let suffix = name
+            .strip_prefix("user.")
+            .ok_or_else(|| unsupported("only native NTFS user.* EAs are exposed as host xattrs"))?;
+        if suffix.is_empty() || name.as_bytes().contains(&0) {
+            return Err(invalid_argument());
+        }
+        Ok(())
+    }
+
+    pub(super) fn setxattr_locked(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        name: &str,
+        value: &[u8],
+        mode: XattrSetMode,
+    ) -> Result<()> {
+        self.ensure_writable()?;
+        Self::user_ea_name(name)?;
+        if value.len() > usize::from(u16::MAX) {
+            return Err(FfsError::RequestRejected {
+                errno: libc::E2BIG,
+                detail: "native NTFS EA value is too large".into(),
+            });
+        }
+        if is_ads_ino(ino) {
+            self.describe(cx, ino)?;
+            return Err(unsupported(
+                "NTFS EAs belong to FILE records, not DATA streams",
+            ));
+        }
+        let record = self.record(cx, ino)?;
+        let flags = self
+            .active_volume()?
+            .extended_attributes(cx, &record)?
+            .find(name.as_bytes())
+            .map_or(0, |entry| entry.flags);
+        let entry = NtfsEa {
+            name: name.as_bytes().to_vec(),
+            flags,
+            value: value.to_vec(),
+        };
+        let mode = match mode {
+            XattrSetMode::Set => NtfsEaSetMode::Set,
+            XattrSetMode::Create => NtfsEaSetMode::Create,
+            XattrSetMode::Replace => NtfsEaSetMode::Replace,
+        };
+        let now = system_time_to_filetime(SystemTime::now())?;
+        self.transact(cx, |engine| {
+            engine.set_extended_attribute(cx, reference(&record), &entry, mode, now)
+        })
+    }
+
+    pub(super) fn removexattr_locked(&self, cx: &Cx, ino: InodeNumber, name: &str) -> Result<bool> {
+        self.ensure_writable()?;
+        if name.len() > MAX_EA_NAME_BYTES {
+            return Err(FfsError::NameTooLong);
+        }
+        if is_ads_ino(ino) {
+            self.describe(cx, ino)?;
+            return Ok(false);
+        }
+        let record = self.record(cx, ino)?;
+        if !name.starts_with("user.") {
+            // Kernel privilege removal probes security.capability on writes.
+            // This frontend does not expose that native namespace as a host
+            // capability, and must not reinterpret or remove unrelated EAs.
+            return Ok(false);
+        }
+        Self::user_ea_name(name)?;
+        if self
+            .active_volume()?
+            .extended_attributes(cx, &record)?
+            .find(name.as_bytes())
+            .is_none()
+        {
+            return Ok(false);
+        }
+        let now = system_time_to_filetime(SystemTime::now())?;
+        self.transact(cx, |engine| {
+            engine.remove_extended_attribute(cx, reference(&record), name.as_bytes(), now)
+        })?;
+        Ok(true)
     }
 
     pub(super) fn setattr_locked(

@@ -497,9 +497,54 @@ Each write accepts at most 16 MiB of payload. On a non-sparse stream, the newly
 initialized span, including any gap before the payload, must also fit 16 MiB.
 Sparse gaps remain holes; partial initialized clusters are zeroed before their
 new bytes become visible. Both the logical end and cluster-rounded allocation
-must fit the native signed 64-bit size limit. These bounds apply independently of the existing
-stream's logical size, so small overwrites and incremental growth of large
-files are supported. Truncate requests retain their existing 16 MiB size bound.
+must fit the native signed 64-bit size limit. These bounds apply independently
+of the existing stream's logical size, so small overwrites and incremental growth
+of large files are supported.
+
+`tx-truncate` and writable `setattr(size)` also support streams larger than
+16 MiB. Shrinking trims extent mappings and reclaims discarded allocation;
+ordinary growth initializes only the newly exposed tail, with a 16 MiB bound
+on that initialization span. Sparse growth extends holes without allocating or
+staging their contents. Named streams, extension records and native hard-link
+size copies retain the same logged publication contract, and regrowth cannot
+expose previously discarded or uninitialized bytes:
+
+```bash
+ffs-ntfs tx-truncate volume.img /large.bin --size 33554432 \
+  --offline-image --allow-write
+ffs-ntfs tx-truncate volume.img /large.bin --stream audit --size 33554432 \
+  --offline-image --allow-write
+```
+
+## NTFS: native extended-attribute updates
+
+`tx-set-ea` and `tx-remove-ea` update the native `$EA` / `$EA_INFORMATION`
+catalog through the logged writer. Select an exact UTF-8 name with `--name`,
+or preserve arbitrary native name bytes with `--name-hex`:
+
+```bash
+ffs-ntfs tx-set-ea volume.img /report.bin --name user.note --data 'reviewed' \
+  --create --offline-image --allow-write
+ffs-ntfs tx-set-ea volume.img /report.bin --name user.note --data-file note.bin \
+  --replace --offline-image --allow-write
+ffs-ntfs tx-remove-ea volume.img /report.bin --name user.note \
+  --offline-image --allow-write
+```
+
+The default set operation creates or replaces an entry; `--create` and
+`--replace` enforce existence checks. Values require `--data`, `--data-file`,
+or explicit `--empty`. `--need-ea` sets the native required-EA flag and
+`--need-ea=false` clears it; omission preserves an existing entry's flag.
+The complete encoded catalog, including names and headers, is bounded to
+64 KiB. Large catalogs use initialized nonresident storage, with obsolete
+allocation reclaimed on replacement or final removal. Catalog bytes,
+allocation changes and every hard-link packed-size copy publish together.
+
+Writable FsOps exposes `user.*` set/remove operations on admitted ordinary
+files, directories and the root, with the same transaction and recovery
+contract. Exact native CLI names preserve EAs outside that host namespace.
+Native Windows ACL enforcement and transformed-file mutation retain their
+existing admission boundaries.
 
 ## NTFS: create and remove named DATA streams
 

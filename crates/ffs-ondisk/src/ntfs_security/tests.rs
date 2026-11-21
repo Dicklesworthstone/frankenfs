@@ -758,7 +758,10 @@ fn inherited_audit_aces_retain_success_failure_flags_and_creator_templates() {
 
         let directory = inherit_security_descriptor(&parent, true, &owner, &group).unwrap();
         assert_eq!(directory.sacl.aces.len(), 2);
-        assert_eq!(directory.sacl.aces[0].flags, audit_flags | ACE_FLAG_INHERITED);
+        assert_eq!(
+            directory.sacl.aces[0].flags,
+            audit_flags | ACE_FLAG_INHERITED
+        );
         assert_eq!(
             directory.sacl.aces[1].flags,
             audit_flags
@@ -774,12 +777,18 @@ fn inherited_audit_aces_retain_success_failure_flags_and_creator_templates() {
             inherit_security_descriptor(&directory, false, &next_owner, &group).unwrap();
         assert_eq!(grandchild.sacl.aces.len(), 1);
         assert_eq!(grandchild.sacl.aces[0].sid.as_ref(), Some(&next_owner));
-        assert_eq!(grandchild.sacl.aces[0].flags, audit_flags | ACE_FLAG_INHERITED);
+        assert_eq!(
+            grandchild.sacl.aces[0].flags,
+            audit_flags | ACE_FLAG_INHERITED
+        );
 
         parent.sacl.aces[0].flags |= ACE_FLAG_NO_PROPAGATE_INHERIT;
         let terminal = inherit_security_descriptor(&parent, true, &owner, &group).unwrap();
         assert_eq!(terminal.sacl.aces.len(), 1);
-        assert_eq!(terminal.sacl.aces[0].flags, audit_flags | ACE_FLAG_INHERITED);
+        assert_eq!(
+            terminal.sacl.aces[0].flags,
+            audit_flags | ACE_FLAG_INHERITED
+        );
         let descendant =
             inherit_security_descriptor(&terminal, false, &next_owner, &group).unwrap();
         assert!(descendant.sacl.aces.is_empty());

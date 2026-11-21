@@ -2,6 +2,7 @@
 //! Native NTFS 3.1 inspection, read-only mounts and explicitly admitted transactions.
 
 mod allocation_commands;
+mod ea_commands;
 mod ea_name;
 mod maintenance_commands;
 
@@ -287,6 +288,16 @@ impl PayloadArgs {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Set a native extended attribute in one logged transaction.
+    TxSetEa {
+        #[command(flatten)]
+        options: ea_commands::SetArgs,
+    },
+    /// Remove a native extended attribute and reclaim its storage.
+    TxRemoveEa {
+        #[command(flatten)]
+        options: ea_commands::RemoveArgs,
+    },
     /// Run the unified non-mutating NTFS 3.0/3.1 structural consistency checker
     /// (optional `--repair-plan` / explicit `--apply-repair --allow-write`).
     Check {
@@ -499,7 +510,7 @@ enum Command {
         /// Exact UTF-16 units, comma-separated four-digit hex (for example d800,0061).
         #[arg(long, value_parser = StreamName::parse, conflicts_with = "stream")]
         stream_utf16: Option<StreamName>,
-        /// Byte offset in the stream, distinct from the volume's --offset. A nonempty write's resulting stream must fit 16 MiB.
+        /// Byte offset in the stream, distinct from the volume's --offset. Payload and newly initialized non-sparse bytes are limited to 16 MiB per write.
         #[arg(long)]
         start: u64,
         #[command(flatten)]
@@ -516,8 +527,8 @@ enum Command {
         /// Exact UTF-16 units, comma-separated four-digit hex (for example d800,0061).
         #[arg(long, value_parser = StreamName::parse, conflicts_with = "stream")]
         stream_utf16: Option<StreamName>,
-        /// New stream size in bytes, from zero through 16 MiB.
-        #[arg(long, value_parser = clap::value_parser!(u64).range(..=MAX_FILE_EDIT_BYTES))]
+        /// New stream size in bytes. Non-sparse growth may initialize at most 16 MiB per transaction; the native size and allocation limits also apply.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(..=i64::MAX as u64))]
         size: u64,
     },
     /// Create a named DATA stream without replacing an existing stream or the unnamed data.
@@ -927,6 +938,8 @@ fn main() -> Result<()> {
         .context("installing NTFS cancellation handler; no image mutation started")?;
     }
     match cli.command {
+        Command::TxSetEa { options } => ea_commands::set(&cx, &options)?,
+        Command::TxRemoveEa { options } => ea_commands::remove(&cx, &options)?,
         Command::Check { options } => maintenance_commands::run_check(&cx, &options)?,
         Command::Format { options } => maintenance_commands::run_format(&cx, &options)?,
         Command::Resize { options } => maintenance_commands::run_resize_cmd(&cx, &options)?,
@@ -2749,7 +2762,13 @@ mod tests {
             "--allow-write",
         ];
         assert!(Cli::try_parse_from(truncate_base).is_err());
-        for (argument, expected) in [("0", 0), ("16777216", MAX_FILE_EDIT_BYTES)] {
+        for (argument, expected) in [
+            ("0", 0),
+            ("16777216", MAX_FILE_EDIT_BYTES),
+            ("16777217", MAX_FILE_EDIT_BYTES + 1),
+            ("1073741824", 1_u64 << 30),
+            ("9223372036854775807", i64::MAX as u64),
+        ] {
             let cli =
                 Cli::try_parse_from(truncate_base.into_iter().chain(["--size", argument])).unwrap();
             let Command::TxTruncate { size, .. } = cli.command else {
@@ -2757,7 +2776,7 @@ mod tests {
             };
             assert_eq!(size, expected);
         }
-        for invalid in ["-1", "16777217", "18446744073709551615"] {
+        for invalid in ["-1", "9223372036854775808", "18446744073709551615"] {
             assert!(
                 Cli::try_parse_from(truncate_base.into_iter().chain(["--size", invalid])).is_err()
             );

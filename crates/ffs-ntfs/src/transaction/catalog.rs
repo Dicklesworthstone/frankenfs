@@ -16,7 +16,7 @@ use ffs_ondisk::ntfs::recovery::{
     FileEditResult, RecoveryPass, deallocate_file_record_slot, initialize_file_record_slot,
 };
 use ffs_ondisk::ntfs::{
-    ATTRIBUTE_LIST, COMPRESSED, DATA, ENCRYPTED, NtfsAttribute, NtfsFileRecord, NtfsGeometry,
+    ATTRIBUTE_LIST, COMPRESSED, DATA, EA, ENCRYPTED, NtfsAttribute, NtfsFileRecord, NtfsGeometry,
     NtfsLogOp, NtfsReference, NtfsRun, NtfsValue, REPARSE_POINT, SPARSE, decode_mapping_pairs,
     encode_mapping_pairs, restore_record,
 };
@@ -1732,6 +1732,41 @@ impl NtfsTransactionEngine {
                     let b_cl = bytes.clone();
                     let idx_flag = *indexed;
                     let est = encode_resident_attribute(kind, 0, &nm, idx_flag, &b_cl)?.len();
+                    if kind == EA && est > max_ext_attr_bytes {
+                        // EA_INFORMATION stays resident, while the bounded EA
+                        // value may need several clusters or mapping extents.
+                        // Initialize fresh storage before publishing any FILE
+                        // record that references it, just like DATA and SDs.
+                        let cb = u64::from(self.geometry.cluster_bytes());
+                        let need_cl = (bytes.len() as u64).div_ceil(cb);
+                        let spans = allocate_clusters(need_cl)?;
+                        let mut runs = Vec::with_capacity(spans.len());
+                        let mut vcn = 0;
+                        for (lcn, clusters) in spans {
+                            runs.push(NtfsRun {
+                                vcn,
+                                clusters,
+                                lcn: Some(lcn),
+                            });
+                            vcn += clusters;
+                        }
+                        let mut padded = vec![0; (need_cl * cb) as usize];
+                        padded[..bytes.len()].copy_from_slice(bytes);
+                        stage_runs_writes(&self.geometry, &runs, &padded, &mut pre_payload_writes)?;
+                        candidates.extend(split_nonresident_stream_extents(
+                            &self.geometry,
+                            kind,
+                            &nm,
+                            &folded,
+                            &runs,
+                            false,
+                            0,
+                            bytes.len() as u64,
+                            bytes.len() as u64,
+                            max_ext_attr_bytes,
+                        )?);
+                        continue;
+                    }
                     candidates.push(CandidateAttr {
                         kind,
                         name: nm,
