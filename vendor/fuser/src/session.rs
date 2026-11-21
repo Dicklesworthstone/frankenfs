@@ -793,10 +793,8 @@ impl<FS: Filesystem> Session<FS> {
         if worker_count <= 1 {
             let (served, res) = self.run_classic_loop_counted(buf);
             info!(
-                worker_count = 1,
-                per_worker_requests = ?[served],
-                total_requests = served,
-                "FUSE dispatch worker summary"
+                "FUSE dispatch worker summary: worker_count=1 per_worker_requests={:?} total_requests={served}",
+                [served]
             );
             return res;
         }
@@ -848,10 +846,7 @@ impl<FS: Filesystem> Session<FS> {
         });
         let total_requests: u64 = per_worker_requests.iter().copied().sum();
         info!(
-            worker_count,
-            ?per_worker_requests,
-            total_requests,
-            "FUSE dispatch worker summary"
+            "FUSE dispatch worker summary: worker_count={worker_count} per_worker_requests={per_worker_requests:?} total_requests={total_requests}"
         );
         res
     }
@@ -937,10 +932,7 @@ impl<FS: Filesystem> Session<FS> {
         });
         let total_requests: u64 = per_worker_requests.iter().copied().sum();
         info!(
-            worker_count,
-            ?per_worker_requests,
-            total_requests,
-            "FUSE per-core dispatch worker summary"
+            "FUSE per-core dispatch worker summary: worker_count={worker_count} per_worker_requests={per_worker_requests:?} total_requests={total_requests}"
         );
         res
     }
