@@ -537,7 +537,7 @@ fn ntfs_secure_intern_dedup_multistripe_256k_inheritance_hardlink_dacl_sacl_and_
             size: None,
             aces: vec![build_simple_ace(
                 ACE_TYPE_SYSTEM_AUDIT,
-                0xC0,
+                0xC0 | ACE_FLAG_OBJECT_INHERIT | ACE_FLAG_CONTAINER_INHERIT,
                 FILE_WRITE_DATA,
                 NtfsSid::world_everyone(),
             )],
