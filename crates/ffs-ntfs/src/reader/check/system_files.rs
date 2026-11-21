@@ -5,13 +5,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use asupersync::Cx;
-use ffs_error::Result;
+use ffs_error::{FfsError, Result};
 use ffs_ondisk::ntfs::ea::{NtfsEaInformation, parse_extended_attributes};
 use ffs_ondisk::ntfs::index::NtfsFileName;
 use ffs_ondisk::ntfs::{
     ATTRIBUTE_LIST, COMPRESSED, DATA, EA, EA_INFORMATION, NtfsAttrDef, NtfsFileRecord, NtfsValue,
     REPARSE_POINT, SPARSE, VOLUME_INFORMATION, decode_mapping_pairs, parse_attr_def_table,
-    parse_ntfs_logfile, restore_record, validate_ntfs31_attr_def_table,
+    validate_ntfs31_attr_def_table,
 };
 
 use super::{NtfsCheckCategory, NtfsCheckLimits, NtfsCheckReport};
@@ -1181,8 +1181,10 @@ fn inspect_logfile_readonly(
         }
     };
     let min_bytes = (50 * LOG_PAGE_BYTES) as u64;
-    if stream.resident()
-        || stream.initialized != stream.size
+    if !matches!(
+        &stream.storage,
+        Storage::Mapped(runs) if runs.iter().all(|run| run.lcn.is_some())
+    ) || stream.initialized != stream.size
         || stream.size < min_bytes
         || !stream.size.is_multiple_of(LOG_PAGE_BYTES as u64)
     {
@@ -1199,50 +1201,6 @@ fn inspect_logfile_readonly(
         return Ok(None);
     }
 
-    // Check first two RSTR pages (8 KiB) first.
-    let head = volume.read(cx, &stream, 0, LOG_PAGE_BYTES * 2)?;
-    if head.iter().all(|&b| b == 0xFF) {
-        return Ok(Some(NtfsLogStateSummary {
-            erased: true,
-            clean: true,
-            version: (0, 0),
-            page_size: LOG_PAGE_BYTES as u32,
-            file_size: stream.size,
-            oldest_lsn: 0,
-            current_lsn: 0,
-            client_restart_lsn: 0,
-            torn_rstr_slot: None,
-        }));
-    }
-
-    let rstr0_ok = restore_record(&head[0..LOG_PAGE_BYTES], b"RSTR").is_ok();
-    let rstr1_ok = restore_record(&head[LOG_PAGE_BYTES..LOG_PAGE_BYTES * 2], b"RSTR").is_ok();
-    let torn_rstr_slot = match (rstr0_ok, rstr1_ok) {
-        (true, true) => None,
-        (false, true) => Some(0),
-        (true, false) => Some(1),
-        (false, false) => {
-            report.push_issue(
-                NtfsCheckCategory::Journal,
-                "logfile_both_rstr_corrupt",
-                Some(2),
-                None,
-                "both $LogFile RSTR restart pages (0 and 1) are corrupt".into(),
-            );
-            return Ok(None);
-        }
-    };
-    if let Some(slot) = torn_rstr_slot {
-        report.push_issue(
-            NtfsCheckCategory::Journal,
-            "logfile_torn_rstr",
-            Some(2),
-            None,
-            format!("$LogFile RSTR restart slot {slot} is torn/corrupt"),
-        );
-    }
-
-    // Parse complete $LogFile up to 64 MiB cap (standard Windows max default).
     if stream.size > 64 * 1024 * 1024 {
         report.complete = false;
         report.push_issue(
@@ -1258,58 +1216,52 @@ fn inspect_logfile_readonly(
         return Ok(None);
     }
 
-    let mut full = Vec::new();
-    full.try_reserve_exact(stream.size as usize)
-        .map_err(|e| ffs_error::FfsError::Io(std::io::Error::other(e)))?;
-    let mut offset = 0_u64;
-    while offset < stream.size {
-        checkpoint(cx)?;
-        let chunk_len = ((stream.size - offset).min(1024 * 1024)) as usize;
-        let part = volume.read(cx, &stream, offset, chunk_len)?;
-        full.extend_from_slice(&part);
-        offset += chunk_len as u64;
-    }
-
-    match parse_ntfs_logfile(&full) {
-        Ok(plan) => {
-            let redo = plan.redo_actions.len();
-            let undo = plan.undo_actions.len();
-            let restart_clean = plan.restart.flags & 0x0002 != 0;
-            let clean = restart_clean && redo == 0 && undo == 0 && torn_rstr_slot.is_none();
-            if !clean {
+    match crate::reader::filesystem::inspect_logfile(cx, stream.size, |offset, size| {
+        volume.read(cx, &stream, offset, size)
+    }) {
+        Ok(state) => {
+            if let Some(slot) = state.torn_rstr_slot {
+                report.push_issue(
+                    NtfsCheckCategory::Journal,
+                    "logfile_torn_rstr",
+                    Some(2),
+                    None,
+                    format!("$LogFile RSTR restart slot {slot} is torn/corrupt"),
+                );
+            }
+            if !state.clean {
                 report.push_issue(
                     NtfsCheckCategory::Journal,
                     "logfile_dirty",
                     Some(2),
                     None,
                     format!(
-                        "$LogFile is dirty (lsn={}, redo_actions={redo}, undo_actions={undo}, flags={:#06x})",
-                        plan.restart.current_lsn, plan.restart.flags
+                        "$LogFile requires recovery or restart repair (lsn={})",
+                        state.current_lsn
                     ),
                 );
             }
-            Ok(Some(NtfsLogStateSummary {
-                erased: false,
-                clean,
-                version: (
-                    u16::try_from(plan.restart.major_version).unwrap_or(0),
-                    u16::try_from(plan.restart.minor_version).unwrap_or(0),
-                ),
-                page_size: plan.restart.log_page_size,
-                file_size: plan.restart.file_size,
-                oldest_lsn: plan.restart.oldest_lsn,
-                current_lsn: plan.restart.current_lsn,
-                client_restart_lsn: plan.restart.client_restart_lsn,
-                torn_rstr_slot,
-            }))
+            Ok(Some(state))
         }
-        Err(err) => {
+        Err(error @ (FfsError::Cancelled | FfsError::Io(_))) => Err(error),
+        Err(FfsError::UnsupportedFeature(detail)) => {
+            report.complete = false;
+            report.push_issue(
+                NtfsCheckCategory::UnsupportedFeature,
+                "logfile_unsupported",
+                Some(2),
+                None,
+                detail,
+            );
+            Ok(None)
+        }
+        Err(error) => {
             report.push_issue(
                 NtfsCheckCategory::Journal,
                 "logfile_parse_failed",
                 Some(2),
                 None,
-                format!("$LogFile failed ARIES parse: {err}"),
+                format!("$LogFile failed checkpoint-aware audit: {error}"),
             );
             Ok(None)
         }

@@ -362,6 +362,59 @@ pub(super) fn validate(
     analyze(cx, restart, stream_length, tail, read, volume).map(|_| ())
 }
 
+/// Verify a clean checkpoint as metadata, without interpreting it as a data
+/// update or silently dropping the checkpoint's native tables.
+pub(super) fn validate_clean_checkpoint(
+    cx: &Cx,
+    restart: &Restart,
+    stream_length: u64,
+    tail: &LogRecord,
+    read: &mut impl FnMut(u64, usize) -> Result<Vec<u8>>,
+) -> Result<()> {
+    if tail.kind != LFS_CLIENT_RESTART
+        || restart.active_client_restart_lsn != Some(tail.lsn)
+        || tail.summary.transaction_id != 0
+        || tail.previous != 0
+        || tail.undo_next != 0
+    {
+        return Err(unsupported(
+            "$LogFile clean audit requires a selected native checkpoint tail",
+        ));
+    }
+    let analyzed = analyze(cx, restart, stream_length, tail, read, None)?;
+    let targets = analyzed
+        .targets
+        .as_ref()
+        .ok_or_else(|| corrupt(0, "$LogFile clean checkpoint has no target analysis"))?;
+    if analyzed.report.active != 0
+        || analyzed.report.prepared != 0
+        || analyzed.report.committed != 0
+        || !analyzed.report.undo.is_empty()
+        || !targets.clusters.is_empty()
+    {
+        return Err(corrupt(
+            0,
+            "$LogFile clean checkpoint retains transactions or dirty pages",
+        ));
+    }
+    // A clean checkpoint interval may retain open-attribute/name dumps and
+    // their forgotten bookkeeping transaction. It must not hide data edits,
+    // mapping changes or unsupported recovery operations behind the clean bit.
+    for record in &analyzed.history {
+        checkpoint(cx)?;
+        if record.kind == LFS_CLIENT_RECORD
+            && (!matches!(record.summary.redo_op, 0x00 | 0x1B | 0x1D | 0x1E)
+                || record.summary.undo_op != 0
+                || u16_at(&record.data, 14)? != 0)
+        {
+            return Err(unsupported(
+                "$LogFile clean checkpoint interval contains recovery work",
+            ));
+        }
+    }
+    checkpoint(cx)
+}
+
 fn analyze(
     cx: &Cx,
     restart: &Restart,

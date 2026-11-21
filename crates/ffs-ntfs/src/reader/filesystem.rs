@@ -10,6 +10,8 @@ mod lifetime;
 mod recovery;
 mod writable;
 
+pub(crate) use recovery::inspect_logfile;
+
 use super::{
     Cx, DATA, FfsError, NtfsFileRecord, NtfsReference, NtfsValue, NtfsVolume, Result, Stream,
     checkpoint, corrupt, parse, relative_link_target, unsupported,

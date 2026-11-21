@@ -3630,3 +3630,29 @@ regressions cover policy forwarding, parent/root identity, reply lifetimes,
 lookup references and errors before mutation. The pre-existing mounted ext4
 casefold htree regression is unchanged. These tests await hosted execution at
 publication; no mounted qualification or bead closure is claimed.
+
+## Native NTFS format/check checkpoint integration (2026-11-21)
+
+The native formatter and structural checker now validate $LogFile through the
+shared checkpoint-aware read-only audit. Native CLIENT_RESTART records are no
+longer passed to the flat physical-action parser, which correctly refuses that
+record class. This addresses the formatter self-check failure that blocked the
+facade, six-format CLI and format/check/resize integration scenarios in CI run
+44871480052 on d6b4dcbef.
+
+Before reporting a clean active journal, the audit validates native checkpoint
+tables, transaction completion, dirty-target claims and retained/tail-copy log
+work. Erased journals require a complete stream scan. Only actual USA trailer
+tears are reported as torn restart copies; unsupported layouts and semantic
+errors retain their refusal status. Read and cancellation errors propagate.
+The formatter audits its serialized journal before its first device write and
+requires the checkpoint's current, oldest and client-restart LSNs to agree.
+
+Nine focused regressions cover native empty and table checkpoints, the 64 MiB
+journal envelope, unfinished transactions, corrupt and torn records/restarts,
+newer retained work, unsupported restart metadata, partially erased streams
+and operational read failures. The audit has no write interface. Mounted
+admission and recovery budgets remain unchanged; the structural audit's bounded
+scan allowance does not widen recovery or native-format compatibility claims.
+At publication these changes are statically reviewed; hosted compilation and
+execution remain pending. The broader bd-h7cme work package stays open.

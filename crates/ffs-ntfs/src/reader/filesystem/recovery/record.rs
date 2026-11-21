@@ -444,6 +444,61 @@ pub(super) fn validate_dirty_volume(
     Ok(tail.summary)
 }
 
+/// Audit dirty retained work through the same tail discovery as clean
+/// checkpoints. Unsupported newer work must not become repairable dirty state.
+pub(super) fn validate_dirty_audit(
+    cx: &Cx,
+    restart: &Restart,
+    stream_length: u64,
+    read: &mut impl FnMut(u64, usize) -> Result<Vec<u8>>,
+) -> Result<u64> {
+    tail::with_latest_for_audit(cx, restart, stream_length, read, |boundary, source| {
+        validate_dirty_volume(
+            cx,
+            boundary,
+            stream_length,
+            &mut |offset, size| source(offset, size),
+            None,
+        )?;
+        Ok(boundary.current_lsn)
+    })
+}
+
+/// Validate the checkpoint and its referenced tables before an audit reports a
+/// clean journal. This performs no target I/O or replay and shares the native
+/// record, table, and transaction analysis used by recovery preflight.
+pub(super) fn validate_clean_checkpoint(
+    cx: &Cx,
+    restart: &Restart,
+    stream_length: u64,
+    read: &mut impl FnMut(u64, usize) -> Result<Vec<u8>>,
+) -> Result<()> {
+    tail::with_latest_for_audit(cx, restart, stream_length, read, |boundary, source| {
+        if boundary.current_lsn != restart.current_lsn {
+            return Err(corrupt(
+                0,
+                "$LogFile clean restart precedes retained native log work",
+            ));
+        }
+        let mut remaining = 64_u64 * 1024 * 1024;
+        let mut bounded = |offset: u64, size: usize| {
+            checkpoint(cx)?;
+            remaining = remaining.checked_sub(size as u64).ok_or_else(|| {
+                unsupported("$LogFile clean checkpoint exceeds the 64 MiB I/O budget")
+            })?;
+            source(offset, size)
+        };
+        let tail = read_record(
+            cx,
+            boundary,
+            stream_length,
+            boundary.current_lsn,
+            &mut bounded,
+        )?;
+        preflight::validate_clean_checkpoint(cx, boundary, stream_length, &tail, &mut bounded)
+    })
+}
+
 /// Journal-only fixtures exercise the identical bounded decoding and Analysis
 /// path without inventing target records or an allocation-bitmap authority.
 #[cfg(test)]
