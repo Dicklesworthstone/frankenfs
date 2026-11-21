@@ -273,13 +273,13 @@ pub fn plan_format(opts: &NtfsFormatOptions) -> Result<NtfsFormatLayout> {
     let index_bytes = DEFAULT_INDEX_BYTES.max(opts.sector_bytes);
 
     let boot_clusters = BOOT_STREAM_BYTES.div_ceil(cb);
-    let mft_records = INITIAL_MFT_RECORDS;
+    let mirror_records = 4_u64;
+    let mirror_bytes = mirror_records * u64::from(record_bytes);
+    let mirror_clusters = mirror_bytes.div_ceil(cb);
+
+    let mft_records = INITIAL_MFT_RECORDS.max(mirror_records);
     let mft_bytes = mft_records * u64::from(record_bytes);
     let mft_clusters = mft_bytes.div_ceil(cb);
-
-    let mirror_min_bytes = (4 * u64::from(record_bytes)).max(cb);
-    let mirror_records = mirror_min_bytes / u64::from(record_bytes);
-    let mirror_clusters = mirror_min_bytes.div_ceil(cb);
 
     // Choose sensible $LogFile size scaled to volume capacity unless explicitly supplied.
     let default_log = if backing_bytes >= 32 * 1024 * 1024 {

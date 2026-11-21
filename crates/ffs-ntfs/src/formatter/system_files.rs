@@ -11,7 +11,7 @@ use ffs_ondisk::ntfs::logfile_writer::{
 use ffs_ondisk::ntfs::{
     DATA, NtfsBootSectorSpec, NtfsFileRecord, NtfsReference, NtfsRun, SPARSE, VOLUME_INFORMATION,
     encode_mapping_pairs, encode_ntfs_boot_sector, encode_standard_ntfs_attr_def_table,
-    parse_ntfs_logfile, protect_record,
+    protect_record,
 };
 use ffs_ondisk::ntfs_security::{
     NtfsSecurityIndexKind, build_default_ntfs_security_descriptor, encode_sds_stream,
@@ -447,10 +447,11 @@ fn build_clean_logfile(logfile_bytes: u64) -> Result<Vec<u8>> {
     copy_page(&mut out, rstr1.page_vbo, &rstr1.bytes)?;
     copy_page(&mut out, appended.page_vbo, &appended.protected_page)?;
 
-    let verified = parse_ntfs_logfile(&out).map_err(|e| parse_err(&e))?;
-    if verified.restart.flags & 0x0002 == 0
-        || !verified.redo_actions.is_empty()
-        || !verified.undo_actions.is_empty()
+    let verified = crate::transaction::audit_logfile_buffer(&out)?;
+    if !verified.summary.clean
+        || verified.flags & 0x0002 == 0
+        || verified.redo_actions != 0
+        || verified.undo_actions != 0
     {
         return Err(format_err(
             "freshly formatted $LogFile failed clean self-check",
@@ -630,7 +631,13 @@ pub fn build_bootstrap_volume(
             fn_raw.clone(),
         ));
         // Bits 0..15 (system) and 24..26 ($ObjId, $Quota, $Reparse) set.
-        let mft_bm = [0xFF_u8, 0xFF, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00];
+        let mft_bm_len = usize::try_from(layout.mft_records.div_ceil(8).next_multiple_of(8))
+            .map_err(|_| format_err("mft_bm_len overflow"))?
+            .max(8);
+        let mut mft_bm = vec![0_u8; mft_bm_len];
+        mft_bm[0] = 0xFF;
+        mft_bm[1] = 0xFF;
+        mft_bm[3] = 0x07;
         let attrs = vec![
             encode_resident_attr(
                 ATTR_STANDARD_INFORMATION,
@@ -802,7 +809,7 @@ pub fn build_bootstrap_volume(
         let mut vol_info = [0_u8; 12];
         vol_info[8] = layout.version[0];
         vol_info[9] = layout.version[1];
-        let attrs = vec![
+        let mut attrs = vec![
             encode_resident_attr(
                 ATTR_STANDARD_INFORMATION,
                 0,
@@ -811,9 +818,26 @@ pub fn build_bootstrap_volume(
                 &encode_standard_info(filetime, FILE_ATTR_HIDDEN_SYSTEM, 256),
             )?,
             encode_resident_attr(ATTR_FILE_NAME, 1, &[], true, &fn_raw)?,
-            encode_resident_attr(ATTR_VOLUME_NAME, 2, &[], false, &vol_name_bytes)?,
-            encode_resident_attr(VOLUME_INFORMATION, 3, &[], false, &vol_info)?,
         ];
+        let mut next_attr_id = 2_u16;
+        if !vol_name_bytes.is_empty() {
+            attrs.push(encode_resident_attr(
+                ATTR_VOLUME_NAME,
+                next_attr_id,
+                &[],
+                false,
+                &vol_name_bytes,
+            )?);
+            next_attr_id += 1;
+        }
+        attrs.push(encode_resident_attr(
+            VOLUME_INFORMATION,
+            next_attr_id,
+            &[],
+            false,
+            &vol_info,
+        )?);
+        next_attr_id += 1;
         let raw = encode_file_record(
             layout.version,
             layout.record_bytes,
@@ -822,7 +846,7 @@ pub fn build_bootstrap_volume(
             0x0001,
             1,
             &attrs,
-            4,
+            next_attr_id,
         )?;
         place_record(3, &raw);
     }

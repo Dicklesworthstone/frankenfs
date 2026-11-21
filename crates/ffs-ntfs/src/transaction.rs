@@ -21,6 +21,7 @@ pub use mutations::{
     validate_ntfs_stream_name_utf16,
 };
 pub use ops::DEFAULT_NTFS_FILETIME;
+pub(crate) use recovery::audit_logfile_buffer;
 pub use secondary::{NtfsObjectIdData, NtfsUsnSummary};
 
 use std::collections::BTreeMap;
@@ -887,13 +888,16 @@ impl NtfsTransactionEngine {
                 if quota_rec.sequence != quota_ref.sequence {
                     return Err(corrupt(0, "stale $Extend/$Quota directory entry"));
                 }
-                Self::validate_inactive_quota_record(&quota_rec)?;
+                Self::validate_inactive_quota_record(&quota_rec, self.geometry.cluster_bytes())?;
             }
         }
         Ok(())
     }
 
-    fn validate_inactive_quota_record(quota_rec: &NtfsFileRecord) -> Result<()> {
+    fn validate_inactive_quota_record(
+        quota_rec: &NtfsFileRecord,
+        cluster_bytes: u32,
+    ) -> Result<()> {
         let mut found_root = false;
         for attr in quota_rec.attributes().map_err(|err| parse_err(&err))? {
             if attr.flags != 0 || attr.kind == ATTRIBUTE_LIST || attr.kind == 0x100 {
@@ -914,7 +918,7 @@ impl NtfsTransactionEngine {
                 };
                 let parsed = ffs_ondisk::ntfs::view_index::parse_view_index_root(
                     ir,
-                    4096,
+                    cluster_bytes,
                     Some(ffs_ondisk::ntfs::view_index::ViewCollation::RawBytes),
                 )
                 .map_err(|err| parse_err(&err))?;

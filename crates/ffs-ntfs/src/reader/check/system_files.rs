@@ -11,7 +11,7 @@ use ffs_ondisk::ntfs::index::NtfsFileName;
 use ffs_ondisk::ntfs::{
     ATTRIBUTE_LIST, COMPRESSED, DATA, EA, EA_INFORMATION, NtfsAttrDef, NtfsFileRecord, NtfsValue,
     REPARSE_POINT, SPARSE, VOLUME_INFORMATION, decode_mapping_pairs, parse_attr_def_table,
-    parse_ntfs_logfile, restore_record, validate_ntfs31_attr_def_table,
+    restore_record, validate_ntfs31_attr_def_table,
 };
 
 use super::{NtfsCheckCategory, NtfsCheckLimits, NtfsCheckReport};
@@ -1412,12 +1412,9 @@ fn inspect_logfile_readonly(
         offset += chunk_len as u64;
     }
 
-    match parse_ntfs_logfile(&full) {
-        Ok(plan) => {
-            let redo = plan.redo_actions.len();
-            let undo = plan.undo_actions.len();
-            let restart_clean = plan.restart.flags & 0x0002 != 0;
-            let clean = restart_clean && redo == 0 && undo == 0 && torn_rstr_slot.is_none();
+    match crate::transaction::audit_logfile_buffer(&full) {
+        Ok(audit) => {
+            let clean = audit.summary.clean && torn_rstr_slot.is_none();
             if !clean {
                 report.push_issue(
                     NtfsCheckCategory::Journal,
@@ -1425,24 +1422,18 @@ fn inspect_logfile_readonly(
                     Some(2),
                     None,
                     format!(
-                        "$LogFile is dirty (lsn={}, redo_actions={redo}, undo_actions={undo}, flags={:#06x})",
-                        plan.restart.current_lsn, plan.restart.flags
+                        "$LogFile is dirty (lsn={}, redo_actions={}, undo_actions={}, flags={:#06x})",
+                        audit.summary.current_lsn,
+                        audit.redo_actions,
+                        audit.undo_actions,
+                        audit.flags
                     ),
                 );
             }
             Ok(Some(NtfsLogStateSummary {
-                erased: false,
+                torn_rstr_slot: torn_rstr_slot.or(audit.summary.torn_rstr_slot),
                 clean,
-                version: (
-                    u16::try_from(plan.restart.major_version).unwrap_or(0),
-                    u16::try_from(plan.restart.minor_version).unwrap_or(0),
-                ),
-                page_size: plan.restart.log_page_size,
-                file_size: plan.restart.file_size,
-                oldest_lsn: plan.restart.oldest_lsn,
-                current_lsn: plan.restart.current_lsn,
-                client_restart_lsn: plan.restart.client_restart_lsn,
-                torn_rstr_slot,
+                ..audit.summary
             }))
         }
         Err(err) => {
