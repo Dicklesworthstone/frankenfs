@@ -950,6 +950,54 @@ impl FsOps for ZfsFs {
         Ok(written)
     }
 
+    fn fallocate(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        ino: InodeNumber,
+        offset: u64,
+        length: u64,
+        mode: i32,
+    ) -> Result<()> {
+        let mut state = self.state(cx)?;
+        let metadata = state.writable_metadata(cx, ino)?;
+        let operation = if mode == (libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE) {
+            crate::ZfsFileRangeOperation::PunchHole
+        } else if mode == libc::FALLOC_FL_ZERO_RANGE {
+            crate::ZfsFileRangeOperation::ZeroRange { keep_size: false }
+        } else if mode == (libc::FALLOC_FL_ZERO_RANGE | libc::FALLOC_FL_KEEP_SIZE) {
+            crate::ZfsFileRangeOperation::ZeroRange { keep_size: true }
+        } else {
+            return Err(unsupported(
+                "ZPL fallocate supports only PUNCH_HOLE|KEEP_SIZE and ZERO_RANGE with optional KEEP_SIZE",
+            ));
+        };
+        if metadata.kind == Kind::Directory {
+            return Err(FfsError::IsDirectory);
+        }
+        if metadata.kind != Kind::Regular {
+            return Err(unsupported("ZPL range mutation requires a regular file"));
+        }
+        state.admit_data_mutation(cx, ino, &metadata)?;
+        let object = state.head.nodes[&ino].object;
+        let timestamp = native_timestamp(SystemTime::now())?;
+        state.mutate(cx, |engine, dataset| {
+            engine.edit_file_range(
+                cx,
+                dataset,
+                object,
+                offset,
+                length,
+                operation,
+                timestamp,
+                crate::ZfsDataChecksum::default(),
+            )
+        })?;
+        // No result metadata is needed. Preserve a known committed outcome if
+        // cancellation arrived after its barrier; the next request refreshes.
+        Ok(())
+    }
+
     fn setattr(
         &self,
         cx: &Cx,

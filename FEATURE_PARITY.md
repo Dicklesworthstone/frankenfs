@@ -1,5 +1,19 @@
 # FEATURE_PARITY
 
+> **ZFS native sparse range edits (2026-11-20):**
+> `ZfsTransactionEngine::edit_file_range`, writable FsOps and the companion
+> `tx-punch-hole` / `tx-zero-range` commands publish sparse edits through the
+> existing native COW/TXG path. Full blocks become holes; edge bytes, snapshot
+> ownership, deadlists and user/group/project charges retain their existing
+> contracts. Zero-range follows native OpenZFS sparse behavior without a space
+> reservation guarantee; optional KEEP_SIZE controls EOF extension.
+> Traversal skips logical holes and bounds allocated leaves and metadata work.
+> Authored regressions cover ZPL v4/v5, SA spill metadata, mirrors, both deadlist
+> formats, quota deltas, multi-terabyte holes, sparse EOF extension, invalid
+> requests, cancellation and seven persistence cut points. Compiler and runtime
+> qualification for this increment are pending. Native OpenZFS interchange,
+> mounted-syscall qualification and the broader ZFS writer roadmap stay open.
+
 > **NTFS logged hole punching (2026-11-20):**
 > `NtfsTransactionEngine::punch_hole_at`, writable FsOps
 > `PUNCH_HOLE | KEEP_SIZE`, and `ffs-ntfs tx-punch-hole` edit unnamed DATA or an

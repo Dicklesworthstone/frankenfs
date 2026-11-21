@@ -42,7 +42,8 @@ pub use self::dsl_ops::{
     ZfsBookmarkInfo, ZfsHoldInfo, ZfsPropertySetValue, list_bookmarks_in_mos, list_holds_in_mos,
 };
 pub use self::zpl_ops::{
-    ZfsDataChecksum, ZfsPosixSetAttr, ZfsSetAttr, ZfsUnlinkedObject, ZfsXattrSetMode,
+    ZfsDataChecksum, ZfsFileRangeOperation, ZfsPosixSetAttr, ZfsSetAttr, ZfsUnlinkedObject,
+    ZfsXattrSetMode,
 };
 use self::zpl_ops::{ZplMutation, stage_zpl_mutation};
 pub use self::zvol_ops::{
@@ -1097,6 +1098,49 @@ impl ZfsTransactionEngine {
                 offset,
                 data: data.to_vec(),
                 clear_suid_sgid: false,
+                timestamp,
+                checksum,
+            },
+        )
+    }
+
+    /// Punch or zero a regular-file byte range and publish its new size in one TXG.
+    /// Sparse intervals are skipped without allocation. At most 65536 allocated
+    /// leaves, 16 MiB of indirect metadata and 16 MiB of edge data are processed;
+    /// larger allocated edits must be split by the caller. No space is reserved.
+    #[allow(clippy::too_many_arguments)]
+    pub fn edit_file_range(
+        &mut self,
+        cx: &Cx,
+        dataset_components: &[Vec<u8>],
+        file_obj: u64,
+        offset: u64,
+        length: u64,
+        operation: ZfsFileRangeOperation,
+        timestamp: Timestamp,
+        checksum: ZfsDataChecksum,
+    ) -> ZfsTxOutcome<u64> {
+        if length == 0
+            || offset
+                .checked_add(length)
+                .is_none_or(|end| i64::try_from(end).is_err())
+        {
+            return ZfsTxOutcome::NotCommitted(FfsError::RequestRejected {
+                errno: libc::EINVAL,
+                detail: "ZPL range must be nonempty and end within i64::MAX".into(),
+            });
+        }
+        if timestamp.nanos >= 1_000_000_000 {
+            return ZfsTxOutcome::NotCommitted(FfsError::Format("invalid ZPL nanoseconds".into()));
+        }
+        self.execute_zpl_txg(
+            cx,
+            dataset_components,
+            &ZplMutation::EditRange {
+                file_obj,
+                offset,
+                length,
+                operation,
                 timestamp,
                 checksum,
             },

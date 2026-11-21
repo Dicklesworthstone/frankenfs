@@ -15,9 +15,10 @@ use asupersync::Cx;
 use clap::{Args, Subcommand};
 use ffs_ondisk::zfs_zpl::Timestamp;
 use ffs_zfs::{
-    Leaf, NbdServerConfig, Pool, ZfsDataChecksum, ZfsMountWriteOptions, ZfsPosixSetAttr,
-    ZfsPropertySetValue, ZfsTransactionEngine, ZfsTxOutcome, ZfsVolumeManager, ZfsWriteOptions,
-    ZfsXattrSetMode, ZfsZvolCreateOptions, ZfsZvolNbdClient, ZfsZvolNbdServer, ZvolSyncPolicy,
+    Leaf, NbdServerConfig, Pool, ZfsDataChecksum, ZfsFileRangeOperation, ZfsMountWriteOptions,
+    ZfsPosixSetAttr, ZfsPropertySetValue, ZfsTransactionEngine, ZfsTxOutcome, ZfsVolumeManager,
+    ZfsWriteOptions, ZfsXattrSetMode, ZfsZvolCreateOptions, ZfsZvolNbdClient, ZfsZvolNbdServer,
+    ZvolSyncPolicy,
 };
 
 use super::json;
@@ -213,6 +214,35 @@ pub enum WriteCommand {
         /// Target logical file size in bytes.
         #[arg(long)]
         size: u64,
+    },
+    /// Punch a native sparse hole without changing the regular file's logical size.
+    TxPunchHole {
+        #[command(flatten)]
+        pool: WritePoolArgs,
+        /// Target ZPL regular-file path inside the selected dataset.
+        path: PathBuf,
+        /// First file byte to clear (distinct from the image partition offset).
+        #[arg(long, value_parser = clap::value_parser!(u64).range(..=i64::MAX as u64))]
+        range_offset: u64,
+        /// Nonzero number of file bytes to clear, clipped at EOF.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=i64::MAX as u64))]
+        range_length: u64,
+    },
+    /// Zero a file range using native holes and COW edge blocks; reserves no space.
+    TxZeroRange {
+        #[command(flatten)]
+        pool: WritePoolArgs,
+        /// Target ZPL regular-file path inside the selected dataset.
+        path: PathBuf,
+        /// First file byte to clear (distinct from the image partition offset).
+        #[arg(long, value_parser = clap::value_parser!(u64).range(..=i64::MAX as u64))]
+        range_offset: u64,
+        /// Nonzero number of file bytes to clear.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=i64::MAX as u64))]
+        range_length: u64,
+        /// Clip at current EOF instead of extending the file to the range's end.
+        #[arg(long)]
+        keep_size: bool,
     },
     /// Create another name for a regular file in the same ZPL head dataset.
     TxLink {
@@ -955,6 +985,33 @@ impl WriteCommand {
                 );
                 emit_tx_outcome("tx_truncate", &pool.dataset, &engine, outcome)
             }
+            Self::TxPunchHole {
+                pool,
+                path,
+                range_offset,
+                range_length,
+            } => edit_file_range(
+                cx,
+                &pool,
+                &path,
+                range_offset,
+                range_length,
+                ZfsFileRangeOperation::PunchHole,
+            ),
+            Self::TxZeroRange {
+                pool,
+                path,
+                range_offset,
+                range_length,
+                keep_size,
+            } => edit_file_range(
+                cx,
+                &pool,
+                &path,
+                range_offset,
+                range_length,
+                ZfsFileRangeOperation::ZeroRange { keep_size },
+            ),
             Self::TxLink {
                 pool,
                 src_path,
@@ -1652,6 +1709,33 @@ impl WriteCommand {
     }
 }
 
+fn edit_file_range(
+    cx: &Cx,
+    pool: &WritePoolArgs,
+    path: &Path,
+    offset: u64,
+    length: u64,
+    operation: ZfsFileRangeOperation,
+) -> Result<()> {
+    let (mut engine, components) = pool.open_engine(cx)?;
+    let object = resolve_target_object(cx, &engine, &components, path.as_os_str())?;
+    let outcome = engine.edit_file_range(
+        cx,
+        &components,
+        object,
+        offset,
+        length,
+        operation,
+        pool.zpl_timestamp(),
+        pool.data_checksum(),
+    );
+    let command = match operation {
+        ZfsFileRangeOperation::PunchHole => "tx_punch_hole",
+        ZfsFileRangeOperation::ZeroRange { .. } => "tx_zero_range",
+    };
+    emit_tx_outcome(command, &pool.dataset, &engine, outcome)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2165,5 +2249,111 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn cli_file_range_edits_require_authority_and_keep_partition_ranges_separate() {
+        for command in ["tx-punch-hole", "tx-zero-range"] {
+            let base = [
+                "ffs-zfs",
+                command,
+                "leaf.img",
+                "/large-file",
+                "--pool-guid",
+                "123",
+                "--label",
+                "0",
+                "--slot",
+                "2",
+                "--dataset",
+                "data",
+                "--range-offset",
+                "1099511627776",
+                "--range-length",
+                "4096",
+                "--offset",
+                "4096",
+                "--length",
+                "16777216",
+            ];
+            for authority in [vec![], vec!["--offline-image"], vec!["--allow-write"]] {
+                assert!(Cli::try_parse_from(base.into_iter().chain(authority)).is_err());
+            }
+            let parsed =
+                Cli::try_parse_from(base.into_iter().chain(["--offline-image", "--allow-write"]))
+                    .unwrap();
+            let (pool, path, range_offset, range_length) = match parsed.command {
+                crate::Command::Write(WriteCommand::TxPunchHole {
+                    pool,
+                    path,
+                    range_offset,
+                    range_length,
+                }) => {
+                    assert_eq!(command, "tx-punch-hole");
+                    (pool, path, range_offset, range_length)
+                }
+                crate::Command::Write(WriteCommand::TxZeroRange {
+                    pool,
+                    path,
+                    range_offset,
+                    range_length,
+                    keep_size,
+                }) => {
+                    assert_eq!(command, "tx-zero-range");
+                    assert!(!keep_size);
+                    (pool, path, range_offset, range_length)
+                }
+                other => panic!("unexpected native range command: {other:?}"),
+            };
+            assert!(pool.offline_image && pool.allow_write);
+            assert_eq!((pool.offset, pool.length), (4096, Some(16_777_216)));
+            assert_eq!((range_offset, range_length), (1_u64 << 40, 4096));
+            assert_eq!(path, PathBuf::from("/large-file"));
+            assert_eq!(pool.dataset, "data");
+            let keep = Cli::try_parse_from(base.into_iter().chain([
+                "--offline-image",
+                "--allow-write",
+                "--keep-size",
+            ]));
+            if command == "tx-zero-range" {
+                assert!(matches!(
+                    keep.unwrap().command,
+                    crate::Command::Write(WriteCommand::TxZeroRange {
+                        keep_size: true,
+                        ..
+                    })
+                ));
+            } else {
+                assert!(keep.is_err());
+            }
+        }
+
+        for (offset, length) in [
+            ("0", "0"),
+            ("9223372036854775808", "1"),
+            ("0", "9223372036854775808"),
+        ] {
+            assert!(
+                Cli::try_parse_from([
+                    "ffs-zfs",
+                    "tx-zero-range",
+                    "leaf.img",
+                    "/file",
+                    "--offline-image",
+                    "--allow-write",
+                    "--pool-guid",
+                    "123",
+                    "--label",
+                    "0",
+                    "--slot",
+                    "2",
+                    "--range-offset",
+                    offset,
+                    "--range-length",
+                    length,
+                ])
+                .is_err()
+            );
+        }
     }
 }

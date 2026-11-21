@@ -190,7 +190,7 @@ impl Objects {
     /// Check the interpretation of an already checksum-protected pointer.
     /// Returns false for a native hole. This does not verify a data payload:
     /// allocation queries inspect leaf pointers without reading file contents.
-    fn validate_pointer(
+    pub(crate) fn validate_pointer(
         &self,
         bp: &BlockPointer,
         kind: u8,

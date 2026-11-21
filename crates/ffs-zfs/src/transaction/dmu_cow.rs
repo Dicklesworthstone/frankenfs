@@ -707,6 +707,117 @@ pub(super) fn collect_non_hole_bps_from(
     Ok(())
 }
 
+/// Find allocated leaves intersecting an inclusive block range without walking
+/// logical holes or reading file payloads. The bounds also cap the number of
+/// retired pointers and the indirect metadata that the following COW can rewrite.
+pub(super) fn allocated_leaf_blocks_in_range(
+    cx: &Cx,
+    view: &mut Objects,
+    node: &Dnode,
+    ceiling: u64,
+    first: u64,
+    last: u64,
+) -> Result<Vec<u64>> {
+    let mut walk = AllocatedRangeWalk {
+        node,
+        first: u128::from(first),
+        end: u128::from(last.min(node.max_block())) + 1,
+        remaining_indirect_bytes: 16 * 1024 * 1024,
+        leaves: Vec::new(),
+    };
+    if walk.first >= walk.end {
+        return Ok(walk.leaves);
+    }
+    let top_level = node.levels() - 1;
+    let span = ((node.indirect_bytes() / 128) as u128)
+        .checked_pow(u32::from(top_level))
+        .ok_or_else(|| corrupt("DMU range tree geometry overflow"))?;
+    for (slot, bp) in node.pointers().iter().enumerate() {
+        walk.visit(
+            cx,
+            view,
+            bp,
+            top_level,
+            (slot as u128) * span,
+            span,
+            ceiling,
+        )?;
+    }
+    Ok(walk.leaves)
+}
+
+struct AllocatedRangeWalk<'a> {
+    node: &'a Dnode,
+    first: u128,
+    end: u128,
+    remaining_indirect_bytes: usize,
+    leaves: Vec<u64>,
+}
+
+impl AllocatedRangeWalk<'_> {
+    #[allow(clippy::too_many_arguments)]
+    fn visit(
+        &mut self,
+        cx: &Cx,
+        view: &mut Objects,
+        bp: &BlockPointer,
+        level: u8,
+        start: u128,
+        span: u128,
+        ceiling: u64,
+    ) -> Result<()> {
+        checkpoint(cx)?;
+        if start >= self.end || start + span <= self.first {
+            return Ok(());
+        }
+        let pointer_bytes = if level == 0 {
+            self.node.data_bytes()
+        } else {
+            self.node.indirect_bytes()
+        };
+        if !view.validate_pointer(bp, self.node.object_type(), level, pointer_bytes, ceiling)? {
+            return Ok(());
+        }
+        if level == 0 {
+            if self.leaves.len() == 65_536 {
+                return Err(unsupported(
+                    "single ZPL range mutation exceeds 65536 allocated data blocks",
+                ));
+            }
+            self.leaves
+                .push(u64::try_from(start).map_err(|_| corrupt("DMU range block ID overflow"))?);
+            return Ok(());
+        }
+        self.remaining_indirect_bytes = self
+            .remaining_indirect_bytes
+            .checked_sub(self.node.indirect_bytes())
+            .ok_or_else(|| {
+                unsupported("single ZPL range mutation exceeds 16 MiB of indirect metadata")
+            })?;
+        let Some((bytes, order, birth)) = view.checked_raw(
+            cx,
+            bp,
+            self.node.object_type(),
+            level,
+            self.node.indirect_bytes(),
+            ceiling,
+        )?
+        else {
+            return Ok(());
+        };
+        let child_span = span / ((bytes.len() / 128) as u128);
+        for (slot, raw) in bytes.as_chunks::<128>().0.iter().enumerate() {
+            let child_start = start + (slot as u128) * child_span;
+            if child_start >= self.end || child_start + child_span <= self.first {
+                continue;
+            }
+            let child = BlockPointer::parse(raw, order).map_err(|e| parse_err(&e))?;
+            self.visit(cx, view, &child, level - 1, child_start, child_span, birth)?;
+        }
+        Ok(())
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collect_subtree_bps(
     cx: &Cx,

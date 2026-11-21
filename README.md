@@ -754,6 +754,38 @@ An uncertain publication fences the mount until explicit recovery and reopen.
 This entry point is experimental. Storage-model and FUSE transport regressions
 do not establish native OpenZFS interchange or real mounted-syscall qualification.
 
+## ZFS: punch holes and zero sparse ranges
+
+The admitted native writer supports `tx-punch-hole` and `tx-zero-range` on
+regular files in a selected writable head dataset. Supply the same explicit
+pool, root candidate, offline-image and write authority used by other native
+mutations:
+
+```bash
+ffs-zfs tx-punch-hole pool.img /large.bin --dataset data \
+  --pool-guid "$POOL_GUID" --label 0 --slot "$SLOT" \
+  --range-offset 4096 --range-length 33554432 --offline-image --allow-write
+ffs-zfs tx-zero-range pool.img /large.bin --dataset data \
+  --pool-guid "$POOL_GUID" --label 0 --slot "$SLOT" \
+  --range-offset 4096 --range-length 8192 --keep-size \
+  --offline-image --allow-write
+```
+
+Writable FsOps exposes `PUNCH_HOLE | KEEP_SIZE` and native ZFS `ZERO_RANGE`,
+optionally with `KEEP_SIZE`. Full blocks become holes; partial edges preserve
+neighboring bytes. Hole punching retains EOF. Zeroing without `--keep-size`
+may extend EOF and also clears any allocated bytes in the newly visible gap.
+Both operations follow native OpenZFS sparse semantics and provide **no space
+reservation or preallocation guarantee**.
+
+Traversal skips hole subtrees instead of walking the logical file size. Each
+edit is bounded to 65,536 allocated leaves, 16 MiB of indirect metadata and
+16 MiB of edge data. The native TXG publishes data, size, timestamps and
+user/group/project accounting together. Snapshots retain their original blocks
+through existing deadlist handling. Read-only/snapshot views and unsupported
+protected-file profiles remain refused. `--range-offset` and `--range-length`
+select file bytes; `--offset` and `--length` still select the image partition.
+
 ## ZFS: extract from surviving mirror disks
 
 `--missing-mirror-member GUID` explicitly identifies every absent child of one

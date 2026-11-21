@@ -22,10 +22,10 @@ use crate::reader::dmu::properties::PropertyValue;
 use super::dmu_cow::{
     DMU_OT_DIRECTORY_CONTENTS, DMU_OT_OBJSET, DMU_OT_PLAIN_FILE_CONTENTS, DMU_OT_SA, DMU_OT_ZNODE,
     DnodeCowOutput, DnodeCowSpec, PoolSpaceAllocator, QuotaDelta, SpaceDelta, StagedBlockWrite,
-    WriteBucket, allocate_object_id, apply_objectset_quota_deltas, collect_non_hole_bps_from,
-    cow_update_dnode, encode_zap_blocks_for_dnode, enqueue_into_dataset_deadlist,
-    objectset_user_accounting_flags, put_dnode_in_table, read_staged_or_committed_dnode,
-    remove_dnode_from_table, zap_optional_u64, zap_required_u64,
+    WriteBucket, allocate_object_id, allocated_leaf_blocks_in_range, apply_objectset_quota_deltas,
+    collect_non_hole_bps_from, cow_update_dnode, encode_zap_blocks_for_dnode,
+    enqueue_into_dataset_deadlist, objectset_user_accounting_flags, put_dnode_in_table,
+    read_staged_or_committed_dnode, remove_dnode_from_table, zap_optional_u64, zap_required_u64,
 };
 use super::{checkpoint, corrupt, parse_err, unsupported};
 
@@ -128,6 +128,22 @@ pub enum ZfsXattrSetMode {
     Replace,
 }
 
+/// Native sparse range edits. Complete blocks become holes; partial blocks are
+/// zeroed without changing bytes outside the requested range. No space is reserved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum ZfsFileRangeOperation {
+    /// Punch a hole while preserving the logical file size.
+    PunchHole,
+    /// Zero a range, optionally extending EOF to its end.
+    ZeroRange { keep_size: bool },
+}
+
+impl ZfsFileRangeOperation {
+    pub(crate) const fn keeps_size(self) -> bool {
+        matches!(self, Self::PunchHole | Self::ZeroRange { keep_size: true })
+    }
+}
+
 /// Native size and timestamp updates published together in one head-dataset TXG.
 #[derive(Debug, Clone, Default)]
 pub struct ZfsSetAttr {
@@ -221,6 +237,14 @@ pub(super) enum ZplMutation {
         timestamp: Timestamp,
         checksum: ZfsDataChecksum,
     },
+    EditRange {
+        file_obj: u64,
+        offset: u64,
+        length: u64,
+        operation: ZfsFileRangeOperation,
+        timestamp: Timestamp,
+        checksum: ZfsDataChecksum,
+    },
     SetAttributes {
         file_obj: u64,
         attrs: ZfsPosixSetAttr,
@@ -276,6 +300,11 @@ impl ZplMutation {
             Self::CreateFile { .. } => "create_file",
             Self::Mkdir { .. } => "mkdir",
             Self::WriteData { .. } => "write_data",
+            Self::EditRange {
+                operation: ZfsFileRangeOperation::PunchHole,
+                ..
+            } => "punch_hole",
+            Self::EditRange { .. } => "zero_range",
             Self::SetAttributes { .. } => "set_attributes",
             Self::SetXattr { .. } => "set_xattr",
             Self::RemoveXattr { .. } => "remove_xattr",
@@ -2017,6 +2046,161 @@ pub(super) fn stage_zpl_mutation(
                 *file_obj,
                 &out.dnode,
             )?;
+            new_size
+        }
+
+        ZplMutation::EditRange {
+            file_obj,
+            offset,
+            length,
+            operation,
+            timestamp,
+            checksum,
+        } => {
+            let loaded = load_zpl_node(
+                cx,
+                &mut os_view,
+                &zpl_meta_base,
+                zpl_ceiling,
+                &zpl_dirty_dnodes,
+                ds_ctx.sa_registry.as_ref(),
+                *file_obj,
+                order,
+            )?;
+            if loaded.metadata.kind == Kind::Directory {
+                return Err(FfsError::IsDirectory);
+            }
+            if loaded.metadata.kind != Kind::Regular {
+                return Err(unsupported("ZPL range mutation requires a regular file"));
+            }
+            reject_flags(
+                &loaded.metadata,
+                ZFS_IMMUTABLE | ZFS_APPENDONLY | ZFS_READONLY,
+            )?;
+            let old_size = loaded.metadata.size;
+            // The public entry point validates the signed range before staging.
+            let requested_end = offset + length;
+            let end = if operation.keeps_size() {
+                requested_end.min(old_size)
+            } else {
+                requested_end
+            };
+            let new_size = old_size.max(end);
+            if *offset < end {
+                // Extending EOF also exposes the gap before `offset`; zero any
+                // allocated tail there rather than trusting bytes beyond old EOF.
+                let start = if new_size > old_size {
+                    (*offset).min(old_size)
+                } else {
+                    *offset
+                };
+                let block_bytes = loaded.dnode.data_bytes();
+                let block_size = block_bytes as u64;
+                let blocks = allocated_leaf_blocks_in_range(
+                    cx,
+                    &mut os_view,
+                    &loaded.dnode,
+                    loaded.ceiling,
+                    start / block_size,
+                    (end - 1) / block_size,
+                )?;
+                let mut dirty_leaves = BTreeMap::new();
+                let mut edge_bytes = 0_usize;
+                for block in blocks {
+                    checkpoint(cx)?;
+                    let block_start = block * block_size;
+                    let within_start = start.saturating_sub(block_start) as usize;
+                    let within_end = (end - block_start).min(block_size) as usize;
+                    if within_start == 0 && within_end == block_bytes {
+                        dirty_leaves.insert(block, None);
+                        continue;
+                    }
+                    edge_bytes = edge_bytes
+                        .checked_add(block_bytes)
+                        .filter(|&bytes| bytes <= MAX_WRITE_PAYLOAD_BYTES)
+                        .ok_or_else(|| {
+                            unsupported("ZPL range edges exceed 16 MiB of initialized data")
+                        })?;
+                    let Some((existing, _, _)) =
+                        os_view.object_data_block(cx, &loaded.dnode, loaded.ceiling, block)?
+                    else {
+                        return Err(corrupt("allocated ZPL range block became a hole"));
+                    };
+                    let mut bytes = existing.as_ref().clone();
+                    bytes[within_start..within_end].fill(0);
+                    dirty_leaves.insert(
+                        block,
+                        (!bytes.iter().all(|&byte| byte == 0)).then_some(bytes),
+                    );
+                }
+                let mut new_meta = loaded.metadata.clone();
+                new_meta.size = new_size;
+                new_meta.times[1] = *timestamp;
+                new_meta.times[2] = *timestamp;
+                let (bonus, spill) = encode_updated_zpl_bonus(
+                    &loaded,
+                    &new_meta,
+                    ds_ctx.sa_registry.as_ref(),
+                    alloc,
+                    order,
+                    new_txg,
+                    staged_writes,
+                )?;
+                let out = cow_update_dnode(
+                    cx,
+                    &mut os_view,
+                    alloc,
+                    DnodeCowSpec {
+                        existing: Some((&loaded.dnode, loaded.ceiling)),
+                        object_type: DMU_OT_PLAIN_FILE_CONTENTS,
+                        bonus_type: loaded.dnode.bonus_type(),
+                        checksum_type: if loaded.dnode.checksum_type()
+                            == ZfsDataChecksum::Sha256.code()
+                        {
+                            ZfsDataChecksum::Sha256.code()
+                        } else {
+                            checksum.code()
+                        },
+                        compress_type: loaded.dnode.compress_type(),
+                        user_flags: acct_flags,
+                        indirect_shift: loaded.dnode.indirect_shift(),
+                        data_bytes: block_bytes,
+                        max_block: loaded.dnode.max_block(),
+                        slots: loaded.dnode.slots(),
+                        nblkptr: loaded.dnode.pointers().len(),
+                        bonus,
+                        spill,
+                        order,
+                        new_txg,
+                        leaf_bucket: WriteBucket::ChildBlocks,
+                        indirect_bucket: WriteBucket::ChildBlocks,
+                    },
+                    &dirty_leaves,
+                    staged_writes,
+                )?;
+                zpl_born.add_assign(out.born)?;
+                zpl_retired.extend(out.retired_bps);
+                let bytes_delta =
+                    signed_bytes_delta(out.dnode.used_bytes(), loaded.dnode.used_bytes())?;
+                if bytes_delta != 0 {
+                    quota_deltas.push(QuotaDelta {
+                        uid: new_meta.uid,
+                        gid: new_meta.gid,
+                        projid: Some(loaded.project_id),
+                        bytes_delta,
+                        objs_delta: 0,
+                    });
+                }
+                put_dnode_in_table(
+                    cx,
+                    &mut os_view,
+                    &zpl_meta_base,
+                    zpl_ceiling,
+                    &mut zpl_dirty_dnodes,
+                    *file_obj,
+                    &out.dnode,
+                )?;
+            }
             new_size
         }
 

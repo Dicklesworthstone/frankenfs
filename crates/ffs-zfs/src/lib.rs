@@ -41,10 +41,10 @@ pub use reader::{Label, Leaf, Pool, RootBlock};
 pub use transaction::{
     DEFAULT_VOLBLOCKSIZE, MAX_VOLBLOCKSIZE, MAX_ZVOL_IO_BYTES, ZVOL_LOGICAL_SECTOR_BYTES,
     ZfsAdmissionReport, ZfsBookmarkInfo, ZfsCommitReceipt, ZfsDataChecksum, ZfsDurableToken,
-    ZfsHoldInfo, ZfsPersistenceEvent, ZfsPersistenceStage, ZfsPosixSetAttr, ZfsPropertySetValue,
-    ZfsSetAttr, ZfsStorageIdentity, ZfsTopologyKind, ZfsTransactionEngine, ZfsTxOutcome,
-    ZfsUnlinkedObject, ZfsWriteOptions, ZfsXattrSetMode, ZfsZvolCreateOptions, ZfsZvolInfo,
-    list_bookmarks_in_mos, list_holds_in_mos,
+    ZfsFileRangeOperation, ZfsHoldInfo, ZfsPersistenceEvent, ZfsPersistenceStage, ZfsPosixSetAttr,
+    ZfsPropertySetValue, ZfsSetAttr, ZfsStorageIdentity, ZfsTopologyKind, ZfsTransactionEngine,
+    ZfsTxOutcome, ZfsUnlinkedObject, ZfsWriteOptions, ZfsXattrSetMode, ZfsZvolCreateOptions,
+    ZfsZvolInfo, list_bookmarks_in_mos, list_holds_in_mos,
 };
 pub use zvol_nbd::{
     NbdExportInfo, NbdServerConfig, ZfsVolumeManager, ZfsZvolNbdClient, ZfsZvolNbdServer,

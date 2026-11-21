@@ -2541,3 +2541,239 @@ fn mount_admission_precedes_durable_orphan_cleanup() {
         }
     }
 }
+
+#[test]
+fn file_range_fsops_support_sparse_modes_and_keep_snapshots_read_only() {
+    let cx = Cx::for_testing();
+    let (engine, devices) = writer_fixture(
+        &cx,
+        &PoolFixtureSpec {
+            ashift: 12,
+            deadlist_mode: DeadlistMode::NativeDeadlist,
+            data_properties: vec![(b"recordsize", 4096)],
+            image_bytes: 24 * 1024 * 1024,
+            ..PoolFixtureSpec::default()
+        },
+    );
+    let fs = ZfsFs::with_writer(&cx, engine, vec![b"data".to_vec()]).unwrap();
+    let mut scope = RequestScope::empty();
+    let file = lookup(&fs, &cx, ROOT, "hello.txt");
+    let payload = vec![0x6B; 6 * 4096 + 17];
+    fs.write(&cx, &mut scope, file.ino, 0, &payload).unwrap();
+    fs.create_snapshot(&cx, b"range-view").unwrap();
+    let control = lookup(&fs, &cx, ROOT, ".zfs");
+    let snapshots = lookup(&fs, &cx, control.ino, "snapshot");
+    let snapshot = lookup(&fs, &cx, snapshots.ino, "range-view");
+    let historical = lookup(&fs, &cx, snapshot.ino, "hello.txt");
+    let before = fs.getattr(&cx, &mut scope, file.ino).unwrap();
+
+    fs.fallocate(
+        &cx,
+        &mut scope,
+        file.ino,
+        31,
+        3 * 4096 + 61,
+        libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+    )
+    .unwrap();
+    let mut expected = payload.clone();
+    expected[31..3 * 4096 + 92].fill(0);
+    assert_eq!(read(&fs, &cx, file.ino), expected);
+    let punched = fs.getattr(&cx, &mut scope, file.ino).unwrap();
+    assert_eq!(punched.size, before.size);
+    assert_eq!(punched.blocks, before.blocks - 2 * 4096 / 512);
+    assert_eq!(punched.generation, before.generation);
+    assert_eq!(read(&fs, &cx, historical.ino), payload);
+    assert_eq!(
+        fs.lseek(&cx, &mut scope, file.ino, 4096, ffs_core::SeekWhence::Data)
+            .unwrap(),
+        3 * 4096
+    );
+
+    let tail = expected.len() - 7;
+    fs.fallocate(
+        &cx,
+        &mut scope,
+        file.ino,
+        tail as u64,
+        8192,
+        libc::FALLOC_FL_ZERO_RANGE | libc::FALLOC_FL_KEEP_SIZE,
+    )
+    .unwrap();
+    expected[tail..].fill(0);
+    assert_eq!(read(&fs, &cx, file.ino), expected);
+    assert_eq!(
+        fs.getattr(&cx, &mut scope, file.ino).unwrap().size,
+        before.size
+    );
+    let extension = expected.len() + 4096;
+    fs.fallocate(
+        &cx,
+        &mut scope,
+        file.ino,
+        extension as u64,
+        17,
+        libc::FALLOC_FL_ZERO_RANGE,
+    )
+    .unwrap();
+    expected.resize(extension + 17, 0);
+    assert_eq!(read(&fs, &cx, file.ino), expected);
+    assert_eq!(
+        fs.getattr(&cx, &mut scope, file.ino).unwrap().size,
+        expected.len() as u64
+    );
+
+    let writes = io_counts(&devices);
+    let token = fs.last_durable_token().unwrap().unwrap();
+    for unsupported_mode in [
+        0,
+        libc::FALLOC_FL_KEEP_SIZE,
+        libc::FALLOC_FL_PUNCH_HOLE,
+        libc::FALLOC_FL_COLLAPSE_RANGE,
+        libc::FALLOC_FL_INSERT_RANGE,
+        libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_ZERO_RANGE | libc::FALLOC_FL_KEEP_SIZE,
+        1 << 30,
+    ] {
+        assert_eq!(
+            fs.fallocate(&cx, &mut scope, file.ino, 0, 4096, unsupported_mode)
+                .unwrap_err()
+                .to_errno(),
+            libc::EOPNOTSUPP
+        );
+    }
+    for (offset, length) in [(0, 0), (u64::MAX, 1), (i64::MAX as u64, 1)] {
+        assert_eq!(
+            fs.fallocate(
+                &cx,
+                &mut scope,
+                file.ino,
+                offset,
+                length,
+                libc::FALLOC_FL_ZERO_RANGE
+            )
+            .unwrap_err()
+            .to_errno(),
+            libc::EINVAL
+        );
+    }
+    assert_eq!(
+        fs.fallocate(&cx, &mut scope, ROOT, 0, 4096, libc::FALLOC_FL_ZERO_RANGE)
+            .unwrap_err()
+            .to_errno(),
+        libc::EISDIR
+    );
+    assert!(matches!(
+        fs.fallocate(
+            &cx,
+            &mut scope,
+            historical.ino,
+            0,
+            4096,
+            libc::FALLOC_FL_ZERO_RANGE
+        ),
+        Err(FfsError::ReadOnly)
+    ));
+    assert_eq!(io_counts(&devices), writes);
+    assert_eq!(fs.last_durable_token().unwrap().unwrap(), token);
+    assert_eq!(read(&fs, &cx, file.ino), expected);
+    assert_eq!(read(&fs, &cx, historical.ino), payload);
+
+    let leaves = devices
+        .iter()
+        .map(|device| {
+            let fresh = device.fresh_from_durable();
+            let len = fresh.len_bytes();
+            Leaf::from_device(&cx, Box::new(fresh), 0, len).unwrap()
+        })
+        .collect();
+    let pool = Pool::from_leaves(leaves).unwrap();
+    let view = pool
+        .import_objects(&cx, Some(POOL_GUID))
+        .unwrap()
+        .zpl(&cx, &[b"data".to_vec()])
+        .unwrap();
+    let read_only = ZfsFs::new(&cx, view, 0, 0).unwrap();
+    let cold_file = lookup(&read_only, &cx, ROOT, "hello.txt");
+    assert_eq!(read(&read_only, &cx, cold_file.ino), expected);
+    assert!(matches!(
+        read_only.fallocate(
+            &cx,
+            &mut scope,
+            cold_file.ino,
+            0,
+            4096,
+            libc::FALLOC_FL_ZERO_RANGE
+        ),
+        Err(FfsError::ReadOnly)
+    ));
+    assert_eq!(io_counts(&devices), writes);
+    assert_pool_scrub_and_allocation_clean(&cx, &devices, POOL_GUID, None);
+}
+
+#[test]
+fn file_range_fsops_late_cancellation_preserves_success_and_refreshes_next_request() {
+    let cx = Cx::for_testing();
+    let (mut engine, devices) = writer_fixture(&cx, &PoolFixtureSpec::default());
+    let dataset = [b"data".to_vec()];
+    let timestamp = Timestamp {
+        seconds: 1_730_000_005,
+        nanos: 0,
+    };
+    engine
+        .write_file_data(
+            &cx,
+            &dataset,
+            4,
+            0,
+            b"abcdefghi",
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    engine
+        .truncate_file(&cx, &dataset, 4, 9, timestamp, ZfsDataChecksum::Fletcher4)
+        .into_result()
+        .unwrap();
+    let pre_txg = engine.committed_txg();
+    let cancelled = cx.clone();
+    let once = Arc::new(AtomicBool::new(true));
+    engine.with_fault_hook(move |event| {
+        if event.stage == ZfsPersistenceStage::BeforeAcknowledge
+            && once.swap(false, Ordering::SeqCst)
+        {
+            cancelled.cancel_with(
+                asupersync::types::CancelKind::User,
+                Some("after sparse range commit"),
+            );
+        }
+        Ok(())
+    });
+    let fs = ZfsFs::with_writer(&cx, engine, dataset.to_vec()).unwrap();
+    let mut scope = RequestScope::empty();
+    let file = lookup(&fs, &cx, ROOT, "hello.txt");
+    fs.fallocate(
+        &cx,
+        &mut scope,
+        file.ino,
+        2,
+        3,
+        libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+    )
+    .expect("durable range mutation must retain success after cancellation");
+    assert_eq!(
+        fs.last_durable_token().unwrap().unwrap().committed_txg(),
+        pre_txg + 1
+    );
+    let writes = io_counts(&devices);
+    assert!(matches!(
+        fs.fallocate(&cx, &mut scope, file.ino, 0, 9, libc::FALLOC_FL_ZERO_RANGE),
+        Err(FfsError::Cancelled)
+    ));
+    assert_eq!(io_counts(&devices), writes);
+    let next = Cx::for_testing();
+    assert_eq!(read(&fs, &next, file.ino), b"ab\0\0\0fghi");
+    fs.write(&next, &mut scope, file.ino, 3, b"X").unwrap();
+    assert_eq!(read(&fs, &next, file.ino), b"ab\0X\0fghi");
+    assert_pool_scrub_and_allocation_clean(&next, &devices, POOL_GUID, None);
+}
