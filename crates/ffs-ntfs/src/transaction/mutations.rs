@@ -1065,14 +1065,6 @@ impl TxWorkspace {
     ) -> Result<(u32, u16, Vec<u8>)> {
         let slot_u64 =
             find_contiguous_zero_bits(&self.mft_bm, self.logical_records, 1, MIN_USER_MFT_SLOT)
-                .or_else(|| {
-                    find_contiguous_zero_bits(
-                        &self.mft_bm,
-                        self.logical_records.min(MIN_USER_MFT_SLOT),
-                        1,
-                        FIRST_NON_RESERVED_SLOT,
-                    )
-                })
                 .ok_or(FfsError::NoSpace)?;
         let slot = u32::try_from(slot_u64).map_err(|_| FfsError::NoSpace)?;
         let rec_bytes = u64::from(engine.geometry.record_bytes());
@@ -1685,7 +1677,7 @@ impl NtfsTransactionEngine {
         let mft_bm = self.read_mft_bitmap_bytes(cx, &mft0, logical_records)?;
 
         let mut free_slots = 0_u64;
-        for bit in FIRST_NON_RESERVED_SLOT..logical_records {
+        for bit in MIN_USER_MFT_SLOT..logical_records {
             if !is_bit_set(&mft_bm, bit) {
                 free_slots += 1;
                 if free_slots >= min_free_slots {
@@ -1712,7 +1704,9 @@ impl NtfsTransactionEngine {
 
         let cb = u64::from(self.geometry.cluster_bytes());
         let recs_per_cluster = (cb / rec_bytes).max(1);
-        let missing_slots = min_free_slots - free_slots;
+        let missing_slots = MIN_USER_MFT_SLOT
+            .saturating_sub(logical_records)
+            .saturating_add(min_free_slots - free_slots);
         let min_add_clusters = missing_slots.div_ceil(recs_per_cluster);
         if total_free_clusters < min_add_clusters.saturating_add(payload_clusters_reserve) {
             return Err(FfsError::NoSpace);
