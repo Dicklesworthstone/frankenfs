@@ -21550,11 +21550,11 @@ mod dir_csum_incremental_verify {
             "dx_root csum"
         );
         assert!(
-            verify_dir_block_checksum(&split.old_leaf, csum_seed, dir_ino, generation),
+            verify_dir_block_checksum(&split.old_leaf, csum_seed, dir_ino, generation).is_ok(),
             "old_leaf csum"
         );
         assert!(
-            verify_dir_block_checksum(&split.new_leaf, csum_seed, dir_ino, generation),
+            verify_dir_block_checksum(&split.new_leaf, csum_seed, dir_ino, generation).is_ok(),
             "new_leaf csum"
         );
 
