@@ -21483,15 +21483,23 @@ mod dir_csum_incremental_verify {
             dx_hash(1, invalid_utf8, &seed)
         );
 
-        // U+1FA70 (Ballet Shoes) was unassigned in Unicode 12.1.0 (added in 13.0).
-        let post_12_1 = "\u{1FA70}.txt".as_bytes();
+        // U+1FA70 BALLET SHOES was assigned in Unicode 12.0.
+        // https://www.unicode.org/Public/12.1.0/ucd/DerivedAge.txt
+        assert_eq!(
+            ext4_casefold_key_strict("\u{1FA70}.TXT".as_bytes(), true).unwrap(),
+            "\u{1FA70}.txt".as_bytes()
+        );
+
+        // U+1FA74 THONG SANDAL was added in Unicode 13.0, outside the 12.1 repertoire.
+        // https://www.unicode.org/emoji/charts-13.0/emoji-released.html
+        let post_12_1 = "\u{1FA74}.txt".as_bytes();
         assert_eq!(
             ext4_casefold_key_strict(post_12_1, true),
-            Err(Ext4CasefoldError::UnassignedCodepoint('\u{1FA70}'))
+            Err(Ext4CasefoldError::UnassignedCodepoint('\u{1FA74}'))
         );
         assert_eq!(
             ext4_casefold_key_strict(post_12_1, false).unwrap(),
-            "\u{1FA70}.txt".as_bytes()
+            "\u{1FA74}.txt".as_bytes()
         );
     }
 

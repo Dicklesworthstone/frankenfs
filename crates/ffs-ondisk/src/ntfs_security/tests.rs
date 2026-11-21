@@ -572,7 +572,7 @@ fn security_descriptor_encode_inheritance_dacl_and_multistripe_sds_roundtrip() {
     // 3. DACL evaluation: DENY before ALLOW denies S-1-5-18 write (bit 2 denied for Everyone).
     let sys_sid = NtfsSid::parse_str("S-1-5-18").unwrap();
     let tok = NtfsAccessToken {
-        user: sys_sid.clone(),
+        user: sys_sid,
         groups: Vec::new(),
     };
     assert!(
@@ -791,7 +791,7 @@ fn inherited_audit_aces_retain_success_failure_flags_and_creator_templates() {
         );
         let descendant =
             inherit_security_descriptor(&terminal, false, &next_owner, &group).unwrap();
-        assert!(descendant.sacl.aces.is_empty());
+        assert_eq!(descendant.sacl.aces, [] as [NtfsAce; 0]);
     }
 }
 

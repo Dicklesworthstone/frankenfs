@@ -522,7 +522,7 @@ mod tests {
         assert!(!parsed.has_external);
         assert_eq!(parsed.entries.len(), 3);
         assert_eq!(parsed.entries[0].key, k1);
-        assert!(parsed.entries[0].data.is_empty());
+        assert_eq!(parsed.entries[0].data, [] as [u8; 0]);
         assert_eq!(parsed.entries[1].key, k2);
         assert!(parsed.entries[2].is_terminal);
 

@@ -3504,3 +3504,42 @@ runs exposed an existing ZFS statfs lifecycle assertion, three NTFS persistence
 failures, Clippy diagnostics, and an AArch64-only harness probe build failure;
 those runs therefore do not establish an all-green workspace. These fixtures
 also do not establish native OpenZFS interchange or a real mounted syscall result.
+
+## NTFS logged EA mutation and large-stream truncation
+
+`set_extended_attribute` and `remove_extended_attribute` update exact native
+eight-bit EA names, binary values and NEED_EA flags through the existing WAL.
+Create/replace checks and the complete 64 KiB encoded-catalog bound precede
+publication. Resident/nonresident transitions initialize fresh storage and retire
+old allocation; EA_INFORMATION and every FILE_NAME/I30 packed-size copy publish
+with the catalog. The companion commands are `tx-set-ea` and `tx-remove-ea`.
+Writable FsOps exposes ordinary `user.*` set/remove operations while preserving
+opaque EAs outside the host projection and the existing writer admission rules.
+
+Truncation now bounds the newly initialized tail instead of total file size.
+Large shrink preserves retained mappings, ordinary growth initializes at most
+16 MiB per operation, and sparse growth extends holes without staging the gap.
+Signed size and cluster-rounded allocation bounds apply before publication.
+Hard links, exact named streams, extension catalogs and zeroed regrowth retain
+the same native transaction contract. Resident-to-nonresident shrink copies only
+the retained prefix, preventing discarded suffix bytes from entering new storage.
+
+Native security helpers preserve nongeneric mask bits, explicitly reject access
+requests requiring unsupported privilege or granted-mask semantics, implement
+OWNER RIGHTS, and retain audit flags and unmapped propagation templates during
+inheritance. These helpers do not enable mounted Windows ACL enforcement.
+
+Six EA regression groups cover catalog transitions, external parent indexes,
+refusals, recovery cuts, read-only admission and cancellation after durable
+commit. Five truncate groups cover large ordinary/sparse streams, initialized
+tails, extension catalogs, recovery cuts and resident promotion. The native EA
+CLI oracle independently reads values, allocation and identities with ntfs-3g,
+including bounded-volume sentinels and exact permitted ownership changes.
+
+The on-disk library passes all 1,001 tests, including all 21 security tests, and
+strict Clippy across all targets. The six new security regressions also failed
+against the original implementation.
+Full workspace gates and the new NTFS/CLI/native-EA test execution remain pending:
+the local compiler is OOM-killed in the unchanged asupersync dependency, and the
+existing x86-64 and AArch64 CI validation runs are queued. No mounted or native
+Windows qualification, broad bd-h8n46 closure, or parity-score increase is claimed.

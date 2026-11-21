@@ -293,7 +293,7 @@ fn ea_native_transitions_preserve_links_unknown_entries_and_reclaim_clusters() {
             .unwrap();
         assert_packed_sizes(&device, &engine, file);
     }
-    assert!(entries(&engine, file).is_empty());
+    assert_eq!(entries(&engine, file), [] as [NtfsEa; 0]);
     assert_eq!(
         used_clusters(&device),
         original_used,
@@ -559,7 +559,7 @@ fn ea_writable_fsops_update_live_view_preserve_flags_and_enforce_host_namespace(
     );
     assert!(fs.removexattr(&cx, &mut scope, ino, "user.note").unwrap());
     assert!(!fs.removexattr(&cx, &mut scope, ino, "user.note").unwrap());
-    assert!(fs.listxattr(&cx, ino).unwrap().is_empty());
+    assert_eq!(fs.listxattr(&cx, ino).unwrap(), [] as [String; 0]);
     let dir = fs
         .mkdir(
             &cx,
@@ -682,6 +682,6 @@ fn ea_writable_fsops_finish_publication_after_committed_cancellation() {
             [entry(b"user.note", 0, &value)]
         );
         assert!(fs.removexattr(&next, &mut scope, ino, "user.note").unwrap());
-        assert!(fs.listxattr(&next, ino).unwrap().is_empty());
+        assert_eq!(fs.listxattr(&next, ino).unwrap(), [] as [String; 0]);
     }
 }

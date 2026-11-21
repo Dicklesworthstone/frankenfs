@@ -252,7 +252,7 @@ fn expand_key_256(key: &[u8; 32]) -> [[u8; 16]; 15] {
     }
     let mut round_keys = [[0_u8; 16]; 15];
     for (r, rk) in round_keys.iter_mut().enumerate() {
-        for (c, slot) in rk.chunks_exact_mut(4).enumerate() {
+        for (c, slot) in rk.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             slot.copy_from_slice(&words[r * 4 + c]);
         }
     }
@@ -405,7 +405,7 @@ pub fn efs_encrypt_sector(
         ));
     }
     let mut prev = efs_sector_iv(logical_sector_offset);
-    for chunk in sector.chunks_exact_mut(16) {
+    for chunk in sector.as_chunks_mut::<16>().0 {
         let mut block = [0_u8; 16];
         for ((dst, &src), &p) in block.iter_mut().zip(chunk.iter()).zip(prev.iter()) {
             *dst = src ^ p;
@@ -432,7 +432,7 @@ pub fn efs_decrypt_sector(
         ));
     }
     let mut prev = efs_sector_iv(logical_sector_offset);
-    for chunk in sector.chunks_exact_mut(16) {
+    for chunk in sector.as_chunks_mut::<16>().0 {
         let mut ct = [0_u8; 16];
         ct.copy_from_slice(chunk);
         let dec = aes256_decrypt_block(key, &ct);
