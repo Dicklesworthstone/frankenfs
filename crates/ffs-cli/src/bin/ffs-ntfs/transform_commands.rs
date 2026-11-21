@@ -20,7 +20,8 @@ use ffs_ondisk::ntfs_security::{
 use super::{ImageArgs, PayloadArgs, TxWriteArgs, emit_tx_outcome, json, select_write_stream};
 
 fn parse_hex_bytes(hex: &str, expected_len: Option<usize>) -> Result<Vec<u8>> {
-    let trimmed = hex.trim().strip_prefix("0x").unwrap_or(hex.trim());
+    let raw_trimmed = hex.trim();
+    let trimmed = raw_trimmed.strip_prefix("0x").unwrap_or(raw_trimmed);
     if !trimmed.len().is_multiple_of(2) {
         bail!("hex string must have even length");
     }
@@ -47,12 +48,15 @@ fn parse_hex_16(hex: &str) -> Result<[u8; 16]> {
 }
 
 fn parse_u32_hex_or_dec(raw: &str) -> Result<u32> {
-    if let Some(hex) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
-        u32::from_str_radix(hex, 16).with_context(|| format!("invalid hex u32 {raw:?}"))
-    } else {
-        raw.parse::<u32>()
-            .with_context(|| format!("invalid decimal u32 {raw:?}"))
-    }
+    raw.strip_prefix("0x")
+        .or_else(|| raw.strip_prefix("0X"))
+        .map_or_else(
+            || {
+                raw.parse::<u32>()
+                    .with_context(|| format!("invalid decimal u32 {raw:?}"))
+            },
+            |hex| u32::from_str_radix(hex, 16).with_context(|| format!("invalid hex u32 {raw:?}")),
+        )
 }
 
 fn parse_sid_string(text: &str) -> Result<NtfsSid> {

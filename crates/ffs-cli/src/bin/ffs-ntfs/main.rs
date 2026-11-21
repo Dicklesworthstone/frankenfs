@@ -2415,10 +2415,15 @@ mod tests {
             mountpoint,
             uid,
             gid,
+            sid_map,
+            enforce_acl,
+            uid_maps,
+            gid_maps,
         } = cli.command
         else {
             panic!("expected explicit native writable mount");
         };
+        assert!(!sid_map && !enforce_acl && uid_maps.is_empty() && gid_maps.is_empty());
         assert!(target.offline_image && target.allow_write && target.recover_dirty);
         assert_eq!((target.offset, target.length), (4096, Some(1_048_576)));
         assert_eq!((uid, gid), (1000, 1001));
