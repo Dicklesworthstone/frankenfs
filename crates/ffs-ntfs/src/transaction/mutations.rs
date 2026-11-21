@@ -56,7 +56,7 @@ use super::ops::{
 };
 use super::secondary::{
     EXTEND_OBJID_UPPER, EXTEND_REPARSE_UPPER, EXTEND_USNJRNL_UPPER, NtfsObjectIdData, OBJID_O_NAME,
-    REPARSE_R_NAME, append_usn_record_to_catalog, encode_objid_o_data, encode_reparse_r_key,
+    REPARSE_R_NAME, append_usn_records_to_catalog, encode_objid_o_data, encode_reparse_r_key,
     flush_view_index_into_catalog, remove_view_entries_matching, upsert_view_entry,
 };
 use super::secure::SecureStoreState;
@@ -1374,44 +1374,42 @@ impl TxWorkspace {
                 .ok_or_else(|| corrupt(0, "missing $UsnJrnl catalog"))?;
             let mut pre = Vec::new();
             let mut freed = Vec::new();
-            let mut assigned_usns = Vec::with_capacity(pending_usn.len());
-            let append_res = (|| -> Result<()> {
-                for ev in pending_usn {
-                    let sec_id = self
-                        .catalogs
-                        .get(&ev.file_ref.record)
-                        .and_then(EditableCatalog::std_security_id)
-                        .unwrap_or(0);
-                    let rec = UsnRecordV2 {
-                        file_ref: ev.file_ref,
-                        parent_ref: ev.parent_ref,
-                        usn: 0,
-                        timestamp: ev.timestamp,
-                        reason: ev.reason,
-                        source_info: 0,
-                        security_id: sec_id,
-                        file_attributes: ev.file_attributes,
-                        name: ev.file_name,
-                    };
-                    let assigned = append_usn_record_to_catalog(
-                        engine,
-                        cx,
-                        &mut usn_cat,
-                        rec,
-                        &mut pre,
-                        &mut freed,
-                        |n| self.alloc_clusters(n, 1),
-                    )?;
-                    assigned_usns.push((ev.file_ref.record, assigned));
-                }
-                Ok(())
-            })();
+            let mut usn_records = Vec::with_capacity(pending_usn.len());
+            let mut target_recs = Vec::with_capacity(pending_usn.len());
+            for ev in pending_usn {
+                let sec_id = self
+                    .catalogs
+                    .get(&ev.file_ref.record)
+                    .and_then(EditableCatalog::std_security_id)
+                    .unwrap_or(0);
+                target_recs.push(ev.file_ref.record);
+                usn_records.push(UsnRecordV2 {
+                    file_ref: ev.file_ref,
+                    parent_ref: ev.parent_ref,
+                    usn: 0,
+                    timestamp: ev.timestamp,
+                    reason: ev.reason,
+                    source_info: 0,
+                    security_id: sec_id,
+                    file_attributes: ev.file_attributes,
+                    name: ev.file_name,
+                });
+            }
+            let append_res = append_usn_records_to_catalog(
+                engine,
+                cx,
+                &mut usn_cat,
+                &mut usn_records,
+                &mut pre,
+                &mut freed,
+                |n| self.alloc_clusters(n, 1),
+            );
             self.catalogs.insert(usn_ref.record, usn_cat);
-            append_res?;
+            let assigned_offsets = append_res?;
             self.pre_payload_writes.extend(pre);
             self.free_clusters_deferred(&freed);
             self.dirty_catalogs.insert(usn_ref.record);
-            for (target_rec, usn) in assigned_usns {
+            for (target_rec, usn) in target_recs.into_iter().zip(assigned_offsets) {
                 if !self.deallocated_records.contains(&target_rec)
                     && let Some(target_cat) = self.catalogs.get_mut(&target_rec)
                 {

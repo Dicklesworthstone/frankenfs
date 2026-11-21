@@ -209,23 +209,26 @@ where
     Ok(())
 }
 
-/// COW-append one `USN_RECORD_V2` entry to `$Extend/$UsnJrnl` (`$Max` + `$J`),
-/// respecting 4 KiB page-boundary zero-padding and trimming the sparse head when
-/// live bytes exceed `$Max.maximum_size`. Returns the assigned `usn` offset.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn append_usn_record_to_catalog<FAlloc>(
+/// COW-append a batch of `USN_RECORD_V2` entries to `$Extend/$UsnJrnl` (`$Max` + `$J`)
+/// in one single COW allocation, respecting 4 KiB page-boundary zero-padding and trimming
+/// the sparse head when live bytes exceed `$Max.maximum_size`. Returns assigned `usn` offsets.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(super) fn append_usn_records_to_catalog<FAlloc>(
     engine: &NtfsTransactionEngine,
     cx: &Cx,
     usn_cat: &mut EditableCatalog,
-    mut record: UsnRecordV2,
+    records: &mut [UsnRecordV2],
     pre_payload_writes: &mut Vec<DirPrePayloadWrite>,
     freed_clusters: &mut Vec<(u64, u64)>,
     mut alloc_clusters: FAlloc,
-) -> Result<u64>
+) -> Result<Vec<u64>>
 where
     FAlloc: FnMut(u64) -> Result<Vec<(u64, u64)>>,
 {
     checkpoint(cx)?;
+    if records.is_empty() {
+        return Ok(Vec::new());
+    }
     let max_idx = usn_cat
         .data_streams
         .iter()
@@ -268,14 +271,23 @@ where
         }
     };
 
-    let rec_len = record.encoded_len();
-    let usn_offset = align_usn_offset(j_size, rec_len);
-    record.usn = usn_offset;
-    let encoded = record.encode().map_err(|err| parse_err(&err))?;
-    let new_end = usn_offset + encoded.len() as u64;
+    let mut cursor = j_size;
+    let mut assigned = Vec::with_capacity(records.len());
+    let mut staged_encoded = Vec::with_capacity(records.len());
+    for record in records.iter_mut() {
+        let rec_len = record.encoded_len();
+        let usn_offset = align_usn_offset(cursor, rec_len);
+        record.usn = usn_offset;
+        let encoded = record.encode().map_err(|err| parse_err(&err))?;
+        cursor = usn_offset + encoded.len() as u64;
+        assigned.push(usn_offset);
+        staged_encoded.push((usn_offset, encoded));
+    }
+    let first_usn_offset = assigned[0];
+    let new_end = cursor;
 
     let cb = u64::from(engine.geometry.cluster_bytes());
-    let start_vcn = usn_offset / cb;
+    let start_vcn = first_usn_offset / cb;
     let end_vcn = new_end.div_ceil(cb);
     let cow_clusters = end_vcn - start_vcn;
     let cow_byte_start = start_vcn * cb;
@@ -315,8 +327,10 @@ where
             }
         }
     }
-    let rel_write = (usn_offset - cow_byte_start) as usize;
-    buf[rel_write..rel_write + encoded.len()].copy_from_slice(&encoded);
+    for (usn_offset, encoded) in &staged_encoded {
+        let rel_write = (*usn_offset - cow_byte_start) as usize;
+        buf[rel_write..rel_write + encoded.len()].copy_from_slice(encoded);
+    }
 
     let spans = alloc_clusters(cow_clusters)?;
     let mut stage_runs = Vec::with_capacity(spans.len());
@@ -381,7 +395,8 @@ where
     j_runs = normalize_ntfs_runs(next_runs);
     freed_clusters.extend(coalesce_physical_spans(displaced));
 
-    // Trim sparse head when active journal span exceeds `maximum_size + allocation_delta`.
+    // Trim sparse head strictly before `start_vcn` when active journal span exceeds
+    // `maximum_size + allocation_delta` (never freeing clusters allocated in this TX).
     let active_span = new_end.saturating_sub(max_data.lowest_valid_usn);
     if active_span
         > max_data
@@ -392,7 +407,7 @@ where
         let trim_to = max_data
             .lowest_valid_usn
             .saturating_add(trim_step)
-            .min(usn_offset)
+            .min(start_vcn * cb)
             / cb
             * cb;
         let trim_vcns = trim_to / cb;
@@ -439,5 +454,5 @@ where
         data_bytes: new_end,
         initialized_bytes: new_end,
     };
-    Ok(usn_offset)
+    Ok(assigned)
 }
