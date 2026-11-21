@@ -5,6 +5,7 @@
 
 #[path = "persistence_prefix/ea.rs"]
 mod ea;
+#[path = "persistence_prefix/transforms.rs"]
 mod transforms;
 
 use std::collections::BTreeMap;

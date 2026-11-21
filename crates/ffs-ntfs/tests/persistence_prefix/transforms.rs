@@ -50,7 +50,7 @@ fn format_to_fault_device(
     opts.version = version;
     opts.serial = Some(serial);
     opts.logfile_bytes = Some(256 * 1024);
-    let rep = format_image_file(cx, &opts).unwrap();
+    let rep = format_image_file(cx, &opts, None).unwrap();
     assert!(rep.boot_published && rep.check_clean);
     let raw = std::fs::read(&img_path).unwrap();
     let vol_bytes = raw.len() as u64 - SECTOR_BYTES as u64;
@@ -278,8 +278,8 @@ fn ntfs_lznt1_compression_partial_write_truncate_dir_inherit_and_incompressible(
         let mut lcg = 0x1234_5678_9ABC_DEF0_u64;
         for b in &mut incomp {
             lcg = lcg
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
             *b = (lcg >> 33) as u8;
         }
         let patch_off = (cluster_bytes as usize) * 8 + 137;
@@ -494,7 +494,7 @@ fn ntfs_wof_decompression_on_write_materializes_plaintext_and_cleans_reparse() {
     assert!(vol.reparse_point(&cx, &rec).unwrap().is_none());
     let streams = vol.data_streams(&cx, &rec).unwrap();
     assert_eq!(streams.len(), 1);
-    assert!(streams[0].name.is_empty());
+    assert_eq!(streams[0].name, [] as [u16; 0]);
     engine.check_clean_consistency(&cx).unwrap();
 }
 
@@ -527,7 +527,6 @@ fn ntfs_secure_intern_dedup_multistripe_256k_inheritance_hardlink_dacl_sacl_and_
 
     // 1. Build a descriptor with SACL + DENY-before-ALLOW DACL + inheritable OI/CI/IO ACEs.
     let sd_parent = NtfsSecurityDescriptor {
-        revision: 1,
         resource_manager_control: 0,
         control: SE_SELF_RELATIVE | SE_DACL_PRESENT | SE_SACL_PRESENT,
         owner: Some(alice_sid.clone()),
@@ -634,8 +633,8 @@ fn ntfs_secure_intern_dedup_multistripe_256k_inheritance_hardlink_dacl_sacl_and_
     );
     {
         let vol = engine.volume_view(&cx).unwrap();
-        let child_rec = vol.resolve(&cx, "/sec_a/secret.txt").unwrap();
-        let info = vol.security_descriptor(&cx, &child_rec).unwrap();
+        let secret_rec = vol.resolve(&cx, "/sec_a/secret.txt").unwrap();
+        let info = vol.security_descriptor(&cx, &secret_rec).unwrap();
         assert!(
             info.descriptor
                 .dacl
@@ -692,7 +691,6 @@ fn ntfs_secure_intern_dedup_multistripe_256k_inheritance_hardlink_dacl_sacl_and_
             ));
         }
         let big_sd = NtfsSecurityDescriptor {
-            revision: 1,
             resource_manager_control: 0,
             control: SE_SELF_RELATIVE | SE_DACL_PRESENT,
             owner: Some(alice_sid.clone()),
@@ -842,11 +840,7 @@ fn ntfs_secure_intern_dedup_multistripe_256k_inheritance_hardlink_dacl_sacl_and_
         NtfsCheckLimits::default(),
     )
     .unwrap();
-    assert!(
-        chk30.is_clean(),
-        "NTFS 3.0 check failed: {:?}",
-        chk30.issues
-    );
+    assert!(chk30.clean, "NTFS 3.0 check failed: {:?}", chk30.issues);
 }
 
 #[test]
@@ -1085,7 +1079,7 @@ fn ntfs_reparse_symlink_junction_opaque_objid_usnjrnl_ea_and_refusals() {
     )
     .unwrap();
     assert!(
-        chk.is_clean(),
+        chk.clean,
         "check failed after secondary metadata ops: {:?}",
         chk.issues
     );
