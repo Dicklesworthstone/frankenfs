@@ -189,6 +189,17 @@ def probe_rw(mountpoint: Path, expected_out: Path) -> None:
     else:
         raise RuntimeError("unsupported restrictive mode 0o600 succeeded on NTFS")
     os.chmod(meta_file, 0o644)
+
+    # Mounted RW symlink + readlink + user.* xattr CRUD (`setxattr`/`getxattr`/`listxattr`/`removexattr`).
+    sym_path = mountpoint / "rw-link"
+    os.symlink("doc.txt", sym_path)
+    require(os.readlink(sym_path) == "doc.txt", "mounted symlink readlink mismatch")
+    os.setxattr(meta_file, "user.ntfs_ea", b"ea-value-1")
+    require(os.getxattr(meta_file, "user.ntfs_ea") == b"ea-value-1", "mounted getxattr mismatch")
+    require("user.ntfs_ea" in os.listxattr(meta_file), "mounted listxattr omitted user.ntfs_ea")
+    os.removexattr(meta_file, "user.ntfs_ea")
+    require("user.ntfs_ea" not in os.listxattr(meta_file), "mounted removexattr left user.ntfs_ea")
+
     sync_fd = os.open(doc, os.O_RDONLY)
     try:
         os.fsync(sync_fd)

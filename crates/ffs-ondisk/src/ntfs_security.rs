@@ -32,7 +32,9 @@ pub const ACE_FLAG_INHERITED: u8 = 0x10;
 
 pub const FILE_READ_DATA: u32 = 0x0000_0001;
 pub const FILE_WRITE_DATA: u32 = 0x0000_0002;
+pub const FILE_ADD_FILE: u32 = FILE_WRITE_DATA;
 pub const FILE_APPEND_DATA: u32 = 0x0000_0004;
+pub const FILE_ADD_SUBDIRECTORY: u32 = FILE_APPEND_DATA;
 pub const FILE_READ_EA: u32 = 0x0000_0008;
 pub const FILE_WRITE_EA: u32 = 0x0000_0010;
 pub const FILE_EXECUTE: u32 = 0x0000_0020;
@@ -201,6 +203,22 @@ impl NtfsSid {
         Self {
             authority: 1,
             subauthorities: vec![0],
+        }
+    }
+
+    #[must_use]
+    pub fn administrators() -> Self {
+        Self {
+            authority: 5,
+            subauthorities: vec![32, 544],
+        }
+    }
+
+    #[must_use]
+    pub fn local_system() -> Self {
+        Self {
+            authority: 5,
+            subauthorities: vec![18],
         }
     }
 }

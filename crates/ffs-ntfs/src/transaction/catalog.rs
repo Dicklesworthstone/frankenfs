@@ -10,18 +10,21 @@ use ffs_error::{FfsError, Result};
 use ffs_ondisk::ntfs::attribute_list::{
     NtfsAttributeListEntry, encode_attribute_list, parse_attribute_list,
 };
+use ffs_ondisk::ntfs::efs::EFS_STREAM_NAME;
 use ffs_ondisk::ntfs::index::NtfsFileName;
 use ffs_ondisk::ntfs::logfile_writer::NtfsClientUpdateSpec;
 use ffs_ondisk::ntfs::recovery::{
     FileEditResult, RecoveryPass, deallocate_file_record_slot, initialize_file_record_slot,
 };
+use ffs_ondisk::ntfs::view_index::{ViewCollation, parse_view_index_root};
 use ffs_ondisk::ntfs::{
-    ATTRIBUTE_LIST, COMPRESSED, DATA, ENCRYPTED, NtfsAttribute, NtfsFileRecord, NtfsGeometry,
-    NtfsLogOp, NtfsReference, NtfsRun, NtfsValue, REPARSE_POINT, SPARSE, decode_mapping_pairs,
-    encode_mapping_pairs, restore_record,
+    ATTRIBUTE_LIST, COMPRESSED, DATA, EA, EA_INFORMATION, ENCRYPTED, LOGGED_UTILITY_STREAM,
+    NtfsAttribute, NtfsFileRecord, NtfsGeometry, NtfsLogOp, NtfsReference, NtfsRun, NtfsValue,
+    OBJECT_ID, REPARSE_POINT, SPARSE, decode_mapping_pairs, encode_mapping_pairs, restore_record,
 };
 
 use super::dir_index::{DirPrePayloadWrite, I30_NAME, encode_resident_attribute};
+use super::view_index::EditableViewIndex;
 use super::{
     NtfsTransactionEngine, SECTOR_BYTES, checkpoint, corrupt, map_logical_offset, parse_err,
     read_mapped_runs, read_mft_record_raw_via_runs, unsupported,
@@ -97,12 +100,14 @@ fn refuse_unsupported_record_metadata(
     record: &NtfsFileRecord,
     raw_record: &[u8],
     attrs: &[NtfsAttribute<'_>],
+    allow_view_index_record: bool,
 ) -> Result<()> {
-    // Bit 0x0008 (MFT_RECORD_IS_VIEW_INDEX, e.g. $Secure/$ObjId/$Quota/$Reparse) is
-    // always refused. Bit 0x0004 (MFT_RECORD_IS_4) is set by mkntfs on system records
-    // including Record 5 (FILE_root); admit and preserve it on Record 5 while keeping
-    // user/metadata records (record != 5) carrying 0x0004 (MFT_RECORD_IN_EXTEND) refused.
-    if record.flags & 0x0008 != 0 || (record.number != 5 && record.flags & 0x0004 != 0) {
+    // Bit 0x0008 (MFT_RECORD_IS_VIEW_INDEX, e.g. $Secure/$ObjId/$Quota/$Reparse) and
+    // bit 0x0004 (MFT_RECORD_IN_EXTEND) are only admitted on explicit view-index/extend
+    // system records (and bit 0x0004 on Record 5 as emitted by mkntfs).
+    if !allow_view_index_record
+        && (record.flags & 0x0008 != 0 || (record.number != 5 && record.flags & 0x0004 != 0))
+    {
         return Err(unsupported(format!(
             "record {} carries metadata or view-index FILE flags {:#x}",
             record.number, record.flags
@@ -110,53 +115,65 @@ fn refuse_unsupported_record_metadata(
     }
     check_raw_resident_data_flags(raw_record)?;
     for attr in attrs {
-        if attr.flags & (COMPRESSED | ENCRYPTED) != 0 {
-            return Err(unsupported(format!(
-                "record {} carries compressed or EFS-encrypted attribute {:#x}",
-                record.number, attr.kind
-            )));
-        }
-        if attr.flags & !SPARSE != 0 {
+        if attr.flags & !(SPARSE | COMPRESSED | ENCRYPTED) != 0 {
             return Err(unsupported(format!(
                 "record {} carries unknown attribute flags {:#x}",
                 record.number, attr.flags
             )));
         }
+        if (attr.flags & COMPRESSED != 0) && (attr.flags & ENCRYPTED != 0) {
+            return Err(unsupported(format!(
+                "record {} combines COMPRESSED and ENCRYPTED on attribute {:#x}",
+                record.number, attr.kind
+            )));
+        }
+        if (attr.flags & (COMPRESSED | ENCRYPTED) != 0) && attr.kind != DATA {
+            return Err(unsupported(format!(
+                "record {} carries compressed or encrypted non-DATA attribute {:#x}",
+                record.number, attr.kind
+            )));
+        }
         match attr.kind {
             ATTR_STANDARD_INFORMATION if attr.name.is_empty() => {
                 if let NtfsValue::Resident(std_bytes) = attr.value
-                    && std_bytes.len() >= 36
+                    && std_bytes.len() == 72
                 {
-                    let flags = u32::from_le_bytes([
-                        std_bytes[32],
-                        std_bytes[33],
-                        std_bytes[34],
-                        std_bytes[35],
+                    let owner_id = u32::from_le_bytes([
+                        std_bytes[48],
+                        std_bytes[49],
+                        std_bytes[50],
+                        std_bytes[51],
                     ]);
-                    if flags & (0x0400 | 0x0800 | 0x4000) != 0 {
+                    let quota_charged = u64::from_le_bytes([
+                        std_bytes[56],
+                        std_bytes[57],
+                        std_bytes[58],
+                        std_bytes[59],
+                        std_bytes[60],
+                        std_bytes[61],
+                        std_bytes[62],
+                        std_bytes[63],
+                    ]);
+                    if owner_id != 0 || quota_charged != 0 {
                         return Err(unsupported(format!(
-                            "record {} has unsupported file attribute flags {flags:#x}",
+                            "record {} carries active NTFS quota accounting (owner_id={owner_id}, quota_charged={quota_charged})",
                             record.number
                         )));
                     }
                 }
             }
-            0x40 => {
-                return Err(unsupported(format!(
-                    "record {} carries $OBJECT_ID (0x40); $Extend/$ObjId maintenance is refused",
-                    record.number
-                )));
+            LOGGED_UTILITY_STREAM => {
+                if attr.name != EFS_STREAM_NAME {
+                    return Err(unsupported(format!(
+                        "record {} carries unsupported logged utility stream ($TXF_DATA / unknown 0x100)",
+                        record.number
+                    )));
+                }
             }
-            REPARSE_POINT => {
+            0xF0 => {
                 return Err(unsupported(format!(
-                    "record {} carries $REPARSE_POINT (0xC0); reparse write maintenance is refused",
+                    "record {} carries unsupported attribute 0xF0",
                     record.number
-                )));
-            }
-            0x100 | 0xF0 => {
-                return Err(unsupported(format!(
-                    "record {} carries unsupported attribute {:#x}",
-                    record.number, attr.kind
                 )));
             }
             _ => {}
@@ -394,6 +411,8 @@ pub(super) enum EditableStreamStorage {
     NonResident {
         runs: Vec<NtfsRun>,
         sparse: bool,
+        compressed: bool,
+        encrypted: bool,
         compression_unit: u16,
         data_bytes: u64,
         initialized_bytes: u64,
@@ -417,9 +436,14 @@ impl EditableDataStream {
     pub(super) fn allocated_for_filename(&self, cluster_bytes: u32) -> u64 {
         match &self.storage {
             EditableStreamStorage::Resident(bytes) => (bytes.len() as u64).next_multiple_of(8),
-            EditableStreamStorage::NonResident { runs, sparse, .. } => {
+            EditableStreamStorage::NonResident {
+                runs,
+                sparse,
+                compressed,
+                ..
+            } => {
                 let cb = u64::from(cluster_bytes);
-                if *sparse {
+                if *sparse || *compressed {
                     runs.iter()
                         .filter(|r| r.lcn.is_some())
                         .map(|r| r.clusters * cb)
@@ -469,13 +493,19 @@ pub(super) struct EditableCatalog {
     pub(super) is_directory: bool,
     pub(super) std_info: Vec<u8>,
     pub(super) file_names: Vec<EditableFileName>,
+    pub(super) object_id: Option<Vec<u8>>,
     pub(super) security_descriptor: Option<Vec<u8>>,
     pub(super) data_streams: Vec<EditableDataStream>,
     pub(super) dir_index: Option<EditableDirIndex>,
+    pub(super) view_indexes: Vec<EditableViewIndex>,
+    pub(super) reparse_point: Option<Vec<u8>>,
+    pub(super) ea_pair: Option<(Vec<u8>, Vec<u8>)>,
+    pub(super) efs_stream: Option<Vec<u8>>,
     pub(super) preserved: Vec<PreservedAttribute>,
     pub(super) old_base_raw: Vec<u8>,
     pub(super) old_extensions: Vec<(u32, u16, Vec<u8>)>,
     pub(super) old_nonres_attrlist_runs: Vec<NtfsRun>,
+    pub(super) old_owned_extra_runs: Vec<NtfsRun>,
 }
 
 impl EditableCatalog {
@@ -552,8 +582,35 @@ impl EditableCatalog {
         }
     }
 
-    /// Synchronize duplicated timestamps, file-attribute flags, and unnamed `$DATA` sizes
-    /// onto all `0x30` `FILE_NAME` attributes of this record.
+    pub(super) fn std_security_id(&self) -> Option<u32> {
+        if self.std_info.len() == 72 {
+            let id = u32::from_le_bytes([
+                self.std_info[52],
+                self.std_info[53],
+                self.std_info[54],
+                self.std_info[55],
+            ]);
+            (id != 0).then_some(id)
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn set_std_security_id(&mut self, sec_id: u32) {
+        if self.std_info.len() < 72 {
+            self.std_info.resize(72, 0);
+        }
+        self.std_info[52..56].copy_from_slice(&sec_id.to_le_bytes());
+    }
+
+    pub(super) fn set_std_usn(&mut self, usn: u64) {
+        if self.std_info.len() == 72 {
+            self.std_info[64..72].copy_from_slice(&usn.to_le_bytes());
+        }
+    }
+
+    /// Synchronize duplicated timestamps, file-attribute flags, reparse/EA tag, and
+    /// unnamed `$DATA` sizes onto all `0x30` `FILE_NAME` attributes of this record.
     pub(super) fn sync_filename_duplicated_fields(&mut self, cluster_bytes: u32) {
         let (ctime, mtime, mft_time, atime) = self.std_times();
         let base_flags = self.std_flags() & !0x1000_0000;
@@ -561,6 +618,17 @@ impl EditableCatalog {
             base_flags | 0x1000_0000
         } else {
             base_flags
+        };
+        let dup_reparse = if let Some(ref rp) = self.reparse_point
+            && rp.len() >= 4
+        {
+            u32::from_le_bytes([rp[0], rp[1], rp[2], rp[3]])
+        } else if let Some((ref ea_info, _)) = self.ea_pair
+            && ea_info.len() >= 2
+        {
+            u32::from(u16::from_le_bytes([ea_info[0], ea_info[1]]))
+        } else {
+            0
         };
         let (alloc_sz, data_sz) = if self.is_directory {
             (0_u64, 0_u64)
@@ -580,6 +648,7 @@ impl EditableCatalog {
             fn_attr.allocated_size = alloc_sz;
             fn_attr.data_size = data_sz;
             fn_attr.flags = dup_flags;
+            fn_attr.reparse = dup_reparse;
         }
     }
 }
@@ -624,7 +693,11 @@ pub(super) fn encode_nonresident_extent(
 ) -> Result<Vec<u8>> {
     let (pairs, last_vcn) = encode_mapping_pairs(runs_slice, first_vcn, volume_clusters)
         .map_err(|err| parse_err(&err))?;
-    let header_len: usize = if flags & SPARSE != 0 { 72 } else { 64 };
+    let header_len: usize = if flags & (SPARSE | COMPRESSED) != 0 {
+        72
+    } else {
+        64
+    };
     let name_bytes = name.len() * 2;
     let mapping_off = (header_len + name_bytes).next_multiple_of(8);
     let total_len = (mapping_off + pairs.len()).next_multiple_of(8);
@@ -663,13 +736,12 @@ fn split_nonresident_stream_extents(
     name: &[u16],
     folded_name: &[u16],
     runs: &[NtfsRun],
-    sparse: bool,
+    flags: u16,
     compression_unit: u16,
     data_bytes: u64,
     initialized_bytes: u64,
     max_attr_bytes: usize,
 ) -> Result<Vec<CandidateAttr>> {
-    let flags = if sparse { SPARSE } else { 0 };
     let cb = u64::from(geometry.cluster_bytes());
     let total_vcns: u64 = runs.iter().map(|r| r.clusters).sum();
     let coverage = total_vcns
@@ -866,6 +938,7 @@ fn split_nonresident_stream_extents(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_restored_mft_record(
     record_bytes: u32,
+    ntfs_version: [u8; 2],
     record_no: u32,
     sequence: u16,
     is_directory: bool,
@@ -876,7 +949,7 @@ pub(super) fn build_restored_mft_record(
     next_attr_id: u16,
 ) -> Result<Vec<u8>> {
     let len = record_bytes as usize;
-    let usa_offset: u16 = 48;
+    let usa_offset: u16 = if ntfs_version == [3, 0] { 42 } else { 48 };
     let usa_count = u16::try_from(len / SECTOR_BYTES + 1).map_err(|_| corrupt(0, "usa_count"))?;
     let first_attr = (usize::from(usa_offset) + usize::from(usa_count) * 2).next_multiple_of(8);
     let attrs_bytes: usize = sorted_encoded_attrs.iter().map(Vec::len).sum();
@@ -897,9 +970,9 @@ pub(super) fn build_restored_mft_record(
     buf[18..20].copy_from_slice(&links.to_le_bytes());
     buf[20..22].copy_from_slice(&(first_attr as u16).to_le_bytes());
     let flags: u16 = if base_reference.is_none() && is_directory {
-        0x0003 | (preserved_base_flags & 0x0004)
+        0x0003 | (preserved_base_flags & 0x000C)
     } else if base_reference.is_none() {
-        0x0001 | (preserved_base_flags & 0x0004)
+        0x0001 | (preserved_base_flags & 0x000C)
     } else {
         0x0001
     };
@@ -911,7 +984,9 @@ pub(super) fn build_restored_mft_record(
         buf[32..40].copy_from_slice(&enc.to_le_bytes());
     }
     buf[40..42].copy_from_slice(&next_attr_id.to_le_bytes());
-    buf[44..48].copy_from_slice(&record_no.to_le_bytes());
+    if usa_offset == 48 {
+        buf[44..48].copy_from_slice(&record_no.to_le_bytes());
+    }
     let mut pos = first_attr;
     for raw_attr in sorted_encoded_attrs {
         buf[pos..pos + raw_attr.len()].copy_from_slice(raw_attr);
@@ -1070,14 +1145,34 @@ impl NtfsTransactionEngine {
         Ok(path)
     }
 
-    /// Load a complete base + extension MFT record catalog into an [`EditableCatalog`],
-    /// enforcing write-profile refusals (`0x40`, `0xC0`, `0x100`, `COMPRESSED`, `ENCRYPTED`).
-    #[allow(clippy::too_many_lines)]
+    /// Load a complete base + extension MFT record catalog into an [`EditableCatalog`].
     pub(super) fn load_editable_catalog(
         &self,
         cx: &Cx,
         mft_runs: &[NtfsRun],
         base_ref: NtfsReference,
+    ) -> Result<EditableCatalog> {
+        self.load_editable_catalog_with_options(cx, mft_runs, base_ref, false)
+    }
+
+    /// Load a view-index / `$Extend` system record catalog (such as `$Secure`, `$Reparse`,
+    /// `$ObjId`, or `$UsnJrnl`) whose FILE flags include `0x0008` / `0x0004`.
+    pub(super) fn load_view_index_catalog(
+        &self,
+        cx: &Cx,
+        mft_runs: &[NtfsRun],
+        base_ref: NtfsReference,
+    ) -> Result<EditableCatalog> {
+        self.load_editable_catalog_with_options(cx, mft_runs, base_ref, true)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn load_editable_catalog_with_options(
+        &self,
+        cx: &Cx,
+        mft_runs: &[NtfsRun],
+        base_ref: NtfsReference,
+        allow_view_index_record: bool,
     ) -> Result<EditableCatalog> {
         checkpoint(cx)?;
         if base_ref.sequence == 0 {
@@ -1095,7 +1190,11 @@ impl NtfsTransactionEngine {
         }
         let old_base_raw =
             read_mft_record_raw_via_runs(&self.device, cx, &self.geometry, mft_runs, base_no)?;
-        let base_record = NtfsFileRecord::parse(&old_base_raw).map_err(|err| parse_err(&err))?;
+        let mut base_record =
+            NtfsFileRecord::parse(&old_base_raw).map_err(|err| parse_err(&err))?;
+        if base_record.self_number.is_none() {
+            base_record.number = base_no;
+        }
         if !base_record.in_use()
             || base_record.number != base_no
             || base_record.sequence != base_ref.sequence
@@ -1107,7 +1206,12 @@ impl NtfsTransactionEngine {
         }
 
         let base_attrs = base_record.attributes().map_err(|err| parse_err(&err))?;
-        refuse_unsupported_record_metadata(&base_record, &old_base_raw, &base_attrs)?;
+        refuse_unsupported_record_metadata(
+            &base_record,
+            &old_base_raw,
+            &base_attrs,
+            allow_view_index_record,
+        )?;
 
         let mut old_extensions: Vec<(u32, u16, Vec<u8>)> = Vec::new();
         let mut ext_records: BTreeMap<u32, NtfsFileRecord> = BTreeMap::new();
@@ -1164,7 +1268,11 @@ impl NtfsTransactionEngine {
                     mft_runs,
                     ext_no,
                 )?;
-                let parsed_ext = NtfsFileRecord::parse(&raw_ext).map_err(|err| parse_err(&err))?;
+                let mut parsed_ext =
+                    NtfsFileRecord::parse(&raw_ext).map_err(|err| parse_err(&err))?;
+                if parsed_ext.self_number.is_none() {
+                    parsed_ext.number = ext_no;
+                }
                 if !parsed_ext.in_use()
                     || parsed_ext.sequence != entry.reference.sequence
                     || parsed_ext.base != base_ref
@@ -1175,7 +1283,12 @@ impl NtfsTransactionEngine {
                     ));
                 }
                 let ext_attrs = parsed_ext.attributes().map_err(|err| parse_err(&err))?;
-                refuse_unsupported_record_metadata(&parsed_ext, &raw_ext, &ext_attrs)?;
+                refuse_unsupported_record_metadata(
+                    &parsed_ext,
+                    &raw_ext,
+                    &ext_attrs,
+                    allow_view_index_record,
+                )?;
                 old_extensions.push((ext_no, parsed_ext.sequence, raw_ext));
                 ext_records.insert(ext_no, parsed_ext);
             }
@@ -1202,13 +1315,22 @@ impl NtfsTransactionEngine {
 
         let mut std_info: Option<Vec<u8>> = None;
         let mut file_names: Vec<EditableFileName> = Vec::new();
+        let mut object_id: Option<Vec<u8>> = None;
         let mut security_descriptor: Option<Vec<u8>> = None;
         let mut data_groups: BTreeMap<Vec<u16>, (Vec<u16>, Vec<NtfsAttribute<'_>>)> =
             BTreeMap::new();
         let mut i30_root: Option<Vec<u8>> = None;
         let mut i30_alloc_extents: Vec<NtfsAttribute<'_>> = Vec::new();
         let mut i30_bitmap: Option<Vec<u8>> = None;
+        let mut view_roots: BTreeMap<Vec<u16>, Vec<u8>> = BTreeMap::new();
+        let mut view_allocs: BTreeMap<Vec<u16>, Vec<NtfsAttribute<'_>>> = BTreeMap::new();
+        let mut view_bitmaps: BTreeMap<Vec<u16>, Vec<u8>> = BTreeMap::new();
+        let mut reparse_point: Option<Vec<u8>> = None;
+        let mut ea_info_bytes: Option<Vec<u8>> = None;
+        let mut ea_bytes: Option<Vec<u8>> = None;
+        let mut efs_stream: Option<Vec<u8>> = None;
         let mut preserved: Vec<PreservedAttribute> = Vec::new();
+        let mut old_owned_extra_runs: Vec<NtfsRun> = Vec::new();
 
         for attr in all_attrs {
             match attr.kind {
@@ -1224,6 +1346,12 @@ impl NtfsTransactionEngine {
                     };
                     file_names.push(EditableFileName::parse_raw(bytes)?);
                 }
+                OBJECT_ID if attr.name.is_empty() => {
+                    let NtfsValue::Resident(bytes) = attr.value else {
+                        return Err(corrupt(0, "nonresident $OBJECT_ID"));
+                    };
+                    object_id = Some(bytes.to_vec());
+                }
                 ATTR_SECURITY_DESCRIPTOR if attr.name.is_empty() => match attr.value {
                     NtfsValue::Resident(bytes) => {
                         security_descriptor = Some(bytes.to_vec());
@@ -1237,7 +1365,7 @@ impl NtfsTransactionEngine {
                         )
                         .map_err(|err| parse_err(&err))?;
                         if nr.first_vcn == 0 {
-                            let _ = read_mapped_runs(
+                            let bytes = read_mapped_runs(
                                 &self.device,
                                 cx,
                                 &self.geometry,
@@ -1245,21 +1373,9 @@ impl NtfsTransactionEngine {
                                 0,
                                 nr.data_bytes as usize,
                             )?;
+                            security_descriptor = Some(bytes);
                         }
-                        preserved.push(PreservedAttribute {
-                            kind: ATTR_SECURITY_DESCRIPTOR,
-                            flags: attr.flags,
-                            name: Vec::new(),
-                            raw_without_id: PreservedValue::NonResident {
-                                first_vcn: nr.first_vcn,
-                                last_vcn: nr.last_vcn,
-                                compression_unit: nr.compression_unit,
-                                allocated_bytes: nr.allocated_bytes,
-                                data_bytes: nr.data_bytes,
-                                initialized_bytes: nr.initialized_bytes,
-                                mapping_pairs: nr.mapping_pairs.to_vec(),
-                            },
-                        });
+                        old_owned_extra_runs.extend(runs);
                     }
                 },
                 DATA => {
@@ -1306,6 +1422,120 @@ impl NtfsTransactionEngine {
                             0,
                             nr.data_bytes as usize,
                         )?);
+                        old_owned_extra_runs.extend(runs);
+                    }
+                },
+                ATTR_INDEX_ROOT if allow_view_index_record && !attr.name.is_empty() => {
+                    let NtfsValue::Resident(bytes) = attr.value else {
+                        return Err(corrupt(0, "nonresident view INDEX_ROOT"));
+                    };
+                    view_roots.insert(attr.name, bytes.to_vec());
+                }
+                ATTR_INDEX_ALLOCATION if allow_view_index_record && !attr.name.is_empty() => {
+                    view_allocs.entry(attr.name.clone()).or_default().push(attr);
+                }
+                ATTR_BITMAP if allow_view_index_record && !attr.name.is_empty() => {
+                    match attr.value {
+                        NtfsValue::Resident(bytes) => {
+                            view_bitmaps.insert(attr.name, bytes.to_vec());
+                        }
+                        NtfsValue::NonResident(nr) => {
+                            let runs = decode_mapping_pairs(
+                                nr.mapping_pairs,
+                                nr.first_vcn,
+                                nr.last_vcn,
+                                self.geometry.cluster_count(),
+                            )
+                            .map_err(|err| parse_err(&err))?;
+                            let bm = read_mapped_runs(
+                                &self.device,
+                                cx,
+                                &self.geometry,
+                                &runs,
+                                0,
+                                nr.data_bytes as usize,
+                            )?;
+                            view_bitmaps.insert(attr.name, bm);
+                            old_owned_extra_runs.extend(runs);
+                        }
+                    }
+                }
+                REPARSE_POINT if attr.name.is_empty() => match attr.value {
+                    NtfsValue::Resident(bytes) => {
+                        reparse_point = Some(bytes.to_vec());
+                    }
+                    NtfsValue::NonResident(nr) => {
+                        let runs = decode_mapping_pairs(
+                            nr.mapping_pairs,
+                            nr.first_vcn,
+                            nr.last_vcn,
+                            self.geometry.cluster_count(),
+                        )
+                        .map_err(|err| parse_err(&err))?;
+                        let bytes = read_mapped_runs(
+                            &self.device,
+                            cx,
+                            &self.geometry,
+                            &runs,
+                            0,
+                            nr.data_bytes as usize,
+                        )?;
+                        reparse_point = Some(bytes);
+                        old_owned_extra_runs.extend(runs);
+                    }
+                },
+                EA_INFORMATION if attr.name.is_empty() => {
+                    let NtfsValue::Resident(bytes) = attr.value else {
+                        return Err(corrupt(0, "nonresident $EA_INFORMATION"));
+                    };
+                    ea_info_bytes = Some(bytes.to_vec());
+                }
+                EA if attr.name.is_empty() => match attr.value {
+                    NtfsValue::Resident(bytes) => {
+                        ea_bytes = Some(bytes.to_vec());
+                    }
+                    NtfsValue::NonResident(nr) => {
+                        let runs = decode_mapping_pairs(
+                            nr.mapping_pairs,
+                            nr.first_vcn,
+                            nr.last_vcn,
+                            self.geometry.cluster_count(),
+                        )
+                        .map_err(|err| parse_err(&err))?;
+                        let bytes = read_mapped_runs(
+                            &self.device,
+                            cx,
+                            &self.geometry,
+                            &runs,
+                            0,
+                            nr.data_bytes as usize,
+                        )?;
+                        ea_bytes = Some(bytes);
+                        old_owned_extra_runs.extend(runs);
+                    }
+                },
+                LOGGED_UTILITY_STREAM if attr.name == EFS_STREAM_NAME => match attr.value {
+                    NtfsValue::Resident(bytes) => {
+                        efs_stream = Some(bytes.to_vec());
+                    }
+                    NtfsValue::NonResident(nr) => {
+                        let runs = decode_mapping_pairs(
+                            nr.mapping_pairs,
+                            nr.first_vcn,
+                            nr.last_vcn,
+                            self.geometry.cluster_count(),
+                        )
+                        .map_err(|err| parse_err(&err))?;
+                        let bytes = read_mapped_runs(
+                            &self.device,
+                            cx,
+                            &self.geometry,
+                            &runs,
+                            0,
+                            nr.data_bytes as usize,
+                        )?;
+                        efs_stream = Some(bytes);
+                        old_owned_extra_runs.extend(runs);
                     }
                 },
                 other => {
@@ -1337,6 +1567,12 @@ impl NtfsTransactionEngine {
         let std_info =
             std_info.ok_or_else(|| corrupt(0, "missing STANDARD_INFORMATION on base record"))?;
 
+        let ea_pair = match (ea_info_bytes, ea_bytes) {
+            (Some(info), Some(data)) => Some((info, data)),
+            (None, None) => None,
+            _ => return Err(corrupt(0, "mismatched $EA_INFORMATION and $EA attributes")),
+        };
+
         let mut data_streams = Vec::new();
         for (_folded, (orig_name, mut extents)) in data_groups {
             if extents.len() == 1
@@ -1357,6 +1593,8 @@ impl NtfsTransactionEngine {
             });
             let first_flags = extents[0].flags;
             let sparse = (first_flags & SPARSE) != 0;
+            let compressed = (first_flags & COMPRESSED) != 0;
+            let encrypted = (first_flags & ENCRYPTED) != 0;
             let mut combined_runs = Vec::new();
             let mut data_bytes = 0_u64;
             let mut init_bytes = 0_u64;
@@ -1366,8 +1604,8 @@ impl NtfsTransactionEngine {
                 let NtfsValue::NonResident(nr) = &ext.value else {
                     return Err(corrupt(0, "mixed resident/nonresident DATA extents"));
                 };
-                if ((ext.flags & SPARSE) != 0) != sparse {
-                    return Err(corrupt(0, "inconsistent SPARSE flag across DATA extents"));
+                if ext.flags != first_flags {
+                    return Err(corrupt(0, "inconsistent storage flags across DATA extents"));
                 }
                 if idx == 0 {
                     if nr.first_vcn != 0 {
@@ -1386,7 +1624,7 @@ impl NtfsTransactionEngine {
                     self.geometry.cluster_count(),
                 )
                 .map_err(|err| parse_err(&err))?;
-                if !sparse && decoded.iter().any(|r| r.lcn.is_none()) {
+                if !sparse && !compressed && decoded.iter().any(|r| r.lcn.is_none()) {
                     return Err(corrupt(0, "sparse hole in non-SPARSE DATA stream"));
                 }
                 expected_vcn = decoded.last().map_or(expected_vcn, |r| r.vcn + r.clusters);
@@ -1401,6 +1639,8 @@ impl NtfsTransactionEngine {
                 storage: EditableStreamStorage::NonResident {
                     runs: normalize_ntfs_runs(combined_runs),
                     sparse,
+                    compressed,
+                    encrypted,
                     compression_unit: comp_unit,
                     data_bytes,
                     initialized_bytes: init_bytes,
@@ -1446,18 +1686,68 @@ impl NtfsTransactionEngine {
             None
         };
 
+        let mut view_indexes = Vec::new();
+        for (idx_name, root_bytes) in view_roots {
+            let parsed_root =
+                parse_view_index_root(&root_bytes, self.geometry.cluster_bytes(), None)
+                    .map_err(|err| parse_err(&err))?;
+            let collation: ViewCollation = parsed_root.collation;
+            let external = if let Some(mut allocs) = view_allocs.remove(&idx_name) {
+                allocs.sort_by_key(|a| match &a.value {
+                    NtfsValue::Resident(_) => 0,
+                    NtfsValue::NonResident(nr) => nr.first_vcn,
+                });
+                let mut a0_runs = Vec::new();
+                let mut a0_size = 0_u64;
+                for (i, ext) in allocs.iter().enumerate() {
+                    let NtfsValue::NonResident(nr) = &ext.value else {
+                        return Err(corrupt(0, "resident view INDEX_ALLOCATION"));
+                    };
+                    if i == 0 {
+                        a0_size = nr.data_bytes;
+                    }
+                    let decoded = decode_mapping_pairs(
+                        nr.mapping_pairs,
+                        nr.first_vcn,
+                        nr.last_vcn,
+                        self.geometry.cluster_count(),
+                    )
+                    .map_err(|err| parse_err(&err))?;
+                    a0_runs.extend(decoded);
+                }
+                let bm = view_bitmaps
+                    .remove(&idx_name)
+                    .ok_or_else(|| corrupt(0, "missing view-index BITMAP"))?;
+                Some((normalize_ntfs_runs(a0_runs), a0_size, bm))
+            } else {
+                None
+            };
+            view_indexes.push(EditableViewIndex {
+                index_name: idx_name,
+                collation,
+                index_root: root_bytes,
+                external,
+            });
+        }
+
         Ok(EditableCatalog {
             base_ref,
             is_directory: base_record.is_directory(),
             std_info,
             file_names,
+            object_id,
             security_descriptor,
             data_streams,
             dir_index,
+            view_indexes,
+            reparse_point,
+            ea_pair,
+            efs_stream,
             preserved,
             old_base_raw,
             old_extensions,
             old_nonres_attrlist_runs,
+            old_owned_extra_runs,
         })
     }
 
@@ -1478,13 +1768,14 @@ impl NtfsTransactionEngine {
         FClus: FnMut(u64) -> Result<Vec<(u64, u64)>>,
     {
         let rec_bytes = self.geometry.record_bytes();
+        let usa_offset: usize = if self.version == [3, 0] { 42 } else { 48 };
         let usa_count = (rec_bytes as usize) / SECTOR_BYTES + 1;
-        let first_attr = (48 + usa_count * 2).next_multiple_of(8);
+        let first_attr = (usa_offset + usa_count * 2).next_multiple_of(8);
         let max_record_body = (rec_bytes as usize) - first_attr - 8;
         let max_ext_attr_bytes = max_record_body;
 
         let preserved_base_flags = if catalog.old_base_raw.len() >= 24 {
-            u16::from_le_bytes([catalog.old_base_raw[22], catalog.old_base_raw[23]]) & 0x0004
+            u16::from_le_bytes([catalog.old_base_raw[22], catalog.old_base_raw[23]]) & 0x000C
         } else {
             0
         };
@@ -1505,6 +1796,7 @@ impl NtfsTransactionEngine {
         }
 
         let mut candidates: Vec<CandidateAttr> = Vec::new();
+        let mut pre_payload_writes: Vec<DirPrePayloadWrite> = Vec::new();
 
         {
             let si = catalog.std_info.clone();
@@ -1539,7 +1831,22 @@ impl NtfsTransactionEngine {
             });
         }
 
-        let mut pre_payload_writes: Vec<DirPrePayloadWrite> = Vec::new();
+        if let Some(ref oid) = catalog.object_id {
+            let oid_cl = oid.clone();
+            let est = encode_resident_attribute(OBJECT_ID, 0, &[], false, &oid_cl)?.len();
+            candidates.push(CandidateAttr {
+                kind: OBJECT_ID,
+                name: Vec::new(),
+                folded_name: Vec::new(),
+                first_vcn: 0,
+                keep_in_base_priority: 2,
+                encode_with_id: Box::new(move |id| {
+                    encode_resident_attribute(OBJECT_ID, id, &[], false, &oid_cl)
+                }),
+                estimated_len: est,
+            });
+        }
+
         if let Some(ref sd) = catalog.security_descriptor {
             let sd_cl = sd.clone();
             let sample =
@@ -1581,7 +1888,7 @@ impl NtfsTransactionEngine {
                     &[],
                     &[],
                     &sd_runs,
-                    false,
+                    0,
                     0,
                     sd_len,
                     sd_len,
@@ -1619,17 +1926,29 @@ impl NtfsTransactionEngine {
                 EditableStreamStorage::NonResident {
                     runs,
                     sparse,
+                    compressed,
+                    encrypted,
                     compression_unit,
                     data_bytes,
                     initialized_bytes,
                 } => {
+                    let mut flags = 0_u16;
+                    if sparse {
+                        flags |= SPARSE;
+                    }
+                    if compressed {
+                        flags |= COMPRESSED;
+                    }
+                    if encrypted {
+                        flags |= ENCRYPTED;
+                    }
                     let extents = split_nonresident_stream_extents(
                         &self.geometry,
                         DATA,
                         &stream.name,
                         &folded,
                         &runs,
-                        sparse,
+                        flags,
                         compression_unit,
                         data_bytes,
                         initialized_bytes,
@@ -1662,7 +1981,7 @@ impl NtfsTransactionEngine {
                     &I30_NAME,
                     &I30_NAME,
                     a0_runs,
-                    false,
+                    0,
                     0,
                     a0_size,
                     a0_size,
@@ -1710,7 +2029,7 @@ impl NtfsTransactionEngine {
                         &I30_NAME,
                         &I30_NAME,
                         &b0_runs,
-                        false,
+                        0,
                         0,
                         b0_len,
                         b0_len,
@@ -1719,6 +2038,155 @@ impl NtfsTransactionEngine {
                     candidates.extend(b0_extents);
                 }
             }
+        }
+
+        for view in &catalog.view_indexes {
+            let vname = view.index_name.clone();
+            let vfolded = self.fold_upcase(&vname);
+            let ir = view.index_root.clone();
+            let vname_ir = vname.clone();
+            let est_ir = encode_resident_attribute(ATTR_INDEX_ROOT, 0, &vname, false, &ir)?.len();
+            candidates.push(CandidateAttr {
+                kind: ATTR_INDEX_ROOT,
+                name: vname.clone(),
+                folded_name: vfolded.clone(),
+                first_vcn: 0,
+                keep_in_base_priority: 2,
+                encode_with_id: Box::new(move |id| {
+                    encode_resident_attribute(ATTR_INDEX_ROOT, id, &vname_ir, false, &ir)
+                }),
+                estimated_len: est_ir,
+            });
+            if let Some((ref a0_runs, a0_size, ref b0_bytes)) = view.external {
+                let a0_extents = split_nonresident_stream_extents(
+                    &self.geometry,
+                    ATTR_INDEX_ALLOCATION,
+                    &vname,
+                    &vfolded,
+                    a0_runs,
+                    0,
+                    0,
+                    a0_size,
+                    a0_size,
+                    max_ext_attr_bytes,
+                )?;
+                candidates.extend(a0_extents);
+
+                let b0_cl = b0_bytes.clone();
+                let vname_b0 = vname.clone();
+                let sample_b0 = encode_resident_attribute(ATTR_BITMAP, 0, &vname, false, &b0_cl)?;
+                if sample_b0.len() <= max_ext_attr_bytes {
+                    let est_b0 = sample_b0.len();
+                    candidates.push(CandidateAttr {
+                        kind: ATTR_BITMAP,
+                        name: vname,
+                        folded_name: vfolded,
+                        first_vcn: 0,
+                        keep_in_base_priority: 2,
+                        encode_with_id: Box::new(move |id| {
+                            encode_resident_attribute(ATTR_BITMAP, id, &vname_b0, false, &b0_cl)
+                        }),
+                        estimated_len: est_b0,
+                    });
+                } else {
+                    let cb = u64::from(self.geometry.cluster_bytes());
+                    let need_cl = (b0_cl.len() as u64).div_ceil(cb);
+                    let spans = allocate_clusters(need_cl)?;
+                    let mut b0_runs = Vec::new();
+                    let mut cur_vcn = 0_u64;
+                    for &(lcn, cnt) in &spans {
+                        b0_runs.push(NtfsRun {
+                            vcn: cur_vcn,
+                            clusters: cnt,
+                            lcn: Some(lcn),
+                        });
+                        cur_vcn += cnt;
+                    }
+                    let mut padded = vec![0_u8; (need_cl * cb) as usize];
+                    padded[..b0_cl.len()].copy_from_slice(&b0_cl);
+                    stage_runs_writes(&self.geometry, &b0_runs, &padded, &mut pre_payload_writes)?;
+                    let b0_len = b0_cl.len() as u64;
+                    let b0_extents = split_nonresident_stream_extents(
+                        &self.geometry,
+                        ATTR_BITMAP,
+                        &vname,
+                        &vfolded,
+                        &b0_runs,
+                        0,
+                        0,
+                        b0_len,
+                        b0_len,
+                        max_ext_attr_bytes,
+                    )?;
+                    candidates.extend(b0_extents);
+                }
+            }
+        }
+
+        // Helper for optional resident-or-spill blob attributes ($REPARSE_POINT, $EA, $EFS).
+        let mut push_blob_attr = |kind: u32, name: &[u16], blob: &[u8]| -> Result<()> {
+            let folded = self.fold_upcase(name);
+            let nm = name.to_vec();
+            let nm_cl = nm.clone();
+            let data_cl = blob.to_vec();
+            let sample = encode_resident_attribute(kind, 0, &nm, false, &data_cl)?;
+            if sample.len() <= max_ext_attr_bytes {
+                let est = sample.len();
+                candidates.push(CandidateAttr {
+                    kind,
+                    name: nm,
+                    folded_name: folded,
+                    first_vcn: 0,
+                    keep_in_base_priority: 2,
+                    encode_with_id: Box::new(move |id| {
+                        encode_resident_attribute(kind, id, &nm_cl, false, &data_cl)
+                    }),
+                    estimated_len: est,
+                });
+            } else {
+                let cb = u64::from(self.geometry.cluster_bytes());
+                let need_cl = (data_cl.len() as u64).div_ceil(cb);
+                let spans = allocate_clusters(need_cl)?;
+                let mut runs = Vec::new();
+                let mut cur_vcn = 0_u64;
+                for &(lcn, cnt) in &spans {
+                    runs.push(NtfsRun {
+                        vcn: cur_vcn,
+                        clusters: cnt,
+                        lcn: Some(lcn),
+                    });
+                    cur_vcn += cnt;
+                }
+                let mut padded = vec![0_u8; (need_cl * cb) as usize];
+                padded[..data_cl.len()].copy_from_slice(&data_cl);
+                stage_runs_writes(&self.geometry, &runs, &padded, &mut pre_payload_writes)?;
+                let blen = data_cl.len() as u64;
+                let exts = split_nonresident_stream_extents(
+                    &self.geometry,
+                    kind,
+                    &nm,
+                    &folded,
+                    &runs,
+                    0,
+                    0,
+                    blen,
+                    blen,
+                    max_ext_attr_bytes,
+                )?;
+                candidates.extend(exts);
+            }
+            Ok(())
+        };
+
+        if let Some(ref rp) = catalog.reparse_point {
+            push_blob_attr(REPARSE_POINT, &[], rp)?;
+        }
+        if let Some((ref ea_info, ref ea_data)) = catalog.ea_pair {
+            push_blob_attr(EA_INFORMATION, &[], ea_info)?;
+            push_blob_attr(EA, &[], ea_data)?;
+        }
+        if let Some(ref efs_raw) = catalog.efs_stream {
+            push_blob_attr(LOGGED_UTILITY_STREAM, &EFS_STREAM_NAME, efs_raw)?;
         }
 
         for pres in &catalog.preserved {
@@ -1760,7 +2228,11 @@ impl NtfsTransactionEngine {
                     let db = *data_bytes;
                     let ib = *initialized_bytes;
                     let mp = mapping_pairs.clone();
-                    let hdr_len = if flags & SPARSE != 0 { 72 } else { 64 };
+                    let hdr_len = if flags & (SPARSE | COMPRESSED) != 0 {
+                        72
+                    } else {
+                        64
+                    };
                     let mp_off = (hdr_len + nm.len() * 2).next_multiple_of(8);
                     let est = (mp_off + mp.len()).next_multiple_of(8);
                     candidates.push(CandidateAttr {
@@ -1808,7 +2280,9 @@ impl NtfsTransactionEngine {
                 .then_with(|| a.first_vcn.cmp(&b.first_vcn))
         });
 
-        let freed_clusters = physical_spans_of_runs(&catalog.old_nonres_attrlist_runs);
+        let mut freed_clusters = physical_spans_of_runs(&catalog.old_nonres_attrlist_runs);
+        freed_clusters.extend(physical_spans_of_runs(&catalog.old_owned_extra_runs));
+        let freed_clusters = coalesce_physical_spans(freed_clusters);
         let mut freed_mft_slots = Vec::new();
         let mut mft_record_writes = Vec::new();
         let mut log_specs = Vec::new();
@@ -1826,6 +2300,7 @@ impl NtfsTransactionEngine {
             let next_id = u16::try_from(encoded.len()).map_err(|_| FfsError::NoSpace)?;
             let new_base_restored = build_restored_mft_record(
                 rec_bytes,
+                self.version,
                 base_no,
                 catalog.base_ref.sequence,
                 catalog.is_directory,
@@ -1990,6 +2465,7 @@ impl NtfsTransactionEngine {
             let next_ext_id = u16::try_from(ext_encoded.len()).map_err(|_| FfsError::NoSpace)?;
             let new_ext_restored = build_restored_mft_record(
                 rec_bytes,
+                self.version,
                 ext_slot,
                 ext_seq,
                 false,
@@ -2074,6 +2550,7 @@ impl NtfsTransactionEngine {
             .collect();
         let new_base_restored = build_restored_mft_record(
             rec_bytes,
+            self.version,
             base_no,
             catalog.base_ref.sequence,
             catalog.is_directory,

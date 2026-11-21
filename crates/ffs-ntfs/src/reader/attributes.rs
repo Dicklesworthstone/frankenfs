@@ -33,7 +33,7 @@ impl AttributeSet<'_> {
         self.extensions.keys().copied()
     }
 
-    pub(super) fn all(&self) -> Result<Vec<NtfsAttribute<'_>>> {
+    pub(crate) fn all(&self) -> Result<Vec<NtfsAttribute<'_>>> {
         let mut result = Vec::new();
         for record in std::iter::once(self.base).chain(self.extensions.values()) {
             result.extend(
@@ -47,7 +47,7 @@ impl AttributeSet<'_> {
         Ok(result)
     }
 
-    pub(super) fn select(
+    pub(crate) fn select(
         &self,
         geometry: &NtfsGeometry,
         kind: u32,
@@ -58,6 +58,32 @@ impl AttributeSet<'_> {
             .into_iter()
             .filter(|attr| attr.kind == kind && attr.name == name)
             .collect();
+        Stream::from_attributes(geometry, &matches)
+    }
+
+    /// Explicit EFS-only raw ciphertext selector permitting `ENCRYPTED (0x4000)` on
+    /// unnamed `$DATA`. Ordinary [`Self::select`] and `data_stream` remain strictly
+    /// refused for encrypted attributes.
+    pub(crate) fn select_raw_encrypted(
+        &self,
+        geometry: &NtfsGeometry,
+        kind: u32,
+        name: &[u16],
+    ) -> Result<Stream> {
+        let mut matches: Vec<_> = self
+            .all()?
+            .into_iter()
+            .filter(|attr| attr.kind == kind && attr.name == name)
+            .collect();
+        for attr in &mut matches {
+            if attr.flags & !(SPARSE | ffs_ondisk::ntfs::ENCRYPTED) != 0 {
+                return Err(unsupported(format!(
+                    "NTFS encrypted attribute flags {:#06x} are unsupported",
+                    attr.flags
+                )));
+            }
+            attr.flags &= !ffs_ondisk::ntfs::ENCRYPTED;
+        }
         Stream::from_attributes(geometry, &matches)
     }
 }

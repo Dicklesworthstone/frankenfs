@@ -6,16 +6,22 @@
 
 mod btree;
 mod catalog;
+mod compression;
 mod dir_index;
 mod mutations;
 mod ops;
 mod recovery;
+mod secondary;
+mod secure;
+mod transforms;
+mod view_index;
 
 pub use mutations::{
     NtfsExtendedRenameOutcome, NtfsRenameOutcome, validate_ntfs_component_utf16,
     validate_ntfs_stream_name_utf16,
 };
 pub use ops::DEFAULT_NTFS_FILETIME;
+pub use secondary::{NtfsObjectIdData, NtfsUsnSummary};
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, Metadata, OpenOptions};
@@ -418,10 +424,11 @@ pub(super) struct OpenAttrRuntime {
 /// Optional post-stage callback invoked immediately after a persistence event is recorded.
 pub type NtfsStageHook = Box<dyn FnMut(&NtfsPersistenceEvent) -> Result<()> + Send + Sync>;
 
-/// Explicitly admitted native NTFS 3.1 transaction & ARIES `$LogFile` recovery engine.
+/// Explicitly admitted native NTFS 3.0/3.1 transaction & ARIES `$LogFile` recovery engine.
 pub struct NtfsTransactionEngine {
     pub(super) device: Arc<dyn ByteDevice>,
     pub(super) geometry: NtfsGeometry,
+    pub(super) version: [u8; 2],
     pub(super) storage_identity: NtfsStorageIdentity,
     pub(super) upcase: Box<[u16]>,
     pub(super) logfile_runs: Vec<NtfsRun>,
@@ -644,13 +651,17 @@ impl NtfsTransactionEngine {
             return Err(corrupt(0, "$MFT mapping disagrees with boot cluster"));
         }
 
-        // Validate $Volume (record 3) version 3.1 and volume flags.
+        // Validate $Volume (record 3) version 3.0 or 3.1 and volume flags.
         let vol_rec = read_mft_record_via_runs(&bounded, cx, &geometry, &mft_runs, 3)?;
         let vol_info = extract_resident_attr(&vol_rec, VOLUME_INFORMATION, &[])?;
-        if vol_info.len() < 12 || vol_info[8..10] != [3, 1] {
+        if vol_info.len() < 12 || !matches!(vol_info[8..10], [3, 0 | 1]) {
             return Err(unsupported(
-                "NTFS native transactions admit version 3.1 only",
+                "NTFS native transactions admit versions 3.0 and 3.1 only",
             ));
+        }
+        let version = [vol_info[8], vol_info[9]];
+        if version == [3, 1] && (mft0.usa_offset < 48 || mft0.self_number != Some(0)) {
+            return Err(corrupt(0, "NTFS 3.1 $MFT record 0 missing 48-byte header"));
         }
         let vol_flags = u16::from_le_bytes([vol_info[10], vol_info[11]]);
         if vol_flags & !0x0001 != 0 {
@@ -659,7 +670,7 @@ impl NtfsTransactionEngine {
             )));
         }
 
-        // Validate system metadata records 0..11 have no EFS/compression/sparse transforms on primary streams.
+        // Validate system metadata records 0..10 have no EFS/compression/sparse/TxF transforms on primary streams.
         for sys_no in [0_u32, 1, 2, 3, 5, 6, 10] {
             let rec = read_mft_record_via_runs(&bounded, cx, &geometry, &mft_runs, sys_no)?;
             for attr in rec.attributes().map_err(|err| parse_err(&err))? {
@@ -727,6 +738,7 @@ impl NtfsTransactionEngine {
         let mut engine = Self {
             device: bounded,
             geometry,
+            version,
             storage_identity,
             upcase,
             logfile_runs,
@@ -800,7 +812,8 @@ impl NtfsTransactionEngine {
                 }
             }
 
-            // Refuse active $UsnJrnl ($J / $Max / $DATA).
+            // Validate active $UsnJrnl ($Max + $J framing) if present; admit well-formed
+            // active change journals while refusing corrupt/non-sparse/$TXF_DATA states.
             if let Some(usn_ref) =
                 self.lookup_in_directory_raw(cx, mft_runs, &extend_rec, &USNJRNL_UPPER)?
             {
@@ -811,12 +824,55 @@ impl NtfsTransactionEngine {
                 if usn_rec.sequence != usn_ref.sequence {
                     return Err(corrupt(0, "stale $Extend/$UsnJrnl directory entry"));
                 }
-                for attr in usn_rec.attributes().map_err(|err| parse_err(&err))? {
-                    if attr.kind == ATTRIBUTE_LIST || attr.kind == DATA || attr.kind == 0x100 {
+                let usn_attrs = usn_rec.attributes().map_err(|err| parse_err(&err))?;
+                let mut has_max = false;
+                let mut has_j = false;
+                for attr in &usn_attrs {
+                    if attr.kind == 0x100 {
                         return Err(unsupported(
-                            "active NTFS $UsnJrnl change journal is refused for native writes",
+                            "NTFS $UsnJrnl carrying $TXF_DATA is refused for native writes",
                         ));
                     }
+                    if attr.kind == ATTRIBUTE_LIST {
+                        return Err(unsupported(
+                            "NTFS $UsnJrnl with $ATTRIBUTE_LIST is refused for native writes",
+                        ));
+                    }
+                    if attr.kind == DATA {
+                        if attr.name == secondary::USN_MAX_NAME {
+                            let NtfsValue::Resident(raw) = attr.value else {
+                                return Err(corrupt(0, "$UsnJrnl:$Max must be resident"));
+                            };
+                            let _ = ffs_ondisk::ntfs::usn::UsnMaxData::parse(raw)
+                                .map_err(|err| parse_err(&err))?;
+                            has_max = true;
+                        } else if attr.name == secondary::USN_J_NAME {
+                            if attr.flags & SPARSE == 0 || attr.flags & !SPARSE != 0 {
+                                return Err(unsupported(
+                                    "$UsnJrnl:$J must be a SPARSE non-resident stream",
+                                ));
+                            }
+                            let NtfsValue::NonResident(ref nr) = attr.value else {
+                                return Err(corrupt(0, "$UsnJrnl:$J must be non-resident"));
+                            };
+                            if nr.first_vcn != 0 {
+                                return Err(unsupported(
+                                    "$UsnJrnl:$J must start at VCN 0 in base record",
+                                ));
+                            }
+                            has_j = true;
+                        } else {
+                            return Err(unsupported(
+                                "unexpected DATA stream on $Extend/$UsnJrnl is refused",
+                            ));
+                        }
+                    }
+                }
+                if has_max != has_j {
+                    return Err(corrupt(
+                        0,
+                        "$Extend/$UsnJrnl must contain both $Max and $J or neither",
+                    ));
                 }
             }
 
@@ -845,10 +901,34 @@ impl NtfsTransactionEngine {
                     "NTFS $Quota with transformed attributes, extension catalog or $TXF_DATA is refused",
                 ));
             }
-            if attr.kind == 0xA0 && attr.name == DOLLAR_Q_NAME {
+            if attr.kind == 0xA0
+                && (attr.name == DOLLAR_Q_NAME || attr.name == secondary::OBJID_O_NAME)
+            {
                 return Err(unsupported(
-                    "NTFS $Quota with external $Q index blocks is refused",
+                    "NTFS $Quota with external $Q or $O index blocks is refused",
                 ));
+            }
+            if attr.kind == 0x90 && attr.name == secondary::OBJID_O_NAME {
+                let NtfsValue::Resident(ir) = attr.value else {
+                    return Err(corrupt(0, "nonresident $Quota::$O INDEX_ROOT"));
+                };
+                let parsed = ffs_ondisk::ntfs::view_index::parse_view_index_root(
+                    ir,
+                    4096,
+                    Some(ffs_ondisk::ntfs::view_index::ViewCollation::RawBytes),
+                )
+                .map_err(|err| parse_err(&err))?;
+                let live_o: Vec<_> = parsed.entries.iter().filter(|e| !e.is_terminal).collect();
+                const ADMINISTRATORS: [u8; 16] = [1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 32, 2, 0, 0];
+                for ent in live_o {
+                    if ent.key.as_slice() != ADMINISTRATORS
+                        || ent.data.as_slice() != 0x100_u32.to_le_bytes()
+                    {
+                        return Err(unsupported(
+                            "non-bootstrap per-user NTFS $Quota::$O owner SID mapping is refused",
+                        ));
+                    }
+                }
             }
             if attr.kind == 0x90 && attr.name == DOLLAR_Q_NAME {
                 if found_root {
@@ -1133,6 +1213,11 @@ impl NtfsTransactionEngine {
     }
 
     #[must_use]
+    pub const fn version(&self) -> [u8; 2] {
+        self.version
+    }
+
+    #[must_use]
     pub const fn storage_identity(&self) -> &NtfsStorageIdentity {
         &self.storage_identity
     }
@@ -1253,6 +1338,7 @@ impl NtfsTransactionEngine {
                 ));
             }
         }
+        let _ = volume.usn_summary(cx)?;
         Ok(())
     }
 
@@ -1908,11 +1994,14 @@ pub(super) fn read_mft_record_via_runs(
     number: u32,
 ) -> Result<NtfsFileRecord> {
     let raw = read_mft_record_raw_via_runs(device, cx, geometry, mft_runs, number)?;
-    let rec = NtfsFileRecord::parse(&raw).map_err(|err| parse_err(&err))?;
-    if !rec.in_use() || rec.number != number {
+    let mut rec = NtfsFileRecord::parse(&raw).map_err(|err| parse_err(&err))?;
+    if !rec.in_use() || rec.self_number.is_some_and(|n| n != number) {
         return Err(FfsError::NotFound(format!(
             "MFT record {number} inactive or mismatched"
         )));
+    }
+    if rec.self_number.is_none() {
+        rec.number = number;
     }
     Ok(rec)
 }

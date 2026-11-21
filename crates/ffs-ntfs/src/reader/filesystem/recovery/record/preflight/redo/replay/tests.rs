@@ -585,6 +585,7 @@ fn concrete_volume_adapter_uses_selected_bounds_fragmented_mft_and_native_bitmap
             overlay: std::collections::BTreeMap::new(),
         },
         geometry,
+        version: [3, 1],
         mft: Stream {
             storage: Storage::Mapped(vec![
                 NtfsRun {

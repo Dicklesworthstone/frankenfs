@@ -6,10 +6,17 @@
 
 use super::{
     Cache, Cx, FfsError, FileType, InodeAttr, InodeNumber, Mutex, NtfsFs, NtfsReference,
-    NtfsTransactionEngine, OsStr, ROOT, Result, SetAttrRequest, SystemTime, TICKS_PER_SECOND,
-    UNIX_EPOCH, UNIX_FILETIME, checkpoint, is_ads_ino, parse_ads_component, reference, unsupported,
+    NtfsTransactionEngine, OsStr, Path, ROOT, Result, SetAttrRequest, SystemTime, TICKS_PER_SECOND,
+    UNIX_EPOCH, UNIX_FILETIME, XattrSetMode, checkpoint, is_ads_ino, parse_ads_component,
+    reference, unsupported,
 };
+use crate::security_policy::{NtfsSecurityPatch, NtfsSidPolicy};
 use crate::transaction::{DEFAULT_NTFS_FILETIME, NtfsTxOutcome, validate_ntfs_component_utf16};
+use ffs_ondisk::ntfs::ea::MAX_EA_NAME_BYTES;
+use ffs_ondisk::ntfs_security::{
+    FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_DELETE_CHILD, FILE_READ_DATA, FILE_WRITE_DATA,
+    STANDARD_DELETE, STANDARD_WRITE_DAC, STANDARD_WRITE_OWNER,
+};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -51,6 +58,17 @@ impl NtfsFs {
     /// entire lifetime. Ordinary `new`/`new_recovered` constructors remain
     /// read-only. Native transforms not admitted by the writer stay refused.
     pub fn from_engine(cx: &Cx, engine: NtfsTransactionEngine, uid: u32, gid: u32) -> Result<Self> {
+        Self::from_engine_with_policy(cx, engine, NtfsSidPolicy::Synthetic { uid, gid })
+    }
+
+    /// Adopt an explicitly admitted native writer with an explicit SID/ACL policy
+    /// (enabling native SID ownership projection, MS-DTYP DACL enforcement, and
+    /// SACL-preserving `chmod`/`chown` when `NtfsSidPolicy::Mapped` is supplied).
+    pub fn from_engine_with_policy(
+        cx: &Cx,
+        engine: NtfsTransactionEngine,
+        policy: NtfsSidPolicy,
+    ) -> Result<Self> {
         if engine.requires_recovery() {
             return Err(unsupported(
                 "NTFS writer requires recovery before filesystem admission",
@@ -58,7 +76,7 @@ impl NtfsFs {
         }
         engine.check_clean_consistency(cx)?;
         let volume = engine.volume_view(cx)?;
-        let mut fs = Self::new(cx, volume, uid, gid)?;
+        let mut fs = Self::new_with_policy(cx, volume, policy)?;
         fs.writer = Some(Mutex::new(engine));
         // Construction populated attributes using read-only permissions.
         *fs.cache()? = Cache::default();
@@ -252,8 +270,15 @@ impl NtfsFs {
         if writing {
             self.ensure_writable()?;
             self.data_target(cx, ino)?;
+            if !is_ads_ino(ino) {
+                let rec = self.record(cx, ino)?;
+                self.enforce_dacl(cx, &rec, FILE_WRITE_DATA)?;
+            }
         } else if self.describe(cx, ino)?.kind == FileType::Directory {
             return Err(FfsError::IsDirectory);
+        } else if !is_ads_ino(ino) {
+            let rec = self.record(cx, ino)?;
+            self.enforce_dacl(cx, &rec, FILE_READ_DATA)?;
         }
         // Validate the data interpretation before returning a usable handle.
         self.stream(cx, ino)?;
@@ -379,7 +404,24 @@ impl NtfsFs {
         mode: u16,
     ) -> Result<InodeAttr> {
         self.ensure_writable()?;
-        let read_only = Self::check_create_mode(mode, false)?;
+        let parent_rec = self.record(cx, parent)?;
+        self.enforce_dacl(cx, &parent_rec, FILE_ADD_FILE)?;
+        let mapped_mode = if matches!(self.sid_policy, NtfsSidPolicy::Mapped { .. }) {
+            let ftype = u32::from(mode) & libc::S_IFMT;
+            if ftype != 0 && ftype != libc::S_IFREG {
+                return Err(unsupported(
+                    "requested file type does not match NTFS create operation",
+                ));
+            }
+            Some(mode & 0o777)
+        } else {
+            None
+        };
+        let read_only = if let Some(perm) = mapped_mode {
+            (perm & 0o222) == 0
+        } else {
+            Self::check_create_mode(mode, false)?
+        };
         if let Some((base, stream)) = self.ads_mutation_component(cx, parent, name)? {
             if read_only {
                 return Err(unsupported(
@@ -406,6 +448,28 @@ impl NtfsFs {
         } else {
             self.transact(cx, |engine| engine.create_file_at(cx, parent, &name, &[]))?
         };
+        if let (
+            Some(perm),
+            NtfsSidPolicy::Mapped {
+                caller_uid,
+                caller_gid,
+                map,
+            },
+        ) = (mapped_mode, &self.sid_policy)
+        {
+            let owner = map.sid_for_uid(*caller_uid)?;
+            let group = map.sid_for_gid(*caller_gid)?;
+            let patch = NtfsSecurityPatch {
+                owner: Some(owner),
+                group: Some(group),
+                replace_dacl: None,
+                posix_mode: Some((perm, false)),
+                dacl_protected: None,
+            };
+            self.transact(cx, |engine| {
+                engine.patch_security_at(cx, target, &patch, DEFAULT_NTFS_FILETIME)
+            })?;
+        }
         cx.masked(|| self.describe(cx, self.inode(target)?))
     }
 
@@ -417,7 +481,24 @@ impl NtfsFs {
         mode: u16,
     ) -> Result<InodeAttr> {
         self.ensure_writable()?;
-        let read_only = Self::check_create_mode(mode, true)?;
+        let parent_rec = self.record(cx, parent)?;
+        self.enforce_dacl(cx, &parent_rec, FILE_ADD_SUBDIRECTORY)?;
+        let mapped_mode = if matches!(self.sid_policy, NtfsSidPolicy::Mapped { .. }) {
+            let ftype = u32::from(mode) & libc::S_IFMT;
+            if ftype != 0 && ftype != libc::S_IFDIR {
+                return Err(unsupported(
+                    "requested file type does not match NTFS mkdir operation",
+                ));
+            }
+            Some(mode & 0o777)
+        } else {
+            None
+        };
+        let read_only = if let Some(perm) = mapped_mode {
+            (perm & 0o222) == 0
+        } else {
+            Self::check_create_mode(mode, true)?
+        };
         let name = self.component(parent, name)?;
         let parent = self.directory_reference(cx, parent)?;
         let target = if read_only {
@@ -427,6 +508,28 @@ impl NtfsFs {
         } else {
             self.transact(cx, |engine| engine.mkdir_at(cx, parent, &name))?
         };
+        if let (
+            Some(perm),
+            NtfsSidPolicy::Mapped {
+                caller_uid,
+                caller_gid,
+                map,
+            },
+        ) = (mapped_mode, &self.sid_policy)
+        {
+            let owner = map.sid_for_uid(*caller_uid)?;
+            let group = map.sid_for_gid(*caller_gid)?;
+            let patch = NtfsSecurityPatch {
+                owner: Some(owner),
+                group: Some(group),
+                replace_dacl: None,
+                posix_mode: Some((perm, true)),
+                dacl_protected: None,
+            };
+            self.transact(cx, |engine| {
+                engine.patch_security_at(cx, target, &patch, DEFAULT_NTFS_FILETIME)
+            })?;
+        }
         cx.masked(|| self.describe(cx, self.inode(target)?))
     }
 
@@ -438,6 +541,10 @@ impl NtfsFs {
         data: &[u8],
     ) -> Result<u32> {
         self.ensure_writable()?;
+        if !is_ads_ino(ino) {
+            let rec = self.record(cx, ino)?;
+            self.enforce_dacl(cx, &rec, FILE_WRITE_DATA)?;
+        }
         let size = u32::try_from(data.len()).map_err(|_| invalid_argument())?;
         let (target, stream) = self.data_target(cx, ino)?;
         self.transact(cx, |engine| {
@@ -446,6 +553,7 @@ impl NtfsFs {
         Ok(size)
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(super) fn setattr_locked(
         &self,
         cx: &Cx,
@@ -454,15 +562,14 @@ impl NtfsFs {
     ) -> Result<InodeAttr> {
         self.ensure_writable()?;
         let current = self.describe(cx, ino)?;
-        // Refuse unsupported ownership changes before mutating anything.
-        if attrs.uid.is_some_and(|uid| uid != current.uid)
-            || attrs.gid.is_some_and(|gid| gid != current.gid)
-        {
-            return Err(unsupported(
-                "native NTFS ownership mutation is not admitted",
-            ));
-        }
         if is_ads_ino(ino) {
+            if attrs.uid.is_some_and(|uid| uid != current.uid)
+                || attrs.gid.is_some_and(|gid| gid != current.gid)
+            {
+                return Err(unsupported(
+                    "native NTFS alternate-stream ownership mutation is not admitted",
+                ));
+            }
             if attrs.mode.is_some_and(|mode| {
                 let ftype = u32::from(mode) & libc::S_IFMT;
                 (ftype != 0 && ftype != libc::S_IFREG) || (mode & 0o7777) != current.perm
@@ -483,44 +590,106 @@ impl NtfsFs {
             return Ok(current);
         }
 
-        let mut new_read_only = match attrs.mode {
-            Some(raw_mode) => {
-                // Linux FUSE FUSE_SETATTR supplies file-type bits (e.g. S_IFREG | 0o444)
-                // whereas direct FsOps callers pass permission bits (`ftype == 0`).
-                let ftype = u32::from(raw_mode) & libc::S_IFMT;
-                let perm = raw_mode & 0o7777;
-                match current.kind {
-                    FileType::Directory if ftype == 0 || ftype == libc::S_IFDIR => {
-                        if perm == current.perm {
-                            None
-                        } else if ino != ROOT && matches!(perm, 0o555 | 0o755) {
-                            Some(perm == 0o555)
-                        } else {
-                            return Err(unsupported(
-                                "requested mode cannot be represented by the NTFS host projection",
-                            ));
+        let target_rec = self.record(cx, ino)?;
+        let base_ref = reference(&target_rec);
+
+        // Under Mapped SID policy, translate chown & chmod onto native `$Secure` / `0x50`
+        // descriptors while preserving SACLs and non-POSIX ACEs!
+        let mut security_patch: Option<NtfsSecurityPatch> = None;
+        let mut new_read_only: Option<bool> = None;
+        match &self.sid_policy {
+            NtfsSidPolicy::Synthetic { .. } => {
+                if attrs.uid.is_some_and(|uid| uid != current.uid)
+                    || attrs.gid.is_some_and(|gid| gid != current.gid)
+                {
+                    return Err(unsupported(
+                        "native NTFS ownership mutation is not admitted",
+                    ));
+                }
+                new_read_only = match attrs.mode {
+                    Some(raw_mode) => {
+                        let ftype = u32::from(raw_mode) & libc::S_IFMT;
+                        let perm = raw_mode & 0o7777;
+                        match current.kind {
+                            FileType::Directory if ftype == 0 || ftype == libc::S_IFDIR => {
+                                if perm == current.perm {
+                                    None
+                                } else if ino != ROOT && matches!(perm, 0o555 | 0o755) {
+                                    Some(perm == 0o555)
+                                } else {
+                                    return Err(unsupported(
+                                        "requested mode cannot be represented by the NTFS host projection",
+                                    ));
+                                }
+                            }
+                            FileType::RegularFile if ftype == 0 || ftype == libc::S_IFREG => {
+                                if perm == current.perm {
+                                    None
+                                } else if matches!(perm, 0o444 | 0o644) {
+                                    Some(perm == 0o444)
+                                } else {
+                                    return Err(unsupported(
+                                        "requested mode cannot be represented by the NTFS host projection",
+                                    ));
+                                }
+                            }
+                            _ => {
+                                return Err(unsupported(
+                                    "requested mode cannot be represented by the NTFS host projection",
+                                ));
+                            }
                         }
                     }
-                    FileType::RegularFile if ftype == 0 || ftype == libc::S_IFREG => {
-                        if perm == current.perm {
-                            None
-                        } else if matches!(perm, 0o444 | 0o644) {
-                            Some(perm == 0o444)
-                        } else {
-                            return Err(unsupported(
-                                "requested mode cannot be represented by the NTFS host projection",
-                            ));
-                        }
-                    }
-                    _ => {
+                    None => None,
+                };
+            }
+            NtfsSidPolicy::Mapped { map, .. } => {
+                let mut patch = NtfsSecurityPatch::default();
+                let mut touched_sec = if let Some(uid) = attrs.uid
+                    && uid != current.uid
+                {
+                    self.enforce_dacl(cx, &target_rec, STANDARD_WRITE_OWNER)?;
+                    patch.owner = Some(map.sid_for_uid(uid)?);
+                    true
+                } else {
+                    false
+                };
+                if let Some(gid) = attrs.gid
+                    && gid != current.gid
+                {
+                    self.enforce_dacl(cx, &target_rec, STANDARD_WRITE_OWNER)?;
+                    patch.group = Some(map.sid_for_gid(gid)?);
+                    touched_sec = true;
+                }
+                if let Some(raw_mode) = attrs.mode {
+                    let ftype = u32::from(raw_mode) & libc::S_IFMT;
+                    let expected = match current.kind {
+                        FileType::Directory => libc::S_IFDIR,
+                        FileType::RegularFile => libc::S_IFREG,
+                        FileType::Symlink => libc::S_IFLNK,
+                        _ => 0,
+                    };
+                    if ftype != 0 && expected != 0 && ftype != expected {
                         return Err(unsupported(
-                            "requested mode cannot be represented by the NTFS host projection",
+                            "requested file type does not match NTFS inode kind",
                         ));
                     }
+                    let perm = raw_mode & 0o777;
+                    if perm != (current.perm & 0o777) {
+                        self.enforce_dacl(cx, &target_rec, STANDARD_WRITE_DAC)?;
+                        patch.posix_mode = Some((perm, current.kind == FileType::Directory));
+                        touched_sec = true;
+                        if ino != ROOT {
+                            new_read_only = Some((perm & 0o222) == 0);
+                        }
+                    }
+                }
+                if touched_sec {
+                    security_patch = Some(patch);
                 }
             }
-            None => None,
-        };
+        }
+
         let mtime_ft = match attrs.mtime {
             Some(mtime) if mtime != current.mtime => Some(system_time_to_filetime(mtime)?),
             _ => None,
@@ -538,22 +707,29 @@ impl NtfsFs {
                     "NTFS native mutation requires an ordinary file",
                 ));
             }
+            self.enforce_dacl(cx, &target_rec, FILE_WRITE_DATA)?;
             if (current.perm & 0o222 == 0) && new_read_only != Some(false) {
                 return Err(FfsError::PermissionDenied);
             }
         }
 
         if attrs.size.is_none()
+            && security_patch.is_none()
             && new_read_only.is_none()
             && mtime_ft.is_none()
             && atime_ft.is_none()
         {
             return Ok(current);
         }
-        if attrs.size.is_some() && (current.perm & 0o222 == 0) && new_read_only == Some(false) {
-            let base_ref = reference(&self.record(cx, ino)?);
+        let now_ft = mtime_ft.or(atime_ft).unwrap_or(DEFAULT_NTFS_FILETIME);
+        if let Some(patch) = security_patch {
             self.transact(cx, |engine| {
-                engine.set_metadata_at(cx, base_ref, Some(false), None, None, DEFAULT_NTFS_FILETIME)
+                engine.patch_security_at(cx, base_ref, &patch, now_ft)
+            })?;
+        }
+        if attrs.size.is_some() && (current.perm & 0o222 == 0) && new_read_only == Some(false) {
+            self.transact(cx, |engine| {
+                engine.set_metadata_at(cx, base_ref, Some(false), None, None, now_ft)
             })?;
             new_read_only = None;
         }
@@ -564,8 +740,6 @@ impl NtfsFs {
             })?;
         }
         if new_read_only.is_some() || mtime_ft.is_some() || atime_ft.is_some() {
-            let base_ref = reference(&self.record(cx, ino)?);
-            let now_ft = mtime_ft.or(atime_ft).unwrap_or(DEFAULT_NTFS_FILETIME);
             self.transact(cx, |engine| {
                 engine.set_metadata_at(cx, base_ref, new_read_only, atime_ft, mtime_ft, now_ft)
             })?;
@@ -619,10 +793,15 @@ impl NtfsFs {
             self.retire_ads(attr.ino)?;
             return Ok(());
         }
+        let parent_rec = self.record(cx, parent)?;
         let name = self.component(parent, name)?;
         let parent = self.directory_reference(cx, parent)?;
         let target = self.writer()?.lookup_reference(cx, parent, &name)?;
         let ino = self.inode(target)?;
+        let target_rec = self.record(cx, ino)?;
+        if self.enforce_dacl(cx, &target_rec, STANDARD_DELETE).is_err() {
+            self.enforce_dacl(cx, &parent_rec, FILE_DELETE_CHILD)?;
+        }
         let attr = self.describe(cx, ino)?;
         if attr.kind == FileType::Directory {
             return Err(FfsError::IsDirectory);
@@ -932,5 +1111,167 @@ impl NtfsFs {
         engine.sync_device(cx)?;
         self.health.mark_clean();
         Ok(())
+    }
+
+    pub(super) fn symlink_locked(
+        &self,
+        cx: &Cx,
+        parent: InodeNumber,
+        name: &OsStr,
+        target: &Path,
+    ) -> Result<InodeAttr> {
+        self.ensure_writable()?;
+        let parent_rec = self.record(cx, parent)?;
+        self.enforce_dacl(cx, &parent_rec, FILE_ADD_FILE)?;
+        let target_str = target
+            .to_str()
+            .ok_or_else(|| unsupported("NTFS symlink target requires lossless UTF-8"))?;
+        if target_str.is_empty()
+            || target_str.starts_with(['/', '\\'])
+            || target_str.contains([':', '\0'])
+        {
+            return Err(unsupported(
+                "mounted NTFS symlink creation admits relative, non-stream-qualified targets only",
+            ));
+        }
+        if target_str.len() > 4095 || target_str.split('/').any(|c| c.len() > 255) {
+            return Err(FfsError::NameTooLong);
+        }
+        let native_target = target_str.replace('/', "\\");
+        let target_utf16: Vec<u16> = native_target.encode_utf16().collect();
+        let name_utf16 = self.component(parent, name)?;
+        let dir_ref = self.directory_reference(cx, parent)?;
+        let child_ref = self.transact(cx, |engine| {
+            engine.create_symlink_at(
+                cx,
+                dir_ref,
+                &name_utf16,
+                &target_utf16,
+                true,
+                false,
+                DEFAULT_NTFS_FILETIME,
+            )
+        })?;
+        cx.masked(|| self.describe(cx, self.inode(child_ref)?))
+    }
+
+    pub(super) fn fallocate_locked(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        offset: u64,
+        length: u64,
+        mode: i32,
+    ) -> Result<()> {
+        self.ensure_writable()?;
+        if !is_ads_ino(ino) {
+            let rec = self.record(cx, ino)?;
+            self.enforce_dacl(cx, &rec, FILE_WRITE_DATA)?;
+        }
+        let (target, stream) = self.data_target(cx, ino)?;
+        let punch_keep = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
+        if mode == punch_keep {
+            let _ = self.transact(cx, |engine| {
+                engine.punch_hole_at(
+                    cx,
+                    target,
+                    &stream,
+                    offset,
+                    length,
+                    true,
+                    DEFAULT_NTFS_FILETIME,
+                )
+            })?;
+            return Ok(());
+        }
+        if mode == 0 {
+            let current = self.describe(cx, ino)?;
+            let end = offset.checked_add(length).ok_or_else(invalid_argument)?;
+            if end > current.size {
+                self.transact(cx, |engine| {
+                    engine.truncate_stream(cx, target, &stream, end)
+                })?;
+            }
+            return Ok(());
+        }
+        Err(unsupported(format!(
+            "NTFS fallocate mode {mode:#x} is not supported (admits 0 or PUNCH_HOLE|KEEP_SIZE)"
+        )))
+    }
+
+    pub(super) fn setxattr_locked(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        name: &str,
+        value: &[u8],
+        mode: XattrSetMode,
+    ) -> Result<()> {
+        self.ensure_writable()?;
+        if name.len() > MAX_EA_NAME_BYTES {
+            return Err(FfsError::NameTooLong);
+        }
+        let Some(suffix) = name.strip_prefix("user.") else {
+            return Err(unsupported(
+                "only native NTFS user.* extended attributes may be mutated via xattr",
+            ));
+        };
+        if suffix.is_empty() || suffix.as_bytes().contains(&0) {
+            return Err(FfsError::Format("invalid user xattr name".into()));
+        }
+        if is_ads_ino(ino) {
+            return Err(unsupported(
+                "NTFS alternate data streams do not carry independent $EA attributes",
+            ));
+        }
+        let record = self.record(cx, ino)?;
+        self.enforce_dacl(cx, &record, FILE_WRITE_DATA)?;
+        let exists = self.user_eas(cx, &record)?.contains_key(name);
+        match mode {
+            XattrSetMode::Create if exists => return Err(FfsError::Exists),
+            XattrSetMode::Replace if !exists => {
+                return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                    libc::ENODATA,
+                )));
+            }
+            _ => {}
+        }
+        let target_ref = reference(&record);
+        self.transact(cx, |engine| {
+            engine.set_ea_at(
+                cx,
+                target_ref,
+                name.as_bytes(),
+                value,
+                0,
+                DEFAULT_NTFS_FILETIME,
+            )
+        })?;
+        Ok(())
+    }
+
+    pub(super) fn removexattr_locked(&self, cx: &Cx, ino: InodeNumber, name: &str) -> Result<bool> {
+        self.ensure_writable()?;
+        if name.len() > MAX_EA_NAME_BYTES {
+            return Err(FfsError::NameTooLong);
+        }
+        let Some(suffix) = name.strip_prefix("user.") else {
+            return Err(unsupported(
+                "only native NTFS user.* extended attributes may be removed via xattr",
+            ));
+        };
+        if suffix.is_empty() || suffix.as_bytes().contains(&0) {
+            return Err(FfsError::Format("invalid user xattr name".into()));
+        }
+        if is_ads_ino(ino) {
+            self.describe(cx, ino)?;
+            return Ok(false);
+        }
+        let record = self.record(cx, ino)?;
+        self.enforce_dacl(cx, &record, FILE_WRITE_DATA)?;
+        let target_ref = reference(&record);
+        self.transact(cx, |engine| {
+            engine.remove_ea_at(cx, target_ref, name.as_bytes(), DEFAULT_NTFS_FILETIME)
+        })
     }
 }

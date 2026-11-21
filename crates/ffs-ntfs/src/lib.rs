@@ -13,12 +13,16 @@ macro_rules! companion_bin_tests {
     };
 }
 
+pub mod efs;
 pub mod formatter;
 pub mod reader;
+pub mod reparse_provider;
 pub mod resize;
+pub mod security_policy;
 pub mod stream_name;
 pub mod transaction;
 
+pub use efs::{NtfsEfsKey, NtfsEfsKeyScope, NtfsEfsMetadataInfo, StaticEfsKeyScope};
 pub use formatter::{
     NtfsFormatLayout, NtfsFormatOptions, NtfsFormatReport, NtfsFormatStage, NtfsFormatStageHook,
     NtfsFormatVersion, format_device, format_image_file, plan_format,
@@ -32,14 +36,21 @@ pub use reader::check::{
     NtfsSubcheckSummary, check_image_file, check_volume_device,
 };
 pub use reader::filesystem::NtfsFs;
+pub use reparse_provider::{
+    ReparseCapability, classify_reparse_point, validate_writable_reparse_point,
+};
 pub use resize::{
     NtfsClusterRelocation, NtfsResizeDirection, NtfsResizeOptions, NtfsResizePlan,
     NtfsResizeReport, NtfsResizeStage, NtfsResizeStageHook, plan_resize, run_resize,
 };
+pub use security_policy::{
+    NtfsSecurityPatch, NtfsSidMap, NtfsSidPolicy, apply_security_patch, build_simple_ace,
+};
 pub use stream_name::StreamName;
 pub use transaction::{
     DEFAULT_NTFS_FILETIME, NtfsAdmissionReport, NtfsDurableToken, NtfsExtendedRenameOutcome,
-    NtfsLogStateSummary, NtfsPersistenceEvent, NtfsPersistenceStage, NtfsRecoverySummary,
-    NtfsRenameOutcome, NtfsStorageIdentity, NtfsTransactionEngine, NtfsTxOutcome, NtfsWriteOptions,
-    validate_ntfs_component_utf16, validate_ntfs_stream_name_utf16,
+    NtfsLogStateSummary, NtfsObjectIdData, NtfsPersistenceEvent, NtfsPersistenceStage,
+    NtfsRecoverySummary, NtfsRenameOutcome, NtfsStorageIdentity, NtfsTransactionEngine,
+    NtfsTxOutcome, NtfsUsnSummary, NtfsWriteOptions, validate_ntfs_component_utf16,
+    validate_ntfs_stream_name_utf16,
 };

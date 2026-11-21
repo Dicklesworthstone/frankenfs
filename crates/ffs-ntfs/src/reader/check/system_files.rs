@@ -725,18 +725,131 @@ fn audit_extend_directory(
                 report,
             )?;
         } else if upper.as_slice() == USNJRNL_UPPER {
-            // Note active $UsnJrnl honestly without falsely declaring corruption.
-            if let Ok(attrs) = child_rec.attributes()
-                && attrs.iter().any(|a| a.kind == DATA)
-            {
-                report.push_issue(
-                    NtfsCheckCategory::UnsupportedFeature,
-                    "usnjrnl_present",
-                    Some(entry.reference.record),
-                    None,
-                    "$Extend/$UsnJrnl change journal is present; journal record payload validation is not implemented".into(),
-                );
-            }
+            validate_usnjrnl_record(cx, volume, &child_rec, report)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_usnjrnl_record(
+    cx: &Cx,
+    volume: &NtfsVolume,
+    child_rec: &NtfsFileRecord,
+    report: &mut NtfsCheckReport,
+) -> Result<()> {
+    checkpoint(cx)?;
+    let Ok(catalog) = volume.attributes(cx, child_rec) else {
+        report.push_issue(
+            NtfsCheckCategory::SecondaryIndex,
+            "usnjrnl_catalog_corrupt",
+            Some(u64::from(child_rec.number)),
+            None,
+            "$Extend/$UsnJrnl attribute catalog failed validation".into(),
+        );
+        return Ok(());
+    };
+    let all = match catalog.all() {
+        Ok(a) => a,
+        Err(err) => {
+            report.push_issue(
+                NtfsCheckCategory::SecondaryIndex,
+                "usnjrnl_attrs_corrupt",
+                Some(u64::from(child_rec.number)),
+                None,
+                format!("$Extend/$UsnJrnl attributes unreadable: {err}"),
+            );
+            return Ok(());
+        }
+    };
+    let has_data = all.iter().any(|a| a.kind == DATA);
+    if !has_data {
+        return Ok(());
+    }
+    let max_name = [
+        u16::from(b'$'),
+        u16::from(b'M'),
+        u16::from(b'a'),
+        u16::from(b'x'),
+    ];
+    let j_name = [u16::from(b'$'), u16::from(b'J')];
+    let max_stream = match catalog.select(&volume.geometry, DATA, &max_name) {
+        Ok(s) => s,
+        Err(err) => {
+            report.push_issue(
+                NtfsCheckCategory::SecondaryIndex,
+                "usnjrnl_max_missing",
+                Some(u64::from(child_rec.number)),
+                None,
+                format!("$Extend/$UsnJrnl:$Max missing or invalid: {err}"),
+            );
+            return Ok(());
+        }
+    };
+    if !max_stream.resident() || max_stream.size != 32 {
+        report.push_issue(
+            NtfsCheckCategory::SecondaryIndex,
+            "usnjrnl_max_invalid",
+            Some(u64::from(child_rec.number)),
+            None,
+            format!(
+                "$Extend/$UsnJrnl:$Max must be 32 resident bytes (got {})",
+                max_stream.size
+            ),
+        );
+        return Ok(());
+    }
+    let max_raw = volume.read(cx, &max_stream, 0, 32)?;
+    let max_data = match ffs_ondisk::ntfs::usn::UsnMaxData::parse(&max_raw) {
+        Ok(m) => m,
+        Err(err) => {
+            report.push_issue(
+                NtfsCheckCategory::SecondaryIndex,
+                "usnjrnl_max_corrupt",
+                Some(u64::from(child_rec.number)),
+                None,
+                format!("$Extend/$UsnJrnl:$Max failed parse: {err}"),
+            );
+            return Ok(());
+        }
+    };
+    let j_stream = match catalog.select(&volume.geometry, DATA, &j_name) {
+        Ok(s) => s,
+        Err(err) => {
+            report.push_issue(
+                NtfsCheckCategory::SecondaryIndex,
+                "usnjrnl_j_missing",
+                Some(u64::from(child_rec.number)),
+                None,
+                format!("$Extend/$UsnJrnl:$J missing or invalid: {err}"),
+            );
+            return Ok(());
+        }
+    };
+    if max_data.lowest_valid_usn > j_stream.size {
+        report.push_issue(
+            NtfsCheckCategory::SecondaryIndex,
+            "usnjrnl_lowest_exceeds_size",
+            Some(u64::from(child_rec.number)),
+            None,
+            format!(
+                "$Extend/$UsnJrnl:$Max.lowest_valid_usn ({}) exceeds $J size ({})",
+                max_data.lowest_valid_usn, j_stream.size
+            ),
+        );
+        return Ok(());
+    }
+    let inspect_start = max_data.lowest_valid_usn;
+    let inspect_len = (j_stream.size - inspect_start).min(4 * 1024 * 1024) as usize;
+    if inspect_len > 0 {
+        let slice = volume.read(cx, &j_stream, inspect_start, inspect_len)?;
+        if let Err(err) = ffs_ondisk::ntfs::usn::parse_usn_journal_slice(inspect_start, &slice) {
+            report.push_issue(
+                NtfsCheckCategory::SecondaryIndex,
+                "usnjrnl_j_corrupt",
+                Some(u64::from(child_rec.number)),
+                None,
+                format!("$Extend/$UsnJrnl:$J record framing corrupt: {err}"),
+            );
         }
     }
     Ok(())
@@ -1067,7 +1180,24 @@ fn audit_single_record_attributes(
             }
         }
 
-        // REPARSE_POINT flag agreement.
+        // REPARSE_POINT & ENCRYPTED ($EFS) / TXF_DATA agreement.
+        let has_efs_stream = attrs.iter().any(|a| {
+            a.kind == ffs_ondisk::ntfs::LOGGED_UTILITY_STREAM
+                && a.name == ffs_ondisk::ntfs::efs::EFS_STREAM_NAME
+        });
+        let has_txf_stream = attrs.iter().any(|a| {
+            a.kind == ffs_ondisk::ntfs::LOGGED_UTILITY_STREAM
+                && a.name != ffs_ondisk::ntfs::efs::EFS_STREAM_NAME
+        });
+        if has_txf_stream {
+            report.push_issue(
+                NtfsCheckCategory::UnsupportedFeature,
+                "txf_data_present",
+                Some(slot),
+                None,
+                format!("record {slot} carries unsupported $TXF_DATA/logged utility stream"),
+            );
+        }
         if let Ok(Some(std_flags)) = standard_flags(&attrs) {
             let flag_set = std_flags & 0x0400 != 0;
             if flag_set != has_reparse_attr {
@@ -1078,6 +1208,18 @@ fn audit_single_record_attributes(
                     None,
                     format!(
                         "record {slot} FILE_ATTRIBUTE_REPARSE_POINT ({flag_set}) disagrees with $REPARSE_POINT attribute ({has_reparse_attr})"
+                    ),
+                );
+            }
+            let enc_flag = std_flags & 0x4000 != 0;
+            if !record.is_directory() && enc_flag != has_efs_stream {
+                report.push_issue(
+                    NtfsCheckCategory::StreamBounds,
+                    "efs_flag_mismatch",
+                    Some(slot),
+                    None,
+                    format!(
+                        "record {slot} FILE_ATTRIBUTE_ENCRYPTED ({enc_flag}) disagrees with $EFS attribute ({has_efs_stream})"
                     ),
                 );
             }

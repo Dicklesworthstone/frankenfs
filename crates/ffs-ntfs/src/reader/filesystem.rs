@@ -14,20 +14,23 @@ use super::{
     Cx, DATA, FfsError, NtfsFileRecord, NtfsReference, NtfsValue, NtfsVolume, Result, Stream,
     checkpoint, corrupt, parse, relative_link_target, unsupported,
 };
+use crate::security_policy::NtfsSidPolicy;
 use crate::transaction::NtfsTransactionEngine;
-use ffs_core::vfs::{OpenHandleOracle, ReleaseRequest};
+use ffs_core::vfs::{OpenHandleOracle, ReleaseRequest, XattrSetMode};
 use ffs_core::{
     DirEntry, FileType, FsOps, FsStat, InodeAttr, ReaddirPage, RequestScope, SeekWhence,
     SetAttrRequest,
 };
 use ffs_ondisk::ntfs::ea::MAX_EA_NAME_BYTES;
 use ffs_ondisk::ntfs::index::NtfsFileName;
+use ffs_ondisk::ntfs_security::{FILE_READ_DATA, evaluate_dacl_access};
 use ffs_types::InodeNumber;
 use health::{MountHealth, OperationGuard};
 use lifetime::{NtfsLifetime, is_ads_ino, parse_ads_component};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::ops::Deref;
+use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -106,8 +109,7 @@ pub struct NtfsFs {
     lifetime: Mutex<NtfsLifetime>,
     root: NtfsReference,
     upcase: Vec<u16>,
-    uid: u32,
-    gid: u32,
+    sid_policy: NtfsSidPolicy,
     indexed_lookup: bool,
     cache: Mutex<Cache>,
 }
@@ -123,7 +125,18 @@ impl NtfsFs {
     }
 
     pub fn new(cx: &Cx, volume: NtfsVolume, uid: u32, gid: u32) -> Result<Self> {
-        Self::build(cx, volume, uid, gid, false, false)
+        Self::build(
+            cx,
+            volume,
+            NtfsSidPolicy::Synthetic { uid, gid },
+            false,
+            false,
+        )
+    }
+
+    /// Construct a read-only [`NtfsFs`] with an explicit SID/ACL projection policy.
+    pub fn new_with_policy(cx: &Cx, volume: NtfsVolume, policy: NtfsSidPolicy) -> Result<Self> {
+        Self::build(cx, volume, policy, false, false)
     }
 
     /// Explicit branch-directed LOOKUP for immutable native images. This does
@@ -131,7 +144,13 @@ impl NtfsFs {
     /// READDIR remains a complete validated enumeration in both modes.
     /// Native journal, root, provider and host projection admission is unchanged.
     pub fn new_indexed(cx: &Cx, volume: NtfsVolume, uid: u32, gid: u32) -> Result<Self> {
-        Self::build(cx, volume, uid, gid, true, false)
+        Self::build(
+            cx,
+            volume,
+            NtfsSidPolicy::Synthetic { uid, gid },
+            true,
+            false,
+        )
     }
 
     /// Mount the volatile view produced by an explicit, successful native
@@ -140,21 +159,32 @@ impl NtfsFs {
     /// Unsupported, partial or failed recovery cannot establish this admission.
     /// Ordinary `new` retains its clean-log requirement.
     pub fn new_recovered(cx: &Cx, volume: NtfsVolume, uid: u32, gid: u32) -> Result<Self> {
-        Self::build(cx, volume, uid, gid, false, true)
+        Self::build(
+            cx,
+            volume,
+            NtfsSidPolicy::Synthetic { uid, gid },
+            false,
+            true,
+        )
     }
 
     /// Branch-directed lookup over an explicitly recovered immutable view.
     /// Recovery admission is identical to `new_recovered`; directory listing
     /// still validates the entire native index.
     pub fn new_recovered_indexed(cx: &Cx, volume: NtfsVolume, uid: u32, gid: u32) -> Result<Self> {
-        Self::build(cx, volume, uid, gid, true, true)
+        Self::build(
+            cx,
+            volume,
+            NtfsSidPolicy::Synthetic { uid, gid },
+            true,
+            true,
+        )
     }
 
     fn build(
         cx: &Cx,
         volume: NtfsVolume,
-        uid: u32,
-        gid: u32,
+        sid_policy: NtfsSidPolicy,
         indexed_lookup: bool,
         recovered_view: bool,
     ) -> Result<Self> {
@@ -207,8 +237,7 @@ impl NtfsFs {
             health: MountHealth::new(),
             lifetime: Mutex::new(NtfsLifetime::default()),
             upcase,
-            uid,
-            gid,
+            sid_policy,
             indexed_lookup,
             cache: Mutex::new(Cache::default()),
         };
@@ -503,29 +532,81 @@ impl NtfsFs {
                     .map_err(|_| corrupt(0, "short NTFS timestamp"))?,
             ))
         };
-        let perm = if self.is_writable() {
-            match kind {
-                FileType::Directory => {
-                    if ino != ROOT && (flags & 0x01 != 0) {
-                        0o555
-                    } else {
-                        0o755
+        let (uid, gid, perm) = match &self.sid_policy {
+            NtfsSidPolicy::Synthetic { uid, gid } => {
+                let perm = if self.is_writable() {
+                    match kind {
+                        FileType::Directory => {
+                            if ino != ROOT && (flags & 0x01 != 0) {
+                                0o555
+                            } else {
+                                0o755
+                            }
+                        }
+                        FileType::Symlink => 0o777,
+                        _ => {
+                            if flags & 0x01 != 0 {
+                                0o444
+                            } else {
+                                0o644
+                            }
+                        }
                     }
-                }
-                FileType::Symlink => 0o777,
-                _ => {
-                    if flags & 0x01 != 0 {
-                        0o444
-                    } else {
-                        0o644
+                } else {
+                    match kind {
+                        FileType::Directory => 0o555,
+                        FileType::Symlink => 0o777,
+                        _ => 0o444,
                     }
-                }
+                };
+                (*uid, *gid, perm)
             }
-        } else {
-            match kind {
-                FileType::Directory => 0o555,
-                FileType::Symlink => 0o777,
-                _ => 0o444,
+            NtfsSidPolicy::Mapped { map, .. } => {
+                if let Ok(sec_info) = volume.security_descriptor(cx, &record) {
+                    let sd = &sec_info.descriptor;
+                    let mapped_uid = sd
+                        .owner
+                        .as_ref()
+                        .map_or(map.fallback_uid, |sid| map.uid_for_sid(sid));
+                    let owner_gid = sd
+                        .group
+                        .as_ref()
+                        .map_or(map.fallback_gid, |sid| map.gid_for_sid(sid));
+                    let proj_perm = if kind == FileType::Symlink {
+                        0o777
+                    } else {
+                        let base = map.project_posix_mode(sd, kind == FileType::Directory);
+                        if self.is_writable() {
+                            if flags & 0x01 != 0 && ino != ROOT {
+                                base & !0o222
+                            } else {
+                                base
+                            }
+                        } else {
+                            base & !0o222
+                        }
+                    };
+                    (mapped_uid, owner_gid, proj_perm)
+                } else {
+                    let perm = match kind {
+                        FileType::Directory => {
+                            if self.is_writable() {
+                                0o755
+                            } else {
+                                0o555
+                            }
+                        }
+                        FileType::Symlink => 0o777,
+                        _ => {
+                            if self.is_writable() {
+                                0o644
+                            } else {
+                                0o444
+                            }
+                        }
+                    };
+                    (map.fallback_uid, map.fallback_gid, perm)
+                }
             }
         };
         checkpoint(cx)?;
@@ -540,12 +621,45 @@ impl NtfsFs {
             kind,
             perm,
             nlink,
-            uid: self.uid,
-            gid: self.gid,
+            uid,
+            gid,
             rdev: 0,
             blksize: volume.geometry.cluster_bytes(),
             generation: u64::from(record.sequence),
         })
+    }
+
+    pub(super) fn enforce_dacl(
+        &self,
+        cx: &Cx,
+        record: &NtfsFileRecord,
+        desired_mask: u32,
+    ) -> Result<()> {
+        let NtfsSidPolicy::Mapped {
+            caller_uid,
+            caller_gid,
+            map,
+        } = &self.sid_policy
+        else {
+            return Ok(());
+        };
+        if !map.enforce_acl {
+            return Ok(());
+        }
+        let token = map.token_for(*caller_uid, *caller_gid)?;
+        let volume = self.active_volume()?;
+        match volume.security_descriptor(cx, record) {
+            Ok(info) => {
+                let allowed = evaluate_dacl_access(&info.descriptor, &token, desired_mask)
+                    .map_err(|err| parse(&err))?;
+                if !allowed {
+                    return Err(FfsError::PermissionDenied);
+                }
+                Ok(())
+            }
+            Err(FfsError::NotFound(_)) => Ok(()),
+            Err(err) => Err(err),
+        }
     }
 
     fn directory(&self, cx: &Cx, ino: InodeNumber) -> Result<Arc<DirectorySnapshot>> {
@@ -876,6 +990,10 @@ impl FsOps for NtfsFs {
         size: u32,
     ) -> Result<Vec<u8>> {
         let _op = self.operation(cx, false)?;
+        if !is_ads_ino(ino) {
+            let record = self.record(cx, ino)?;
+            self.enforce_dacl(cx, &record, FILE_READ_DATA)?;
+        }
         let stream = self.stream(cx, ino)?;
         let volume = self.active_volume()?;
         volume.read(cx, &stream, offset, size as usize)
@@ -1023,6 +1141,35 @@ impl FsOps for NtfsFs {
         op.complete(attr)
     }
 
+    fn symlink(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        parent: InodeNumber,
+        name: &OsStr,
+        target: &Path,
+        _uid: u32,
+        _gid: u32,
+    ) -> Result<InodeAttr> {
+        let op = self.operation(cx, true)?;
+        let attr = self.symlink_locked(cx, parent, name, target)?;
+        op.complete(attr)
+    }
+
+    fn fallocate(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        ino: InodeNumber,
+        offset: u64,
+        length: u64,
+        mode: i32,
+    ) -> Result<()> {
+        let op = self.operation(cx, true)?;
+        self.fallocate_locked(cx, ino, offset, length, mode)?;
+        op.complete(())
+    }
+
     fn rename(
         &self,
         cx: &Cx,
@@ -1129,6 +1276,20 @@ impl FsOps for NtfsFs {
         Ok(result)
     }
 
+    fn setxattr(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        ino: InodeNumber,
+        name: &str,
+        value: &[u8],
+        mode: XattrSetMode,
+    ) -> Result<()> {
+        let op = self.operation(cx, true)?;
+        self.setxattr_locked(cx, ino, name, value, mode)?;
+        op.complete(())
+    }
+
     fn removexattr(
         &self,
         cx: &Cx,
@@ -1136,19 +1297,9 @@ impl FsOps for NtfsFs {
         ino: InodeNumber,
         name: &str,
     ) -> Result<bool> {
-        let _op = self.operation(cx, false)?;
-        self.ensure_writable()?;
-        if is_ads_ino(ino) {
-            self.describe(cx, ino)?;
-            return Ok(false);
-        }
-        let record = self.record(cx, ino)?;
-        if name.starts_with("user.") && self.user_eas(cx, &record)?.contains_key(name) {
-            return Err(unsupported(
-                "removing existing native NTFS user.* extended attributes is not supported",
-            ));
-        }
-        Ok(false)
+        let op = self.operation(cx, true)?;
+        let removed = self.removexattr_locked(cx, ino, name)?;
+        op.complete(removed)
     }
 
     fn statfs(&self, cx: &Cx, _scope: &mut RequestScope, ino: InodeNumber) -> Result<FsStat> {

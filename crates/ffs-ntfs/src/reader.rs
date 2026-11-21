@@ -10,7 +10,7 @@ mod namespace;
 mod recovery_apply;
 pub mod security;
 mod source;
-mod wof;
+pub(crate) mod wof;
 
 use asupersync::Cx;
 use ffs_block::ByteDevice;
@@ -595,6 +595,210 @@ impl NtfsVolume {
 
     pub fn read(&self, cx: &Cx, stream: &Stream, offset: u64, size: usize) -> Result<Vec<u8>> {
         stream.read(&self.source, &self.geometry, cx, offset, size)
+    }
+
+    /// Read full 512-byte encrypted sectors covering `[aligned_offset .. aligned_offset + aligned_len)`
+    /// directly from physical clusters, including encrypted padding bytes between `stream.size`
+    /// and the next 512-byte EFS sector boundary.
+    pub(crate) fn read_raw_aligned_encrypted(
+        &self,
+        cx: &Cx,
+        stream: &Stream,
+        aligned_offset: u64,
+        aligned_len: usize,
+    ) -> Result<Vec<u8>> {
+        checkpoint(cx)?;
+        if aligned_len > MAX_READ {
+            return Err(unsupported("NTFS encrypted read exceeds 16 MiB"));
+        }
+        let mut out = buffer(aligned_len)?;
+        if aligned_len == 0 {
+            return Ok(out);
+        }
+        match &stream.storage {
+            Storage::Resident(bytes) => {
+                let start = usize::try_from(aligned_offset)
+                    .map_err(|_| corrupt(aligned_offset, "resident EFS offset overflow"))?;
+                let slice = bytes.get(start..start + aligned_len).ok_or_else(|| {
+                    corrupt(
+                        aligned_offset,
+                        "resident EFS stream shorter than 512B sector",
+                    )
+                })?;
+                out.copy_from_slice(slice);
+            }
+            Storage::Mapped(runs) => {
+                let cb = u64::from(self.geometry.cluster_bytes());
+                let mut done = 0_usize;
+                while done < aligned_len {
+                    checkpoint(cx)?;
+                    let logical = aligned_offset + done as u64;
+                    let vcn = logical / cb;
+                    let idx = runs
+                        .partition_point(|r| r.vcn <= vcn)
+                        .checked_sub(1)
+                        .ok_or_else(|| corrupt(logical, "missing NTFS EFS mapping"))?;
+                    let run = &runs[idx];
+                    let within = logical - run.vcn * cb;
+                    let avail = (run.clusters * cb)
+                        .checked_sub(within)
+                        .filter(|c| *c != 0)
+                        .ok_or_else(|| corrupt(logical, "gap in NTFS EFS mapping"))?;
+                    let chunk = avail.min((aligned_len - done) as u64) as usize;
+                    if let Some(lcn) = run.lcn {
+                        let phys = self
+                            .geometry
+                            .cluster_offset(lcn)
+                            .map_err(|error| parse(&error))?
+                            + within;
+                        self.source.read(cx, phys, &mut out[done..done + chunk])?;
+                    }
+                    done += chunk;
+                }
+            }
+            Storage::Compressed(_) | Storage::Wof(_) => {
+                return Err(unsupported(
+                    "NTFS stream cannot combine EFS with native compression or WOF",
+                ));
+            }
+        }
+        checkpoint(cx)?;
+        Ok(out)
+    }
+
+    /// Decode the full logical plaintext of a WOF-compressed file (bounded by `max_bytes`)
+    /// so transactional writers can perform decompression-on-write safely.
+    pub(crate) fn read_wof_all(
+        &self,
+        cx: &Cx,
+        record: &NtfsFileRecord,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        checkpoint(cx)?;
+        let stream = self.data_stream(cx, record, &[])?;
+        let total = usize::try_from(stream.size)
+            .map_err(|_| unsupported("WOF file exceeds decompression-on-write staging limit"))?;
+        if total > max_bytes {
+            return Err(unsupported(
+                "WOF file exceeds decompression-on-write staging limit",
+            ));
+        }
+        let mut out = Vec::with_capacity(total);
+        let mut off = 0_u64;
+        while (off as usize) < total {
+            let step = (total - off as usize).min(MAX_READ);
+            let chunk = self.read(cx, &stream, off, step)?;
+            if chunk.is_empty() {
+                break;
+            }
+            off += chunk.len() as u64;
+            out.extend_from_slice(&chunk);
+        }
+        if out.len() != total {
+            return Err(corrupt(0, "short WOF decompression read"));
+        }
+        Ok(out)
+    }
+
+    /// Inspect a file's `$OBJECT_ID` (`0x40`) attribute if present.
+    pub fn object_id(
+        &self,
+        cx: &Cx,
+        record: &NtfsFileRecord,
+    ) -> Result<Option<crate::transaction::NtfsObjectIdData>> {
+        checkpoint(cx)?;
+        let catalog = self.attributes(cx, record)?;
+        let all = catalog.all()?;
+        if !all
+            .iter()
+            .any(|a| a.kind == ffs_ondisk::ntfs::OBJECT_ID && a.name.is_empty())
+        {
+            return Ok(None);
+        }
+        let stream = catalog.select(&self.geometry, ffs_ondisk::ntfs::OBJECT_ID, &[])?;
+        if stream.size != 16 && stream.size != 64 {
+            return Err(corrupt(0, "invalid $OBJECT_ID attribute length"));
+        }
+        let raw = self.read(cx, &stream, 0, stream.size as usize)?;
+        crate::transaction::NtfsObjectIdData::parse(&raw).map(Some)
+    }
+
+    /// Inspect `$Extend/$UsnJrnl` (`$Max` + `$J` framing) if active on this volume.
+    pub fn usn_summary(&self, cx: &Cx) -> Result<Option<crate::transaction::NtfsUsnSummary>> {
+        checkpoint(cx)?;
+        let extend_rec = match self.record(cx, 11, None) {
+            Ok(r) if r.is_directory() => r,
+            _ => return Ok(None),
+        };
+        let entries = self.list_directory(cx, &extend_rec)?;
+        let usn_upper: [u16; 8] = [
+            u16::from(b'$'),
+            u16::from(b'U'),
+            u16::from(b'S'),
+            u16::from(b'N'),
+            u16::from(b'J'),
+            u16::from(b'R'),
+            u16::from(b'N'),
+            u16::from(b'L'),
+        ];
+        let Some(usn_entry) = entries.into_iter().find(|e| {
+            let up: Vec<u16> = e
+                .filename
+                .name
+                .iter()
+                .map(|&u| {
+                    if (u16::from(b'a')..=u16::from(b'z')).contains(&u) {
+                        u - 32
+                    } else {
+                        u
+                    }
+                })
+                .collect();
+            up.as_slice() == usn_upper
+        }) else {
+            return Ok(None);
+        };
+        let usn_rec = self.record(
+            cx,
+            usn_entry.reference.record,
+            Some(usn_entry.reference.sequence),
+        )?;
+        let catalog = self.attributes(cx, &usn_rec)?;
+        let max_name = [
+            u16::from(b'$'),
+            u16::from(b'M'),
+            u16::from(b'a'),
+            u16::from(b'x'),
+        ];
+        let j_name = [u16::from(b'$'), u16::from(b'J')];
+        let max_stream = match catalog.select(&self.geometry, DATA, &max_name) {
+            Ok(s) => s,
+            Err(FfsError::NotFound(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let max_raw = self.read(cx, &max_stream, 0, max_stream.size.min(64) as usize)?;
+        let max_data =
+            ffs_ondisk::ntfs::usn::UsnMaxData::parse(&max_raw).map_err(|err| parse(&err))?;
+        let j_stream = catalog.select(&self.geometry, DATA, &j_name)?;
+        let start = max_data.lowest_valid_usn.min(j_stream.size);
+        let span = (j_stream.size - start).min(4 * 1024 * 1024) as usize;
+        let records_inspected = if span > 0 {
+            let slice = self.read(cx, &j_stream, start, span)?;
+            ffs_ondisk::ntfs::usn::parse_usn_journal_slice(start, &slice)
+                .map_err(|err| parse(&err))?
+                .len()
+        } else {
+            0
+        };
+        Ok(Some(crate::transaction::NtfsUsnSummary {
+            record: usn_rec.number,
+            maximum_size: max_data.maximum_size,
+            allocation_delta: max_data.allocation_delta,
+            usn_id: max_data.usn_id,
+            lowest_valid_usn: max_data.lowest_valid_usn,
+            next_usn: j_stream.size,
+            records_inspected,
+        }))
     }
 }
 

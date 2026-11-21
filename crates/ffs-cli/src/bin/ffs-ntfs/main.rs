@@ -4,6 +4,7 @@
 mod allocation_commands;
 mod ea_name;
 mod maintenance_commands;
+mod transform_commands;
 
 #[cfg(test)]
 mod indexed_tests;
@@ -60,7 +61,7 @@ impl ffs_block::ByteDevice for ReadOnlySidecar {
 }
 
 #[derive(Debug, Args)]
-struct ImageArgs {
+pub(crate) struct ImageArgs {
     image: PathBuf,
     /// Byte offset of an already selected NTFS volume, not a sector number.
     #[arg(long, default_value_t = 0)]
@@ -153,7 +154,7 @@ struct AdmissionProbeArgs {
 }
 
 #[derive(Debug, Args)]
-struct TxWriteArgs {
+pub(crate) struct TxWriteArgs {
     image: PathBuf,
     /// Byte offset of an already selected NTFS volume, not a sector number.
     #[arg(long, default_value_t = 0)]
@@ -204,7 +205,10 @@ fn parse_link_name(text: &str) -> std::result::Result<String, String> {
     Ok(text.to_owned())
 }
 
-fn select_write_stream(text: Option<&str>, native: Option<StreamName>) -> Result<StreamName> {
+pub(crate) fn select_write_stream(
+    text: Option<&str>,
+    native: Option<StreamName>,
+) -> Result<StreamName> {
     let stream = StreamName::select(text, native).map_err(anyhow::Error::msg)?;
     // Reject invalid mutation selectors before opening a writable engine:
     // --recover-dirty can otherwise change native recovery state on open.
@@ -222,7 +226,7 @@ fn select_named_write_stream(text: Option<&str>, native: Option<StreamName>) -> 
 }
 
 #[derive(Debug, Args)]
-struct PayloadArgs {
+pub(crate) struct PayloadArgs {
     /// Exact UTF-8 payload string.
     #[arg(long, conflicts_with_all = ["data_file", "empty"])]
     data: Option<String>,
@@ -432,17 +436,30 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         gid: u32,
     },
-    /// Mount the explicitly admitted ordinary native writer (experimental).
+    /// Mount the explicitly admitted native writer.
     MountWrite {
         #[command(flatten)]
         target: TxWriteArgs,
         /// Existing empty directory; must not contain the backing image.
         mountpoint: PathBuf,
-        /// Synthetic host ownership; native Windows ACLs are not enforced.
+        /// Host caller UID (or synthetic fallback UID when --sid-map is unset).
         #[arg(long, default_value_t = 0)]
         uid: u32,
+        /// Host caller GID (or synthetic fallback GID when --sid-map is unset).
         #[arg(long, default_value_t = 0)]
         gid: u32,
+        /// Enable native SID-to-POSIX projection (NFSv4 SIDs S-1-5-88-1/2-*) and SACL-preserving chmod/chown.
+        #[arg(long)]
+        sid_map: bool,
+        /// Enforce MS-DTYP DACL access evaluation (DENY before ALLOW) under the active SID map.
+        #[arg(long)]
+        enforce_acl: bool,
+        /// Explicit `<uid>=<SID>` mapping entry (repeatable).
+        #[arg(long = "uid-map")]
+        uid_maps: Vec<String>,
+        /// Explicit `<gid>=<SID>` mapping entry (repeatable).
+        #[arg(long = "gid-map")]
+        gid_maps: Vec<String>,
     },
     /// Probe native NTFS 3.1 writable admission without modifying a single byte.
     AdmitWrite {
@@ -612,9 +629,104 @@ enum Command {
         #[arg(long, value_parser = clap::value_parser!(u32).range(1..=65_536))]
         records: u32,
     },
+    /// Enable or disable native SPARSE (0x8000) storage on a DATA stream.
+    TxSetSparse {
+        #[command(flatten)]
+        options: transform_commands::TxSetSparseArgs,
+    },
+    /// Punch a sparse hole and reclaim full interior clusters via a native logged transaction.
+    TxPunchHole {
+        #[command(flatten)]
+        options: transform_commands::TxPunchHoleArgs,
+    },
+    /// Enable or disable native NTFS LZNT1 compression on a file or directory.
+    TxSetCompression {
+        #[command(flatten)]
+        options: transform_commands::TxSetCompressionArgs,
+    },
+    /// Replace or patch an object's native MS-DTYP security descriptor (`$Secure` or `0x50`).
+    TxSetSecurity {
+        #[command(flatten)]
+        options: transform_commands::TxSetSecurityArgs,
+    },
+    /// Evaluate MS-DTYP DACL access (DENY before ALLOW) for a SID token against a path.
+    CheckAccess {
+        #[command(flatten)]
+        options: transform_commands::CheckAccessArgs,
+    },
+    /// Create a native NTFS symbolic link (`IO_REPARSE_TAG_SYMLINK`) and update `$Extend/$Reparse::$R`.
+    TxSymlink {
+        #[command(flatten)]
+        options: transform_commands::TxSymlinkArgs,
+    },
+    /// Install or replace `$REPARSE_POINT` (0xC0) and synchronize `$Extend/$Reparse::$R`.
+    TxSetReparse {
+        #[command(flatten)]
+        options: transform_commands::TxSetReparseArgs,
+    },
+    /// Remove `$REPARSE_POINT` (0xC0) and synchronize `$Extend/$Reparse::$R` (materializing WOF plaintext).
+    TxRemoveReparse {
+        #[command(flatten)]
+        options: transform_commands::TxRemoveReparseArgs,
+    },
+    /// Set `$OBJECT_ID` (0x40) and synchronize `$Extend/$ObjId::$O`.
+    TxSetObjid {
+        #[command(flatten)]
+        options: transform_commands::TxSetObjIdArgs,
+    },
+    /// Remove `$OBJECT_ID` (0x40) and synchronize `$Extend/$ObjId::$O`.
+    TxRemoveObjid {
+        #[command(flatten)]
+        options: transform_commands::TxRemoveObjIdArgs,
+    },
+    /// Enable or configure `$Extend/$UsnJrnl` (`$Max` + sparse `$J`) on an NTFS 3.1 image.
+    TxEnableUsn {
+        #[command(flatten)]
+        options: transform_commands::TxEnableUsnArgs,
+    },
+    /// Inspect active `$Extend/$UsnJrnl` metadata and record framing (read-only).
+    UsnSummary {
+        #[command(flatten)]
+        options: transform_commands::UsnSummaryArgs,
+    },
+    /// Set or replace a native `$EA` extended attribute via a native logged transaction.
+    TxSetEa {
+        #[command(flatten)]
+        options: transform_commands::TxSetEaArgs,
+    },
+    /// Remove a native `$EA` extended attribute via a native logged transaction.
+    TxRemoveEa {
+        #[command(flatten)]
+        options: transform_commands::TxRemoveEaArgs,
+    },
+    /// Inspect redacted `$EFS` (0x100) metadata on a path (no key material required or printed).
+    EfsInfo {
+        #[command(flatten)]
+        options: transform_commands::EfsInfoArgs,
+    },
+    /// Read raw EFS ciphertext (`--raw-ciphertext`) or authorized plaintext (`--key-file`).
+    EfsRead {
+        #[command(flatten)]
+        options: transform_commands::EfsReadArgs,
+    },
+    /// Encrypt an ordinary file under an explicit 256-bit FEK (`--key-file`).
+    TxEfsEncrypt {
+        #[command(flatten)]
+        options: transform_commands::TxEfsKeyArgs,
+    },
+    /// Perform an authorized key-scoped COW write to an EFS-encrypted file.
+    TxEfsWrite {
+        #[command(flatten)]
+        options: transform_commands::TxEfsWriteArgs,
+    },
+    /// Decrypt an EFS-encrypted file back to plain `$DATA` using an authorized `--key-file`.
+    TxEfsDecrypt {
+        #[command(flatten)]
+        options: transform_commands::TxEfsKeyArgs,
+    },
 }
 
-fn emit_tx_outcome<T>(
+pub(crate) fn emit_tx_outcome<T>(
     operation: &str,
     engine: &NtfsTransactionEngine,
     outcome: NtfsTxOutcome<T>,
@@ -663,7 +775,7 @@ fn token_report_json(
     })
 }
 
-fn json(value: &serde_json::Value) -> Result<()> {
+pub(crate) fn json(value: &serde_json::Value) -> Result<()> {
     let mut out = io::stdout().lock();
     serde_json::to_writer_pretty(&mut out, value)?;
     writeln!(out)?;
@@ -1225,6 +1337,10 @@ fn main() -> Result<()> {
             mountpoint,
             uid,
             gid,
+            sid_map,
+            enforce_acl,
+            uid_maps,
+            gid_maps,
         } => {
             let mountpoint = mountpoint
                 .canonicalize()
@@ -1240,8 +1356,16 @@ fn main() -> Result<()> {
             if target.image.canonicalize()?.starts_with(&mountpoint) {
                 bail!("NTFS mountpoint would hide its backing image");
             }
+            let policy = transform_commands::build_mount_sid_policy(
+                uid,
+                gid,
+                sid_map,
+                enforce_acl,
+                &uid_maps,
+                &gid_maps,
+            )?;
             let engine = target.open(&cx, false)?;
-            let fs = reader::filesystem::NtfsFs::from_engine(&cx, engine, uid, gid)?;
+            let fs = reader::filesystem::NtfsFs::from_engine_with_policy(&cx, engine, policy)?;
             let options = ffs_fuse::MountOptions {
                 read_only: false,
                 allow_other: false,
@@ -1250,7 +1374,7 @@ fn main() -> Result<()> {
                 ..ffs_fuse::MountOptions::default()
             };
             eprintln!(
-                "experimental NTFS ordinary writer: native WAL commits; fixed host permissions and noatime; native ACLs are not enforced"
+                "experimental NTFS native writer: WAL commits; sid_map={sid_map} enforce_acl={enforce_acl}"
             );
             let _ = ffs_fuse::mount(&cx, Box::new(fs), &mountpoint, &options)?;
         }
@@ -1561,6 +1685,35 @@ fn main() -> Result<()> {
                 })
             })?;
         }
+        Command::TxSetSparse { options } => transform_commands::run_tx_set_sparse(&cx, &options)?,
+        Command::TxPunchHole { options } => transform_commands::run_tx_punch_hole(&cx, &options)?,
+        Command::TxSetCompression { options } => {
+            transform_commands::run_tx_set_compression(&cx, &options)?;
+        }
+        Command::TxSetSecurity { options } => {
+            transform_commands::run_tx_set_security(&cx, &options)?;
+        }
+        Command::CheckAccess { options } => transform_commands::run_check_access(&cx, &options)?,
+        Command::TxSymlink { options } => transform_commands::run_tx_symlink(&cx, &options)?,
+        Command::TxSetReparse { options } => {
+            transform_commands::run_tx_set_reparse(&cx, &options)?;
+        }
+        Command::TxRemoveReparse { options } => {
+            transform_commands::run_tx_remove_reparse(&cx, &options)?;
+        }
+        Command::TxSetObjid { options } => transform_commands::run_tx_set_objid(&cx, &options)?,
+        Command::TxRemoveObjid { options } => {
+            transform_commands::run_tx_remove_objid(&cx, &options)?;
+        }
+        Command::TxEnableUsn { options } => transform_commands::run_tx_enable_usn(&cx, &options)?,
+        Command::UsnSummary { options } => transform_commands::run_usn_summary(&cx, &options)?,
+        Command::TxSetEa { options } => transform_commands::run_tx_set_ea(&cx, &options)?,
+        Command::TxRemoveEa { options } => transform_commands::run_tx_remove_ea(&cx, &options)?,
+        Command::EfsInfo { options } => transform_commands::run_efs_info(&cx, &options)?,
+        Command::EfsRead { options } => transform_commands::run_efs_read(&cx, &options)?,
+        Command::TxEfsEncrypt { options } => transform_commands::run_tx_efs_encrypt(&cx, &options)?,
+        Command::TxEfsWrite { options } => transform_commands::run_tx_efs_write(&cx, &options)?,
+        Command::TxEfsDecrypt { options } => transform_commands::run_tx_efs_decrypt(&cx, &options)?,
     }
     Ok(())
 }

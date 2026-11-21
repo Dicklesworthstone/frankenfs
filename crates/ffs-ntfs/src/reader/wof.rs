@@ -12,8 +12,8 @@ use super::{
 };
 use ffs_ondisk::{lzx, xpress};
 
-pub(super) const TAG: u32 = 0x8000_0017;
-const BACKING_NAME: &[u16] = &[
+pub const TAG: u32 = 0x8000_0017;
+pub const BACKING_NAME: &[u16] = &[
     87, 111, 102, 67, 111, 109, 112, 114, 101, 115, 115, 101, 100, 68, 97, 116, 97,
 ];
 

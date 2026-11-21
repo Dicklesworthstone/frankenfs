@@ -3,6 +3,8 @@
 //! fault-cut / write-reordering / torn-sector / crash-during-recovery tests,
 //! `$Bitmap` & `$LogFile` exhaustion checks, and negative admission controls.
 
+mod transforms;
+
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 

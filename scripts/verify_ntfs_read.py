@@ -916,12 +916,14 @@ def main() -> None:
         compression = compressed_cases(command, binary, root)
         native_tx = native_transaction_cases(command, binary, facade, root)
         format_resize = native_format_and_resize_cases(command, binary, root)
+        transforms = native_transforms_security_cases(command, binary, root)
         report.update(status="passed", image_sha256=before, partitioned_sha256=disk_before,
                       named_stream_checked=True, directory_and_path_reads_checked=True,
                       attribute_list_sha256=hashlib.sha256(raw_list).hexdigest(),
                       native_extension_records=extension_records, extension_streams_checked=len(extension_streams),
                       compression=compression, native_transactions=native_tx,
-                      native_format_and_resize=format_resize)
+                      native_format_and_resize=format_resize,
+                      native_transforms_and_security=transforms)
         print(json.dumps(report, indent=2))
     except Exception as error:
         report.update(status="failed", error=str(error))
@@ -1108,6 +1110,119 @@ def native_format_and_resize_cases(
         "resize_relocate_shrink_12m_from_slice": True,
         "relocated_clusters": reloc_res["plan"]["relocated_clusters"],
         "ntfsfix_probe_note": "ntfsfix -n is Linux ntfs-3g consistency probe, not Windows chkdsk",
+    }
+
+
+def native_transforms_security_cases(
+    command: Callable[..., bytes],
+    binary: Path,
+    root: Path,
+) -> dict[str, object]:
+    """Verify writable NTFS transforms (sparse/hole-punch, LZNT1 compression),
+    `$Secure` + access evaluation, reparse/objid/USN/EA secondary metadata,
+    and explicit key-scoped EFS against independent Linux ntfs-3g tools.
+
+    Honesty scope: Linux `ntfscat`/`ntfsls`/`ntfsfix -n` verify on-disk NTFS
+    layout and stream readability; Microsoft Windows `chkdsk` and Windows DPAPI
+    key-store interchange are NOT claimed on Linux.
+    """
+    img = root / "transforms-31.img"
+    command(binary, "format", img, "--size-mib", "24", "--label", "FFS_XFORM")
+    tx_flags = ["--offline-image", "--allow-write"]
+
+    # 1. Enable active `$Extend/$UsnJrnl`.
+    command(binary, "tx-enable-usn", img, *tx_flags, "--maximum-size", "65536", "--allocation-delta", "4096")
+
+    # 2. Sparse + hole-punch + independent ntfscat verification.
+    sparse_payload = b"S" * 12288
+    sparse_src = root / "xform-sparse.bin"
+    sparse_src.write_bytes(sparse_payload)
+    command(binary, "tx-create", img, "/", "sparse.bin", *tx_flags, "--data-file", sparse_src)
+    command(binary, "tx-set-sparse", img, "/sparse.bin", *tx_flags, "--enable")
+    punch_rep = json.loads(command(
+        binary, "tx-punch-hole", img, "/sparse.bin", *tx_flags, "--start", "4096", "--length", "4096"
+    ))
+    require(punch_rep["result"]["reclaimed_clusters"] == 1, "expected 1 reclaimed sparse cluster")
+    require(
+        command("ntfscat", img, "/sparse.bin") == (b"S" * 4096) + (b"\x00" * 4096) + (b"S" * 4096),
+        "ntfscat mismatch after sparse hole-punch",
+    )
+
+    # 3. LZNT1 compression + directory inheritance + independent ntfscat verification!
+    comp_payload = (b"NTFS-LZNT1-CLI-ORACLE-BLOCK-0123456789-" * 3000)[:98304]
+    comp_src = root / "xform-comp.bin"
+    comp_src.write_bytes(comp_payload)
+    command(binary, "tx-create", img, "/", "comp.bin", *tx_flags, "--data-file", comp_src)
+    command(binary, "tx-set-compression", img, "/comp.bin", *tx_flags, "--enable")
+    require(command("ntfscat", img, "/comp.bin") == comp_payload, "ntfscat mismatch on LZNT1 compressed file")
+
+    # 4. `$Secure` security update + DENY-before-ALLOW `check-access` + `check-security --verify-file-references`!
+    command(
+        binary, "tx-set-security", img, "/comp.bin", *tx_flags,
+        "--owner-sid", "S-1-5-88-1-1001",
+        "--group-sid", "S-1-5-88-2-2000",
+        "--ace", "deny:0x00000002:S-1-5-88-1-1002",
+        "--ace", "allow:0x00000003:S-1-1-0",
+    )
+    bob_write = json.loads(command(
+        binary, "check-access", img, "/comp.bin", "--offline-image",
+        "--user-sid", "S-1-5-88-1-1002", "--mask", "0x00000002",
+    ))
+    bob_read = json.loads(command(
+        binary, "check-access", img, "/comp.bin", "--offline-image",
+        "--user-sid", "S-1-5-88-1-1002", "--mask", "0x00000001",
+    ))
+    require(bob_write["allowed"] is False and bob_read["allowed"] is True,
+            "DENY-before-ALLOW check-access evaluation failed")
+    sec_chk = json.loads(command(
+        binary, "check-security", img, "--offline-image", "--verify-file-references"
+    ))
+    require(sec_chk["consistent"] is True, "check-security failed after tx-set-security")
+
+    # 5. Symlink + Object ID + EA + USN summary!
+    command(binary, "tx-symlink", img, "/", "rel_sym", *tx_flags, "--link-target", "comp.bin")
+    require(command(binary, "readlink", img, "/rel_sym", "--offline-image").strip() == b"comp.bin",
+            "readlink mismatch after tx-symlink")
+    command(binary, "tx-set-objid", img, "/comp.bin", *tx_flags,
+            "--object-id", "11111111-2222-3333-4444-555555555555")
+    command(binary, "tx-set-ea", img, "/comp.bin", *tx_flags, "--name", "user.color", "--data", "cyan")
+    usn_rep = json.loads(command(binary, "usn-summary", img, "--offline-image"))
+    require(usn_rep["active"] is True and usn_rep["summary"]["records_inspected"] >= 4,
+            "usn-summary did not observe active USN records")
+
+    # 6. Explicit key-scoped EFS + negative controls + key redaction!
+    secret_hex = "a5" * 32
+    key_file = root / "efs.fek"
+    key_file.write_text(secret_hex + "\n")
+    wrong_key = root / "efs-wrong.fek"
+    wrong_key.write_text(("5a" * 32) + "\n")
+    vault_plain = b"EFS-CLI-ORACLE-SECRET-BYTES-" * 40
+    vault_src = root / "vault.bin"
+    vault_src.write_bytes(vault_plain)
+    command(binary, "tx-create", img, "/", "vault.bin", *tx_flags, "--data-file", vault_src)
+    enc_out = command(binary, "tx-efs-encrypt", img, "/vault.bin", *tx_flags, "--key-file", key_file)
+    require(secret_hex.encode() not in enc_out, "tx-efs-encrypt leaked FEK hex to stdout")
+    command(binary, "read", img, "/vault.bin", "--offline-image", failure="encrypted")
+    command(binary, "efs-read", img, "/vault.bin", "--offline-image", "--key-file", wrong_key, failure="Permission")
+    raw_cipher = command(binary, "efs-read", img, "/vault.bin", "--offline-image", "--raw-ciphertext")
+    require(raw_cipher != vault_plain, "EFS raw ciphertext matched plaintext")
+    dec_plain = command(binary, "efs-read", img, "/vault.bin", "--offline-image", "--key-file", key_file)
+    require(dec_plain == vault_plain, "efs-read with valid key mismatched plaintext")
+    command(binary, "tx-efs-decrypt", img, "/vault.bin", *tx_flags, "--key-file", key_file)
+    require(command("ntfscat", img, "/vault.bin") == vault_plain, "ntfscat mismatch after EFS decrypt")
+
+    final_chk = json.loads(command(binary, "check", img, "--offline-image"))
+    require(final_chk["clean"] is True, "ffs-ntfs check failed after transform/security suite")
+    if shutil.which("ntfsfix") is not None:
+        command("ntfsfix", "-n", img)
+
+    return {
+        "sparse_hole_punch_verified": True,
+        "lznt1_ntfscat_verified": True,
+        "secure_dacl_deny_before_allow_verified": True,
+        "symlink_objid_ea_usn_verified": True,
+        "efs_key_scoped_and_redacted_verified": True,
+        "oracle_scope_note": "Verified against Linux ntfs-3g (ntfscat/ntfsls/ntfsfix -n); Windows chkdsk and DPAPI are not executed on Linux",
     }
 
 

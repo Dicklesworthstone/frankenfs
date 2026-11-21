@@ -11,9 +11,26 @@ use ffs_ondisk::ntfs::logfile_writer::NtfsClientUpdateSpec;
 use ffs_ondisk::ntfs::recovery::{
     FileEdit, FileEditResult, FileOperation, RecoveryPass, apply_file_edit,
 };
-use ffs_ondisk::ntfs::{
-    ATTRIBUTE_LIST, DATA, NtfsFileRecord, NtfsLogOp, NtfsReference, NtfsRun, SPARSE, restore_record,
+use ffs_ondisk::ntfs::reparse::NtfsReparsePoint;
+use ffs_ondisk::ntfs::usn::{
+    USN_REASON_BASIC_INFO_CHANGE, USN_REASON_CLOSE, USN_REASON_DATA_EXTEND,
+    USN_REASON_DATA_OVERWRITE, USN_REASON_DATA_TRUNCATION, USN_REASON_FILE_CREATE,
+    USN_REASON_FILE_DELETE, USN_REASON_HARD_LINK_CHANGE, USN_REASON_RENAME_NEW_NAME,
+    USN_REASON_RENAME_OLD_NAME, UsnRecordV2,
 };
+use ffs_ondisk::ntfs::view_index::ViewCollation;
+use ffs_ondisk::ntfs::{
+    ATTRIBUTE_LIST, COMPRESSED, DATA, EA, EA_INFORMATION, ENCRYPTED, LOGGED_UTILITY_STREAM,
+    NtfsFileRecord, NtfsLogOp, NtfsReference, NtfsRun, OBJECT_ID, REPARSE_POINT, SPARSE,
+    restore_record,
+};
+use ffs_ondisk::ntfs_security::{
+    ACE_FLAG_CONTAINER_INHERIT, ACE_FLAG_OBJECT_INHERIT, NtfsSecurityDescriptor,
+    inherit_security_descriptor,
+};
+
+use crate::reader::wof::BACKING_NAME as WOF_BACKING_NAME;
+use crate::reparse_provider::{ReparseCapability, classify_reparse_point};
 
 use super::btree::I30RawEntry;
 use super::catalog::{
@@ -22,6 +39,7 @@ use super::catalog::{
     normalize_ntfs_runs, physical_spans_of_runs, set_or_clear_run_list, stage_runs_writes,
     stale_reference,
 };
+use super::compression::{self, UNIT_CLUSTERS};
 use super::dir_index::{
     DirPrePayloadWrite, I30_NAME, build_empty_small_index_root, directory_has_external_indx,
     find_attr_offset_in_restored,
@@ -31,6 +49,12 @@ use super::ops::{
     MAX_RESIDENT_DATA_PAYLOAD, PreparedTxPlan, TargetWriteKind, encode_standard_information,
     extract_parent_security, find_contiguous_zero_bits, set_or_clear_bits,
 };
+use super::secondary::{
+    EXTEND_OBJID_UPPER, EXTEND_REPARSE_UPPER, EXTEND_USNJRNL_UPPER, NtfsObjectIdData, OBJID_O_NAME,
+    REPARSE_R_NAME, append_usn_record_to_catalog, encode_objid_o_data, encode_reparse_r_key,
+    flush_view_index_into_catalog, remove_view_entries_matching, upsert_view_entry,
+};
+use super::secure::SecureStoreState;
 use super::{
     MAX_FILE_EDIT_BYTES, NtfsTransactionEngine, NtfsTxOutcome, OpenAttrRuntime, SECTOR_BYTES,
     checkpoint, corrupt, extract_plain_nonresident_stream, parse_err, read_mapped_runs,
@@ -38,9 +62,13 @@ use super::{
 };
 
 const ATTR_INDEX_ALLOCATION: u32 = 0xA0;
-const FILE_ATTR_READONLY: u32 = 0x0000_0001;
-const MIN_USER_MFT_SLOT: u64 = 24;
-const FIRST_NON_RESERVED_SLOT: u64 = 16;
+pub(super) const FILE_ATTR_READONLY: u32 = 0x0000_0001;
+pub(super) const FILE_ATTR_SPARSE_FILE: u32 = 0x0000_0200;
+pub(super) const FILE_ATTR_REPARSE_POINT: u32 = 0x0000_0400;
+pub(super) const FILE_ATTR_COMPRESSED: u32 = 0x0000_0800;
+pub(super) const FILE_ATTR_ENCRYPTED: u32 = 0x0000_4000;
+pub(super) const MIN_USER_MFT_SLOT: u64 = 24;
+pub(super) const FIRST_NON_RESERVED_SLOT: u64 = 16;
 
 /// Objects participating in one completed native rename transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,7 +131,7 @@ fn stale_target() -> FfsError {
     }
 }
 
-fn too_large_edit() -> FfsError {
+pub(super) fn too_large_edit() -> FfsError {
     FfsError::RequestRejected {
         errno: libc::EFBIG,
         detail: "NTFS stream edit exceeds the 16 MiB staging limit".into(),
@@ -111,7 +139,7 @@ fn too_large_edit() -> FfsError {
 }
 
 /// Select native `FILE_NAME` namespace flag (`3 = WIN32_AND_DOS`, `1 = WIN32`, `0 = POSIX`).
-fn choose_ntfs_namespace(name: &[u16]) -> u8 {
+pub(super) fn choose_ntfs_namespace(name: &[u16]) -> u8 {
     let has_posix_only = name
         .iter()
         .any(|&u| u < 0x20 || matches!(u, 0x22 | 0x2A | 0x3C | 0x3E | 0x3F | 0x7C))
@@ -151,7 +179,7 @@ fn is_strict_dos_8_3(name: &[u16]) -> bool {
 }
 
 /// Read `[offset .. offset + len]` from an [`EditableDataStream`] (`0` beyond `initialized_bytes` or sparse holes).
-fn read_editable_stream_prefix(
+pub(super) fn read_editable_stream_prefix(
     engine: &NtfsTransactionEngine,
     cx: &Cx,
     stream: &EditableDataStream,
@@ -169,6 +197,47 @@ fn read_editable_stream_prefix(
             {
                 let avail = (bytes.len() - start).min(len);
                 out[..avail].copy_from_slice(&bytes[start..start + avail]);
+            }
+            Ok(out)
+        }
+        EditableStreamStorage::NonResident {
+            runs,
+            compressed: true,
+            data_bytes,
+            initialized_bytes,
+            ..
+        } => {
+            let valid_limit = (*initialized_bytes).min(*data_bytes);
+            let mut out = vec![0_u8; len];
+            if offset >= valid_limit {
+                return Ok(out);
+            }
+            let readable = usize::try_from(valid_limit - offset)
+                .unwrap_or(usize::MAX)
+                .min(len);
+            let cb = u64::from(engine.geometry.cluster_bytes());
+            let unit_bytes = UNIT_CLUSTERS * cb;
+            let end_offset = offset + readable as u64;
+            let first_u = offset / unit_bytes;
+            let last_u = end_offset.div_ceil(unit_bytes);
+            for u in first_u..last_u {
+                let logical = compression::read_compressed_unit_plaintext(
+                    engine,
+                    cx,
+                    runs,
+                    *initialized_bytes,
+                    u,
+                )?;
+                let u_start = u * unit_bytes;
+                let u_end = u_start + unit_bytes;
+                let ov_start = offset.max(u_start);
+                let ov_end = end_offset.min(u_end);
+                if ov_start < ov_end {
+                    let src_off = (ov_start - u_start) as usize;
+                    let dst_off = (ov_start - offset) as usize;
+                    let cnt = (ov_end - ov_start) as usize;
+                    out[dst_off..dst_off + cnt].copy_from_slice(&logical[src_off..src_off + cnt]);
+                }
             }
             Ok(out)
         }
@@ -224,9 +293,9 @@ fn read_editable_stream_prefix(
     }
 }
 
-type SplicedRunPlan = (Vec<NtfsRun>, Vec<(u64, u64)>);
+pub(super) type SplicedRunPlan = (Vec<NtfsRun>, Vec<(u64, u64)>);
 
-fn splice_vcn_interval(
+pub(super) fn splice_vcn_interval(
     old_runs: &[NtfsRun],
     start_vcn: u64,
     end_vcn: u64,
@@ -317,40 +386,52 @@ fn splice_vcn_interval(
     ))
 }
 
-struct TxWorkspace {
-    cur_mft0_raw: Vec<u8>,
-    mft0_modified: bool,
-    mft_runs: Vec<NtfsRun>,
-    mft_data_bytes: u64,
-    cur_mft_init_bytes: u64,
-    logical_records: u64,
-    cur_init_records: u64,
-    mft_bm: Vec<u8>,
-    vol_bm_orig: Vec<u8>,
-    vol_bm: Vec<u8>,
-    bm_runs: Vec<NtfsRun>,
-    bm_rec_seq: u16,
-    vol_clusters: u64,
-    staged_open: BTreeMap<u32, OpenAttrRuntime>,
-    open_regs: Vec<(u32, OpenAttrRuntime, NtfsClientUpdateSpec)>,
-    mft_attr_slot: u16,
-    pre_payload_writes: Vec<DirPrePayloadWrite>,
-    mft_zero_writes: Vec<DirPrePayloadWrite>,
-    mutation_specs: Vec<NtfsClientUpdateSpec>,
-    target_writes: Vec<TargetWriteKind>,
-    catalogs: BTreeMap<u64, EditableCatalog>,
-    dirty_catalogs: BTreeSet<u64>,
-    deallocated_records: BTreeSet<u64>,
-    dir_entries_cache: BTreeMap<u64, Vec<I30RawEntry>>,
-    dirty_dirs: BTreeSet<u64>,
-    claimed_spans: Vec<(u64, u64)>,
-    allocated_clusters: Vec<(u64, u64)>,
-    freed_clusters: Vec<(u64, u64)>,
-    alloc_cursor: u64,
+pub(super) struct PendingUsnEvent {
+    pub(super) file_ref: NtfsReference,
+    pub(super) parent_ref: NtfsReference,
+    pub(super) reason: u32,
+    pub(super) file_attributes: u32,
+    pub(super) timestamp: u64,
+    pub(super) file_name: Vec<u16>,
+}
+
+pub(super) struct TxWorkspace {
+    pub(super) cur_mft0_raw: Vec<u8>,
+    pub(super) mft0_modified: bool,
+    pub(super) mft_runs: Vec<NtfsRun>,
+    pub(super) mft_data_bytes: u64,
+    pub(super) cur_mft_init_bytes: u64,
+    pub(super) logical_records: u64,
+    pub(super) cur_init_records: u64,
+    pub(super) mft_bm: Vec<u8>,
+    pub(super) vol_bm_orig: Vec<u8>,
+    pub(super) vol_bm: Vec<u8>,
+    pub(super) bm_runs: Vec<NtfsRun>,
+    pub(super) bm_rec_seq: u16,
+    pub(super) vol_clusters: u64,
+    pub(super) staged_open: BTreeMap<u32, OpenAttrRuntime>,
+    pub(super) open_regs: Vec<(u32, OpenAttrRuntime, NtfsClientUpdateSpec)>,
+    pub(super) mft_attr_slot: u16,
+    pub(super) pre_payload_writes: Vec<DirPrePayloadWrite>,
+    pub(super) mft_zero_writes: Vec<DirPrePayloadWrite>,
+    pub(super) mutation_specs: Vec<NtfsClientUpdateSpec>,
+    pub(super) target_writes: Vec<TargetWriteKind>,
+    pub(super) catalogs: BTreeMap<u64, EditableCatalog>,
+    pub(super) dirty_catalogs: BTreeSet<u64>,
+    pub(super) fresh_base_records: BTreeMap<u64, Vec<u8>>,
+    pub(super) deallocated_records: BTreeSet<u64>,
+    pub(super) dir_entries_cache: BTreeMap<u64, Vec<I30RawEntry>>,
+    pub(super) dirty_dirs: BTreeSet<u64>,
+    pub(super) claimed_spans: Vec<(u64, u64)>,
+    pub(super) allocated_clusters: Vec<(u64, u64)>,
+    pub(super) freed_clusters: Vec<(u64, u64)>,
+    pub(super) alloc_cursor: u64,
+    pub(super) secure_store: Option<SecureStoreState>,
+    pub(super) pending_usn_events: Vec<PendingUsnEvent>,
 }
 
 impl TxWorkspace {
-    fn load(engine: &NtfsTransactionEngine, cx: &Cx) -> Result<Self> {
+    pub(super) fn load(engine: &NtfsTransactionEngine, cx: &Cx) -> Result<Self> {
         let mft0 = engine.read_mft_record_zero(cx)?;
         let (mft_runs, mft_data_bytes, mft_init_bytes) =
             extract_plain_nonresident_stream(&engine.geometry, &mft0, DATA, &[])?;
@@ -411,6 +492,7 @@ impl TxWorkspace {
             target_writes: Vec::new(),
             catalogs: BTreeMap::new(),
             dirty_catalogs: BTreeSet::new(),
+            fresh_base_records: BTreeMap::new(),
             deallocated_records: BTreeSet::new(),
             dir_entries_cache: BTreeMap::new(),
             dirty_dirs: BTreeSet::new(),
@@ -418,7 +500,13 @@ impl TxWorkspace {
             allocated_clusters: Vec::new(),
             freed_clusters: Vec::new(),
             alloc_cursor: 1,
+            secure_store: None,
+            pending_usn_events: Vec::new(),
         })
+    }
+
+    pub(super) fn mft_slot_is_allocated(&self, slot: u64) -> bool {
+        slot < self.logical_records && is_bit_set(&self.mft_bm, slot)
     }
 
     fn verify_and_register_runs(&mut self, runs: &[NtfsRun]) -> Result<()> {
@@ -451,11 +539,12 @@ impl TxWorkspace {
         Ok(())
     }
 
-    fn load_catalog(
+    fn load_catalog_inner(
         &mut self,
         engine: &NtfsTransactionEngine,
         cx: &Cx,
         target_ref: NtfsReference,
+        allow_view_index: bool,
     ) -> Result<&EditableCatalog> {
         if !self.catalogs.contains_key(&target_ref.record) {
             if target_ref.record >= self.logical_records
@@ -463,7 +552,11 @@ impl TxWorkspace {
             {
                 return Err(stale_reference(target_ref));
             }
-            let cat = engine.load_editable_catalog(cx, &self.mft_runs, target_ref)?;
+            let cat = if allow_view_index {
+                engine.load_view_index_catalog(cx, &self.mft_runs, target_ref)?
+            } else {
+                engine.load_editable_catalog(cx, &self.mft_runs, target_ref)?
+            };
             for &(ext_no, _, _) in &cat.old_extensions {
                 if !is_bit_set(&self.mft_bm, u64::from(ext_no)) {
                     return Err(corrupt(
@@ -484,9 +577,15 @@ impl TxWorkspace {
             {
                 self.verify_and_register_runs(a0_runs)?;
             }
+            for view in &cat.view_indexes {
+                if let Some((ref a0_runs, _, _)) = view.external {
+                    self.verify_and_register_runs(a0_runs)?;
+                }
+            }
             let pres_runs = cat.preserved_nonresident_runs(engine.geometry.cluster_count())?;
             self.verify_and_register_runs(&pres_runs)?;
             self.verify_and_register_runs(&cat.old_nonres_attrlist_runs)?;
+            self.verify_and_register_runs(&cat.old_owned_extra_runs)?;
             self.catalogs.insert(target_ref.record, cat);
         }
         let cat = self
@@ -499,7 +598,25 @@ impl TxWorkspace {
         Ok(cat)
     }
 
-    fn catalog_mut(
+    pub(super) fn load_catalog(
+        &mut self,
+        engine: &NtfsTransactionEngine,
+        cx: &Cx,
+        target_ref: NtfsReference,
+    ) -> Result<&EditableCatalog> {
+        self.load_catalog_inner(engine, cx, target_ref, false)
+    }
+
+    pub(super) fn load_view_catalog(
+        &mut self,
+        engine: &NtfsTransactionEngine,
+        cx: &Cx,
+        target_ref: NtfsReference,
+    ) -> Result<&EditableCatalog> {
+        self.load_catalog_inner(engine, cx, target_ref, true)
+    }
+
+    pub(super) fn catalog_mut(
         &mut self,
         engine: &NtfsTransactionEngine,
         cx: &Cx,
@@ -513,14 +630,310 @@ impl TxWorkspace {
             .expect("loaded catalog"))
     }
 
-    fn dir_entries(
+    pub(super) fn register_fresh_catalog(
+        &mut self,
+        cat: EditableCatalog,
+        existing_slot_raw: Vec<u8>,
+    ) {
+        let rec = cat.base_ref.record;
+        self.catalogs.insert(rec, cat);
+        self.dirty_catalogs.insert(rec);
+        self.fresh_base_records.insert(rec, existing_slot_raw);
+    }
+
+    pub(super) fn ensure_secure_store(
+        &mut self,
+        engine: &NtfsTransactionEngine,
+        cx: &Cx,
+    ) -> Result<&mut SecureStoreState> {
+        if self.secure_store.is_none() {
+            if !self.mft_slot_is_allocated(9) {
+                return Err(unsupported(
+                    "$Secure (Record 9) is not allocated on this volume",
+                ));
+            }
+            let rec9 =
+                read_mft_record_via_runs(&engine.device, cx, &engine.geometry, &self.mft_runs, 9)?;
+            let sec_ref = NtfsReference {
+                record: 9,
+                sequence: rec9.sequence,
+            };
+            let sec_cat = self.load_view_catalog(engine, cx, sec_ref)?.clone();
+            let store = SecureStoreState::load(engine, cx, &sec_cat)?;
+            self.secure_store = Some(store);
+        }
+        Ok(self.secure_store.as_mut().expect("loaded secure store"))
+    }
+
+    pub(super) fn intern_security_descriptor(
+        &mut self,
+        engine: &NtfsTransactionEngine,
+        cx: &Cx,
+        descriptor_bytes: &[u8],
+    ) -> Result<u32> {
+        let _ = self.ensure_secure_store(engine, cx)?;
+        let mut store = self.secure_store.take().expect("secure store loaded");
+        let mut pre_writes = Vec::new();
+        let mut freed = Vec::new();
+        let res = store.intern_descriptor(
+            engine,
+            cx,
+            descriptor_bytes,
+            &mut pre_writes,
+            &mut freed,
+            |need_cl| self.alloc_clusters(need_cl, 1),
+        );
+        self.secure_store = Some(store);
+        let id = res?;
+        self.pre_payload_writes.extend(pre_writes);
+        self.free_clusters_deferred(&freed);
+        Ok(id)
+    }
+
+    pub(super) fn read_catalog_security_descriptor(
+        &mut self,
+        engine: &NtfsTransactionEngine,
+        cx: &Cx,
+        cat: &EditableCatalog,
+    ) -> Result<Option<Vec<u8>>> {
+        if let Some(ref raw) = cat.security_descriptor {
+            return Ok(Some(raw.clone()));
+        }
+        if let Some(sec_id) = cat.std_security_id()
+            && self.mft_slot_is_allocated(9)
+        {
+            let _ = self.ensure_secure_store(engine, cx)?;
+            let store = self.secure_store.as_ref().expect("secure store");
+            let desc = store.read_descriptor_by_id(engine, cx, sec_id)?;
+            return Ok(Some(desc));
+        }
+        Ok(None)
+    }
+
+    pub(super) fn lookup_extend_child(
+        &mut self,
+        engine: &NtfsTransactionEngine,
+        cx: &Cx,
+        upper_name: &[u16],
+    ) -> Result<Option<NtfsReference>> {
+        if !self.mft_slot_is_allocated(11) {
+            return Ok(None);
+        }
+        let rec11 =
+            read_mft_record_via_runs(&engine.device, cx, &engine.geometry, &self.mft_runs, 11)?;
+        if !rec11.is_directory() {
+            return Ok(None);
+        }
+        let ext_ref = NtfsReference {
+            record: 11,
+            sequence: rec11.sequence,
+        };
+        let _ = self.load_view_catalog(engine, cx, ext_ref)?;
+        Ok(self
+            .lookup_in_dir(engine, cx, ext_ref, upper_name)?
+            .map(|e| e.reference))
+    }
+
+    pub(super) fn max_view_root_value_bytes(engine: &NtfsTransactionEngine) -> usize {
+        let rec_bytes = engine.geometry.record_bytes() as usize;
+        let usa_count = rec_bytes / SECTOR_BYTES + 1;
+        let hdr_base = if engine.version == [3, 0] { 42 } else { 48 };
+        let first_attr = (hdr_base + usa_count * 2).next_multiple_of(8);
+        rec_bytes.saturating_sub(first_attr + 540).max(96)
+    }
+
+    pub(super) fn sync_reparse_r_index(
+        &mut self,
+        engine: &NtfsTransactionEngine,
+        cx: &Cx,
+        target_ref: NtfsReference,
+        new_tag: Option<u32>,
+    ) -> Result<()> {
+        let Some(reparse_ref) = self.lookup_extend_child(engine, cx, &EXTEND_REPARSE_UPPER)? else {
+            return Ok(());
+        };
+        let _ = self.load_view_catalog(engine, cx, reparse_ref)?;
+        let mut rep_cat = self
+            .catalogs
+            .remove(&reparse_ref.record)
+            .ok_or_else(|| corrupt(0, "missing $Extend/$Reparse catalog"))?;
+        let res = (|| -> Result<()> {
+            let mut entries = if let Some(view) = rep_cat
+                .view_indexes
+                .iter()
+                .find(|v| v.index_name == REPARSE_R_NAME)
+            {
+                engine.collect_view_index_entries(cx, view)?
+            } else {
+                Vec::new()
+            };
+            let removed = remove_view_entries_matching(&mut entries, |e| {
+                e.key.len() >= 12
+                    && (u64::from_le_bytes([
+                        e.key[4], e.key[5], e.key[6], e.key[7], e.key[8], e.key[9], e.key[10],
+                        e.key[11],
+                    ]) & 0x0000_FFFF_FFFF_FFFF)
+                        == target_ref.record
+            });
+            if let Some(tag) = new_tag {
+                let key = encode_reparse_r_key(tag, target_ref)?;
+                upsert_view_entry(&mut entries, key, Vec::new(), ViewCollation::U32Slice);
+            } else if !removed {
+                return Ok(());
+            }
+            let max_root = Self::max_view_root_value_bytes(engine);
+            let mut pre = Vec::new();
+            let mut freed = Vec::new();
+            flush_view_index_into_catalog(
+                &engine.geometry,
+                &mut rep_cat,
+                &REPARSE_R_NAME,
+                ViewCollation::U32Slice,
+                entries,
+                max_root,
+                &mut pre,
+                &mut freed,
+                |n, min_c| self.alloc_clusters(n, min_c),
+            )?;
+            self.pre_payload_writes.extend(pre);
+            self.free_clusters_deferred(&freed);
+            self.dirty_catalogs.insert(reparse_ref.record);
+            Ok(())
+        })();
+        self.catalogs.insert(reparse_ref.record, rep_cat);
+        res
+    }
+
+    pub(super) fn sync_objid_o_index(
+        &mut self,
+        engine: &NtfsTransactionEngine,
+        cx: &Cx,
+        target_ref: NtfsReference,
+        new_objid: Option<&NtfsObjectIdData>,
+    ) -> Result<()> {
+        let Some(objid_ref) = self.lookup_extend_child(engine, cx, &EXTEND_OBJID_UPPER)? else {
+            return Ok(());
+        };
+        let _ = self.load_view_catalog(engine, cx, objid_ref)?;
+        let mut obj_cat = self
+            .catalogs
+            .remove(&objid_ref.record)
+            .ok_or_else(|| corrupt(0, "missing $Extend/$ObjId catalog"))?;
+        let res = (|| -> Result<()> {
+            let (collation, mut entries) = if let Some(view) = obj_cat
+                .view_indexes
+                .iter()
+                .find(|v| v.index_name == OBJID_O_NAME)
+            {
+                (view.collation, engine.collect_view_index_entries(cx, view)?)
+            } else {
+                (ViewCollation::U32Slice, Vec::new())
+            };
+            if let Some(data) = new_objid {
+                let colliding_other = entries.iter().any(|e| {
+                    e.key.as_slice() == data.object_id
+                        && e.data.len() >= 8
+                        && (u64::from_le_bytes([
+                            e.data[0], e.data[1], e.data[2], e.data[3], e.data[4], e.data[5],
+                            e.data[6], e.data[7],
+                        ]) & 0x0000_FFFF_FFFF_FFFF)
+                            != target_ref.record
+                });
+                if colliding_other {
+                    return Err(FfsError::Exists);
+                }
+            }
+            let removed = remove_view_entries_matching(&mut entries, |e| {
+                e.data.len() >= 8
+                    && (u64::from_le_bytes([
+                        e.data[0], e.data[1], e.data[2], e.data[3], e.data[4], e.data[5],
+                        e.data[6], e.data[7],
+                    ]) & 0x0000_FFFF_FFFF_FFFF)
+                        == target_ref.record
+            });
+            if let Some(data) = new_objid {
+                let val = encode_objid_o_data(target_ref, data)?;
+                upsert_view_entry(&mut entries, data.object_id.to_vec(), val, collation);
+            } else if !removed {
+                return Ok(());
+            }
+            let max_root = Self::max_view_root_value_bytes(engine);
+            let mut pre = Vec::new();
+            let mut freed = Vec::new();
+            flush_view_index_into_catalog(
+                &engine.geometry,
+                &mut obj_cat,
+                &OBJID_O_NAME,
+                collation,
+                entries,
+                max_root,
+                &mut pre,
+                &mut freed,
+                |n, min_c| self.alloc_clusters(n, min_c),
+            )?;
+            self.pre_payload_writes.extend(pre);
+            self.free_clusters_deferred(&freed);
+            self.dirty_catalogs.insert(objid_ref.record);
+            Ok(())
+        })();
+        self.catalogs.insert(objid_ref.record, obj_cat);
+        res
+    }
+
+    pub(super) fn push_usn_event_for_catalog(
+        &mut self,
+        cat: &EditableCatalog,
+        reason: u32,
+        timestamp: u64,
+    ) {
+        if let Some(fn_attr) = cat
+            .file_names
+            .iter()
+            .find(|f| f.file_name.namespace != 2)
+            .or_else(|| cat.file_names.first())
+        {
+            self.pending_usn_events.push(PendingUsnEvent {
+                file_ref: cat.base_ref,
+                parent_ref: fn_attr.file_name.parent,
+                reason,
+                file_attributes: cat.std_flags(),
+                timestamp,
+                file_name: fn_attr.file_name.name.clone(),
+            });
+        }
+    }
+
+    pub(super) fn push_usn_event_explicit(
+        &mut self,
+        file_ref: NtfsReference,
+        parent_ref: NtfsReference,
+        reason: u32,
+        file_attributes: u32,
+        timestamp: u64,
+        file_name: Vec<u16>,
+    ) {
+        self.pending_usn_events.push(PendingUsnEvent {
+            file_ref,
+            parent_ref,
+            reason,
+            file_attributes,
+            timestamp,
+            file_name,
+        });
+    }
+
+    pub(super) fn dir_entries(
         &mut self,
         engine: &NtfsTransactionEngine,
         cx: &Cx,
         dir_ref: NtfsReference,
     ) -> Result<&Vec<I30RawEntry>> {
         if !self.dir_entries_cache.contains_key(&dir_ref.record) {
-            let cat = self.load_catalog(engine, cx, dir_ref)?;
+            let cat = if dir_ref.record == 11 {
+                self.load_view_catalog(engine, cx, dir_ref)?
+            } else {
+                self.load_catalog(engine, cx, dir_ref)?
+            };
             if !cat.is_directory {
                 return Err(FfsError::NotDirectory);
             }
@@ -538,7 +951,7 @@ impl TxWorkspace {
         Ok(self.dir_entries_cache.get(&dir_ref.record).expect("cached"))
     }
 
-    fn dir_entries_mut(
+    pub(super) fn dir_entries_mut(
         &mut self,
         engine: &NtfsTransactionEngine,
         cx: &Cx,
@@ -553,7 +966,7 @@ impl TxWorkspace {
             .expect("cached dir entries"))
     }
 
-    fn lookup_in_dir(
+    pub(super) fn lookup_in_dir(
         &mut self,
         engine: &NtfsTransactionEngine,
         cx: &Cx,
@@ -597,7 +1010,11 @@ impl TxWorkspace {
             }
             return Ok(Some(folded_matches[0].clone()));
         }
-        let cat = self.load_catalog(engine, cx, dir_ref)?;
+        let cat = if dir_ref.record == 11 {
+            self.load_view_catalog(engine, cx, dir_ref)?
+        } else {
+            self.load_catalog(engine, cx, dir_ref)?
+        };
         if !cat.is_directory {
             return Err(FfsError::NotDirectory);
         }
@@ -608,7 +1025,11 @@ impl TxWorkspace {
         engine.lookup_in_catalog_i30(cx, dir_idx, query_utf16)
     }
 
-    fn alloc_clusters(&mut self, needed: u64, min_chunk: u64) -> Result<Vec<(u64, u64)>> {
+    pub(super) fn alloc_clusters(
+        &mut self,
+        needed: u64,
+        min_chunk: u64,
+    ) -> Result<Vec<(u64, u64)>> {
         let spans = allocate_cluster_runs(
             &self.vol_bm,
             self.vol_clusters,
@@ -624,7 +1045,7 @@ impl TxWorkspace {
         Ok(spans)
     }
 
-    fn free_clusters_deferred(&mut self, spans: &[(u64, u64)]) {
+    pub(super) fn free_clusters_deferred(&mut self, spans: &[(u64, u64)]) {
         for &(start, len) in spans {
             if len > 0 {
                 self.freed_clusters.push((start, len));
@@ -632,7 +1053,7 @@ impl TxWorkspace {
         }
     }
 
-    fn alloc_mft_slot(
+    pub(super) fn alloc_mft_slot(
         &mut self,
         engine: &NtfsTransactionEngine,
         cx: &Cx,
@@ -758,9 +1179,10 @@ impl TxWorkspace {
         Ok((slot, next_seq, existing_raw))
     }
 
-    fn deallocate_entire_catalog(
+    pub(super) fn deallocate_entire_catalog(
         &mut self,
         engine: &NtfsTransactionEngine,
+        cx: &Cx,
         rec_no: u64,
     ) -> Result<()> {
         let cat = self
@@ -768,6 +1190,12 @@ impl TxWorkspace {
             .get(&rec_no)
             .ok_or_else(|| corrupt(0, "missing catalog for deallocation"))?
             .clone();
+        if cat.reparse_point.is_some() {
+            self.sync_reparse_r_index(engine, cx, cat.base_ref, None)?;
+        }
+        if cat.object_id.is_some() {
+            self.sync_objid_o_index(engine, cx, cat.base_ref, None)?;
+        }
         self.dirty_catalogs.remove(&rec_no);
         self.dirty_dirs.remove(&rec_no);
         self.deallocated_records.insert(rec_no);
@@ -784,9 +1212,15 @@ impl TxWorkspace {
         {
             self.free_clusters_deferred(&physical_spans_of_runs(a0_runs));
         }
+        for view in &cat.view_indexes {
+            if let Some((ref a0_runs, _, _)) = view.external {
+                self.free_clusters_deferred(&physical_spans_of_runs(a0_runs));
+            }
+        }
         let pres_runs = cat.preserved_nonresident_runs(engine.geometry.cluster_count())?;
         self.free_clusters_deferred(&physical_spans_of_runs(&pres_runs));
         self.free_clusters_deferred(&physical_spans_of_runs(&cat.old_nonres_attrlist_runs));
+        self.free_clusters_deferred(&physical_spans_of_runs(&cat.old_owned_extra_runs));
 
         for &(ext_slot, _, ref old_ext_raw) in &cat.old_extensions {
             let protected_dealloc = engine.emit_mft_slot_dealloc_spec(
@@ -847,7 +1281,7 @@ impl TxWorkspace {
         Ok(())
     }
 
-    fn sync_target_into_parent_dirs(
+    pub(super) fn sync_target_into_parent_dirs(
         &mut self,
         engine: &NtfsTransactionEngine,
         cx: &Cx,
@@ -888,7 +1322,7 @@ impl TxWorkspace {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn finalize<T>(
+    pub(super) fn finalize<T>(
         mut self,
         engine: &NtfsTransactionEngine,
         cx: &Cx,
@@ -896,10 +1330,91 @@ impl TxWorkspace {
         operation_digest: [u8; 32],
         result_value: T,
     ) -> Result<PreparedTxPlan<T>> {
-        let rec_bytes = engine.geometry.record_bytes() as usize;
-        let usa_count = rec_bytes / SECTOR_BYTES + 1;
-        let first_attr = (48 + usa_count * 2).next_multiple_of(8);
-        let max_root_value_bytes = rec_bytes.saturating_sub(first_attr + 540).max(96);
+        let max_root_value_bytes = Self::max_view_root_value_bytes(engine);
+
+        // 1. Flush any modified `$Secure` (Record 9) state into its catalog before packing.
+        if let Some(store) = self.secure_store.take()
+            && store.modified
+        {
+            let mut sec_cat = self
+                .catalogs
+                .remove(&9)
+                .ok_or_else(|| corrupt(0, "$Secure catalog missing during finalize"))?;
+            let mut pre = Vec::new();
+            let mut freed = Vec::new();
+            let res = store.flush_into_catalog(
+                &engine.geometry,
+                &mut sec_cat,
+                max_root_value_bytes,
+                &mut pre,
+                &mut freed,
+                |n, min_c| self.alloc_clusters(n, min_c),
+            );
+            self.catalogs.insert(9, sec_cat);
+            res?;
+            self.pre_payload_writes.extend(pre);
+            self.free_clusters_deferred(&freed);
+            self.dirty_catalogs.insert(9);
+        }
+
+        // 2. Append any pending USN events to active `$Extend/$UsnJrnl` and stamp target USNs.
+        let pending_usn = std::mem::take(&mut self.pending_usn_events);
+        if !pending_usn.is_empty()
+            && let Some(usn_ref) = self.lookup_extend_child(engine, cx, &EXTEND_USNJRNL_UPPER)?
+        {
+            let _ = self.load_view_catalog(engine, cx, usn_ref)?;
+            let mut usn_cat = self
+                .catalogs
+                .remove(&usn_ref.record)
+                .ok_or_else(|| corrupt(0, "missing $UsnJrnl catalog"))?;
+            let mut pre = Vec::new();
+            let mut freed = Vec::new();
+            let mut assigned_usns = Vec::with_capacity(pending_usn.len());
+            let append_res = (|| -> Result<()> {
+                for ev in pending_usn {
+                    let sec_id = self
+                        .catalogs
+                        .get(&ev.file_ref.record)
+                        .and_then(EditableCatalog::std_security_id)
+                        .unwrap_or(0);
+                    let rec = UsnRecordV2 {
+                        file_ref: ev.file_ref,
+                        parent_ref: ev.parent_ref,
+                        usn: 0,
+                        timestamp: ev.timestamp,
+                        reason: ev.reason,
+                        source_info: 0,
+                        security_id: sec_id,
+                        file_attributes: ev.file_attributes,
+                        name: ev.file_name,
+                    };
+                    let assigned = append_usn_record_to_catalog(
+                        engine,
+                        cx,
+                        &mut usn_cat,
+                        rec,
+                        &mut pre,
+                        &mut freed,
+                        |n| self.alloc_clusters(n, 1),
+                    )?;
+                    assigned_usns.push((ev.file_ref.record, assigned));
+                }
+                Ok(())
+            })();
+            self.catalogs.insert(usn_ref.record, usn_cat);
+            append_res?;
+            self.pre_payload_writes.extend(pre);
+            self.free_clusters_deferred(&freed);
+            self.dirty_catalogs.insert(usn_ref.record);
+            for (target_rec, usn) in assigned_usns {
+                if !self.deallocated_records.contains(&target_rec)
+                    && let Some(target_cat) = self.catalogs.get_mut(&target_rec)
+                {
+                    target_cat.set_std_usn(usn);
+                    self.dirty_catalogs.insert(target_rec);
+                }
+            }
+        }
 
         let dirty_dir_ids: Vec<u64> = self.dirty_dirs.iter().copied().collect();
         for dir_id in dirty_dir_ids {
@@ -947,23 +1462,35 @@ impl TxWorkspace {
             if self.deallocated_records.contains(&rec_id) {
                 continue;
             }
-            let cat = self
+            let mut cat = self
                 .catalogs
                 .get(&rec_id)
                 .ok_or_else(|| corrupt(0, "missing dirty catalog"))?
                 .clone();
             let mft_runs_clone = self.mft_runs.clone();
             let mft_attr_slot = self.mft_attr_slot;
+            let fresh_existing = self.fresh_base_records.get(&rec_id).cloned();
 
             let packed = {
                 let ws_cell = std::cell::RefCell::new(&mut self);
-                engine.pack_editable_catalog(
-                    &cat,
-                    mft_attr_slot,
-                    &mft_runs_clone,
-                    || ws_cell.borrow_mut().alloc_mft_slot(engine, cx),
-                    |need_cl| ws_cell.borrow_mut().alloc_clusters(need_cl, 1),
-                )?
+                if let Some(ref existing_raw) = fresh_existing {
+                    engine.pack_fresh_base_catalog(
+                        &mut cat,
+                        existing_raw,
+                        mft_attr_slot,
+                        &mft_runs_clone,
+                        || ws_cell.borrow_mut().alloc_mft_slot(engine, cx),
+                        |need_cl| ws_cell.borrow_mut().alloc_clusters(need_cl, 1),
+                    )?
+                } else {
+                    engine.pack_editable_catalog(
+                        &cat,
+                        mft_attr_slot,
+                        &mft_runs_clone,
+                        || ws_cell.borrow_mut().alloc_mft_slot(engine, cx),
+                        |need_cl| ws_cell.borrow_mut().alloc_clusters(need_cl, 1),
+                    )?
+                }
             };
 
             self.pre_payload_writes.extend(packed.pre_payload_writes);
@@ -1079,20 +1606,69 @@ fn is_slot_in_original_mft(engine: &NtfsTransactionEngine, cx: &Cx, slot: u32) -
 }
 
 impl NtfsTransactionEngine {
+    fn has_active_usn_journal(&self, cx: &Cx) -> Result<bool> {
+        let vol = self.volume_view(cx)?;
+        Ok(vol.usn_summary(cx)?.is_some())
+    }
+
     fn record_uses_extended_catalog_or_sparse(
         &self,
         cx: &Cx,
         reference: NtfsReference,
     ) -> Result<bool> {
+        if self.version != [3, 1] || self.has_active_usn_journal(cx)? {
+            return Ok(true);
+        }
         let volume = self.volume_view(cx)?;
         let record = Self::checked_reference(&volume, cx, reference)?;
         let attrs = record.attributes().map_err(|err| parse_err(&err))?;
-        Ok(attrs
-            .iter()
-            .any(|a| a.kind == ATTRIBUTE_LIST || (a.kind == DATA && (a.flags & SPARSE) != 0)))
+        for a in &attrs {
+            if matches!(
+                a.kind,
+                ATTRIBUTE_LIST
+                    | OBJECT_ID
+                    | REPARSE_POINT
+                    | EA_INFORMATION
+                    | EA
+                    | LOGGED_UTILITY_STREAM
+            ) {
+                return Ok(true);
+            }
+            if a.kind == DATA && (a.flags & (SPARSE | COMPRESSED | ENCRYPTED)) != 0 {
+                return Ok(true);
+            }
+            if a.kind == 0x10
+                && a.name.is_empty()
+                && let ffs_ondisk::ntfs::NtfsValue::Resident(std_raw) = a.value
+                && std_raw.len() >= 36
+            {
+                let f = u32::from_le_bytes([std_raw[32], std_raw[33], std_raw[34], std_raw[35]]);
+                if f & (FILE_ATTR_COMPRESSED | FILE_ATTR_REPARSE_POINT | FILE_ATTR_ENCRYPTED) != 0 {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
-    fn ensure_mft_headroom(
+    fn parent_requires_extended_create(&self, cx: &Cx, parent: NtfsReference) -> Result<bool> {
+        if self.record_uses_extended_catalog_or_sparse(cx, parent)? {
+            return Ok(true);
+        }
+        let volume = self.volume_view(cx)?;
+        let record = Self::checked_reference(&volume, cx, parent)?;
+        if let Ok(info) = volume.security_descriptor(cx, &record)
+            && info.descriptor.dacl.present
+            && info.descriptor.dacl.aces.iter().any(|ace| {
+                (ace.flags & (ACE_FLAG_OBJECT_INHERIT | ACE_FLAG_CONTAINER_INHERIT)) != 0
+            })
+        {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    pub(super) fn ensure_mft_headroom(
         &mut self,
         cx: &Cx,
         min_free_slots: u64,
@@ -1168,7 +1744,11 @@ impl NtfsTransactionEngine {
         if let Err(err) = validate_ntfs_component_utf16(name) {
             return NtfsTxOutcome::NotCommitted(err);
         }
-        if let Ok(path) = self.resolve_reference_path(cx, parent)
+        let use_extended = self
+            .parent_requires_extended_create(cx, parent)
+            .unwrap_or(true);
+        if !use_extended
+            && let Ok(path) = self.resolve_reference_path(cx, parent)
             && let Ok(text) = String::from_utf16(name)
         {
             match self.lookup_reference(cx, parent, name) {
@@ -1198,7 +1778,11 @@ impl NtfsTransactionEngine {
         if let Err(err) = validate_ntfs_component_utf16(name) {
             return NtfsTxOutcome::NotCommitted(err);
         }
-        if let Ok(path) = self.resolve_reference_path(cx, parent)
+        let use_extended = self
+            .parent_requires_extended_create(cx, parent)
+            .unwrap_or(true);
+        if !use_extended
+            && let Ok(path) = self.resolve_reference_path(cx, parent)
             && let Ok(text) = String::from_utf16(name)
         {
             match self.lookup_reference(cx, parent, name) {
@@ -1229,7 +1813,14 @@ impl NtfsTransactionEngine {
         if let Err(err) = validate_ntfs_component_utf16(name) {
             return NtfsTxOutcome::NotCommitted(err);
         }
-        if let Ok(source) = self.resolve_reference_path(cx, reference)
+        let use_extended = self
+            .record_uses_extended_catalog_or_sparse(cx, reference)
+            .unwrap_or(true)
+            || self
+                .record_uses_extended_catalog_or_sparse(cx, parent)
+                .unwrap_or(true);
+        if !use_extended
+            && let Ok(source) = self.resolve_reference_path(cx, reference)
             && let Ok(destination_parent) = self.resolve_reference_path(cx, parent)
             && let Ok(text) = String::from_utf16(name)
         {
@@ -1676,19 +2267,67 @@ impl NtfsTransactionEngine {
                 return Err(FfsError::Exists);
             }
 
-            let parent_raw_rec = read_mft_record_via_runs(
-                &self.device,
-                cx,
-                &self.geometry,
-                &ws.mft_runs,
-                u32::try_from(parent_ref.record).map_err(|_| corrupt(0, "parent u32"))?,
-            )?;
-            let security = extract_parent_security(&parent_raw_rec);
-            let mut std_info = encode_standard_information(is_dir, &security);
+            let parent_cat = ws.load_catalog(self, cx, parent_ref)?.clone();
+            if parent_cat.reparse_point.is_some() {
+                return Err(unsupported(
+                    "cannot create NTFS child inside a reparse directory",
+                ));
+            }
+            let inherit_compressed = (parent_cat.std_flags() & FILE_ATTR_COMPRESSED) != 0;
+            if inherit_compressed && !is_dir {
+                compression::check_lznt1_geometry(&self.geometry)?;
+            }
+
             let mut base_flags = if is_dir { 0_u32 } else { FILE_ATTR_ARCHIVE };
             if read_only {
                 base_flags |= FILE_ATTR_READONLY;
             }
+            if inherit_compressed {
+                base_flags |= FILE_ATTR_COMPRESSED;
+            }
+
+            let (mut std_info, sd_opt) = if let Some(parent_sd_raw) =
+                ws.read_catalog_security_descriptor(self, cx, &parent_cat)?
+                && let Ok(parent_sd) = NtfsSecurityDescriptor::parse(&parent_sd_raw)
+            {
+                let default_owner = ffs_ondisk::ntfs_security::NtfsSid::administrators();
+                let default_group = ffs_ondisk::ntfs_security::NtfsSid::local_system();
+                let child_owner = parent_sd.owner.as_ref().unwrap_or(&default_owner);
+                let child_group = parent_sd.group.as_ref().unwrap_or(&default_group);
+                let inherited_sd =
+                    inherit_security_descriptor(&parent_sd, is_dir, child_owner, child_group)
+                        .map_err(|err| parse_err(&err))?;
+                let inherited_bytes = inherited_sd.encode().map_err(|err| parse_err(&err))?;
+                if self.version == [3, 1] && ws.mft_slot_is_allocated(9) {
+                    let sec_id = ws.intern_security_descriptor(self, cx, &inherited_bytes)?;
+                    let info = encode_standard_information(
+                        is_dir,
+                        &super::ops::InheritedSecurity::SharedId(sec_id),
+                    );
+                    (info, None)
+                } else {
+                    let info = encode_standard_information(
+                        is_dir,
+                        &super::ops::InheritedSecurity::Descriptor(inherited_bytes.clone()),
+                    );
+                    (info, Some(inherited_bytes))
+                }
+            } else {
+                let parent_raw_rec = read_mft_record_via_runs(
+                    &self.device,
+                    cx,
+                    &self.geometry,
+                    &ws.mft_runs,
+                    u32::try_from(parent_ref.record).map_err(|_| corrupt(0, "parent u32"))?,
+                )?;
+                let security = extract_parent_security(&parent_raw_rec);
+                let info = encode_standard_information(is_dir, &security);
+                let sd = match security {
+                    super::ops::InheritedSecurity::SharedId(_) => None,
+                    super::ops::InheritedSecurity::Descriptor(sd) => Some(sd),
+                };
+                (info, sd)
+            };
             std_info[32..36].copy_from_slice(&base_flags.to_le_bytes());
             for off in [0_usize, 8, 16, 24] {
                 std_info[off..off + 8].copy_from_slice(&now_ticks.to_le_bytes());
@@ -1710,7 +2349,18 @@ impl NtfsTransactionEngine {
                     external: None,
                 })
             } else {
-                let storage = if initial_data.len() <= MAX_RESIDENT_DATA_PAYLOAD {
+                let storage = if inherit_compressed {
+                    let mut pre = Vec::new();
+                    let st = compression::rebuild_stream_for_compression_toggle(
+                        &self.geometry,
+                        initial_data,
+                        true,
+                        &mut pre,
+                        |n| ws.alloc_clusters(n, 1),
+                    )?;
+                    ws.pre_payload_writes.extend(pre);
+                    st
+                } else if initial_data.len() <= MAX_RESIDENT_DATA_PAYLOAD {
                     EditableStreamStorage::Resident(initial_data.to_vec())
                 } else {
                     let n_cl = (initial_data.len() as u64).div_ceil(cb);
@@ -1731,6 +2381,8 @@ impl NtfsTransactionEngine {
                     EditableStreamStorage::NonResident {
                         runs,
                         sparse: false,
+                        compressed: false,
+                        encrypted: false,
                         compression_unit: 0,
                         data_bytes: initial_data.len() as u64,
                         initialized_bytes: initial_data.len() as u64,
@@ -1763,50 +2415,37 @@ impl NtfsTransactionEngine {
                 },
                 reparse: 0,
             };
-            let sd_opt = match security {
-                super::ops::InheritedSecurity::SharedId(_) => None,
-                super::ops::InheritedSecurity::Descriptor(sd) => Some(sd),
-            };
             let mut child_cat = EditableCatalog {
                 base_ref: child_ref,
                 is_directory: is_dir,
                 std_info,
                 file_names: vec![fn_attr],
+                object_id: None,
                 security_descriptor: sd_opt,
                 data_streams,
                 dir_index,
+                view_indexes: Vec::new(),
+                reparse_point: None,
+                ea_pair: None,
+                efs_stream: None,
                 preserved: Vec::new(),
                 old_base_raw: existing_raw.clone(),
                 old_extensions: Vec::new(),
                 old_nonres_attrlist_runs: Vec::new(),
+                old_owned_extra_runs: Vec::new(),
             };
             child_cat.sync_filename_duplicated_fields(self.geometry.cluster_bytes());
             let raw_fn_bytes = child_cat.file_names[0].encode()?;
             let fn_struct = child_cat.file_names[0].file_name.clone();
-
-            let mft_runs_clone = ws.mft_runs.clone();
-            let mft_attr_slot = ws.mft_attr_slot;
-            {
-                let mut tmp_cat = child_cat;
-                let ws_cell = std::cell::RefCell::new(&mut ws);
-                let packed = self.pack_fresh_base_catalog(
-                    &mut tmp_cat,
-                    &existing_raw,
-                    mft_attr_slot,
-                    &mft_runs_clone,
-                    || ws_cell.borrow_mut().alloc_mft_slot(self, cx),
-                    |need_cl| ws_cell.borrow_mut().alloc_clusters(need_cl, 1),
-                )?;
-                ws.pre_payload_writes.extend(packed.pre_payload_writes);
-                ws.mutation_specs.extend(packed.log_specs);
-                for (slot_no, raw_protected) in packed.mft_record_writes {
-                    ws.target_writes.push(TargetWriteKind::MftRecord {
-                        runs: ws.mft_runs.clone(),
-                        record_no: slot_no,
-                        raw_protected,
-                    });
-                }
-            }
+            ws.push_usn_event_explicit(
+                child_ref,
+                parent_ref,
+                USN_REASON_FILE_CREATE | USN_REASON_CLOSE,
+                child_cat.std_flags(),
+                now_ticks,
+                name_utf16.to_vec(),
+            );
+            ws.register_fresh_catalog(child_cat, existing_raw);
 
             ws.dir_entries_mut(self, cx, parent_ref)?.push(I30RawEntry {
                 reference: child_ref,
@@ -1852,6 +2491,7 @@ impl NtfsTransactionEngine {
         let base_no = u32::try_from(catalog.base_ref.record).map_err(|_| corrupt(0, "base_no"))?;
         let dummy_restored = super::catalog::build_restored_mft_record(
             self.geometry.record_bytes(),
+            self.version,
             base_no,
             catalog.base_ref.sequence,
             catalog.is_directory,
@@ -2056,6 +2696,55 @@ impl NtfsTransactionEngine {
         }
     }
 
+    /// Materialize a WOF-compressed file's unnamed `$DATA` stream into plain plaintext on
+    /// write (removing `WofCompressedData`, `$REPARSE_POINT`, `FILE_ATTR_REPARSE_POINT`, and
+    /// its `$Extend/$Reparse::$R` entry), or refuse any non-WOF reparse point for `$DATA` edits.
+    fn prepare_reparse_unnamed_data_write(
+        &self,
+        cx: &Cx,
+        ws: &mut TxWorkspace,
+        target_ref: NtfsReference,
+        cat_ro: &EditableCatalog,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(ref rp_bytes) = cat_ro.reparse_point else {
+            return Ok(None);
+        };
+        let point = NtfsReparsePoint::parse(rp_bytes).map_err(|err| parse_err(&err))?;
+        match classify_reparse_point(&point) {
+            ReparseCapability::WofFileProvider => {
+                let vol = self.volume_view(cx)?;
+                let rec = vol.record(cx, target_ref.record, Some(target_ref.sequence))?;
+                let decoded = vol.read_wof_all(cx, &rec, MAX_FILE_EDIT_BYTES as usize)?;
+                let wof_folded = self.fold_upcase(WOF_BACKING_NAME);
+                let mut freed_spans = Vec::new();
+                {
+                    let cat = ws.catalog_mut(self, cx, target_ref)?;
+                    // Free old unnamed $DATA runs (if non-resident) and remove WofCompressedData.
+                    for s in &cat.data_streams {
+                        if (s.name.is_empty() || self.fold_upcase(&s.name) == wof_folded)
+                            && let EditableStreamStorage::NonResident { ref runs, .. } = s.storage
+                        {
+                            freed_spans.extend(physical_spans_of_runs(runs));
+                        }
+                    }
+                    cat.data_streams
+                        .retain(|s| self.fold_upcase(&s.name) != wof_folded);
+                    cat.reparse_point = None;
+                    let flags = cat.std_flags() & !FILE_ATTR_REPARSE_POINT;
+                    cat.set_std_flags(flags);
+                }
+                ws.free_clusters_deferred(&freed_spans);
+                ws.sync_reparse_r_index(self, cx, target_ref, None)?;
+                Ok(Some(decoded))
+            }
+            ReparseCapability::Symlink { .. }
+            | ReparseCapability::MountPoint
+            | ReparseCapability::OpaquePreserved { .. } => Err(unsupported(
+                "ordinary NTFS $DATA write/truncate refused on reparse point; remove reparse metadata explicitly first",
+            )),
+        }
+    }
+
     #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     pub(super) fn plan_stream_write(
         &self,
@@ -2086,6 +2775,17 @@ impl NtfsTransactionEngine {
         if target_ref.record < MIN_USER_MFT_SLOT {
             return Err(FfsError::PermissionDenied);
         }
+        if stream_utf16.is_empty() && (cat_ro.std_flags() & FILE_ATTR_ENCRYPTED) != 0 {
+            return Err(unsupported(
+                "ordinary NTFS write refused on encrypted file; use explicit keyed EFS write",
+            ));
+        }
+        let wof_decoded = if stream_utf16.is_empty() {
+            self.prepare_reparse_unnamed_data_write(cx, &mut ws, target_ref, &cat_ro)?
+        } else {
+            None
+        };
+        let cat_ro = ws.load_catalog(self, cx, target_ref)?.clone();
 
         let target_folded = self.fold_upcase(stream_utf16);
         let existing_idx = cat_ro
@@ -2105,16 +2805,35 @@ impl NtfsTransactionEngine {
             ));
         }
 
-        let cur_stream = match existing_idx {
-            Some(i) => cat_ro.data_streams[i].clone(),
-            None => EditableDataStream {
-                name: stream_utf16.to_vec(),
-                storage: EditableStreamStorage::Resident(Vec::new()),
-            },
+        let wof_materialized = wof_decoded.is_some();
+        let cur_stream = if let Some(decoded) = wof_decoded {
+            EditableDataStream {
+                name: Vec::new(),
+                storage: EditableStreamStorage::Resident(decoded),
+            }
+        } else {
+            match existing_idx {
+                Some(i) => cat_ro.data_streams[i].clone(),
+                None => EditableDataStream {
+                    name: stream_utf16.to_vec(),
+                    storage: EditableStreamStorage::Resident(Vec::new()),
+                },
+            }
         };
+        if matches!(
+            cur_stream.storage,
+            EditableStreamStorage::NonResident {
+                encrypted: true,
+                ..
+            }
+        ) {
+            return Err(unsupported(
+                "ordinary NTFS write refused on encrypted DATA stream; use explicit keyed EFS write",
+            ));
+        }
 
         let old_size = cur_stream.logical_size();
-        if data.is_empty() && existing_idx.is_some() {
+        if data.is_empty() && existing_idx.is_some() && !wof_materialized {
             let cat = ws.catalog_mut(self, cx, target_ref)?;
             cat.set_std_times(None, Some(now_ticks), Some(now_ticks), None);
             if stream_utf16.is_empty() {
@@ -2128,33 +2847,54 @@ impl NtfsTransactionEngine {
             .filter(|&end| i64::try_from(end).is_ok())
             .ok_or_else(too_large_edit)?;
 
-        let (old_sparse, old_comp_unit, old_init, old_runs) = match &cur_stream.storage {
-            EditableStreamStorage::Resident(b) => (false, 0_u16, b.len() as u64, Vec::new()),
+        let (old_sparse, old_compressed, old_comp_unit, old_init, old_runs) = match &cur_stream
+            .storage
+        {
+            EditableStreamStorage::Resident(b) => (false, false, 0_u16, b.len() as u64, Vec::new()),
             EditableStreamStorage::NonResident {
                 runs,
                 sparse,
+                compressed,
                 compression_unit,
                 initialized_bytes,
                 ..
-            } => (*sparse, *compression_unit, *initialized_bytes, runs.clone()),
+            } => (
+                *sparse,
+                *compressed,
+                *compression_unit,
+                *initialized_bytes,
+                runs.clone(),
+            ),
         };
 
-        // The budget bounds bytes that must be initialized or copied,
-        // not the logical file size or the position of a small edit.
-        // Sparse gaps require metadata only. For an ordinary stream,
-        // extending ValidDataLength must initialize the entire gap.
-        if !old_sparse && end_offset.saturating_sub(offset.min(old_init)) > MAX_FILE_EDIT_BYTES {
+        if !old_sparse
+            && !old_compressed
+            && end_offset.saturating_sub(offset.min(old_init)) > MAX_FILE_EDIT_BYTES
+        {
             return Err(too_large_edit());
         }
         let new_size = old_size.max(end_offset);
-        // Nonresident allocation sizes are signed too. The catalog encoder
-        // records the complete cluster coverage, so even a tiny sparse write
-        // must not round that coverage beyond the native size limit.
         let old_coverage_vcns = old_runs.last().map_or(0, |run| run.vcn + run.clusters);
         if new_size.div_ceil(cb).max(old_coverage_vcns) > i64::MAX as u64 / cb {
             return Err(too_large_edit());
         }
-        let updated_storage = if !old_sparse && new_size <= MAX_RESIDENT_DATA_PAYLOAD as u64 {
+        let updated_storage = if old_compressed {
+            let mut pre = Vec::new();
+            let (st, disp) = compression::rewrite_compressed_stream_range(
+                self,
+                cx,
+                &old_runs,
+                old_size,
+                old_init,
+                offset,
+                data,
+                &mut pre,
+                |n| ws.alloc_clusters(n, 1),
+            )?;
+            ws.pre_payload_writes.extend(pre);
+            ws.free_clusters_deferred(&disp);
+            st
+        } else if !old_sparse && new_size <= MAX_RESIDENT_DATA_PAYLOAD as u64 {
             let mut buf = read_editable_stream_prefix(self, cx, &cur_stream, 0, new_size as usize)?;
             if !data.is_empty() {
                 buf[offset as usize..end_offset as usize].copy_from_slice(data);
@@ -2246,6 +2986,8 @@ impl NtfsTransactionEngine {
             EditableStreamStorage::NonResident {
                 runs: working_runs,
                 sparse: true,
+                compressed: false,
+                encrypted: false,
                 compression_unit: old_comp_unit,
                 data_bytes: new_size,
                 initialized_bytes: old_init.max(end_offset),
@@ -2307,13 +3049,15 @@ impl NtfsTransactionEngine {
             EditableStreamStorage::NonResident {
                 runs: working_runs,
                 sparse: false,
+                compressed: false,
+                encrypted: false,
                 compression_unit: 0,
                 data_bytes: new_size,
                 initialized_bytes: old_init.max(end_offset),
             }
         };
 
-        {
+        let usn_snapshot = {
             let cat = ws.catalog_mut(self, cx, target_ref)?;
             match existing_idx {
                 Some(i) => {
@@ -2327,7 +3071,14 @@ impl NtfsTransactionEngine {
                 }
             }
             cat.set_std_times(None, Some(now_ticks), Some(now_ticks), None);
-        }
+            cat.clone()
+        };
+        let reason = if new_size > old_size {
+            USN_REASON_DATA_EXTEND | USN_REASON_DATA_OVERWRITE | USN_REASON_CLOSE
+        } else {
+            USN_REASON_DATA_OVERWRITE | USN_REASON_CLOSE
+        };
+        ws.push_usn_event_for_catalog(&usn_snapshot, reason, now_ticks);
         if stream_utf16.is_empty() {
             ws.sync_target_into_parent_dirs(self, cx, target_ref)?;
         }
@@ -2351,7 +3102,7 @@ impl NtfsTransactionEngine {
         if let Err(err) = validate_ntfs_stream_name_utf16(stream_utf16) {
             return NtfsTxOutcome::NotCommitted(err);
         }
-        if new_size > MAX_FILE_EDIT_BYTES {
+        if i64::try_from(new_size).is_err() {
             return NtfsTxOutcome::NotCommitted(too_large_edit());
         }
         let mut hasher = blake3::Hasher::new();
@@ -2373,6 +3124,17 @@ impl NtfsTransactionEngine {
             if target_ref.record < MIN_USER_MFT_SLOT {
                 return Err(FfsError::PermissionDenied);
             }
+            if stream_utf16.is_empty() && (cat_ro.std_flags() & FILE_ATTR_ENCRYPTED) != 0 {
+                return Err(unsupported(
+                    "ordinary NTFS truncate refused on encrypted file; decrypt explicitly first",
+                ));
+            }
+            let wof_decoded = if stream_utf16.is_empty() {
+                self.prepare_reparse_unnamed_data_write(cx, &mut ws, target_ref, &cat_ro)?
+            } else {
+                None
+            };
+            let cat_ro = ws.load_catalog(self, cx, target_ref)?.clone();
             let target_folded = self.fold_upcase(stream_utf16);
             let stream_idx = cat_ro
                 .data_streams
@@ -2384,11 +3146,25 @@ impl NtfsTransactionEngine {
                     "NTFS exact named stream not found".into(),
                 ));
             }
-            let cur_stream = cat_ro.data_streams[stream_idx].clone();
+            let cur_stream = if let Some(decoded) = wof_decoded {
+                EditableDataStream {
+                    name: Vec::new(),
+                    storage: EditableStreamStorage::Resident(decoded),
+                }
+            } else {
+                cat_ro.data_streams[stream_idx].clone()
+            };
+            let old_size = cur_stream.logical_size();
             let cb = u64::from(self.geometry.cluster_bytes());
+            if new_size.div_ceil(cb) > i64::MAX as u64 / cb {
+                return Err(too_large_edit());
+            }
 
             let updated_storage = match cur_stream.storage {
                 EditableStreamStorage::Resident(ref old_bytes) => {
+                    if new_size > MAX_FILE_EDIT_BYTES {
+                        return Err(too_large_edit());
+                    }
                     if new_size <= MAX_RESIDENT_DATA_PAYLOAD as u64 {
                         let mut next = old_bytes.clone();
                         next.resize(new_size as usize, 0);
@@ -2417,6 +3193,8 @@ impl NtfsTransactionEngine {
                         EditableStreamStorage::NonResident {
                             runs: normalize_ntfs_runs(runs),
                             sparse: false,
+                            compressed: false,
+                            encrypted: false,
                             compression_unit: 0,
                             data_bytes: new_size,
                             initialized_bytes: new_size,
@@ -2424,12 +3202,46 @@ impl NtfsTransactionEngine {
                     }
                 }
                 EditableStreamStorage::NonResident {
+                    encrypted: true, ..
+                } => {
+                    return Err(unsupported(
+                        "ordinary NTFS truncate refused on encrypted stream",
+                    ));
+                }
+                EditableStreamStorage::NonResident {
+                    ref runs,
+                    compressed: true,
+                    data_bytes: old_sz,
+                    initialized_bytes: old_init,
+                    ..
+                } => {
+                    let mut pre = Vec::new();
+                    let (st, disp) = compression::truncate_compressed_stream(
+                        self,
+                        cx,
+                        runs,
+                        old_sz,
+                        old_init,
+                        new_size,
+                        &mut pre,
+                        |n| ws.alloc_clusters(n, 1),
+                    )?;
+                    ws.pre_payload_writes.extend(pre);
+                    ws.free_clusters_deferred(&disp);
+                    st
+                }
+                EditableStreamStorage::NonResident {
                     ref runs,
                     sparse,
+                    compressed: false,
+                    encrypted: false,
                     compression_unit,
-                    data_bytes: old_size,
+                    data_bytes: old_sz,
                     initialized_bytes: old_init,
                 } => {
+                    if !sparse && new_size > MAX_FILE_EDIT_BYTES {
+                        return Err(too_large_edit());
+                    }
                     if !sparse && new_size <= MAX_RESIDENT_DATA_PAYLOAD as u64 {
                         let prefix = read_editable_stream_prefix(
                             self,
@@ -2445,6 +3257,8 @@ impl NtfsTransactionEngine {
                         EditableStreamStorage::NonResident {
                             runs: Vec::new(),
                             sparse: true,
+                            compressed: false,
+                            encrypted: false,
                             compression_unit,
                             data_bytes: 0,
                             initialized_bytes: 0,
@@ -2452,7 +3266,7 @@ impl NtfsTransactionEngine {
                     } else {
                         let need_vcns = new_size.div_ceil(cb);
                         let old_vcns: u64 = runs.iter().map(|r| r.clusters).sum();
-                        if new_size <= old_size {
+                        if new_size <= old_sz {
                             let (mut kept, disp) = splice_vcn_interval(
                                 runs,
                                 need_vcns,
@@ -2461,9 +3275,6 @@ impl NtfsTransactionEngine {
                                 sparse,
                             )?;
                             ws.free_clusters_deferred(&disp);
-                            // Splicing a sparse hole can coalesce it with the
-                            // retained prefix hole. Clip that merged run as well
-                            // as dropping runs wholly beyond the new EOF.
                             kept.retain_mut(|run| {
                                 if run.vcn >= need_vcns {
                                     return false;
@@ -2474,6 +3285,8 @@ impl NtfsTransactionEngine {
                             EditableStreamStorage::NonResident {
                                 runs: normalize_ntfs_runs(kept),
                                 sparse,
+                                compressed: false,
+                                encrypted: false,
                                 compression_unit,
                                 data_bytes: new_size,
                                 initialized_bytes: old_init.min(new_size),
@@ -2490,6 +3303,8 @@ impl NtfsTransactionEngine {
                             EditableStreamStorage::NonResident {
                                 runs: normalize_ntfs_runs(next_runs),
                                 sparse: true,
+                                compressed: false,
+                                encrypted: false,
                                 compression_unit,
                                 data_bytes: new_size,
                                 initialized_bytes: old_init,
@@ -2528,6 +3343,8 @@ impl NtfsTransactionEngine {
                             EditableStreamStorage::NonResident {
                                 runs: working_runs,
                                 sparse: false,
+                                compressed: false,
+                                encrypted: false,
                                 compression_unit,
                                 data_bytes: new_size,
                                 initialized_bytes: new_size,
@@ -2537,11 +3354,18 @@ impl NtfsTransactionEngine {
                 }
             };
 
-            {
+            let usn_snapshot = {
                 let cat = ws.catalog_mut(self, cx, target_ref)?;
                 cat.data_streams[stream_idx].storage = updated_storage;
                 cat.set_std_times(None, Some(now_ticks), Some(now_ticks), None);
-            }
+                cat.clone()
+            };
+            let reason = if new_size < old_size {
+                USN_REASON_DATA_TRUNCATION | USN_REASON_CLOSE
+            } else {
+                USN_REASON_DATA_EXTEND | USN_REASON_CLOSE
+            };
+            ws.push_usn_event_for_catalog(&usn_snapshot, reason, now_ticks);
             if stream_utf16.is_empty() {
                 ws.sync_target_into_parent_dirs(self, cx, target_ref)?;
             }
@@ -2888,6 +3712,18 @@ impl NtfsTransactionEngine {
                 None,
             );
             ws.sync_target_into_parent_dirs(self, cx, target_ref)?;
+            let target_flags = ws
+                .catalogs
+                .get(&target_ref.record)
+                .map_or(0, EditableCatalog::std_flags);
+            ws.push_usn_event_explicit(
+                target_ref,
+                new_parent_ref,
+                USN_REASON_HARD_LINK_CHANGE | USN_REASON_CLOSE,
+                target_flags,
+                now_ticks,
+                new_name_utf16.to_vec(),
+            );
 
             ws.finalize(self, cx, "link_entry_at", digest, ())
         })();
@@ -2957,8 +3793,24 @@ impl NtfsTransactionEngine {
                 now_ticks,
             )?;
             if remaining_visible == 0 {
-                ws.deallocate_entire_catalog(self, target_ref.record)?;
+                ws.push_usn_event_explicit(
+                    target_ref,
+                    parent_ref,
+                    USN_REASON_FILE_DELETE | USN_REASON_CLOSE,
+                    target_ro.std_flags(),
+                    now_ticks,
+                    matched.file_name.name.clone(),
+                );
+                ws.deallocate_entire_catalog(self, cx, target_ref.record)?;
             } else {
+                ws.push_usn_event_explicit(
+                    target_ref,
+                    parent_ref,
+                    USN_REASON_HARD_LINK_CHANGE | USN_REASON_CLOSE,
+                    target_ro.std_flags(),
+                    now_ticks,
+                    matched.file_name.name.clone(),
+                );
                 ws.sync_target_into_parent_dirs(self, cx, target_ref)?;
             }
 
@@ -3006,11 +3858,17 @@ impl NtfsTransactionEngine {
         if target_ref.record < FIRST_NON_RESERVED_SLOT {
             return Err(FfsError::PermissionDenied);
         }
+        if self.version != [3, 1] {
+            return Err(FfsError::NoSpace);
+        }
         let parent_cat = ws.load_catalog(self, cx, parent_ref)?.clone();
         if !parent_cat.old_extensions.is_empty() || matched.file_name.namespace == 2 {
             return Err(FfsError::NoSpace);
         }
         let target_ro = ws.load_catalog(self, cx, target_ref)?.clone();
+        if target_ro.reparse_point.is_some() || target_ro.object_id.is_some() {
+            return Err(FfsError::NoSpace);
+        }
         match expect_dir {
             Some(true) if !target_ro.is_directory => return Err(FfsError::NotDirectory),
             Some(false) if target_ro.is_directory => return Err(FfsError::IsDirectory),
@@ -3086,7 +3944,7 @@ impl NtfsTransactionEngine {
             }
         }
 
-        ws.deallocate_entire_catalog(self, target_ref.record)?;
+        ws.deallocate_entire_catalog(self, cx, target_ref.record)?;
         ws.finalize(
             self,
             cx,
@@ -3282,7 +4140,15 @@ impl NtfsTransactionEngine {
                             });
                         overwritten_retained = true;
                     } else {
-                        ws.deallocate_entire_catalog(self, dst_ref.record)?;
+                        ws.push_usn_event_explicit(
+                            dst_ref,
+                            dst_parent_ref,
+                            USN_REASON_FILE_DELETE | USN_REASON_CLOSE,
+                            dst_ro.std_flags(),
+                            now_ticks,
+                            dst_match.file_name.name.clone(),
+                        );
+                        ws.deallocate_entire_catalog(self, cx, dst_ref.record)?;
                     }
                 } else {
                     ws.sync_target_into_parent_dirs(self, cx, dst_ref)?;
@@ -3334,6 +4200,22 @@ impl NtfsTransactionEngine {
                 None,
             );
             ws.sync_target_into_parent_dirs(self, cx, src_ref)?;
+            ws.push_usn_event_explicit(
+                src_ref,
+                src_parent_ref,
+                USN_REASON_RENAME_OLD_NAME,
+                src_ro.std_flags(),
+                now_ticks,
+                src_match.file_name.name,
+            );
+            ws.push_usn_event_explicit(
+                src_ref,
+                dst_parent_ref,
+                USN_REASON_RENAME_NEW_NAME | USN_REASON_CLOSE,
+                src_ro.std_flags(),
+                now_ticks,
+                dst_name_utf16.to_vec(),
+            );
 
             ws.finalize(
                 self,
@@ -3389,7 +4271,7 @@ impl NtfsTransactionEngine {
                 ));
             }
             let mut ws = TxWorkspace::load(self, cx)?;
-            {
+            let usn_snap = {
                 let cat = ws.catalog_mut(self, cx, target_ref)?;
                 if let Some(ro) = read_only {
                     let mut flags = cat.std_flags();
@@ -3401,7 +4283,13 @@ impl NtfsTransactionEngine {
                     cat.set_std_flags(flags);
                 }
                 cat.set_std_times(None, mtime_ticks, Some(mft_time_ticks), atime_ticks);
-            }
+                cat.clone()
+            };
+            ws.push_usn_event_for_catalog(
+                &usn_snap,
+                USN_REASON_BASIC_INFO_CHANGE | USN_REASON_CLOSE,
+                mft_time_ticks,
+            );
             ws.sync_target_into_parent_dirs(self, cx, target_ref)?;
             ws.finalize(self, cx, "set_metadata_at", digest, ())
         })();
@@ -3657,6 +4545,17 @@ impl NtfsTransactionEngine {
             if target_ref.record < MIN_USER_MFT_SLOT {
                 return Err(FfsError::PermissionDenied);
             }
+            if stream_utf16.is_empty() && (cat_ro.std_flags() & FILE_ATTR_ENCRYPTED) != 0 {
+                return Err(unsupported(
+                    "ordinary NTFS replace refused on encrypted file; use explicit keyed EFS write",
+                ));
+            }
+            let _wof_decoded = if stream_utf16.is_empty() {
+                self.prepare_reparse_unnamed_data_write(cx, &mut ws, target_ref, &cat_ro)?
+            } else {
+                None
+            };
+            let cat_ro = ws.load_catalog(self, cx, target_ref)?.clone();
             let target_folded = self.fold_upcase(stream_utf16);
             let stream_idx = cat_ro
                 .data_streams
@@ -3668,13 +4567,42 @@ impl NtfsTransactionEngine {
                     "NTFS exact named stream not found".into(),
                 ));
             }
+            let was_compressed = matches!(
+                cat_ro.data_streams[stream_idx].storage,
+                EditableStreamStorage::NonResident {
+                    compressed: true,
+                    ..
+                }
+            );
+            if matches!(
+                cat_ro.data_streams[stream_idx].storage,
+                EditableStreamStorage::NonResident {
+                    encrypted: true,
+                    ..
+                }
+            ) {
+                return Err(unsupported(
+                    "ordinary NTFS replace refused on encrypted stream",
+                ));
+            }
             if let EditableStreamStorage::NonResident { ref runs, .. } =
                 cat_ro.data_streams[stream_idx].storage
             {
                 ws.free_clusters_deferred(&physical_spans_of_runs(runs));
             }
 
-            let updated_storage = if new_data.len() <= MAX_RESIDENT_DATA_PAYLOAD {
+            let updated_storage = if was_compressed {
+                let mut pre = Vec::new();
+                let st = compression::rebuild_stream_for_compression_toggle(
+                    &self.geometry,
+                    new_data,
+                    true,
+                    &mut pre,
+                    |n| ws.alloc_clusters(n, 1),
+                )?;
+                ws.pre_payload_writes.extend(pre);
+                st
+            } else if new_data.len() <= MAX_RESIDENT_DATA_PAYLOAD {
                 EditableStreamStorage::Resident(new_data.to_vec())
             } else {
                 let need_vcns = (new_data.len() as u64).div_ceil(cb);
@@ -3695,17 +4623,25 @@ impl NtfsTransactionEngine {
                 EditableStreamStorage::NonResident {
                     runs: normalize_ntfs_runs(runs),
                     sparse: false,
+                    compressed: false,
+                    encrypted: false,
                     compression_unit: 0,
                     data_bytes: new_data.len() as u64,
                     initialized_bytes: new_data.len() as u64,
                 }
             };
 
-            {
+            let usn_snap = {
                 let cat = ws.catalog_mut(self, cx, target_ref)?;
                 cat.data_streams[stream_idx].storage = updated_storage;
                 cat.set_std_times(None, Some(now_ticks), Some(now_ticks), None);
-            }
+                cat.clone()
+            };
+            ws.push_usn_event_for_catalog(
+                &usn_snap,
+                USN_REASON_DATA_OVERWRITE | USN_REASON_DATA_TRUNCATION | USN_REASON_CLOSE,
+                now_ticks,
+            );
             if stream_utf16.is_empty() {
                 ws.sync_target_into_parent_dirs(self, cx, target_ref)?;
             }

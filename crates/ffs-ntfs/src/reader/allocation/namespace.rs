@@ -259,10 +259,10 @@ impl Scan {
         upcase: &[u16],
     ) -> Result<()> {
         self.report.directories_examined += 1;
-        if attrs.all()?.iter().any(|attr| attr.kind == REPARSE_POINT) {
-            return Err(unsupported(
-                "namespace checking does not interpret reparse directory providers",
-            ));
+        let is_reparse_dir = attrs.all()?.iter().any(|attr| attr.kind == REPARSE_POINT);
+        if is_reparse_dir {
+            // Validate the reparse payload itself so corrupt reparse directories are caught.
+            let _ = volume.reparse_point(cx, record)?;
         }
         let root = attrs.select(&volume.geometry, 0x90, I30)?;
         if !root.resident() {
@@ -281,6 +281,11 @@ impl Scan {
                 .all()?
                 .iter()
                 .any(|attr| matches!(attr.kind, 0xA0 | 0xB0) && attr.name == I30);
+        if is_reparse_dir && (external || root.entries.iter().any(|e| e.key.is_some())) {
+            return Err(unsupported(
+                "namespace checking does not interpret non-empty reparse directory providers",
+            ));
+        }
         let (allocation, bitmap) = if external {
             let allocation = attrs.select(&volume.geometry, 0xA0, I30)?;
             let bitmap = attrs.select(&volume.geometry, 0xB0, I30)?;
