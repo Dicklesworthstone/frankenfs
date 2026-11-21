@@ -1849,9 +1849,10 @@ impl NtfsTransactionEngine {
         self.write_file_stream_range(cx, path, &[], offset, data)
     }
 
-    /// Write an existing plain DATA stream selected by path and exact UTF-16
-    /// name. Empty selects unnamed DATA. Other streams and their native
-    /// attributes are preserved; new stream creation is not implied.
+    /// Write an existing DATA stream selected by path and exact UTF-16 name.
+    /// Empty selects unnamed DATA. Sparse mappings and extension records use
+    /// the same catalog-aware engine as reference-addressed writes; other
+    /// streams are preserved and new stream creation is not implied.
     ///
     /// The staging, initialization and native WAL guarantees of
     /// [`Self::write_file_range`] apply equally to named streams.
@@ -1866,7 +1867,11 @@ impl NtfsTransactionEngine {
         if let Err(error) = super::validate_ntfs_stream_name_utf16(stream) {
             return NtfsTxOutcome::NotCommitted(error);
         }
-        self.edit_stream_data(cx, path, stream, FileDataEdit::Write { offset, data })
+        let reference = match self.resolve_path_reference(cx, path) {
+            Ok(reference) => reference,
+            Err(error) => return NtfsTxOutcome::NotCommitted(error),
+        };
+        self.write_stream_range(cx, reference, stream, offset, data)
     }
 
     /// Set a regular file's unnamed stream length through a native logged
@@ -1885,9 +1890,10 @@ impl NtfsTransactionEngine {
         self.truncate_file_stream(cx, path, &[], size)
     }
 
-    /// Truncate an existing plain DATA stream by path and exact UTF-16 name.
-    /// Named streams retain their native identity through zero-length
-    /// truncation and do not change the unnamed sizes in FILE_NAME or $I30.
+    /// Truncate an existing DATA stream by path and exact UTF-16 name, including
+    /// sparse streams and attributes stored in extension records. Named streams
+    /// retain their identity through zero-length truncation and do not change
+    /// the unnamed sizes in FILE_NAME or $I30.
     /// The same bounded staging and recovery contract as [`Self::truncate_file`]
     /// applies; missing streams fail before any backing write.
     pub fn truncate_file_stream(
@@ -1900,12 +1906,17 @@ impl NtfsTransactionEngine {
         if let Err(error) = super::validate_ntfs_stream_name_utf16(stream) {
             return NtfsTxOutcome::NotCommitted(error);
         }
-        self.edit_stream_data(cx, path, stream, FileDataEdit::Truncate { size })
+        let reference = match self.resolve_path_reference(cx, path) {
+            Ok(reference) => reference,
+            Err(error) => return NtfsTxOutcome::NotCommitted(error),
+        };
+        self.truncate_stream(cx, reference, stream, size)
     }
 
-    /// Create one named, ordinary base-record DATA attribute. Its complete
-    /// initial payload is initialized before native WAL publication; the
-    /// unnamed DATA stream and every FILE_NAME/$I30 size remain unchanged.
+    /// Create one named DATA stream, spilling into extension records when
+    /// needed and preserving existing sparse streams. Its complete initial
+    /// payload is initialized before native WAL publication; the unnamed DATA
+    /// stream and every FILE_NAME/$I30 size remain unchanged.
     pub fn create_file_stream(
         &mut self,
         cx: &Cx,
@@ -1913,7 +1924,11 @@ impl NtfsTransactionEngine {
         stream: &[u16],
         data: &[u8],
     ) -> NtfsTxOutcome<NtfsReference> {
-        self.edit_named_stream(cx, path, stream, Some(data))
+        let reference = match self.resolve_path_reference(cx, path) {
+            Ok(reference) => reference,
+            Err(error) => return NtfsTxOutcome::NotCommitted(error),
+        };
+        self.create_stream(cx, reference, stream, data)
     }
 
     /// Remove exactly the named DATA attribute and reclaim its admitted native
@@ -1925,10 +1940,14 @@ impl NtfsTransactionEngine {
         path: &str,
         stream: &[u16],
     ) -> NtfsTxOutcome<NtfsReference> {
-        self.edit_named_stream(cx, path, stream, None)
+        let reference = match self.resolve_path_reference(cx, path) {
+            Ok(reference) => reference,
+            Err(error) => return NtfsTxOutcome::NotCommitted(error),
+        };
+        self.remove_stream(cx, reference, stream)
     }
 
-    fn edit_named_stream(
+    pub(super) fn edit_named_stream(
         &mut self,
         cx: &Cx,
         path: &str,

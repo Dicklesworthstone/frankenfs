@@ -7977,12 +7977,26 @@ fn file_range_large_sparse_edits_skip_holes_and_extend_without_allocation() {
             ..PoolFixtureSpec::default()
         },
     );
+    let (file, _) = engine
+        .create_file(
+            &cx,
+            &dataset,
+            2,
+            b"sparse-range",
+            0o644,
+            1000,
+            1000,
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .expect("create the sparse file in the initially empty dataset");
     let prefix = vec![0x45; 4096];
     engine
         .write_file_data(
             &cx,
             &dataset,
-            4,
+            file,
             0,
             &prefix,
             timestamp,
@@ -7994,7 +8008,7 @@ fn file_range_large_sparse_edits_skip_holes_and_extend_without_allocation() {
         .write_file_data(
             &cx,
             &dataset,
-            4,
+            file,
             FAR,
             b"TAIL",
             timestamp,
@@ -8002,12 +8016,12 @@ fn file_range_large_sparse_edits_skip_holes_and_extend_without_allocation() {
         )
         .into_result()
         .unwrap();
-    let used = file_range_head(&cx, &engine).stat(&cx, 4).unwrap().1;
+    let used = file_range_head(&cx, &engine).stat(&cx, file).unwrap().1;
     engine
         .edit_file_range(
             &cx,
             &dataset,
-            4,
+            file,
             4096,
             FAR - 4096,
             PunchHole,
@@ -8017,14 +8031,14 @@ fn file_range_large_sparse_edits_skip_holes_and_extend_without_allocation() {
         .into_result()
         .unwrap();
     let mut head = file_range_head(&cx, &engine);
-    assert_eq!(head.read(&cx, 4, 0, 4096).unwrap(), prefix);
-    assert_eq!(head.read(&cx, 4, FAR, 4).unwrap(), b"TAIL");
-    assert_eq!(head.stat(&cx, 4).unwrap().1, used);
+    assert_eq!(head.read(&cx, file, 0, 4096).unwrap(), prefix);
+    assert_eq!(head.read(&cx, file, FAR, 4).unwrap(), b"TAIL");
+    assert_eq!(head.stat(&cx, file).unwrap().1, used);
     engine
         .edit_file_range(
             &cx,
             &dataset,
-            4,
+            file,
             1024,
             FAR + 3 - 1024,
             PunchHole,
@@ -8034,19 +8048,19 @@ fn file_range_large_sparse_edits_skip_holes_and_extend_without_allocation() {
         .into_result()
         .unwrap();
     let mut head = file_range_head(&cx, &engine);
-    assert_eq!(head.read(&cx, 4, 0, 1024).unwrap(), vec![0x45; 1024]);
-    assert_eq!(head.read(&cx, 4, 1024, 4096).unwrap(), vec![0; 4096]);
-    assert_eq!(head.read(&cx, 4, FAR, 4).unwrap(), b"\0\0\0L");
+    assert_eq!(head.read(&cx, file, 0, 1024).unwrap(), vec![0x45; 1024]);
+    assert_eq!(head.read(&cx, file, 1024, 4096).unwrap(), vec![0; 4096]);
+    assert_eq!(head.read(&cx, file, FAR, 4).unwrap(), b"\0\0\0L");
     assert_eq!(
-        head.seek(&cx, 4, 4096, ffs_core::SeekWhence::Data).unwrap(),
+        head.seek(&cx, file, 4096, ffs_core::SeekWhence::Data).unwrap(),
         FAR
     );
-    let used = head.stat(&cx, 4).unwrap().1;
+    let used = head.stat(&cx, file).unwrap().1;
     let (size, _) = engine
         .edit_file_range(
             &cx,
             &dataset,
-            4,
+            file,
             NEW_EOF - 4096,
             4096,
             ZeroRange { keep_size: false },
@@ -8057,16 +8071,16 @@ fn file_range_large_sparse_edits_skip_holes_and_extend_without_allocation() {
         .unwrap();
     let mut head = file_range_head(&cx, &engine);
     assert_eq!(size, NEW_EOF);
-    assert_eq!(head.stat(&cx, 4).unwrap().1, used);
+    assert_eq!(head.stat(&cx, file).unwrap().1, used);
     assert_eq!(
-        head.read(&cx, 4, NEW_EOF - 4096, 4096).unwrap(),
+        head.read(&cx, file, NEW_EOF - 4096, 4096).unwrap(),
         vec![0; 4096]
     );
     engine
         .edit_file_range(
             &cx,
             &dataset,
-            4,
+            file,
             0,
             NEW_EOF,
             PunchHole,
@@ -8076,16 +8090,41 @@ fn file_range_large_sparse_edits_skip_holes_and_extend_without_allocation() {
         .into_result()
         .unwrap();
     let mut head = file_range_head(&cx, &engine);
-    assert_eq!(head.stat(&cx, 4).unwrap().1, 0);
-    assert_eq!(head.stat(&cx, 4).unwrap().0.size, NEW_EOF);
-    assert_eq!(head.seek(&cx, 4, 0, ffs_core::SeekWhence::Hole).unwrap(), 0);
+    assert_eq!(head.stat(&cx, file).unwrap().1, 0);
+    assert_eq!(head.stat(&cx, file).unwrap().0.size, NEW_EOF);
+    assert_eq!(head.seek(&cx, file, 0, ffs_core::SeekWhence::Hole).unwrap(), 0);
     assert_eq!(
-        head.seek(&cx, 4, 0, ffs_core::SeekWhence::Data)
+        head.seek(&cx, file, 0, ffs_core::SeekWhence::Data)
             .unwrap_err()
             .to_errno(),
         libc::ENXIO
     );
-    assert_pool_scrub_and_allocation_clean(&cx, &devices, POOL_GUID, None);
+
+    let slot = engine.committed_slot();
+    let txg = engine.committed_txg();
+    drop(head);
+    drop(engine);
+    let fresh: Vec<_> = devices
+        .iter()
+        .map(FaultableMemberDevice::fresh_from_durable)
+        .collect();
+    let reopened =
+        open_engine_on_devices(&cx, &fresh, default_write_opts(POOL_GUID, slot)).unwrap();
+    assert_eq!(reopened.committed_txg(), txg);
+    let mut head = file_range_head(&cx, &reopened);
+    assert_eq!(head.resolve(&cx, b"/sparse-range").unwrap(), file);
+    assert_eq!(head.stat(&cx, file).unwrap().0.size, NEW_EOF);
+    assert_eq!(head.stat(&cx, file).unwrap().1, 0);
+    for offset in [0, FAR, NEW_EOF - 4096] {
+        assert_eq!(head.read(&cx, file, offset, 4096).unwrap(), vec![0; 4096]);
+    }
+    assert_eq!(
+        head.seek(&cx, file, 0, ffs_core::SeekWhence::Data)
+            .unwrap_err()
+            .to_errno(),
+        libc::ENXIO
+    );
+    assert_pool_scrub_and_allocation_clean(&cx, &fresh, POOL_GUID, Some(slot));
 }
 
 #[test]
@@ -8165,6 +8204,34 @@ fn file_range_invalid_bounds_times_and_native_flags_refuse_before_writes() {
         nanos: 0,
     };
     let (mut engine, devices) = file_range_fixture(&cx, &PoolFixtureSpec::default());
+    for operation in [PunchHole, ZeroRange { keep_size: false }] {
+        assert_native_write_refused(&mut engine, &devices, libc::ENOENT, |writer| {
+            writer.edit_file_range(
+                &cx,
+                &dataset,
+                4,
+                0,
+                1,
+                operation,
+                timestamp,
+                ZfsDataChecksum::Fletcher4,
+            )
+        });
+    }
+    let (file, _) = engine
+        .create_file(
+            &cx,
+            &dataset,
+            2,
+            b"range-admission",
+            0o644,
+            1000,
+            1000,
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
     for (offset, length) in [
         (0, 0),
         (u64::MAX, 1),
@@ -8175,7 +8242,7 @@ fn file_range_invalid_bounds_times_and_native_flags_refuse_before_writes() {
             writer.edit_file_range(
                 &cx,
                 &dataset,
-                4,
+                file,
                 offset,
                 length,
                 PunchHole,
@@ -8188,7 +8255,7 @@ fn file_range_invalid_bounds_times_and_native_flags_refuse_before_writes() {
         writer.edit_file_range(
             &cx,
             &dataset,
-            4,
+            file,
             0,
             1,
             PunchHole,
@@ -8203,7 +8270,7 @@ fn file_range_invalid_bounds_times_and_native_flags_refuse_before_writes() {
         writer.edit_file_range(
             &cx,
             &dataset,
-            6,
+            2,
             0,
             1,
             PunchHole,
@@ -8215,16 +8282,22 @@ fn file_range_invalid_bounds_times_and_native_flags_refuse_before_writes() {
         let (mut protected, devices) = file_range_fixture(
             &cx,
             &PoolFixtureSpec {
+                deadlist_mode: DeadlistMode::Bpobj,
                 zpl_flags: BTreeMap::from([(4, 0x408 | flag)]),
                 ..PoolFixtureSpec::default()
             },
         );
+        let mut head = file_range_head(&cx, &protected);
+        let protected_file = head.resolve(&cx, b"/hello.txt").unwrap();
+        let (metadata, _) = head.stat(&cx, protected_file).unwrap();
+        assert_eq!(metadata.kind, Kind::Regular);
+        assert_ne!(metadata.flags & flag, 0);
         for operation in [PunchHole, ZeroRange { keep_size: false }] {
             assert_native_write_refused(&mut protected, &devices, libc::EPERM, |writer| {
                 writer.edit_file_range(
                     &cx,
                     &dataset,
-                    4,
+                    protected_file,
                     0,
                     17,
                     operation,

@@ -3588,3 +3588,26 @@ memory pressure cleared; executable code generation then exhausted writable
 storage. The existing integrity validation workflows retain the runtime gates.
 No mounted or native Windows qualification, broad bd-h8n46 closure, or parity-score
 increase is claimed.
+
+## Native stream API integration (2026-11-21)
+
+NTFS path-addressed named-stream creation/removal and positioned write/truncate
+now use the same sequence-bound catalog operations as mounted/reference-addressed
+callers. Sparse DATA and MFT extension records retain their complete catalogs;
+plain base-record edits retain the existing planner. Native compression,
+encryption and unsupported metadata admission remain unchanged.
+
+The unchanged large sparse ADS hole-punch regression failed during stream
+creation on `d6b4dcbef` in CI run `44871480052`, before reaching hole punching.
+The routing fix is accompanied by path-based sparse/extension lifecycle,
+cold-reopen, exact UTF-16 identity and no-write refusal regressions in
+`crates/ffs-ntfs/tests/persistence_prefix/punch.rs`. At publication these new
+regressions are authored and statically reviewed; hosted execution is pending.
+They do not establish Windows interchange or hardware power-loss qualification.
+
+The ZFS sparse-range and committed-cancellation regressions now create their
+target files through native transactions rather than assuming an allocated
+object in an empty fixture. Refusal coverage verifies absent objects separately
+from directories and immutable/read-only files. The large sparse test retains
+its range, allocation and seek assertions and adds a fresh durable reopen.
+These corrected scenarios also await hosted execution at this checkpoint.

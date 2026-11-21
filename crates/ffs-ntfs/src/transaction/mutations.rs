@@ -1394,7 +1394,7 @@ impl NtfsTransactionEngine {
             Err(err) => return NtfsTxOutcome::NotCommitted(err),
         };
         if !use_extended && let Ok(path) = self.resolve_reference_path(cx, reference) {
-            let outcome = self.create_file_stream(cx, &path, stream, data);
+            let outcome = self.edit_named_stream(cx, &path, stream, Some(data));
             if !matches!(
                 outcome,
                 NtfsTxOutcome::NotCommitted(FfsError::UnsupportedFeature(_) | FfsError::NoSpace)
@@ -1428,7 +1428,7 @@ impl NtfsTransactionEngine {
             Err(err) => return NtfsTxOutcome::NotCommitted(err),
         };
         if !use_extended && let Ok(path) = self.resolve_reference_path(cx, reference) {
-            let outcome = self.remove_file_stream(cx, &path, stream);
+            let outcome = self.edit_named_stream(cx, &path, stream, None);
             if !matches!(
                 outcome,
                 NtfsTxOutcome::NotCommitted(FfsError::UnsupportedFeature(_) | FfsError::NoSpace)
