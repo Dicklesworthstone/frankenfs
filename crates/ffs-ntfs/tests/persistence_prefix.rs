@@ -3,6 +3,7 @@
 //! fault-cut / write-reordering / torn-sector / crash-during-recovery tests,
 //! `$Bitmap` & `$LogFile` exhaustion checks, and negative admission controls.
 
+#[path = "persistence_prefix/ea.rs"]
 mod ea;
 mod transforms;
 

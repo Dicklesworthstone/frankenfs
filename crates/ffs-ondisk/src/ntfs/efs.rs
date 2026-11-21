@@ -433,7 +433,8 @@ pub fn efs_decrypt_sector(
     }
     let mut prev = efs_sector_iv(logical_sector_offset);
     for chunk in sector.as_chunks_mut::<16>().0 {
-        let ct = *chunk;
+        let mut ct = [0_u8; 16];
+        ct.copy_from_slice(chunk);
         let dec = aes256_decrypt_block(key, &ct);
         for ((dst, &d), &p) in chunk.iter_mut().zip(dec.iter()).zip(prev.iter()) {
             *dst = d ^ p;

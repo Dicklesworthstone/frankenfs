@@ -41,6 +41,73 @@ fn data_stream_metadata(record: &serde_json::Value) -> Vec<serde_json::Value> {
         .collect()
 }
 
+fn native_attribute_clusters(
+    information: &[u8],
+    attribute_type: &str,
+    cluster_limit: u64,
+) -> BTreeSet<u64> {
+    // EA names may contain arbitrary OEM bytes; only ASCII runlist fields are
+    // interpreted here. The separate raw EA oracle verifies all exact bytes.
+    let text = String::from_utf8_lossy(information);
+    let mut selected = false;
+    let mut runlist = false;
+    let mut clusters = BTreeSet::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with("Dumping attribute ") {
+            selected = line.split_whitespace().nth(3) == Some(attribute_type);
+            runlist = false;
+        } else if selected && line.starts_with("Runlist:") {
+            runlist = true;
+        } else if runlist && !line.is_empty() {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            if fields.len() != 3 || !fields.iter().all(|field| field.starts_with("0x")) {
+                runlist = false;
+                continue;
+            }
+            let numbers: Vec<_> = fields
+                .iter()
+                .map(|field| u64::from_str_radix(&field[2..], 16).unwrap())
+                .collect();
+            let first = numbers[1];
+            let length = numbers[2];
+            assert!(length > 0);
+            let end = first.checked_add(length).unwrap();
+            assert!(end <= cluster_limit, "native run escapes the volume");
+            for cluster in first..end {
+                assert!(
+                    clusters.insert(cluster),
+                    "native attribute aliases cluster {cluster}"
+                );
+            }
+        }
+    }
+    clusters
+}
+
+fn replace_owned_clusters(bitmap: &mut [u8], removed: &BTreeSet<u64>, replacement: &BTreeSet<u64>) {
+    for cluster in removed {
+        let index = usize::try_from(cluster / 8).unwrap();
+        let mask = 1_u8 << (cluster % 8);
+        assert_ne!(
+            bitmap[index] & mask,
+            0,
+            "original native owner was unallocated"
+        );
+        bitmap[index] &= !mask;
+    }
+    for cluster in replacement {
+        let index = usize::try_from(cluster / 8).unwrap();
+        let mask = 1_u8 << (cluster % 8);
+        assert_eq!(
+            bitmap[index] & mask,
+            0,
+            "native allocation aliases an unchanged owner"
+        );
+        bitmap[index] |= mask;
+    }
+}
+
 // Decode the bytes returned by the independent native reader without using
 // FrankenFS's EA codec. Native entry sizes include their four-byte offsets
 // and alignment, while PackedEaSize excludes both.
@@ -153,6 +220,16 @@ fn native_ntfs_ea_cli_preserves_data_allocation_and_volume_bounds() {
     let original_mft_bitmap =
         checked(Path::new("ntfscat"), &["-i", "0", "-a", "176", native_path]).stdout;
     assert!(!original_bitmap.is_empty() && !original_mft_bitmap.is_empty());
+    let original_root_information = checked(Path::new("ntfsinfo"), &["-v", "-i", "5", native_path]);
+    let original_root_clusters = native_attribute_clusters(
+        &original_root_information.stdout,
+        "(0xa0)",
+        VOLUME_BYTES / 4096,
+    );
+    assert!(
+        !original_root_clusters.is_empty(),
+        "native root uses external I30 storage"
+    );
     let allocated = |bitmap: &[u8]| {
         bitmap
             .iter()
@@ -233,12 +310,29 @@ fn native_ntfs_ea_cli_preserves_data_allocation_and_volume_bounds() {
         }
         let bitmap = checked(Path::new("ntfscat"), &["-i", "6", native_path]).stdout;
         assert_eq!(allocated(&bitmap), original_allocated + extra_clusters);
-        if extra_clusters == 0 {
-            assert_eq!(
-                bitmap, original_bitmap,
-                "native EA allocation must not leak"
-            );
-        }
+        let root_information = checked(Path::new("ntfsinfo"), &["-v", "-i", "5", native_path]);
+        let file_information = checked(Path::new("ntfsinfo"), &["-v", "-F", "/notes", native_path]);
+        let root_clusters =
+            native_attribute_clusters(&root_information.stdout, "(0xa0)", VOLUME_BYTES / 4096);
+        let ea_clusters =
+            native_attribute_clusters(&file_information.stdout, "(0xe0)", VOLUME_BYTES / 4096);
+        assert_eq!(root_clusters.len(), original_root_clusters.len());
+        assert_eq!(ea_clusters.len() as u64, extra_clusters);
+        assert!(
+            root_clusters.is_disjoint(&ea_clusters),
+            "EA and parent I30 ownership overlap"
+        );
+        let mut replacement = root_clusters;
+        replacement.extend(ea_clusters);
+        let mut expected_bitmap = original_bitmap.clone();
+        // Parent I30 pages are copy-on-write too. Permit their verified native
+        // relocation while still checking every allocation bit and rejecting
+        // leaks, missing allocations, and aliases of all unchanged owners.
+        replace_owned_clusters(&mut expected_bitmap, &original_root_clusters, &replacement);
+        assert_eq!(
+            bitmap, expected_bitmap,
+            "native ownership exactly matches allocation"
+        );
         assert_eq!(
             checked(Path::new("ntfscat"), &["-i", "0", "-a", "176", native_path]).stdout,
             original_mft_bitmap,
@@ -283,7 +377,6 @@ fn native_ntfs_ea_cli_preserves_data_allocation_and_volume_bounds() {
                     .all(|attribute| attribute["type"] != "0xd0")
             );
         }
-        checked(Path::new("ntfsinfo"), &["-F", "/notes", native_path]);
         checked(Path::new("ntfsfix"), &["-n", native_path]);
         let mut args = vec![
             "check-allocation",
