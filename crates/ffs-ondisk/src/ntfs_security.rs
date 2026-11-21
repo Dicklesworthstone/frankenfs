@@ -14,6 +14,52 @@ pub const MAX_SECURITY_DESCRIPTOR_BYTES: usize = 128 * 1024;
 pub const SDS_HEADER_BYTES: usize = 20;
 pub const SDS_COPY_DISTANCE: u64 = 0x4_0000;
 
+pub const SE_DACL_PRESENT: u16 = 0x0004;
+pub const SE_SACL_PRESENT: u16 = 0x0010;
+pub const SE_DACL_AUTO_INHERITED: u16 = 0x0400;
+pub const SE_SACL_AUTO_INHERITED: u16 = 0x0800;
+pub const SE_DACL_PROTECTED: u16 = 0x1000;
+pub const SE_SACL_PROTECTED: u16 = 0x2000;
+pub const SE_SELF_RELATIVE: u16 = 0x8000;
+
+pub const ACE_TYPE_ACCESS_ALLOWED: u8 = 0x00;
+pub const ACE_TYPE_ACCESS_DENIED: u8 = 0x01;
+pub const ACE_FLAG_OBJECT_INHERIT: u8 = 0x01;
+pub const ACE_FLAG_CONTAINER_INHERIT: u8 = 0x02;
+pub const ACE_FLAG_NO_PROPAGATE_INHERIT: u8 = 0x04;
+pub const ACE_FLAG_INHERIT_ONLY: u8 = 0x08;
+pub const ACE_FLAG_INHERITED: u8 = 0x10;
+
+pub const FILE_READ_DATA: u32 = 0x0000_0001;
+pub const FILE_WRITE_DATA: u32 = 0x0000_0002;
+pub const FILE_APPEND_DATA: u32 = 0x0000_0004;
+pub const FILE_READ_EA: u32 = 0x0000_0008;
+pub const FILE_WRITE_EA: u32 = 0x0000_0010;
+pub const FILE_EXECUTE: u32 = 0x0000_0020;
+pub const FILE_DELETE_CHILD: u32 = 0x0000_0040;
+pub const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+pub const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
+pub const STANDARD_DELETE: u32 = 0x0001_0000;
+pub const STANDARD_READ_CONTROL: u32 = 0x0002_0000;
+pub const STANDARD_WRITE_DAC: u32 = 0x0004_0000;
+pub const STANDARD_WRITE_OWNER: u32 = 0x0008_0000;
+pub const STANDARD_SYNCHRONIZE: u32 = 0x0010_0000;
+pub const FILE_GENERIC_READ: u32 =
+    STANDARD_READ_CONTROL | FILE_READ_DATA | FILE_READ_ATTRIBUTES | FILE_READ_EA | STANDARD_SYNCHRONIZE;
+pub const FILE_GENERIC_WRITE: u32 = STANDARD_READ_CONTROL
+    | FILE_WRITE_DATA
+    | FILE_WRITE_ATTRIBUTES
+    | FILE_WRITE_EA
+    | FILE_APPEND_DATA
+    | STANDARD_SYNCHRONIZE;
+pub const FILE_GENERIC_EXECUTE: u32 =
+    STANDARD_READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_EXECUTE | STANDARD_SYNCHRONIZE;
+pub const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
+pub const GENERIC_ALL: u32 = 0x1000_0000;
+pub const GENERIC_EXECUTE: u32 = 0x2000_0000;
+pub const GENERIC_WRITE: u32 = 0x4000_0000;
+pub const GENERIC_READ: u32 = 0x8000_0000;
+
 fn invalid(reason: &'static str) -> ParseError {
     ParseError::InvalidField {
         field: "ntfs.security",
@@ -73,6 +119,82 @@ impl NtfsSid {
             },
             length,
         ))
+    }
+
+    /// Parse a canonical Windows SID string (`S-1-<authority>[-<subauthority>...]`).
+    pub fn parse_str(text: &str) -> Result<Self, ParseError> {
+        let mut parts = text.split('-');
+        if parts.next() != Some("S") || parts.next() != Some("1") {
+            return Err(invalid("SID string must begin with S-1-"));
+        }
+        let auth_str = parts.next().ok_or_else(|| invalid("missing SID authority"))?;
+        let authority = if let Some(hex) = auth_str
+            .strip_prefix("0x")
+            .or_else(|| auth_str.strip_prefix("0X"))
+        {
+            u64::from_str_radix(hex, 16).map_err(|_| invalid("invalid hex SID authority"))?
+        } else {
+            auth_str
+                .parse::<u64>()
+                .map_err(|_| invalid("invalid decimal SID authority"))?
+        };
+        if authority > 0x0000_FFFF_FFFF_FFFF {
+            return Err(invalid("SID authority exceeds 48-bit range"));
+        }
+        let mut subauthorities = Vec::new();
+        for part in parts {
+            let sub = part
+                .parse::<u32>()
+                .map_err(|_| invalid("invalid SID subauthority"))?;
+            subauthorities.push(sub);
+        }
+        if subauthorities.len() > 15 {
+            return Err(invalid("SID has more than 15 subauthorities"));
+        }
+        Ok(Self {
+            authority,
+            subauthorities,
+        })
+    }
+
+    /// Encode this SID into its exact MS-DTYP binary representation.
+    pub fn encode(&self) -> Result<Vec<u8>, ParseError> {
+        if self.authority > 0x0000_FFFF_FFFF_FFFF || self.subauthorities.len() > 15 {
+            return Err(invalid("SID authority or subauthority count out of range"));
+        }
+        let mut out = Vec::with_capacity(8 + self.subauthorities.len() * 4);
+        out.push(1); // revision 1
+        out.push(self.subauthorities.len() as u8);
+        let auth_be = self.authority.to_be_bytes();
+        out.extend_from_slice(&auth_be[2..8]);
+        for &sub in &self.subauthorities {
+            out.extend_from_slice(&sub.to_le_bytes());
+        }
+        Ok(out)
+    }
+
+    #[must_use]
+    pub fn creator_owner() -> Self {
+        Self {
+            authority: 3,
+            subauthorities: vec![0],
+        }
+    }
+
+    #[must_use]
+    pub fn creator_group() -> Self {
+        Self {
+            authority: 3,
+            subauthorities: vec![1],
+        }
+    }
+
+    #[must_use]
+    pub fn world_everyone() -> Self {
+        Self {
+            authority: 1,
+            subauthorities: vec![0],
+        }
     }
 }
 
@@ -162,6 +284,96 @@ impl NtfsAce {
         ace.opaque = remaining[length..].to_vec();
         Ok(ace)
     }
+
+    /// Encode this ACE losslessly in MS-DTYP binary form (preserving exact order,
+    /// object GUIDs, and trailing opaque bytes).
+    pub fn encode(&self) -> Result<Vec<u8>, ParseError> {
+        let mut body = Vec::new();
+        let ordinary = matches!(self.kind, 0 | 1 | 2 | 9 | 10 | 13 | 17 | 18 | 19);
+        let object = matches!(self.kind, 5 | 6 | 7 | 11 | 12 | 15);
+        if !ordinary && !object {
+            body.extend_from_slice(&self.opaque);
+        } else {
+            let mask = self
+                .mask
+                .ok_or_else(|| invalid("known ACE missing access mask"))?;
+            body.extend_from_slice(&mask.to_le_bytes());
+            if object {
+                let obj_flags = self
+                    .object_flags
+                    .ok_or_else(|| invalid("object ACE missing object_flags"))?;
+                if obj_flags & !3 != 0 {
+                    return Err(invalid("unknown object-ACE presence flags"));
+                }
+                body.extend_from_slice(&obj_flags.to_le_bytes());
+                if obj_flags & 1 != 0 {
+                    let guid = self
+                        .object_type
+                        .ok_or_else(|| invalid("object ACE missing object_type GUID"))?;
+                    body.extend_from_slice(&guid);
+                }
+                if obj_flags & 2 != 0 {
+                    let guid = self
+                        .inherited_object_type
+                        .ok_or_else(|| invalid("object ACE missing inherited_object_type GUID"))?;
+                    body.extend_from_slice(&guid);
+                }
+            }
+            let sid = self
+                .sid
+                .as_ref()
+                .ok_or_else(|| invalid("known ACE missing trustee SID"))?;
+            body.extend_from_slice(&sid.encode()?);
+            body.extend_from_slice(&self.opaque);
+        }
+        let total = (4 + body.len()).next_multiple_of(4);
+        let total_u16 =
+            u16::try_from(total).map_err(|_| invalid("encoded ACE size exceeds u16"))?;
+        let mut out = vec![0_u8; total];
+        out[0] = self.kind;
+        out[1] = self.flags;
+        out[2..4].copy_from_slice(&total_u16.to_le_bytes());
+        out[4..4 + body.len()].copy_from_slice(&body);
+        Ok(out)
+    }
+}
+
+impl NtfsAcl {
+    /// Encode this ACL in MS-DTYP binary form (preserving exact ACE ordering and padding).
+    /// Returns `Ok(None)` for an absent or NULL ACL (`offset == 0 && revision.is_none() && aces.is_empty()`).
+    pub fn encode(&self) -> Result<Option<Vec<u8>>, ParseError> {
+        if !self.present {
+            return Ok(None);
+        }
+        if self.revision.is_none() && self.aces.is_empty() && self.padding.is_empty() {
+            // Native NULL ACL (`present == true`, offset == 0).
+            return Ok(None);
+        }
+        let has_object = self
+            .aces
+            .iter()
+            .any(|ace| matches!(ace.kind, 5 | 6 | 7 | 11 | 12 | 15));
+        let revision = self.revision.unwrap_or(if has_object { 4 } else { 2 });
+        if !matches!(revision, 2 | 4) || (has_object && revision != 4) {
+            return Err(invalid("invalid ACL revision for contained ACEs"));
+        }
+        let ace_count = u16::try_from(self.aces.len())
+            .map_err(|_| invalid("ACL ACE count exceeds u16"))?;
+        let mut payload = Vec::new();
+        for ace in &self.aces {
+            payload.extend_from_slice(&ace.encode()?);
+        }
+        payload.extend_from_slice(&self.padding);
+        let total = (8 + payload.len()).next_multiple_of(4);
+        let total_u16 =
+            u16::try_from(total).map_err(|_| invalid("encoded ACL size exceeds u16"))?;
+        let mut out = vec![0_u8; total];
+        out[0] = revision;
+        out[2..4].copy_from_slice(&total_u16.to_le_bytes());
+        out[4..6].copy_from_slice(&ace_count.to_le_bytes());
+        out[8..8 + payload.len()].copy_from_slice(&payload);
+        Ok(Some(out))
+    }
 }
 
 /// `present == false` is an absent ACL; `present && offset == 0` is a
@@ -210,6 +422,352 @@ impl NtfsSecurityDescriptor {
             dacl: acl_at(value, le32(value, 16)?, control & 0x04 != 0, false)?,
         })
     }
+
+    /// Encode this security descriptor in MS-DTYP self-relative binary form,
+    /// preserving SACL, DACL, ACE order, opaque ACEs, and control flags, and
+    /// verifying round-trip parsing via [`Self::parse`].
+    pub fn encode(&self) -> Result<Vec<u8>, ParseError> {
+        let mut control = self.control | SE_SELF_RELATIVE;
+        if self.dacl.present {
+            control |= SE_DACL_PRESENT;
+        } else {
+            control &= !SE_DACL_PRESENT;
+        }
+        if self.sacl.present {
+            control |= SE_SACL_PRESENT;
+        } else {
+            control &= !SE_SACL_PRESENT;
+        }
+
+        let sacl_bytes = self.sacl.encode()?;
+        let dacl_bytes = self.dacl.encode()?;
+        let owner_bytes = match &self.owner {
+            Some(sid) => Some(sid.encode()?),
+            None => None,
+        };
+        let group_bytes = match &self.group {
+            Some(sid) => Some(sid.encode()?),
+            None => None,
+        };
+
+        let mut out = vec![0_u8; 20];
+        let mut append_part = |part: Option<Vec<u8>>| -> Result<u32, ParseError> {
+            let Some(bytes) = part else {
+                return Ok(0);
+            };
+            let aligned = out.len().next_multiple_of(4);
+            out.resize(aligned, 0);
+            let off = u32::try_from(out.len())
+                .map_err(|_| invalid("security descriptor offset overflow"))?;
+            out.extend_from_slice(&bytes);
+            let end_aligned = out.len().next_multiple_of(4);
+            out.resize(end_aligned, 0);
+            Ok(off)
+        };
+
+        let sacl_off = append_part(sacl_bytes)?;
+        let dacl_off = append_part(dacl_bytes)?;
+        let owner_off = append_part(owner_bytes)?;
+        let group_off = append_part(group_bytes)?;
+
+        if out.len() > MAX_SECURITY_DESCRIPTOR_BYTES {
+            return Err(invalid("encoded security descriptor exceeds 128 KiB limit"));
+        }
+        out[0] = 1; // revision
+        out[1] = self.resource_manager_control;
+        out[2..4].copy_from_slice(&control.to_le_bytes());
+        out[4..8].copy_from_slice(&owner_off.to_le_bytes());
+        out[8..12].copy_from_slice(&group_off.to_le_bytes());
+        out[12..16].copy_from_slice(&sacl_off.to_le_bytes());
+        out[16..20].copy_from_slice(&dacl_off.to_le_bytes());
+
+        // Self-verify round-trip with parser.
+        let _ = Self::parse(&out)?;
+        Ok(out)
+    }
+}
+
+/// Caller security token for MS-DTYP DACL access evaluation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NtfsAccessToken {
+    pub user: NtfsSid,
+    pub groups: Vec<NtfsSid>,
+}
+
+impl NtfsAccessToken {
+    #[must_use]
+    pub fn matches_sid(&self, sid: &NtfsSid) -> bool {
+        self.user == *sid
+            || *sid == NtfsSid::world_everyone()
+            || self.groups.iter().any(|g| g == sid)
+    }
+}
+
+/// Map generic access bits (`GENERIC_READ`/`WRITE`/`EXECUTE`/`ALL`) to standard
+/// NTFS file/directory access mask bits per MS-DTYP / Win32 `RtlMapGenericMask`.
+#[must_use]
+pub fn map_generic_file_rights(mut mask: u32) -> u32 {
+    if mask & GENERIC_ALL != 0 {
+        mask |= FILE_ALL_ACCESS;
+    }
+    if mask & GENERIC_READ != 0 {
+        mask |= FILE_GENERIC_READ;
+    }
+    if mask & GENERIC_WRITE != 0 {
+        mask |= FILE_GENERIC_WRITE;
+    }
+    if mask & GENERIC_EXECUTE != 0 {
+        mask |= FILE_GENERIC_EXECUTE;
+    }
+    mask & 0x00FF_FFFF
+}
+
+/// Evaluate MS-DTYP DACL access in stored ACE order (`ACCESS_DENIED_ACE` before
+/// later `ACCESS_ALLOWED_ACE` immediately denies).
+///
+/// - Absent or NULL DACL (`!dacl.present || (dacl.offset == 0 && dacl.revision.is_none())`)
+///   grants all requested rights per MS-DTYP 2.5.3.2.
+/// - Present empty DACL denies all requested non-zero rights.
+/// - `INHERIT_ONLY_ACE (0x08)` entries are skipped for object access evaluation.
+/// - Unrecognized, conditional/callback, or object-typed DACL ACEs fail closed (`Err`)
+///   rather than silently allowing access.
+pub fn evaluate_dacl_access(
+    sd: &NtfsSecurityDescriptor,
+    token: &NtfsAccessToken,
+    desired_mask: u32,
+) -> Result<bool, ParseError> {
+    let mut remaining = map_generic_file_rights(desired_mask);
+    if remaining == 0 {
+        return Ok(true);
+    }
+    if !sd.dacl.present || (sd.dacl.revision.is_none() && sd.dacl.aces.is_empty()) {
+        return Ok(true);
+    }
+    // Owner implicitly holds READ_CONTROL and WRITE_DAC unless explicitly denied
+    // (handled after ACE scan if not explicitly denied).
+    let mut explicitly_denied = 0_u32;
+    for ace in &sd.dacl.aces {
+        if ace.flags & ACE_FLAG_INHERIT_ONLY != 0 {
+            continue;
+        }
+        match ace.kind {
+            ACE_TYPE_ACCESS_ALLOWED | ACE_TYPE_ACCESS_DENIED => {
+                let (Some(mask), Some(sid)) = (ace.mask, ace.sid.as_ref()) else {
+                    return Err(invalid("malformed DACL ACE missing mask or SID"));
+                };
+                if !ace.opaque.is_empty() {
+                    return Err(invalid(
+                        "DACL contains trailing conditional/opaque ACE data; failing closed",
+                    ));
+                }
+                if !token.matches_sid(sid) {
+                    continue;
+                }
+                let mapped = map_generic_file_rights(mask);
+                if ace.kind == ACE_TYPE_ACCESS_DENIED {
+                    if remaining & mapped != 0 {
+                        return Ok(false);
+                    }
+                    explicitly_denied |= mapped;
+                } else {
+                    remaining &= !mapped;
+                    if remaining == 0 {
+                        return Ok(true);
+                    }
+                }
+            }
+            _ => {
+                return Err(invalid(
+                    "DACL contains unsupported callback/object/compound ACE type; failing closed",
+                ));
+            }
+        }
+    }
+    if sd.owner.as_ref() == Some(&token.user) {
+        let owner_implicit = (STANDARD_READ_CONTROL | STANDARD_WRITE_DAC) & !explicitly_denied;
+        remaining &= !owner_implicit;
+    }
+    Ok(remaining == 0)
+}
+
+/// Derive a child object's MS-DTYP security descriptor from its parent directory's
+/// inheritable ACEs (`OI`/`CI`/`NP`/`IO`/`INHERITED_ACE`, `CREATOR_OWNER`,
+/// `CREATOR_GROUP`), honoring `SE_DACL_PROTECTED`.
+pub fn inherit_security_descriptor(
+    parent: &NtfsSecurityDescriptor,
+    is_directory: bool,
+    owner: &NtfsSid,
+    group: &NtfsSid,
+) -> Result<NtfsSecurityDescriptor, ParseError> {
+    let inherit_acl = |parent_acl: &NtfsAcl| -> NtfsAcl {
+        if !parent_acl.present {
+            return NtfsAcl {
+                present: false,
+                offset: 0,
+                revision: None,
+                ace_count: None,
+                size: None,
+                aces: Vec::new(),
+                padding: Vec::new(),
+            };
+        }
+        if parent_acl.revision.is_none() && parent_acl.aces.is_empty() {
+            return parent_acl.clone();
+        }
+        let mut child_aces = Vec::new();
+        for ace in &parent_acl.aces {
+            let oi = ace.flags & ACE_FLAG_OBJECT_INHERIT != 0;
+            let ci = ace.flags & ACE_FLAG_CONTAINER_INHERIT != 0;
+            let np = ace.flags & ACE_FLAG_NO_PROPAGATE_INHERIT != 0;
+            let io = ace.flags & ACE_FLAG_INHERIT_ONLY != 0;
+
+            let applies_to_child = if is_directory { ci } else { oi };
+            let propagates_further = is_directory && !np && (oi || ci);
+
+            let is_creator_owner = ace.sid.as_ref() == Some(&NtfsSid::creator_owner());
+            let is_creator_group = ace.sid.as_ref() == Some(&NtfsSid::creator_group());
+            let is_creator = is_creator_owner || is_creator_group;
+
+            if applies_to_child {
+                let effective_sid = if is_creator_owner {
+                    Some(owner.clone())
+                } else if is_creator_group {
+                    Some(group.clone())
+                } else {
+                    ace.sid.clone()
+                };
+                let mut effective_flags = ACE_FLAG_INHERITED;
+                if is_directory && !np && !is_creator {
+                    if oi {
+                        effective_flags |= ACE_FLAG_OBJECT_INHERIT;
+                    }
+                    if ci {
+                        effective_flags |= ACE_FLAG_CONTAINER_INHERIT;
+                    }
+                }
+                let mut cloned = ace.clone();
+                cloned.flags = effective_flags;
+                cloned.sid = effective_sid;
+                child_aces.push(cloned);
+            }
+
+            // If this is a directory and the ACE must continue propagating to
+            // descendants (either OI-only for files or a CREATOR_OWNER/GROUP template),
+            // emit an INHERIT_ONLY template ACE as specified by MS-DTYP 2.5.3.4.
+            if propagates_further && (!applies_to_child || is_creator) {
+                let mut prop_flags = ACE_FLAG_INHERITED | ACE_FLAG_INHERIT_ONLY;
+                if oi {
+                    prop_flags |= ACE_FLAG_OBJECT_INHERIT;
+                }
+                if ci {
+                    prop_flags |= ACE_FLAG_CONTAINER_INHERIT;
+                }
+                let mut template = ace.clone();
+                template.flags = prop_flags;
+                child_aces.push(template);
+            } else if !is_directory && io && !oi {
+                // Container-only template does not propagate to non-directory child.
+            }
+        }
+        let has_obj = child_aces
+            .iter()
+            .any(|a| matches!(a.kind, 5 | 6 | 7 | 11 | 12 | 15));
+        let rev = parent_acl.revision.unwrap_or(if has_obj { 4 } else { 2 });
+        NtfsAcl {
+            present: true,
+            offset: 0,
+            revision: Some(if has_obj { 4 } else { rev }),
+            ace_count: Some(child_aces.len() as u16),
+            size: None,
+            aces: child_aces,
+            padding: Vec::new(),
+        }
+    };
+
+    let dacl = inherit_acl(&parent.dacl);
+    let sacl = inherit_acl(&parent.sacl);
+    let mut control = SE_SELF_RELATIVE;
+    if dacl.present {
+        control |= SE_DACL_PRESENT | SE_DACL_AUTO_INHERITED;
+    }
+    if sacl.present {
+        control |= SE_SACL_PRESENT | SE_SACL_AUTO_INHERITED;
+    }
+    let child = NtfsSecurityDescriptor {
+        control,
+        resource_manager_control: parent.resource_manager_control,
+        owner: Some(owner.clone()),
+        group: Some(group.clone()),
+        sacl,
+        dacl,
+    };
+    let encoded = child.encode()?;
+    NtfsSecurityDescriptor::parse(&encoded)
+}
+
+/// Compute the next valid 16-byte-aligned primary `$SDS` offset for an entry of
+/// `entry_length` bytes (`SDS_HEADER_BYTES + descriptor.len()`), advancing across
+/// `256 KiB` (`SDS_COPY_DISTANCE`) even/odd mirror stripes whenever the entry
+/// would cross a `256 KiB` primary stripe boundary.
+pub fn next_sds_primary_offset(
+    current_primary_end: u64,
+    entry_length: u32,
+) -> Result<u64, ParseError> {
+    if !(40..=MAX_SECURITY_DESCRIPTOR_BYTES as u32 + SDS_HEADER_BYTES as u32)
+        .contains(&entry_length)
+        || !entry_length.is_multiple_of(4)
+    {
+        return Err(invalid("invalid SDS entry length"));
+    }
+    let mut off = current_primary_end.next_multiple_of(16);
+    if off & SDS_COPY_DISTANCE != 0 {
+        // Advance past an odd (mirror) stripe to the start of the next even (primary) stripe.
+        off = (off / SDS_COPY_DISTANCE + 1)
+            .checked_mul(SDS_COPY_DISTANCE)
+            .ok_or_else(|| invalid("SDS stripe offset overflow"))?;
+    }
+    let within_stripe = off % SDS_COPY_DISTANCE;
+    if within_stripe + u64::from(entry_length) > SDS_COPY_DISTANCE {
+        // Jump from current even stripe `2k` to next even stripe `2k + 2`.
+        let next_even_stripe = (off / SDS_COPY_DISTANCE)
+            .checked_add(2)
+            .ok_or_else(|| invalid("SDS stripe index overflow"))?;
+        off = next_even_stripe
+            .checked_mul(SDS_COPY_DISTANCE)
+            .ok_or_else(|| invalid("SDS stripe offset overflow"))?;
+    }
+    if off
+        .checked_add(SDS_COPY_DISTANCE + u64::from(entry_length))
+        .is_none()
+    {
+        return Err(invalid("SDS mirror offset overflow"));
+    }
+    Ok(off)
+}
+
+/// Encode one validated `$Secure:$SDS` entry (`20B header + descriptor`, 16-byte aligned).
+pub fn encode_sds_entry(
+    header: NtfsSecurityHeader,
+    descriptor: &[u8],
+) -> Result<Vec<u8>, ParseError> {
+    NtfsSecurityDescriptor::parse(descriptor)?;
+    let expected_len = SDS_HEADER_BYTES + descriptor.len();
+    if u64::from(header.length) != expected_len as u64 {
+        return Err(invalid("SDS header length disagrees with descriptor bytes"));
+    }
+    if security_hash(descriptor) != header.hash {
+        return Err(invalid("SDS header hash disagrees with descriptor bytes"));
+    }
+    let mut raw = Vec::with_capacity(expected_len);
+    raw.extend_from_slice(&header.hash.to_le_bytes());
+    raw.extend_from_slice(&header.security_id.to_le_bytes());
+    raw.extend_from_slice(&header.offset.to_le_bytes());
+    raw.extend_from_slice(&header.length.to_le_bytes());
+    raw.extend_from_slice(descriptor);
+    let _ = header.descriptor(&raw)?;
+    let aligned = raw.len().next_multiple_of(16);
+    raw.resize(aligned, 0);
+    Ok(raw)
 }
 
 fn component_offset(value: &[u8], offset: u32, minimum: usize) -> Result<usize, ParseError> {

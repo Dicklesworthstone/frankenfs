@@ -39,6 +39,7 @@ fn mapped(pairs: &[u8], first: u64, last: u64, size: u64, initialized: u64) -> N
             allocated_bytes: last.checked_add(1).unwrap_or(0) * 512,
             data_bytes: size,
             initialized_bytes: initialized,
+            compressed_size: None,
             mapping_pairs: pairs,
         }),
     }
