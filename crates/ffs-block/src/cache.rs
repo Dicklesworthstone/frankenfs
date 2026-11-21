@@ -4594,7 +4594,10 @@ pub struct ShardedExtentReadCache {
 }
 
 impl ShardedExtentReadCache {
-    const MIN_SHARD_BUDGET_BYTES: usize = 256 * 1024;
+    /// Minimum per-shard byte budget so each shard holds at least 8 full
+    /// 32-block (128 KiB) tiles and S3-FIFO has genuine Small+Main headroom
+    /// rather than degenerating to a 2-tile FIFO under sequential scans.
+    const MIN_SHARD_BUDGET_BYTES: usize = 1024 * 1024;
 
     #[must_use]
     pub fn new(capacity_bytes: usize) -> Self {
@@ -4624,8 +4627,9 @@ impl ShardedExtentReadCache {
 
     #[inline]
     fn shard_index(&self, tile_id: u64) -> usize {
-        let mixed = tile_id.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        ((mixed ^ (mixed >> 32)) as usize) & self.shard_mask
+        // Round-robin stripe contiguous tiles across shards so sequential
+        // working sets distribute evenly without hot-shard birthday collisions.
+        (tile_id as usize) & self.shard_mask
     }
 
     fn record_epoch_once(epochs: &mut ExtentMissEpochs, shard_idx: usize, epoch: u64) {
