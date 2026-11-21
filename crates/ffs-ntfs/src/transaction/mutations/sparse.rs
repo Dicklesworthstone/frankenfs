@@ -49,7 +49,7 @@ impl NtfsTransactionEngine {
             }
             let end = offset
                 .checked_add(length)
-                .filter(|&end| end <= i64::MAX as u64)
+                .filter(|&end| i64::try_from(end).is_ok())
                 .ok_or_else(|| {
                     invalid_range(
                         libc::EFBIG,

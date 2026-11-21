@@ -71,6 +71,9 @@ jobs:
         env:
           FFS_REQUIRE_ORACLES: "1"
         run: cargo test --locked -p ffs-zfs
+      - name: ZFS CLI file range and authority tests
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p ffs-cli --bin ffs-zfs cli_file_range -- --nocapture
       - name: Native ZPL metadata codec tests
         if: ${{ !cancelled() }}
         run: cargo test --locked -p ffs-ondisk --lib zfs_zpl::tests

@@ -10,8 +10,11 @@
 > Traversal skips logical holes and bounds allocated leaves and metadata work.
 > Authored regressions cover ZPL v4/v5, SA spill metadata, mirrors, both deadlist
 > formats, quota deltas, multi-terabyte holes, sparse EOF extension, invalid
-> requests, cancellation and seven persistence cut points. Compiler and runtime
-> qualification for this increment are pending. Native OpenZFS interchange,
+> requests, cancellation and seven persistence cut points. Formatting and the
+> workspace all-target compiler/strict-Clippy checks excluding `ffs-harness`
+> pass. The full workspace check was killed by memory exhaustion in the existing
+> harness lib-test; full gates and runtime qualification remain pending.
+> Native OpenZFS interchange,
 > mounted-syscall qualification and the broader ZFS writer roadmap stay open.
 
 > **NTFS logged hole punching (2026-11-20):**
@@ -24,8 +27,11 @@
 > copies and mounted caches publish through the existing WAL transaction.
 > Authored regressions cover native allocation, ADS isolation, uninitialized
 > tails, large ranges, rejected operations, ENOSPC, committed cancellation,
-> failed barriers and durable/reordered persistence cuts. Compiler, runtime
-> and independent native-image qualification for this increment are pending;
+> failed barriers and durable/reordered persistence cuts. Formatting and the
+> workspace all-target compiler/strict-Clippy checks excluding `ffs-harness`
+> pass. The full workspace check was killed by memory exhaustion in the existing
+> harness lib-test. Full gates, runtime and independent native-image
+> qualification for this increment remain pending;
 > no Windows-interchange or mounted-syscall qualification is claimed.
 
 > **Extent read-cache lifetime bounds (2026-11-20):**

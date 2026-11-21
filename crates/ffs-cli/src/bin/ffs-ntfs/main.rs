@@ -235,7 +235,7 @@ fn punch_hole_command(
     ensure!(
         start
             .checked_add(bytes)
-            .is_some_and(|end| end <= i64::MAX as u64),
+            .is_some_and(|end| i64::try_from(end).is_ok()),
         "hole-punch range exceeds the signed native size limit"
     );
     let mut engine = target.open(cx, false)?;
