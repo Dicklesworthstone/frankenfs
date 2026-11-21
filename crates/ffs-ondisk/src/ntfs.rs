@@ -7,20 +7,25 @@
 
 pub mod attribute_list;
 pub mod ea;
+pub mod efs;
 pub mod index;
 mod log_transactions;
 pub mod logfile_writer;
 pub mod recovery;
 pub mod reparse;
+pub mod usn;
+pub mod view_index;
 
 use ffs_types::ParseError;
 
 pub const ATTRIBUTE_LIST: u32 = 0x20;
+pub const OBJECT_ID: u32 = 0x40;
 pub const DATA: u32 = 0x80;
 pub const VOLUME_INFORMATION: u32 = 0x70;
 pub const REPARSE_POINT: u32 = 0xC0;
 pub const EA_INFORMATION: u32 = 0xD0;
 pub const EA: u32 = 0xE0;
+pub const LOGGED_UTILITY_STREAM: u32 = 0x100;
 pub const COMPRESSED: u16 = 0x0001;
 pub const ENCRYPTED: u16 = 0x4000;
 pub const SPARSE: u16 = 0x8000;
@@ -513,6 +518,9 @@ pub struct NtfsNonResident<'a> {
     pub allocated_bytes: u64,
     pub data_bytes: u64,
     pub initialized_bytes: u64,
+    /// On-disk physical allocation size (`raw[64..72]`) when `flags & (SPARSE | COMPRESSED) != 0`
+    /// and `first_vcn == 0`.
+    pub compressed_size: Option<u64>,
     pub mapping_pairs: &'a [u8],
 }
 
@@ -546,13 +554,20 @@ impl<'a> NtfsAttribute<'a> {
                         "mapping pairs overlap header or are absent",
                     ));
                 }
+                let first_vcn = le64(raw, 16)?;
+                let compressed_size = if header == 72 && first_vcn == 0 {
+                    Some(le64(raw, 64)?)
+                } else {
+                    None
+                };
                 let value = NtfsNonResident {
-                    first_vcn: le64(raw, 16)?,
+                    first_vcn,
                     last_vcn: le64(raw, 24)?,
                     compression_unit: le16(raw, 34)?,
                     allocated_bytes: le64(raw, 40)?,
                     data_bytes: le64(raw, 48)?,
                     initialized_bytes: le64(raw, 56)?,
+                    compressed_size,
                     mapping_pairs: &raw[start..],
                 };
                 if value.first_vcn == 0 && value.initialized_bytes > value.data_bytes {

@@ -82,6 +82,119 @@ impl NtfsReparsePoint {
     pub const fn is_name_surrogate(&self) -> bool {
         self.tag & 0x2000_0000 != 0
     }
+
+    /// Encode this reparse point into its exact MS-FSCC binary buffer and
+    /// verify round-trip parsing via [`Self::parse`].
+    pub fn encode(&self) -> Result<Vec<u8>, ParseError> {
+        if self.tag <= 2 {
+            return Err(invalid("ntfs.reparse", "reserved reparse tag"));
+        }
+        let is_microsoft = self.tag & 0x8000_0000 != 0;
+        let payload = match (&self.data, self.tag) {
+            (
+                NtfsReparseData::SymbolicLink {
+                    substitute,
+                    print,
+                    relative,
+                },
+                SYMLINK_TAG,
+            ) => {
+                if self.guid.is_some() {
+                    return Err(invalid("ntfs.reparse", "symlink tag must not carry a GUID"));
+                }
+                if substitute.is_empty() || substitute.contains(&0) || print.contains(&0) {
+                    return Err(invalid("ntfs.reparse", "invalid symlink reparse target"));
+                }
+                let sub_bytes = u16::try_from(substitute.len() * 2)
+                    .map_err(|_| invalid("ntfs.reparse", "symlink substitute overflow"))?;
+                let print_bytes = u16::try_from(print.len() * 2)
+                    .map_err(|_| invalid("ntfs.reparse", "symlink print name overflow"))?;
+                // Store substitute + NUL then print + NUL inside PathBuffer (MS-FSCC canonical order).
+                let print_off = u16::try_from(usize::from(sub_bytes) + 2)
+                    .map_err(|_| invalid("ntfs.reparse", "symlink print offset overflow"))?;
+                let mut body = Vec::with_capacity(12 + usize::from(sub_bytes) + usize::from(print_bytes) + 4);
+                body.extend_from_slice(&0_u16.to_le_bytes()); // SubstituteNameOffset
+                body.extend_from_slice(&sub_bytes.to_le_bytes());
+                body.extend_from_slice(&print_off.to_le_bytes());
+                body.extend_from_slice(&print_bytes.to_le_bytes());
+                body.extend_from_slice(&u32::from(*relative).to_le_bytes());
+                for &u in substitute {
+                    body.extend_from_slice(&u.to_le_bytes());
+                }
+                body.extend_from_slice(&0_u16.to_le_bytes());
+                for &u in print {
+                    body.extend_from_slice(&u.to_le_bytes());
+                }
+                body.extend_from_slice(&0_u16.to_le_bytes());
+                body
+            }
+            (NtfsReparseData::MountPoint { substitute, print }, MOUNT_POINT_TAG) => {
+                if self.guid.is_some() {
+                    return Err(invalid("ntfs.reparse", "mount point tag must not carry a GUID"));
+                }
+                if substitute.is_empty() || substitute.contains(&0) || print.contains(&0) {
+                    return Err(invalid("ntfs.reparse", "invalid mount point reparse target"));
+                }
+                let sub_bytes = u16::try_from(substitute.len() * 2)
+                    .map_err(|_| invalid("ntfs.reparse", "mount point substitute overflow"))?;
+                let print_bytes = u16::try_from(print.len() * 2)
+                    .map_err(|_| invalid("ntfs.reparse", "mount point print name overflow"))?;
+                let print_off = u16::try_from(usize::from(sub_bytes) + 2)
+                    .map_err(|_| invalid("ntfs.reparse", "mount point print offset overflow"))?;
+                let mut body = Vec::with_capacity(8 + usize::from(sub_bytes) + usize::from(print_bytes) + 4);
+                body.extend_from_slice(&0_u16.to_le_bytes());
+                body.extend_from_slice(&sub_bytes.to_le_bytes());
+                body.extend_from_slice(&print_off.to_le_bytes());
+                body.extend_from_slice(&print_bytes.to_le_bytes());
+                for &u in substitute {
+                    body.extend_from_slice(&u.to_le_bytes());
+                }
+                body.extend_from_slice(&0_u16.to_le_bytes());
+                for &u in print {
+                    body.extend_from_slice(&u.to_le_bytes());
+                }
+                body.extend_from_slice(&0_u16.to_le_bytes());
+                body
+            }
+            (NtfsReparseData::Opaque(bytes), tag)
+                if tag != SYMLINK_TAG && tag != MOUNT_POINT_TAG =>
+            {
+                if is_microsoft && self.guid.is_some() {
+                    return Err(invalid("ntfs.reparse", "Microsoft reparse tag must not carry a GUID"));
+                }
+                if !is_microsoft && self.guid.is_none() {
+                    return Err(invalid("ntfs.reparse", "non-Microsoft reparse tag requires a 16-byte GUID"));
+                }
+                bytes.clone()
+            }
+            _ => {
+                return Err(invalid(
+                    "ntfs.reparse",
+                    "reparse tag disagrees with reparse data variant",
+                ));
+            }
+        };
+        let header_len: usize = if is_microsoft { 8 } else { 24 };
+        let total = header_len + payload.len();
+        if total > MAX_REPARSE_BYTES {
+            return Err(invalid("ntfs.reparse", "encoded reparse buffer exceeds 16 KiB"));
+        }
+        let data_len = u16::try_from(payload.len())
+            .map_err(|_| invalid("ntfs.reparse", "reparse payload length overflow"))?;
+        let mut out = Vec::with_capacity(total);
+        out.extend_from_slice(&self.tag.to_le_bytes());
+        out.extend_from_slice(&data_len.to_le_bytes());
+        out.extend_from_slice(&0_u16.to_le_bytes());
+        if let Some(guid) = self.guid {
+            out.extend_from_slice(&guid);
+        }
+        out.extend_from_slice(&payload);
+        let parsed = Self::parse(&out)?;
+        if parsed != *self {
+            return Err(invalid("ntfs.reparse", "encoded reparse buffer round-trip mismatch"));
+        }
+        Ok(out)
+    }
 }
 
 fn paths(raw: &[u8], path_offset: usize) -> Result<(Vec<u16>, Vec<u16>), ParseError> {
@@ -218,5 +331,34 @@ mod tests {
         assert_eq!(point.data, NtfsReparseData::Opaque(vec![0x00, 0xFF, 0x80]));
         unknown[4..6].copy_from_slice(&19_u16.to_le_bytes());
         assert!(NtfsReparsePoint::parse(&unknown).is_err());
+
+        // Round-trip encode for symlink, mount point, and custom GUID opaque tag.
+        let sym = NtfsReparsePoint {
+            tag: SYMLINK_TAG,
+            guid: None,
+            data: NtfsReparseData::SymbolicLink {
+                substitute: "..\\target.bin".encode_utf16().collect(),
+                print: "..\\target.bin".encode_utf16().collect(),
+                relative: true,
+            },
+        };
+        assert_eq!(NtfsReparsePoint::parse(&sym.encode().unwrap()).unwrap(), sym);
+
+        let mp = NtfsReparsePoint {
+            tag: MOUNT_POINT_TAG,
+            guid: None,
+            data: NtfsReparseData::MountPoint {
+                substitute: "\\??\\C:\\dir".encode_utf16().collect(),
+                print: "C:\\dir".encode_utf16().collect(),
+            },
+        };
+        assert_eq!(NtfsReparsePoint::parse(&mp.encode().unwrap()).unwrap(), mp);
+
+        let opaque = NtfsReparsePoint {
+            tag: 0x0000_1234,
+            guid: Some([0x5A; 16]),
+            data: NtfsReparseData::Opaque(vec![1, 2, 3, 4]),
+        };
+        assert_eq!(NtfsReparsePoint::parse(&opaque.encode().unwrap()).unwrap(), opaque);
     }
 }

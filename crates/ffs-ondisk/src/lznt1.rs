@@ -135,6 +135,106 @@ fn decode_chunk(
     Ok(())
 }
 
+/// Compress one logical NTFS compression unit (up to 64 KiB) into MS-XCA 2.5
+/// LZNT1 chunk framing.
+///
+/// Each 4 KiB chunk uses an independent dictionary; chunks that do not shrink
+/// fall back to an uncompressed raw chunk (`0x3000 | (len - 1)`). A trailing
+/// `0x0000` end marker is appended so trailing zero allocation padding inside
+/// physical clusters is never misinterpreted as another chunk.
+///
+/// Round-trip verified against [`decompress_unit`] before returning.
+pub fn compress_unit(input: &[u8]) -> Result<Vec<u8>, ParseError> {
+    if input.is_empty() || input.len() > MAX_UNIT_BYTES {
+        return Err(invalid("invalid LZNT1 compression input length"));
+    }
+    let mut out = Vec::with_capacity(input.len() + 34);
+    for chunk in input.chunks(CHUNK_BYTES) {
+        let compressed = encode_chunk(chunk);
+        if compressed.len() < chunk.len() && compressed.len() <= CHUNK_BYTES {
+            let hdr = 0xB000_u16 | u16::try_from(compressed.len() - 1).map_err(|_| invalid("chunk header overflow"))?;
+            out.extend_from_slice(&hdr.to_le_bytes());
+            out.extend_from_slice(&compressed);
+        } else {
+            let hdr = 0x3000_u16 | u16::try_from(chunk.len() - 1).map_err(|_| invalid("raw chunk header overflow"))?;
+            out.extend_from_slice(&hdr.to_le_bytes());
+            out.extend_from_slice(chunk);
+        }
+    }
+    // Always append the 2-byte end-of-unit marker (`0x0000`).
+    out.extend_from_slice(&0_u16.to_le_bytes());
+    let decoded = decompress_unit(&out, input.len())?;
+    if decoded != input {
+        return Err(invalid("LZNT1 compression round-trip verification failed"));
+    }
+    Ok(out)
+}
+
+fn encode_chunk(chunk: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(chunk.len());
+    let mut pos = 0_usize;
+    let mut length_bits: u32 = 12;
+    let mut threshold: usize = 16;
+
+    while pos < chunk.len() {
+        let flag_idx = out.len();
+        out.push(0);
+        let mut flags = 0_u8;
+        for bit in 0..8 {
+            if pos >= chunk.len() {
+                break;
+            }
+            while pos > threshold {
+                length_bits -= 1;
+                threshold *= 2;
+            }
+            let max_len = ((1_usize << length_bits) + 2).min(chunk.len() - pos);
+            let mut best_len = 0_usize;
+            let mut best_dist = 0_usize;
+            if pos > 0 && max_len >= 3 {
+                // Bounded backward search across this chunk's <= 4096B dictionary.
+                let first = chunk[pos];
+                let second = chunk[pos + 1];
+                let third = chunk[pos + 2];
+                for cand in (0..pos).rev() {
+                    if chunk[cand] != first || chunk[cand + 1] != second || chunk[cand + 2] != third
+                    {
+                        continue;
+                    }
+                    let dist = pos - cand;
+                    let mut mlen = 3_usize;
+                    while mlen < max_len && chunk[cand + mlen] == chunk[pos + mlen] {
+                        mlen += 1;
+                    }
+                    if mlen > best_len {
+                        best_len = mlen;
+                        best_dist = dist;
+                        if best_len == max_len {
+                            break;
+                        }
+                    }
+                }
+            }
+            if best_len >= 3 {
+                flags |= 1_u8 << bit;
+                let word = u16::try_from(((best_dist - 1) << length_bits) | (best_len - 3))
+                    .unwrap_or(0);
+                out.extend_from_slice(&word.to_le_bytes());
+                pos += best_len;
+            } else {
+                out.push(chunk[pos]);
+                pos += 1;
+            }
+        }
+        out[flag_idx] = flags;
+        if out.len() >= chunk.len() {
+            // Early exit: raw chunk will win anyway.
+            return out;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,5 +354,43 @@ mod tests {
         let mut partial = raw(b"abc");
         partial.push(0xFF); // No complete following header fits this allocation.
         assert_eq!(decompress_unit(&partial, 4096).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn compress_unit_roundtrips_compressible_random_boundaries_and_multi_chunk() {
+        // 1. Highly compressible 64 KiB unit (all 'A's)
+        let zeros = vec![b'A'; MAX_UNIT_BYTES];
+        let packed = compress_unit(&zeros).unwrap();
+        assert!(packed.len() < 512, "expected high compression ratio, got {}", packed.len());
+        assert_eq!(decompress_unit(&packed, MAX_UNIT_BYTES).unwrap(), zeros);
+
+        // 2. Multi-chunk mixed patterns crossing 16/17/32/33/2048/2049 boundaries
+        let mut mixed = Vec::with_capacity(20_000);
+        for i in 0..20_000_usize {
+            if (i / 128) % 2 == 0 {
+                mixed.push(b'Z');
+            } else {
+                mixed.push(((i.wrapping_mul(37)) ^ (i >> 3)) as u8);
+            }
+        }
+        let packed_mixed = compress_unit(&mixed).unwrap();
+        assert!(packed_mixed.len() < mixed.len());
+        assert_eq!(decompress_unit(&packed_mixed, mixed.len()).unwrap(), mixed);
+
+        // 3. Incompressible payload falls back to raw chunks and round-trips exactly
+        let mut prng = 0x1234_5678_9abc_def0_u64;
+        let mut random = vec![0_u8; 8192];
+        for b in &mut random {
+            prng ^= prng << 13;
+            prng ^= prng >> 7;
+            prng ^= prng << 17;
+            *b = prng as u8;
+        }
+        let packed_rand = compress_unit(&random).unwrap();
+        assert_eq!(decompress_unit(&packed_rand, random.len()).unwrap(), random);
+
+        // 4. Reject empty or oversized input
+        assert!(compress_unit(&[]).is_err());
+        assert!(compress_unit(&vec![0; MAX_UNIT_BYTES + 1]).is_err());
     }
 }
