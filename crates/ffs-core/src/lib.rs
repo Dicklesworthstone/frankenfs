@@ -2306,7 +2306,7 @@ impl BtrfsPressureRetry {
             && pending > 0
             && self
                 .failed_after_bytes
-                .is_none_or(|failed| pending == u64::MAX || pending > failed)
+                .map_or(limit != 0, |failed| pending == u64::MAX || pending > failed)
         {
             return true;
         }
@@ -118833,7 +118833,7 @@ pub(crate) mod scrub;\n";
             {
                 let res = alloc
                     .extent_alloc
-                    .alloc_metadata_for_root_tree(nodesize, 0)
+                    .alloc_metadata_for_tree(nodesize, BTRFS_ROOT_TREE_OBJECTID, 0)
                     .unwrap();
                 dummy_reserved.push(res.bytenr);
             }
