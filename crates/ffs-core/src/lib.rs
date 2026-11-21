@@ -41134,7 +41134,7 @@ impl OpenFs {
             // Inline copies need fresh data, unlike reference-only shares. Reject
             // a latched allocation refusal before removing destination mappings.
             if !inline_copies.is_empty() {
-                self.require_btrfs_allocation_space_locked(&alloc)?;
+                self.require_btrfs_allocation_space_locked(alloc)?;
             }
 
             // Secure every inline copy before carving the destination. Otherwise
