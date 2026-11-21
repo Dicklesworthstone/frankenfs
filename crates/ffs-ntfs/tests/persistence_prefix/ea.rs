@@ -1,9 +1,11 @@
 //! EA publication, allocation and native recovery share the DATA fault oracle.
 
 use super::{
-    Arc, ByteDevice, CLUSTER_BYTES, Cx, DEFAULT_FILETIME, FaultInjectingNtfsDevice, FfsError,
-    Mutex, NtfsPersistenceStage, NtfsReference, NtfsTransactionEngine, NtfsTxOutcome, SECTOR_BYTES,
-    build_clean_ntfs_image, hard_link_index_values, write_options_clean, write_options_recover,
+    Arc, ByteDevice, ByteOffset, CLUSTER_BYTES, Cx, DEFAULT_FILETIME, FaultInjectingNtfsDevice,
+    FfsError, Mutex, NtfsPersistenceStage, NtfsReference, NtfsTransactionEngine, NtfsTxOutcome,
+    RECORD_BYTES, SECTOR_BYTES, build_clean_ntfs_image, build_file_record, build_nonresident_attr,
+    copied_test_record_attributes, hard_link_index_values, write_options_clean,
+    write_options_recover,
 };
 use ffs_core::vfs::XattrSetMode;
 use ffs_core::{FsOps, RequestScope};
@@ -311,6 +313,296 @@ fn ea_native_transitions_preserve_links_unknown_entries_and_reclaim_clusters() {
             .information
             .is_none()
     );
+}
+
+struct DirectoryBitmapFixture {
+    image: Vec<u8>,
+    file: NtfsReference,
+    directory: NtfsReference,
+    bitmap_cluster: u64,
+    bitmap_bytes: Vec<u8>,
+}
+
+fn directory_bitmap_fixture() -> DirectoryBitmapFixture {
+    let cx = Cx::for_testing();
+    let (device, mut engine, file) = fixture(256);
+    let (directory, _) = engine.mkdir(&cx, "/", "archive").into_result().unwrap();
+    for index in 0..6 {
+        engine
+            .create_file(
+                &cx,
+                "/archive",
+                &format!("entry_{index:02}_long_name_for_external_directory_index.bin"),
+                b"filler",
+            )
+            .into_result()
+            .unwrap();
+    }
+    engine
+        .link_file(&cx, "/notes", "/archive", "copy")
+        .into_result()
+        .unwrap();
+    let volume = engine.volume_view(&cx).unwrap();
+    let record = volume
+        .record(&cx, directory.record, Some(directory.sequence))
+        .unwrap();
+    let attributes = record.attributes().unwrap();
+    assert!(
+        !attributes
+            .iter()
+            .any(|attribute| attribute.kind == ATTRIBUTE_LIST)
+    );
+    let index = attributes
+        .iter()
+        .find(|attribute| attribute.kind == 0xA0)
+        .unwrap();
+    let NtfsValue::NonResident(index) = &index.value else {
+        panic!("fixture must use an external directory index");
+    };
+    assert_eq!(index.allocated_bytes, CLUSTER_BYTES as u64);
+    let bitmap = attributes
+        .iter()
+        .find(|attribute| attribute.kind == 0xB0)
+        .unwrap();
+    let NtfsValue::Resident(bitmap_bytes) = &bitmap.value else {
+        panic!("fixture bitmap starts resident");
+    };
+    let bitmap_bytes = bitmap_bytes.to_vec();
+    assert!(!bitmap_bytes.is_empty() && bitmap_bytes.len() <= 8);
+    let mut image = device.snapshot_durable_only();
+    let bitmap_cluster = 255_u64;
+    let allocation_byte = 60 * CLUSTER_BYTES + bitmap_cluster as usize / 8;
+    let allocation_mask = 1_u8 << (bitmap_cluster % 8);
+    assert_eq!(image[allocation_byte] & allocation_mask, 0);
+    image[allocation_byte] |= allocation_mask;
+    let data_offset = bitmap_cluster as usize * CLUSTER_BYTES;
+    image[data_offset..data_offset + bitmap_bytes.len()].copy_from_slice(&bitmap_bytes);
+    let record_offset = CLUSTER_BYTES + directory.record as usize * RECORD_BYTES;
+    let mut raw_attributes =
+        copied_test_record_attributes(&image[record_offset..record_offset + RECORD_BYTES]);
+    let bitmap_attribute = raw_attributes
+        .iter_mut()
+        .find(|attribute| attribute[..4] == 0xB0_u32.to_le_bytes())
+        .unwrap();
+    *bitmap_attribute = build_nonresident_attr(
+        0xB0,
+        bitmap.id,
+        &bitmap.name,
+        bitmap_cluster,
+        1,
+        bitmap_bytes.len() as u64,
+        volume.geometry.cluster_count(),
+    );
+    image[record_offset..record_offset + RECORD_BYTES].copy_from_slice(&build_file_record(
+        record.number,
+        record.sequence,
+        record.hard_links,
+        true,
+        &raw_attributes,
+    ));
+    DirectoryBitmapFixture {
+        image,
+        file,
+        directory,
+        bitmap_cluster,
+        bitmap_bytes,
+    }
+}
+
+fn open_bitmap_image(
+    image: Vec<u8>,
+    recover: bool,
+) -> (Arc<FaultInjectingNtfsDevice>, NtfsTransactionEngine) {
+    let cx = Cx::for_testing();
+    let length = image.len() as u64 - SECTOR_BYTES as u64;
+    let device = FaultInjectingNtfsDevice::new(image);
+    let engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        length,
+        if recover {
+            write_options_recover()
+        } else {
+            write_options_clean()
+        },
+    )
+    .unwrap();
+    engine.check_clean_consistency(&cx).unwrap();
+    (device, engine)
+}
+
+fn assert_directory_bitmap_storage(
+    device: &FaultInjectingNtfsDevice,
+    engine: &NtfsTransactionEngine,
+    fixture: &DirectoryBitmapFixture,
+    retired: bool,
+) {
+    let cx = Cx::for_testing();
+    let image = device.snapshot_durable_only();
+    let allocation_byte = 60 * CLUSTER_BYTES + fixture.bitmap_cluster as usize / 8;
+    let mask = 1_u8 << (fixture.bitmap_cluster % 8);
+    assert_eq!(image[allocation_byte] & mask == 0, retired);
+    let volume = engine.volume_view(&cx).unwrap();
+    let records = catalog_records(&image, &volume, fixture.directory);
+    let mut count = 0;
+    for record in &records {
+        for attribute in record.attributes().unwrap() {
+            if attribute.kind != 0xB0 {
+                continue;
+            }
+            count += 1;
+            match attribute.value {
+                NtfsValue::Resident(bytes) => {
+                    assert!(
+                        retired,
+                        "predecessor must retain the original bitmap mapping"
+                    );
+                    assert_eq!(bytes, fixture.bitmap_bytes);
+                }
+                NtfsValue::NonResident(extent) => {
+                    assert!(!retired, "committed small bitmap must become resident");
+                    let runs = decode_mapping_pairs(
+                        extent.mapping_pairs,
+                        extent.first_vcn,
+                        extent.last_vcn,
+                        volume.geometry.cluster_count(),
+                    )
+                    .unwrap();
+                    assert_eq!(runs.len(), 1);
+                    assert_eq!(runs[0].lcn, Some(fixture.bitmap_cluster));
+                    assert_eq!(runs[0].clusters, 1);
+                }
+            }
+        }
+    }
+    assert_eq!(count, 1);
+    engine.check_clean_consistency(&cx).unwrap();
+    let _ = entries(engine, fixture.file);
+}
+
+#[test]
+fn ea_repack_reclaims_nonresident_directory_bitmap_and_recovers_atomically() {
+    let cx = Cx::for_testing();
+    let fixture = directory_bitmap_fixture();
+    for target in [fixture.file, fixture.directory] {
+        let (device, mut engine) = open_bitmap_image(fixture.image.clone(), false);
+        let allocated_before = used_clusters(&device);
+        assert_directory_bitmap_storage(&device, &engine, &fixture, false);
+        let cuts = Arc::new(Mutex::new(Vec::<(bool, Vec<u8>)>::new()));
+        if target == fixture.file {
+            let captured = Arc::clone(&cuts);
+            let backing = Arc::clone(&device);
+            engine.set_stage_hook(Some(Box::new(move |event| {
+                if matches!(
+                    event.stage,
+                    NtfsPersistenceStage::DirtyRestartBarrier
+                        | NtfsPersistenceStage::LogCommitBarrier
+                ) {
+                    let committed = event.stage == NtfsPersistenceStage::LogCommitBarrier;
+                    let mut cuts = captured.lock().unwrap();
+                    if !cuts.iter().any(|(seen, _)| *seen == committed) {
+                        cuts.push((committed, backing.snapshot_durable_only()));
+                    }
+                }
+                Ok(())
+            })));
+        }
+        // An empty value still dirties both EA metadata and the child's parent index.
+        let attribute = entry(b"user.bitmap", 0, b"");
+        engine
+            .set_extended_attribute(
+                &cx,
+                target,
+                &attribute,
+                NtfsEaSetMode::Create,
+                DEFAULT_FILETIME,
+            )
+            .into_result()
+            .unwrap();
+        engine.set_stage_hook(None);
+        assert_directory_bitmap_storage(&device, &engine, &fixture, true);
+        assert_eq!(used_clusters(&device), allocated_before - 1);
+        assert_packed_sizes(&device, &engine, target);
+        let volume = engine.volume_view(&cx).unwrap();
+        let record = volume
+            .record(&cx, target.record, Some(target.sequence))
+            .unwrap();
+        assert_eq!(
+            volume
+                .extended_attributes(&cx, &record)
+                .unwrap()
+                .entries
+                .as_slice(),
+            std::slice::from_ref(&attribute),
+        );
+
+        let captured = std::mem::take(&mut *cuts.lock().unwrap());
+        assert_eq!(captured.len(), if target == fixture.file { 2 } else { 0 });
+        for (committed, image) in captured {
+            let (recovered_device, recovered) = open_bitmap_image(image, true);
+            let volume = recovered.volume_view(&cx).unwrap();
+            let record = volume
+                .record(&cx, target.record, Some(target.sequence))
+                .unwrap();
+            assert_eq!(
+                volume.extended_attributes(&cx, &record).unwrap().entries,
+                if committed {
+                    vec![attribute.clone()]
+                } else {
+                    Vec::new()
+                },
+            );
+            assert_eq!(
+                used_clusters(&recovered_device),
+                allocated_before - u32::from(committed)
+            );
+            // Only the durable commit may retire the original directory bitmap.
+            assert_directory_bitmap_storage(&recovered_device, &recovered, &fixture, committed);
+            assert_packed_sizes(&recovered_device, &recovered, target);
+        }
+    }
+}
+
+#[test]
+fn ea_repack_refuses_unallocated_directory_bitmap_before_writes() {
+    let cx = Cx::for_testing();
+    let fixture = directory_bitmap_fixture();
+    let (device, mut engine) = open_bitmap_image(fixture.image.clone(), false);
+    let allocation_byte = 60 * CLUSTER_BYTES + fixture.bitmap_cluster as usize / 8;
+    let mask = 1_u8 << (fixture.bitmap_cluster % 8);
+    device
+        .write_all_at(
+            &cx,
+            ByteOffset(allocation_byte as u64),
+            &[fixture.image[allocation_byte] & !mask],
+        )
+        .unwrap();
+    device.sync(&cx).unwrap();
+    let before = device.snapshot_durable_only();
+    let writes = device.write_bytes_total();
+    let events = engine.persistence_trace().len();
+    for target in [fixture.file, fixture.directory] {
+        let outcome = engine.set_extended_attribute(
+            &cx,
+            target,
+            &entry(b"user.bitmap", 0, b""),
+            NtfsEaSetMode::Create,
+            DEFAULT_FILETIME,
+        );
+        assert!(
+            matches!(
+                &outcome,
+                NtfsTxOutcome::NotCommitted(FfsError::Corruption { detail, .. })
+                    if detail.contains("unallocated cluster")
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(device.write_bytes_total(), writes);
+        assert_eq!(engine.persistence_trace().len(), events);
+        assert_eq!(device.snapshot_live(), before);
+        assert_eq!(device.snapshot_durable_only(), before);
+    }
 }
 
 #[test]

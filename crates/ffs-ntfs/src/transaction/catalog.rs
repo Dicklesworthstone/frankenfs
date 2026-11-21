@@ -504,6 +504,10 @@ pub(super) struct EditableCatalog {
     pub(super) old_base_raw: Vec<u8>,
     pub(super) old_extensions: Vec<(u32, u16, Vec<u8>)>,
     pub(super) old_nonres_attrlist_runs: Vec<NtfsRun>,
+    // Original nonresident $I30::$BITMAP runs, plus view-bitmap, reparse, and
+    // $EFS runs. Held on the catalog so index rebalancing can replace dir_index
+    // without dropping bitmap ownership. Verified before mutation and retired
+    // once through the deferred-free path on repack or deletion.
     pub(super) old_owned_extra_runs: Vec<NtfsRun>,
 }
 

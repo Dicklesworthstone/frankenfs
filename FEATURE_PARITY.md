@@ -3515,6 +3515,9 @@ old allocation; EA_INFORMATION and every FILE_NAME/I30 packed-size copy publish
 with the catalog. The companion commands are `tx-set-ea` and `tx-remove-ea`.
 Writable FsOps exposes ordinary `user.*` set/remove operations while preserving
 opaque EAs outside the host projection and the existing writer admission rules.
+Nonresident directory-bitmap storage retains verified ownership through index
+rebalancing; catalog repacking and deletion retire the original bitmap clusters
+through the same deferred-free transaction path.
 
 Truncation now bounds the newly initialized tail instead of total file size.
 Large shrink preserves retained mappings, ordinary growth initializes at most
@@ -3529,10 +3532,11 @@ requests requiring unsupported privilege or granted-mask semantics, implement
 OWNER RIGHTS, and retain audit flags and unmapped propagation templates during
 inheritance. These helpers do not enable mounted Windows ACL enforcement.
 
-Six EA regression groups cover catalog transitions, external parent indexes,
-refusals, recovery cuts, read-only admission and cancellation after durable
-commit. Five truncate groups cover large ordinary/sparse streams, initialized
-tails, extension catalogs, recovery cuts and resident promotion. The native EA
+Eight EA regression groups cover catalog transitions, external parent indexes,
+nonresident directory-bitmap retirement, refusals, recovery cuts, read-only
+admission and cancellation after durable commit. Five truncate groups cover
+large ordinary/sparse streams, initialized tails, extension catalogs, recovery
+cuts and resident promotion. The native EA
 CLI oracle independently reads values, allocation and identities with ntfs-3g,
 including bounded-volume sentinels and exact permitted ownership changes.
 
