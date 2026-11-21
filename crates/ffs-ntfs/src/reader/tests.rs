@@ -334,7 +334,7 @@ fn malformed_and_disagreeing_mft_bootstrap_never_fall_back_silently() {
 
 #[test]
 fn volume_flags_versions_and_out_of_bounds_ranges_refuse_admission() {
-    for (major, minor, flags) in [(3, 1, 1_u16), (3, 0, 0), (4, 0, 0)] {
+    for (major, minor, flags) in [(3, 1, 1_u16), (3, 0, 1), (1, 2, 0), (4, 0, 0)] {
         let mut image = Image::new();
         let mut info = [0; 12];
         info[8] = major;
@@ -348,6 +348,19 @@ fn volume_flags_versions_and_out_of_bounds_ranges_refuse_admission() {
             image.open(Arc::default(), None),
             Err(FfsError::UnsupportedFeature(_))
         ));
+    }
+    {
+        // Clean NTFS 3.0 is admitted natively (legacy 0x50 $SECURITY_DESCRIPTOR, no $Secure).
+        let mut image = Image::new();
+        let mut info = [0; 12];
+        info[8] = 3;
+        info[9] = 0;
+        image.put_record(
+            3,
+            &file_record(3, &[resident(VOLUME_INFORMATION, 0, "", &info)]),
+        );
+        let vol = image.open(Arc::default(), None).unwrap();
+        assert_eq!(vol.version(), [3, 0]);
     }
     let reads: Reads = Arc::default();
     for (base, length) in [(u64::MAX, 512), (1, 1024), (0, 511)] {

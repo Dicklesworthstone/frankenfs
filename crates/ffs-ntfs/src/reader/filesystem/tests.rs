@@ -1799,7 +1799,12 @@ fn root_system_metafiles_without_unnamed_data_are_hidden_from_host_namespace() {
     let names: Vec<Vec<u8>> = page.iter().map(|e| e.name.clone()).collect();
     assert_eq!(
         names,
-        vec![b".".to_vec(), b"..".to_vec(), b"hello.txt".to_vec()]
+        vec![
+            b".".to_vec(),
+            b"..".to_vec(),
+            b"hello.txt".to_vec(),
+            b"HELLO~1.TXT".to_vec(),
+        ]
     );
     for entry in &page {
         fs.getattr(&cx, &mut scope, entry.ino).unwrap();
