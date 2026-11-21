@@ -24019,12 +24019,11 @@ print("GENERIC_310_WORKLOAD_PASS")
 fn ext4_casefold_htree_unicode_12_1_matches_kernel_dx_hash_and_e2fsck_bd_vsuni_3() {
     let scenario_id =
         "ext4_casefold_htree_unicode_12_1_matches_kernel_dx_hash_and_e2fsck_bd_vsuni_3";
-    if !command_available("mkfs.ext4")
-        || !command_available("debugfs")
-        || !command_available("e2fsck")
-    {
-        require_oracles_or_skip("mkfs.ext4/debugfs/e2fsck required for bd-vsuni.3 E2E");
-        return;
+    for tool in ["mkfs.ext4", "debugfs", "e2fsck"] {
+        if !command_available(tool) {
+            require_oracle_or_skip(tool);
+            return;
+        }
     }
 
     let tmp = TempDir::new_in("/tmp")
