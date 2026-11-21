@@ -25,9 +25,7 @@ use ffs_ntfs::transaction::{
     DEFAULT_NTFS_FILETIME, NtfsObjectIdData, NtfsPersistenceStage, NtfsTransactionEngine,
     NtfsTxOutcome,
 };
-use ffs_ondisk::ntfs::efs::EFS_STREAM_NAME;
 use ffs_ondisk::ntfs::reparse::{MOUNT_POINT_TAG, NtfsReparseData, NtfsReparsePoint};
-use ffs_ondisk::ntfs::{DATA, NtfsReference, REPARSE_POINT, SPARSE};
 use ffs_ondisk::ntfs_security::{
     ACE_FLAG_CONTAINER_INHERIT, ACE_FLAG_INHERIT_ONLY, ACE_FLAG_INHERITED, ACE_FLAG_OBJECT_INHERIT,
     ACE_TYPE_ACCESS_ALLOWED, ACE_TYPE_ACCESS_DENIED, ACE_TYPE_SYSTEM_AUDIT, FILE_ALL_ACCESS,
@@ -101,7 +99,7 @@ fn ntfs_sparse_toggle_large_tail_and_hole_punch_fiemap_seek_roundtrip() {
     let root = engine.resolve_path_reference(&cx, "/").unwrap();
 
     // 1. Create file, mark SPARSE, extend logical tail to 24 MiB (> 16 MiB staging cap!).
-    let file_ref = engine
+    let (file_ref, _) = engine
         .create_file_at(&cx, root, &utf16("sparse.bin"), b"head-prefix")
         .into_result()
         .unwrap();
@@ -139,7 +137,7 @@ fn ntfs_sparse_toggle_large_tail_and_hole_punch_fiemap_seek_roundtrip() {
     }
 
     // 2. Punch middle 4 KiB cluster of the 12 KiB run -> reclaims 1 cluster!
-    let reclaimed = engine
+    let (reclaimed, _) = engine
         .punch_hole_at(
             &cx,
             file_ref,
@@ -211,7 +209,7 @@ fn ntfs_sparse_toggle_large_tail_and_hole_punch_fiemap_seek_roundtrip() {
     // 4. Disable sparse on a smaller file -> holes materialize to real allocated clusters.
     let mut engine = open_clean_engine(&cx, &dev, vol_bytes);
     let root = engine.resolve_path_reference(&cx, "/").unwrap();
-    let mat_ref = engine
+    let (mat_ref, _) = engine
         .create_file_at(&cx, root, &utf16("materialize.bin"), &[])
         .into_result()
         .unwrap();
@@ -250,11 +248,10 @@ fn ntfs_lznt1_compression_partial_write_truncate_dir_inherit_and_incompressible(
 
         // 1. Compressible 128 KiB payload -> enable LZNT1 compression -> verify real space savings!
         let mut expected = Vec::with_capacity(128 * 1024);
-        for i in 0..4096_u32 {
+        for _ in 0..4096_u32 {
             expected.extend_from_slice(b"FRANKENFS-LZNT1-COMPRESS-PATTERN");
-            let _ = i;
         }
-        let file_ref = engine
+        let (file_ref, _) = engine
             .create_file_at(&cx, root, &utf16("comp.bin"), &expected)
             .into_result()
             .unwrap();
@@ -320,7 +317,7 @@ fn ntfs_lznt1_compression_partial_write_truncate_dir_inherit_and_incompressible(
         assert_eq!(read_file_by_path(&cx, &engine, "/comp.bin"), expected);
 
         // 5. Directory compression inheritance: new child created inside compressed dir inherits compression!
-        let dir_ref = engine
+        let (dir_ref, _) = engine
             .mkdir_at(&cx, root, &utf16("cdir"))
             .into_result()
             .unwrap();
@@ -329,7 +326,7 @@ fn ntfs_lznt1_compression_partial_write_truncate_dir_inherit_and_incompressible(
             .into_result()
             .unwrap();
         let child_data = vec![b'A'; (cluster_bytes as usize) * 32];
-        let _child_ref = engine
+        let (_child_ref, _) = engine
             .create_file_at(&cx, dir_ref, &utf16("inherited.bin"), &child_data)
             .into_result()
             .unwrap();
@@ -368,7 +365,7 @@ fn ntfs_wof_decompression_on_write_materializes_plaintext_and_cleans_reparse() {
     // verbatim in `WofCompressedData`, sparse 2048-byte placeholder unnamed `$DATA`, and
     // WOF reparse tag `0x8000_0017` installed on the base record).
     let wof_initial = b"WOF-INITIAL-PLAINTEXT-PAYLOAD-0123456789".repeat(50); // 2000 bytes (< 4096)
-    let wof_ref = engine
+    let (wof_ref, _) = engine
         .create_file_at(&cx, root, &utf16("wof.bin"), &[])
         .into_result()
         .unwrap();
@@ -432,9 +429,9 @@ fn ntfs_wof_decompression_on_write_materializes_plaintext_and_cleans_reparse() {
         .unwrap();
     drop(engine);
 
-    // Patch tag `0x9000_0017` -> `0x8000_0017` in the MFT record (updating USA fixups & `$Reparse::$R` isn't needed for reader).
+    // Patch tag `0x9000_0017` -> `0x8000_0017` in both the file MFT record AND `$Extend/$Reparse::$R`
+    // so both the `$REPARSE_POINT` attribute and the `$Reparse` index agree on the WOF tag!
     let mut img = dev.snapshot_durable_only();
-    let rec_no = wof_ref.record as usize;
     let vol_probe = NtfsVolume::from_device(
         &cx,
         Box::new(FaultInjectingNtfsDevice::new(img.clone())),
@@ -442,34 +439,40 @@ fn ntfs_wof_decompression_on_write_materializes_plaintext_and_cleans_reparse() {
         vol_bytes,
     )
     .unwrap();
-    let mft_rec_off = (vol_probe.geometry.mft_cluster()
-        * u64::from(vol_probe.geometry.cluster_bytes())) as usize
-        + rec_no * (vol_probe.geometry.record_bytes() as usize);
+    let reparse_rec_no = vol_probe.resolve(&cx, "/$Extend/$Reparse").unwrap().number as usize;
+    let mft_base =
+        (vol_probe.geometry.mft_cluster() * u64::from(vol_probe.geometry.cluster_bytes())) as usize;
     let rec_len = vol_probe.geometry.record_bytes() as usize;
-    let mut restored =
-        ffs_ondisk::ntfs::restore_record(&img[mft_rec_off..mft_rec_off + rec_len], b"FILE")
-            .unwrap();
     let old_tag = 0x9000_0017_u32.to_le_bytes();
     let new_tag = 0x8000_0017_u32.to_le_bytes();
-    let mut replaced_count = 0;
-    for pos in 0..restored.len().saturating_sub(4) {
-        if restored[pos..pos + 4] == old_tag {
-            restored[pos..pos + 4].copy_from_slice(&new_tag);
-            replaced_count += 1;
+    for rec_no in [wof_ref.record as usize, reparse_rec_no] {
+        let mft_rec_off = mft_base + rec_no * rec_len;
+        let mut restored =
+            ffs_ondisk::ntfs::restore_record(&img[mft_rec_off..mft_rec_off + rec_len], b"FILE")
+                .unwrap();
+        let mut replaced_count = 0;
+        for pos in 0..restored.len().saturating_sub(4) {
+            if restored[pos..pos + 4] == old_tag {
+                restored[pos..pos + 4].copy_from_slice(&new_tag);
+                replaced_count += 1;
+            }
         }
+        assert!(
+            replaced_count >= 1,
+            "missing placeholder tag in rec {rec_no}"
+        );
+        let usa_off = u16::from_le_bytes([restored[4], restored[5]]) as usize;
+        let usa_cnt = u16::from_le_bytes([restored[6], restored[7]]) as usize;
+        let token = [0x22_u8, 0x00];
+        restored[usa_off..usa_off + 2].copy_from_slice(&token);
+        for s in 1..usa_cnt {
+            let end = s * 512;
+            let orig = [restored[end - 2], restored[end - 1]];
+            restored[usa_off + s * 2..usa_off + s * 2 + 2].copy_from_slice(&orig);
+            restored[end - 2..end].copy_from_slice(&token);
+        }
+        img[mft_rec_off..mft_rec_off + rec_len].copy_from_slice(&restored);
     }
-    assert!(replaced_count >= 1);
-    let usa_off = u16::from_le_bytes([restored[4], restored[5]]) as usize;
-    let usa_cnt = u16::from_le_bytes([restored[6], restored[7]]) as usize;
-    let token = [0x22_u8, 0x00];
-    restored[usa_off..usa_off + 2].copy_from_slice(&token);
-    for s in 1..usa_cnt {
-        let end = s * 512;
-        let orig = [restored[end - 2], restored[end - 1]];
-        restored[usa_off + s * 2..usa_off + s * 2 + 2].copy_from_slice(&orig);
-        restored[end - 2..end].copy_from_slice(&token);
-    }
-    img[mft_rec_off..mft_rec_off + rec_len].copy_from_slice(&restored);
     let wof_dev = FaultInjectingNtfsDevice::new(img);
 
     // Confirm reader opens it as genuine WOF and reads exact initial plaintext!
@@ -491,7 +494,7 @@ fn ntfs_wof_decompression_on_write_materializes_plaintext_and_cleans_reparse() {
     assert!(vol.reparse_point(&cx, &rec).unwrap().is_none());
     let streams = vol.data_streams(&cx, &rec).unwrap();
     assert_eq!(streams.len(), 1);
-    assert_eq!(streams[0].name, [] as [u16; 0]);
+    assert!(streams[0].name.is_empty());
     engine.check_clean_consistency(&cx).unwrap();
 }
 
@@ -577,11 +580,11 @@ fn ntfs_secure_intern_dedup_multistripe_256k_inheritance_hardlink_dacl_sacl_and_
     };
     let parent_sd_bytes = sd_parent.encode().unwrap();
 
-    let dir_a = engine
+    let (dir_a, _) = engine
         .mkdir_at(&cx, root, &utf16("sec_a"))
         .into_result()
         .unwrap();
-    let dir_b = engine
+    let (dir_b, _) = engine
         .mkdir_at(&cx, root, &utf16("sec_b"))
         .into_result()
         .unwrap();
@@ -589,17 +592,19 @@ fn ntfs_secure_intern_dedup_multistripe_256k_inheritance_hardlink_dacl_sacl_and_
         .set_security_at(&cx, dir_a, &parent_sd_bytes, DEFAULT_NTFS_FILETIME)
         .into_result()
         .unwrap()
+        .0
         .expect("NTFS 3.1 must assign $Secure security_id");
     let id_b = engine
         .set_security_at(&cx, dir_b, &parent_sd_bytes, DEFAULT_NTFS_FILETIME)
         .into_result()
         .unwrap()
+        .0
         .expect("NTFS 3.1 must assign $Secure security_id");
     // Exact `$SDH` hash + byte deduplication!
     assert_eq!(id_a, id_b);
 
     // 2. Create child inside `sec_a` -> verify inheritance + DENY-before-ALLOW!
-    let child_ref = engine
+    let (child_ref, _) = engine
         .create_file_at(&cx, dir_a, &utf16("secret.txt"), b"classified")
         .into_result()
         .unwrap();
@@ -668,7 +673,7 @@ fn ntfs_secure_intern_dedup_multistripe_256k_inheritance_hardlink_dacl_sacl_and_
 
     // 4. Push `$Secure::$SDS` across the 256 KiB even/odd stripe mirror boundary AND
     //    split `$SII`/`$SDH` into external `INDX` blocks!
-    let target_ref = engine
+    let (target_ref, _) = engine
         .create_file_at(&cx, root, &utf16("stripe_driver.bin"), b"x")
         .into_result()
         .unwrap();
@@ -813,11 +818,11 @@ fn ntfs_secure_intern_dedup_multistripe_256k_inheritance_hardlink_dacl_sacl_and_
     let mut eng30 = open_clean_engine(&cx, &dev30, vol30_bytes);
     assert_eq!(eng30.version(), [3, 0]);
     let root30 = eng30.resolve_path_reference(&cx, "/").unwrap();
-    let f30 = eng30
+    let (f30, _) = eng30
         .create_file_at(&cx, root30, &utf16("ntfs30.txt"), b"hello-win2k")
         .into_result()
         .unwrap();
-    let assigned30 = eng30
+    let (assigned30, _) = eng30
         .set_security_at(&cx, f30, &parent_sd_bytes, DEFAULT_NTFS_FILETIME)
         .into_result()
         .unwrap();
@@ -858,13 +863,13 @@ fn ntfs_reparse_symlink_junction_opaque_objid_usnjrnl_ea_and_refusals() {
     let root = engine.resolve_path_reference(&cx, "/").unwrap();
 
     // 1. Enable active `$Extend/$UsnJrnl` with small 8 KiB max so we also prove sparse head trimming!
-    let _usn_ref = engine
+    let (_usn_ref, _) = engine
         .enable_usn_journal(&cx, 8192, 4096, DEFAULT_NTFS_FILETIME)
         .into_result()
         .unwrap();
 
     // 2. Symlink + mount-point junction + opaque reparse preservation & refusal!
-    let _sym_ref = engine
+    let (_sym_ref, _) = engine
         .create_symlink_at(
             &cx,
             root,
@@ -876,7 +881,7 @@ fn ntfs_reparse_symlink_junction_opaque_objid_usnjrnl_ea_and_refusals() {
         )
         .into_result()
         .unwrap();
-    let junc_dir = engine
+    let (junc_dir, _) = engine
         .mkdir_at(&cx, root, &utf16("junction_dir"))
         .into_result()
         .unwrap();
@@ -894,7 +899,7 @@ fn ntfs_reparse_symlink_junction_opaque_objid_usnjrnl_ea_and_refusals() {
         .unwrap();
 
     // Opaque third-party tag (0x9000_101A): refused without allow_opaque, admitted with allow_opaque.
-    let opaque_file = engine
+    let (opaque_file, _) = engine
         .create_file_at(&cx, root, &utf16("cloud_placeholder.bin"), b"backing")
         .into_result()
         .unwrap();
@@ -944,11 +949,11 @@ fn ntfs_reparse_symlink_junction_opaque_objid_usnjrnl_ea_and_refusals() {
     }
 
     // 3. `$OBJECT_ID` (`0x40`) + `$Extend/$ObjId::$O` uniqueness & cleanup!
-    let f1 = engine
+    let (f1, _) = engine
         .create_file_at(&cx, root, &utf16("obj1.bin"), b"one")
         .into_result()
         .unwrap();
-    let f2 = engine
+    let (f2, _) = engine
         .create_file_at(&cx, root, &utf16("obj2.bin"), b"two")
         .into_result()
         .unwrap();
@@ -1112,7 +1117,7 @@ fn ntfs_efs_encrypt_raw_keyed_rw_decrypt_negative_controls_and_redaction() {
     assert!(!format!("{key}").contains("a5a5a5"));
 
     let plaintext = b"TOP-SECRET-EFS-PAYLOAD-ACROSS-MULTIPLE-512B-SECTORS!".repeat(30); // 1560 bytes
-    let f_ref = engine
+    let (f_ref, _) = engine
         .create_file_at(&cx, root, &utf16("vault.bin"), &plaintext)
         .into_result()
         .unwrap();
@@ -1203,8 +1208,6 @@ fn ntfs_efs_encrypt_raw_keyed_rw_decrypt_negative_controls_and_redaction() {
         assert!(vol.efs_metadata(&cx, &rec).unwrap().is_none());
     }
     engine.check_clean_consistency(&cx).unwrap();
-    let _ = EFS_STREAM_NAME;
-    let _ = (DATA, REPARSE_POINT, SPARSE);
 }
 
 #[test]
@@ -1223,7 +1226,7 @@ fn ntfs_transforms_persistence_prefix_fault_cuts_and_cx_cancel() {
         .enable_usn_journal(&cx, 65_536, 4096, DEFAULT_NTFS_FILETIME)
         .into_result()
         .unwrap();
-    let f_ref = engine
+    let (f_ref, _) = engine
         .create_file_at(&cx, root, &utf16("crash.bin"), &vec![b'Z'; 32 * 1024])
         .into_result()
         .unwrap();
@@ -1238,13 +1241,13 @@ fn ntfs_transforms_persistence_prefix_fault_cuts_and_cx_cancel() {
     ));
     assert_eq!(dev.snapshot_durable_only(), before_cancel);
 
-    // Fault-cut during LZNT1 compression transaction right after CommitLogFlush (winner redo)!
+    // Fault-cut during LZNT1 compression transaction right after LogCommitBarrier (winner redo)!
     let cut_snapshot: Arc<std::sync::Mutex<Option<Vec<u8>>>> =
         Arc::new(std::sync::Mutex::new(None));
     let cap_dev = Arc::clone(&dev);
     let cap_slot = Arc::clone(&cut_snapshot);
-    engine.set_stage_hook(Some(Box::new(move |stage| {
-        if stage == NtfsPersistenceStage::CommitLogFlush {
+    engine.set_stage_hook(Some(Box::new(move |event| {
+        if event.stage == NtfsPersistenceStage::LogCommitBarrier {
             *cap_slot.lock().unwrap() = Some(cap_dev.snapshot_durable_only());
         }
         Ok(())
@@ -1271,8 +1274,4 @@ fn ntfs_transforms_persistence_prefix_fault_cuts_and_cx_cancel() {
         read_file_by_path(&cx, &recovered, "/crash.bin"),
         vec![b'Z'; 32 * 1024]
     );
-    let _ = NtfsReference {
-        record: 0,
-        sequence: 0,
-    };
 }
