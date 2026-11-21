@@ -3538,8 +3538,15 @@ including bounded-volume sentinels and exact permitted ownership changes.
 
 The on-disk library passes all 1,001 tests, including all 21 security tests, and
 strict Clippy across all targets. The six new security regressions also failed
-against the original implementation.
-Full workspace gates and the new NTFS/CLI/native-EA test execution remain pending:
-the local compiler is OOM-killed in the unchanged asupersync dependency, and the
-existing x86-64 and AArch64 CI validation runs are queued. No mounted or native
-Windows qualification, broad bd-h8n46 closure, or parity-score increase is claimed.
+against the original implementation. CI on the feature commit passes all 48
+NTFS CLI unit tests, including the new EA authority and payload-admission tests.
+The corrected source passes workspace formatting, full workspace/all-target
+checking, and strict workspace/all-target Clippy without lint suppression.
+
+At this implementation checkpoint, runtime qualification of the new NTFS
+mutation/persistence tests, the strengthened ZVOL crash oracle, and the native
+EA lifecycle test remains pending. The full local source checks completed after
+memory pressure cleared; executable code generation then exhausted writable
+storage. The existing integrity validation workflows retain the runtime gates.
+No mounted or native Windows qualification, broad bd-h8n46 closure, or parity-score
+increase is claimed.

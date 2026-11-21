@@ -37,7 +37,7 @@ fn name_hex(name: &[u8]) -> String {
 }
 
 #[derive(Debug, Args)]
-pub(super) struct SetArgs {
+pub struct SetArgs {
     #[command(flatten)]
     target: TxWriteArgs,
     path: String,
@@ -57,7 +57,7 @@ pub(super) struct SetArgs {
 }
 
 #[derive(Debug, Args)]
-pub(super) struct RemoveArgs {
+pub struct RemoveArgs {
     #[command(flatten)]
     target: TxWriteArgs,
     path: String,
@@ -86,7 +86,7 @@ fn load_payload(payload: &PayloadArgs) -> Result<Vec<u8>> {
     Ok(data)
 }
 
-pub(super) fn set(cx: &Cx, options: &SetArgs) -> Result<()> {
+pub fn set(cx: &Cx, options: &SetArgs) -> Result<()> {
     let name = options.selector.bytes()?;
     let mut entry = NtfsEa {
         name: name.to_vec(),
@@ -121,7 +121,7 @@ pub(super) fn set(cx: &Cx, options: &SetArgs) -> Result<()> {
     })
 }
 
-pub(super) fn remove(cx: &Cx, options: &RemoveArgs) -> Result<()> {
+pub fn remove(cx: &Cx, options: &RemoveArgs) -> Result<()> {
     let name = options.selector.bytes()?;
     let mut engine = options.target.open(cx, false)?;
     let reference = engine.resolve_path_reference(cx, &options.path)?;

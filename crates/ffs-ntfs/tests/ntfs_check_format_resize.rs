@@ -267,7 +267,7 @@ fn resize_grow_free_tail_shrink_relocate_shrink_and_slice_sentinel_preservation(
     )
     .expect("format 32 MiB");
 
-    let payload_a: Vec<u8> = (0..128 * 1024).map(|i| (i % 251) as u8).collect();
+    let payload_a: Vec<u8> = (0_u32..128 * 1024).map(|i| (i % 251) as u8).collect();
     let payload_ads = b"named-alternate-stream-payload-v1".to_vec();
     {
         let mut engine = NtfsTransactionEngine::open(
@@ -336,7 +336,7 @@ fn resize_grow_free_tail_shrink_relocate_shrink_and_slice_sentinel_preservation(
     let free_shrink_report = run_resize(
         &cx,
         &NtfsResizeOptions {
-            source_image: grown_img.clone(),
+            source_image: grown_img,
             source_offset: 0,
             source_length: None,
             output: free_shrunk.clone(),
@@ -384,8 +384,10 @@ fn resize_grow_free_tail_shrink_relocate_shrink_and_slice_sentinel_preservation(
 
     // 4. Embed 40 MiB image inside a container with random prefix/suffix sentinels,
     //    then shrink 40 MiB -> 12 MiB WITH --relocate using --offset/--length!
-    let sentinel_prefix: Vec<u8> = (0..65_536).map(|i| ((i * 31) % 253) as u8).collect();
-    let sentinel_suffix: Vec<u8> = (0..65_536).map(|i| ((i * 17 + 7) % 251) as u8).collect();
+    let sentinel_prefix: Vec<u8> = (0_u32..65_536).map(|i| ((i * 31) % 253) as u8).collect();
+    let sentinel_suffix: Vec<u8> = (0_u32..65_536)
+        .map(|i| ((i * 17 + 7) % 251) as u8)
+        .collect();
     let container = dir.path().join("partition_container.img");
     let slice_bytes = fs::read(&free_shrunk).unwrap();
     let mut combined =

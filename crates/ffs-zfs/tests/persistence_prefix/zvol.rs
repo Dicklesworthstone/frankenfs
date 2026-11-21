@@ -546,6 +546,13 @@ fn zvol_shrink_retires_boundary_indirect_pointers_and_large_blocks_feature_refco
 #[test]
 #[allow(clippy::too_many_lines)]
 fn zvol_persistence_prefix_fault_cuts_across_all_stages() {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum CrashState {
+        NotCommitted,
+        UncertainPredecessor,
+        UncertainTarget,
+    }
+
     let cx = Cx::for_testing();
     let ts = Timestamp {
         seconds: 1_726_200_000,
@@ -553,6 +560,7 @@ fn zvol_persistence_prefix_fault_cuts_across_all_stages() {
     };
     let parent_ds = vec![b"data".to_vec()];
     let vol_ds = vec![b"data".to_vec(), b"cut_vol".to_vec()];
+    let new_vol_ds = vec![b"data".to_vec(), b"cut_new".to_vec()];
 
     // Build a pool with an existing populated ZVOL so we can fault-cut write, discard, resize, destroy.
     let base_built = build_clean_zfs_pool(&PoolFixtureSpec {
@@ -596,52 +604,52 @@ fn zvol_persistence_prefix_fault_cuts_across_all_stages() {
     };
     let base_snapshot = base_dev.durable_snapshot();
 
-    type ZvolStageSpec = (&'static str, fn(&ZfsPersistenceStage) -> bool, bool);
+    type ZvolStageSpec = (&'static str, fn(&ZfsPersistenceStage) -> bool, CrashState);
     let stages: Vec<ZvolStageSpec> = vec![
         (
             "ChildBlocksWrite",
             |s| matches!(s, ZfsPersistenceStage::ChildBlocksWrite { .. }),
-            false,
+            CrashState::NotCommitted,
         ),
         (
             "ChildBlocksBarrier",
             |s| matches!(s, ZfsPersistenceStage::ChildBlocksBarrier { .. }),
-            false,
+            CrashState::NotCommitted,
         ),
         (
             "DatasetMetadataWrite",
             |s| matches!(s, ZfsPersistenceStage::DatasetMetadataWrite { .. }),
-            false,
+            CrashState::NotCommitted,
         ),
         (
             "DatasetMetadataBarrier",
             |s| matches!(s, ZfsPersistenceStage::DatasetMetadataBarrier { .. }),
-            false,
+            CrashState::NotCommitted,
         ),
         (
             "MosSpaceMapWrite",
             |s| matches!(s, ZfsPersistenceStage::MosSpaceMapWrite { .. }),
-            false,
+            CrashState::NotCommitted,
         ),
         (
             "MosRootWrite",
             |s| matches!(s, ZfsPersistenceStage::MosRootWrite { .. }),
-            false,
+            CrashState::NotCommitted,
         ),
         (
             "UberblockWriteWave2",
             |s| matches!(s, ZfsPersistenceStage::UberblockWrite { label: 2, .. }),
-            true,
+            CrashState::UncertainTarget,
         ),
         (
             "UberblockBarrierWave1",
             |s| matches!(s, ZfsPersistenceStage::UberblockBarrier { wave: 1, .. }),
-            true,
+            CrashState::UncertainPredecessor,
         ),
     ];
 
     for op in ["create", "write", "discard", "resize_shrink", "destroy"] {
-        for &(stage_name, matcher, is_uncertain) in &stages {
+        for &(stage_name, matcher, expected_state) in &stages {
             let dev = FaultableMemberDevice::new(base_snapshot.clone());
             let mut eng = open_engine_on_devices(
                 &cx,
@@ -737,48 +745,128 @@ fn zvol_persistence_prefix_fault_cuts_across_all_stages() {
                 continue;
             }
 
-            if is_uncertain {
-                let ZfsTxOutcome::Uncertain { target_slot, .. } = outcome else {
+            let crashed = dev.fresh_from_durable();
+            let is_uncertain = expected_state != CrashState::NotCommitted;
+            let published = expected_state == CrashState::UncertainTarget;
+            let expected_txg = pre_txg + u64::from(published);
+            let recovered_slot = if is_uncertain {
+                let ZfsTxOutcome::Uncertain {
+                    target_txg,
+                    target_slot,
+                    ..
+                } = outcome
+                else {
                     panic!("{op} cut at {stage_name} must report Uncertain");
                 };
                 assert!(eng.requires_recovery());
-                let crashed = dev.fresh_from_durable();
-                let mut opts = default_write_opts(base_built.pool_guid, target_slot);
-                opts.reconcile_torn_uberblocks = true;
-                let recovered = open_engine_on_devices(&cx, std::slice::from_ref(&crashed), opts)
-                    .expect("explicit reconciliation after Uberblock wave cut");
-                assert!(recovered.committed_txg() >= pre_txg);
-                assert_pool_scrub_and_allocation_clean(
-                    &cx,
-                    std::slice::from_ref(&crashed),
-                    base_built.pool_guid,
-                    Some(recovered.committed_slot()),
-                );
+                assert_eq!(target_txg, pre_txg + 1, "{op} cut at {stage_name}");
+                if published {
+                    // The first wave reached its barrier before the second wave's write hook.
+                    target_slot
+                } else {
+                    // Hooks run before their I/O. At the first wave's barrier hook, both
+                    // new Uberblocks are still volatile and disappear on this crash.
+                    let mut absent_opts = default_write_opts(base_built.pool_guid, target_slot);
+                    absent_opts.reconcile_torn_uberblocks = true;
+                    assert!(
+                        matches!(
+                            open_engine_on_devices(
+                                &cx,
+                                std::slice::from_ref(&crashed),
+                                absent_opts,
+                            ),
+                            Err(FfsError::Corruption { detail, .. })
+                                if detail == "explicitly selected (label, slot) does not contain a valid Uberblock"
+                        ),
+                        "{op} cut at {stage_name} must reject the absent target slot"
+                    );
+                    pre_slot
+                }
             } else {
                 assert!(
                     matches!(outcome, ZfsTxOutcome::NotCommitted(_)),
                     "{op} cut at {stage_name} must report NotCommitted"
                 );
-                let crashed = dev.fresh_from_durable();
-                let reopened = open_engine_on_devices(
+                pre_slot
+            };
+
+            // Native import must independently select exactly the durable root before
+            // explicit writer reconciliation heals any split label copies.
+            assert_eq!(
+                assert_pool_scrub_and_allocation_clean(
                     &cx,
                     std::slice::from_ref(&crashed),
-                    default_write_opts(base_built.pool_guid, pre_slot),
-                )
-                .expect("pre-Uberblock cut must preserve clean predecessor TXG");
-                assert_eq!(reopened.committed_txg(), pre_txg);
-                let mut check = vec![0_u8; 4096];
-                reopened
+                    base_built.pool_guid,
+                    None,
+                ),
+                expected_txg,
+                "{op} cut at {stage_name} recovered the wrong native root"
+            );
+            let mut opts = default_write_opts(base_built.pool_guid, recovered_slot);
+            opts.reconcile_torn_uberblocks = is_uncertain;
+            let recovered = open_engine_on_devices(&cx, std::slice::from_ref(&crashed), opts)
+                .unwrap_or_else(|error| panic!("{op} cut at {stage_name}: {error:?}"));
+            assert_eq!(recovered.committed_txg(), expected_txg);
+            assert_eq!(recovered.committed_slot(), recovered_slot);
+
+            let destroyed = published && op == "destroy";
+            if destroyed {
+                assert!(matches!(
+                    recovered.zvol_info(&cx, &vol_ds, None),
+                    Err(FfsError::NotFound(_))
+                ));
+            } else {
+                let size = if published && op == "resize_shrink" {
+                    8192
+                } else {
+                    256 * 1024
+                };
+                let info = recovered.zvol_info(&cx, &vol_ds, None).unwrap();
+                assert_eq!(info.volsize, size, "{op} cut at {stage_name}");
+                assert_eq!(info.volblocksize, 4096);
+                let mut expected = vec![0_u8; size as usize];
+                let initialized = expected.len().min(16_384);
+                expected[..initialized].fill(0x33);
+                if published && op == "write" {
+                    expected[512..1024].fill(0x77);
+                } else if published && op == "discard" {
+                    expected[..4096].fill(0);
+                }
+                let mut check = vec![0xAA_u8; expected.len()];
+                recovered
                     .zvol_read_at(&cx, &vol_ds, None, 0, &mut check)
                     .unwrap();
-                assert_eq!(check, vec![0x33_u8; 4096]);
+                assert_eq!(check, expected, "{op} cut at {stage_name}");
+            }
+            assert_zvol_and_pool_clean(
+                &cx,
+                std::slice::from_ref(&crashed),
+                base_built.pool_guid,
+                recovered_slot,
+                (!destroyed).then_some(vol_ds.as_slice()),
+            );
+
+            if published && op == "create" {
+                let info = recovered.zvol_info(&cx, &new_vol_ds, None).unwrap();
+                assert_eq!(info.volsize, 64 * 1024);
+                assert_eq!(info.volblocksize, 4096);
+                let mut check = vec![0xAA_u8; 64 * 1024];
+                recovered
+                    .zvol_read_at(&cx, &new_vol_ds, None, 0, &mut check)
+                    .unwrap();
+                assert!(check.iter().all(|&byte| byte == 0));
                 assert_zvol_and_pool_clean(
                     &cx,
                     std::slice::from_ref(&crashed),
                     base_built.pool_guid,
-                    pre_slot,
-                    Some(&vol_ds),
+                    recovered_slot,
+                    Some(&new_vol_ds),
                 );
+            } else {
+                assert!(matches!(
+                    recovered.zvol_info(&cx, &new_vol_ds, None),
+                    Err(FfsError::NotFound(_))
+                ));
             }
         }
     }

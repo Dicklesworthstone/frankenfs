@@ -31,12 +31,17 @@ impl From<CliNtfsVersion> for NtfsFormatVersion {
 }
 
 fn parse_serial(raw: &str) -> std::result::Result<u64, String> {
-    if let Some(hex) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
-        u64::from_str_radix(hex, 16).map_err(|e| format!("invalid hex serial {raw:?}: {e}"))
-    } else {
-        raw.parse::<u64>()
-            .map_err(|e| format!("invalid serial {raw:?}: {e}"))
-    }
+    raw.strip_prefix("0x")
+        .or_else(|| raw.strip_prefix("0X"))
+        .map_or_else(
+            || {
+                raw.parse::<u64>()
+                    .map_err(|e| format!("invalid serial {raw:?}: {e}"))
+            },
+            |hex| {
+                u64::from_str_radix(hex, 16).map_err(|e| format!("invalid hex serial {raw:?}: {e}"))
+            },
+        )
 }
 
 /// Arguments for `ffs-ntfs check`.

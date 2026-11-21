@@ -330,7 +330,7 @@ fn native_ntfs_large_positioned_cli_edits_preserve_native_bytes() {
         Path::new("mkntfs"),
         &["-F", "-Q", "-s", "512", "-c", "4096", image_path],
     );
-    let original: Vec<u8> = (0..17 * 1024 * 1024 + 19)
+    let original: Vec<u8> = (0_u32..17 * 1024 * 1024 + 19)
         .map(|i| (i % 251) as u8)
         .collect();
     fs::write(&source, &original).unwrap();
@@ -8611,6 +8611,8 @@ fn unsafe_free_clk_tck() -> f64 {
 )]
 fn measure_fuse_dispatch_modes_vs_kernel_incumbent_bd_28mw2_bd_iah1f() {
     use std::os::unix::fs::FileExt;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     assert!(
         std::path::Path::new("/dev/fuse").exists(),

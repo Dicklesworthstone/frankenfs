@@ -1429,9 +1429,10 @@ impl WriteCommand {
                     bail!("at most seven additional member images are supported");
                 }
                 let components = parse_dataset_components(&dataset)?;
-                let export = export_name.unwrap_or_else(|| match snapshot.as_deref() {
-                    Some(snap) => format!("{dataset}@{snap}"),
-                    None => dataset.clone(),
+                let export = export_name.unwrap_or_else(|| {
+                    snapshot
+                        .as_deref()
+                        .map_or_else(|| dataset.clone(), |snap| format!("{dataset}@{snap}"))
                 });
                 let cfg = NbdServerConfig {
                     export_name: export.clone(),
