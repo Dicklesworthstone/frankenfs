@@ -2,8 +2,9 @@
 //!
 //! Layout: Microsoft MS-DTYP self-relative security descriptors; NTFS 3.1
 //! security indexes as documented by NTFS-3G 2022.10.3 and Linux NTFS3 v6.19.
-//! This module validates structure and preserves native metadata. It does not
-//! evaluate access, map SIDs to host users, or rewrite an ACL.
+//! This module validates and encodes native metadata, with bounded DACL access
+//! evaluation and new-child inheritance helpers. It does not map SIDs to host
+//! users or model token privileges.
 
 use crate::ntfs::restore_record;
 use ffs_types::ParseError;
@@ -29,6 +30,14 @@ pub const ACE_FLAG_CONTAINER_INHERIT: u8 = 0x02;
 pub const ACE_FLAG_NO_PROPAGATE_INHERIT: u8 = 0x04;
 pub const ACE_FLAG_INHERIT_ONLY: u8 = 0x08;
 pub const ACE_FLAG_INHERITED: u8 = 0x10;
+pub const ACE_FLAG_SUCCESSFUL_ACCESS: u8 = 0x40;
+pub const ACE_FLAG_FAILED_ACCESS: u8 = 0x80;
+
+const ACE_INHERITANCE_FLAGS: u8 = ACE_FLAG_OBJECT_INHERIT
+    | ACE_FLAG_CONTAINER_INHERIT
+    | ACE_FLAG_NO_PROPAGATE_INHERIT
+    | ACE_FLAG_INHERIT_ONLY
+    | ACE_FLAG_INHERITED;
 
 pub const FILE_READ_DATA: u32 = 0x0000_0001;
 pub const FILE_WRITE_DATA: u32 = 0x0000_0002;
@@ -62,6 +71,10 @@ pub const GENERIC_ALL: u32 = 0x1000_0000;
 pub const GENERIC_EXECUTE: u32 = 0x2000_0000;
 pub const GENERIC_WRITE: u32 = 0x4000_0000;
 pub const GENERIC_READ: u32 = 0x8000_0000;
+pub const ACCESS_SYSTEM_SECURITY: u32 = 0x0100_0000;
+pub const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
+
+const GENERIC_ACCESS_MASK: u32 = GENERIC_ALL | GENERIC_EXECUTE | GENERIC_WRITE | GENERIC_READ;
 
 fn invalid(reason: &'static str) -> ParseError {
     ParseError::InvalidField {
@@ -197,6 +210,14 @@ impl NtfsSid {
     }
 
     #[must_use]
+    pub fn owner_rights() -> Self {
+        Self {
+            authority: 3,
+            subauthorities: vec![4],
+        }
+    }
+
+    #[must_use]
     pub fn world_everyone() -> Self {
         Self {
             authority: 1,
@@ -220,7 +241,8 @@ impl fmt::Display for NtfsSid {
 }
 
 /// An ACE in native order, retaining unimplemented layout bytes losslessly.
-/// This is structural metadata, never an evaluated grant, deny or condition.
+/// Parsing alone does not authorize access; evaluation supports only the
+/// explicitly admitted layouts in `evaluate_dacl_access`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NtfsAce {
     pub kind: u8,
@@ -488,7 +510,9 @@ impl NtfsSecurityDescriptor {
     }
 }
 
-/// Caller security token for MS-DTYP DACL access evaluation.
+/// Caller security token for bounded MS-DTYP DACL access evaluation.
+/// All listed groups are treated as enabled; privileges and restricted-token
+/// semantics are not represented.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NtfsAccessToken {
     pub user: NtfsSid,
@@ -520,7 +544,9 @@ pub fn map_generic_file_rights(mut mask: u32) -> u32 {
     if mask & GENERIC_EXECUTE != 0 {
         mask |= FILE_GENERIC_EXECUTE;
     }
-    mask & 0x00FF_FFFF
+    // MS-DTYP 2.4.3: only the four generic bits are replaced. In particular,
+    // ACCESS_SYSTEM_SECURITY and MAXIMUM_ALLOWED remain distinct requests.
+    mask & !GENERIC_ACCESS_MASK
 }
 
 /// Evaluate MS-DTYP DACL access in stored ACE order (`ACCESS_DENIED_ACE` before
@@ -528,25 +554,53 @@ pub fn map_generic_file_rights(mut mask: u32) -> u32 {
 ///
 /// - Absent or NULL DACL (`!dacl.present || (dacl.offset == 0 && dacl.revision.is_none())`)
 ///   grants all requested rights per MS-DTYP 2.5.3.2.
-/// - Present empty DACL denies all requested non-zero rights.
+/// - Present empty DACL denies nonzero rights other than the owner's implicit rights.
 /// - `INHERIT_ONLY_ACE (0x08)` entries are skipped for object access evaluation.
 /// - Unrecognized, conditional/callback, or object-typed DACL ACEs fail closed (`Err`)
 ///   rather than silently allowing access.
+/// - `ACCESS_SYSTEM_SECURITY`, `MAXIMUM_ALLOWED`, and reserved file access bits
+///   return `Err`: this token has no privilege state, and this boolean API cannot
+///   return the granted-access mask required for maximum-allowed evaluation.
+/// - Owners receive `READ_CONTROL` and `WRITE_DAC` before ordinary ACE checks,
+///   unless an effective `OWNER RIGHTS` ACE replaces those implicit rights.
 pub fn evaluate_dacl_access(
     sd: &NtfsSecurityDescriptor,
     token: &NtfsAccessToken,
     desired_mask: u32,
 ) -> Result<bool, ParseError> {
+    if desired_mask & ACCESS_SYSTEM_SECURITY != 0 {
+        return Err(invalid(
+            "ACCESS_SYSTEM_SECURITY requires token privilege evaluation",
+        ));
+    }
+    if desired_mask & MAXIMUM_ALLOWED != 0 {
+        return Err(invalid(
+            "MAXIMUM_ALLOWED requires a granted-access-mask result",
+        ));
+    }
     let mut remaining = map_generic_file_rights(desired_mask);
+    if remaining & !FILE_ALL_ACCESS != 0 {
+        return Err(invalid("unsupported file access mask bits"));
+    }
     if remaining == 0 {
         return Ok(true);
     }
     if !sd.dacl.present || (sd.dacl.revision.is_none() && sd.dacl.aces.is_empty()) {
         return Ok(true);
     }
-    // Owner implicitly holds READ_CONTROL and WRITE_DAC unless explicitly denied
-    // (handled after ACE scan if not explicitly denied).
-    let mut explicitly_denied = 0_u32;
+    let is_owner = sd.owner.as_ref() == Some(&token.user);
+    let owner_rights = NtfsSid::owner_rights();
+    let explicit_owner_rights = sd.dacl.aces.iter().any(|ace| {
+        ace.flags & ACE_FLAG_INHERIT_ONLY == 0 && ace.sid.as_ref() == Some(&owner_rights)
+    });
+    // Ordinary DENY entries do not remove the owner's implicit rights. The
+    // OWNER RIGHTS SID (S-1-3-4) is the native mechanism that replaces them.
+    if is_owner && !explicit_owner_rights {
+        remaining &= !(STANDARD_READ_CONTROL | STANDARD_WRITE_DAC);
+        if remaining == 0 {
+            return Ok(true);
+        }
+    }
     for ace in &sd.dacl.aces {
         if ace.flags & ACE_FLAG_INHERIT_ONLY != 0 {
             continue;
@@ -561,17 +615,23 @@ pub fn evaluate_dacl_access(
                         "DACL contains trailing conditional/opaque ACE data; failing closed",
                     ));
                 }
-                if !token.matches_sid(sid) {
+                let matches = if sid == &owner_rights {
+                    is_owner
+                } else {
+                    token.matches_sid(sid)
+                };
+                if !matches {
                     continue;
                 }
-                let mapped = map_generic_file_rights(mask);
+                // Attached ACE masks are compared as stored (MS-DTYP 2.4.3).
+                // Generic mapping belongs to attachment/inheritance, not to
+                // access evaluation; otherwise an unmapped ACE gains rights.
                 if ace.kind == ACE_TYPE_ACCESS_DENIED {
-                    if remaining & mapped != 0 {
+                    if remaining & mask != 0 {
                         return Ok(false);
                     }
-                    explicitly_denied |= mapped;
                 } else {
-                    remaining &= !mapped;
+                    remaining &= !mask;
                     if remaining == 0 {
                         return Ok(true);
                     }
@@ -584,16 +644,14 @@ pub fn evaluate_dacl_access(
             }
         }
     }
-    if sd.owner.as_ref() == Some(&token.user) {
-        let owner_implicit = (STANDARD_READ_CONTROL | STANDARD_WRITE_DAC) & !explicitly_denied;
-        remaining &= !owner_implicit;
-    }
     Ok(remaining == 0)
 }
 
 /// Derive a child object's MS-DTYP security descriptor from its parent directory's
 /// inheritable ACEs (`OI`/`CI`/`NP`/`IO`/`INHERITED_ACE`, `CREATOR_OWNER`,
-/// `CREATOR_GROUP`), honoring `SE_DACL_PROTECTED`.
+/// `CREATOR_GROUP`). The new child has no explicit or protected ACL of its own;
+/// protection on the parent does not stop that parent's inheritable ACEs from
+/// reaching its children. Audit flags and opaque payloads remain intact.
 pub fn inherit_security_descriptor(
     parent: &NtfsSecurityDescriptor,
     is_directory: bool,
@@ -627,6 +685,11 @@ pub fn inherit_security_descriptor(
             let is_creator_owner = ace.sid.as_ref() == Some(&NtfsSid::creator_owner());
             let is_creator_group = ace.sid.as_ref() == Some(&NtfsSid::creator_group());
             let is_creator = is_creator_owner || is_creator_group;
+            let has_generic_rights = ace.mask.is_some_and(|mask| mask & GENERIC_ACCESS_MASK != 0);
+            let needs_mapping = is_creator || has_generic_rights;
+            // Inheritance changes only inheritance bits. Dropping the other
+            // flags would silently disable success/failure auditing in SACLs.
+            let retained_flags = ace.flags & !ACE_INHERITANCE_FLAGS;
 
             if applies_to_child {
                 let effective_sid = if is_creator_owner {
@@ -636,8 +699,8 @@ pub fn inherit_security_descriptor(
                 } else {
                     ace.sid.clone()
                 };
-                let mut effective_flags = ACE_FLAG_INHERITED;
-                if is_directory && !np && !is_creator {
+                let mut effective_flags = retained_flags | ACE_FLAG_INHERITED;
+                if is_directory && !np && !needs_mapping {
                     if oi {
                         effective_flags |= ACE_FLAG_OBJECT_INHERIT;
                     }
@@ -648,14 +711,15 @@ pub fn inherit_security_descriptor(
                 let mut cloned = ace.clone();
                 cloned.flags = effective_flags;
                 cloned.sid = effective_sid;
+                cloned.mask = ace.mask.map(map_generic_file_rights);
                 child_aces.push(cloned);
             }
 
             // If this is a directory and the ACE must continue propagating to
-            // descendants (either OI-only for files or a CREATOR_OWNER/GROUP template),
+            // descendants (OI-only for files, or a generic SID/rights template),
             // emit an INHERIT_ONLY template ACE as specified by MS-DTYP 2.5.3.4.
-            if propagates_further && (!applies_to_child || is_creator) {
-                let mut prop_flags = ACE_FLAG_INHERITED | ACE_FLAG_INHERIT_ONLY;
+            if propagates_further && (!applies_to_child || needs_mapping) {
+                let mut prop_flags = retained_flags | ACE_FLAG_INHERITED | ACE_FLAG_INHERIT_ONLY;
                 if oi {
                     prop_flags |= ACE_FLAG_OBJECT_INHERIT;
                 }

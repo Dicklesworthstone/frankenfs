@@ -169,8 +169,8 @@ impl UsnRecordV2 {
         {
             return Err(invalid("ntfs.usn", "invalid USN_RECORD_V2 record length"));
         }
-        let file_ref = NtfsReference::parse(le64(raw, 8)?);
-        let parent_ref = NtfsReference::parse(le64(raw, 16)?);
+        let file_ref = NtfsReference::decode(le64(raw, 8)?);
+        let parent_ref = NtfsReference::decode(le64(raw, 16)?);
         let usn = le64(raw, 24)?;
         let timestamp = le64(raw, 32)?;
         let reason = le32(raw, 40)?;

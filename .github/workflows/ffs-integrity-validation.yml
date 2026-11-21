@@ -50,6 +50,11 @@ jobs:
       - name: Native NTFS journal reservation tests
         if: ${{ !cancelled() }}
         run: cargo test --locked -p ffs-ondisk ntfs::logfile_writer::tests
+      - name: Native NTFS security descriptor and change journal regression tests
+        if: ${{ !cancelled() }}
+        run: |
+          cargo test --locked -p ffs-ondisk --lib ntfs_security -- --nocapture
+          cargo test --locked -p ffs-ondisk --lib ntfs::usn -- --nocapture
       - name: Complete MVCC tests
         if: ${{ !cancelled() }}
         run: cargo test --locked -p ffs-mvcc
