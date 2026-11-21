@@ -7723,3 +7723,682 @@ fn cloned_dataset_from_snapshot_with_unwritten_zil_tail_admits_reopen_and_resets
         ffs_zfs::reader::dmu::zil::Termination::Empty
     );
 }
+
+fn file_range_fixture(
+    cx: &Cx,
+    spec: &PoolFixtureSpec,
+) -> (ZfsTransactionEngine, Vec<FaultableMemberDevice>) {
+    let built = build_clean_zfs_pool(spec);
+    let devices: Vec<_> = built
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let engine = open_engine_on_devices(
+        cx,
+        &devices,
+        default_write_opts(built.pool_guid, built.initial_slot),
+    )
+    .unwrap();
+    (engine, devices)
+}
+
+fn file_range_head(cx: &Cx, engine: &ZfsTransactionEngine) -> ffs_zfs::Zpl {
+    engine
+        .open_read_objects(cx)
+        .unwrap()
+        .zpl(cx, &[b"data".to_vec()])
+        .unwrap()
+}
+
+#[test]
+fn file_range_edits_preserve_edges_snapshots_links_and_exact_allocation() {
+    use ffs_zfs::ZfsFileRangeOperation::{PunchHole, ZeroRange};
+
+    const BLOCK: usize = 4096;
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    let timestamp = Timestamp {
+        seconds: 1_730_000_000,
+        nanos: 987_654_321,
+    };
+    let payload: Vec<_> = (0..9 * BLOCK + 37)
+        .map(|index| u8::try_from(index % 251 + 1).unwrap())
+        .collect();
+    for (zpl_version, mirror_width, ashift, deadlist_mode) in [
+        (4, 1, 9, DeadlistMode::Bpobj),
+        (5, 2, 12, DeadlistMode::NativeDeadlist),
+    ] {
+        let (mut engine, devices) = file_range_fixture(
+            &cx,
+            &PoolFixtureSpec {
+                zpl_version,
+                mirror_width,
+                ashift,
+                deadlist_mode,
+                with_sa_spill_timestamps: zpl_version == 5,
+                user_accounting: true,
+                data_properties: vec![(b"recordsize", BLOCK as u64)],
+                image_bytes: 24 * 1024 * 1024,
+                ..PoolFixtureSpec::default()
+            },
+        );
+        engine
+            .write_file_data(
+                &cx,
+                &dataset,
+                4,
+                0,
+                &payload,
+                timestamp,
+                ZfsDataChecksum::Sha256,
+            )
+            .into_result()
+            .unwrap();
+        engine
+            .link_entry(&cx, &dataset, 4, 6, b"range-alias", timestamp)
+            .into_result()
+            .unwrap();
+        engine
+            .create_snapshot(&cx, &dataset, b"range-base", timestamp)
+            .into_result()
+            .unwrap();
+        let (before, used_before) = file_range_head(&cx, &engine).stat(&cx, 4).unwrap();
+        let edited_time = Timestamp {
+            seconds: timestamp.seconds + 10,
+            nanos: 123,
+        };
+        let (_, token) = engine
+            .edit_file_range(
+                &cx,
+                &dataset,
+                4,
+                101,
+                (4 * BLOCK + 202) as u64,
+                PunchHole,
+                edited_time,
+                ZfsDataChecksum::Sha256,
+            )
+            .into_result()
+            .unwrap();
+        assert!(token.matches_engine(&engine));
+        let mut expected = payload.clone();
+        expected[101..4 * BLOCK + 303].fill(0);
+        let mut head = file_range_head(&cx, &engine);
+        assert_eq!(head.read(&cx, 4, 0, expected.len()).unwrap(), expected);
+        assert_eq!(head.resolve(&cx, b"/sub/range-alias").unwrap(), 4);
+        let (after, used_after) = head.stat(&cx, 4).unwrap();
+        assert_eq!(used_after, used_before - 3 * BLOCK as u64);
+        assert_eq!((after.times[1], after.times[2]), (edited_time, edited_time));
+        assert_eq!(after.times[0], before.times[0]);
+        assert_eq!(after.times[3], before.times[3]);
+        assert_eq!(
+            (
+                after.size,
+                after.links,
+                after.generation,
+                after.mode,
+                after.uid,
+                after.gid
+            ),
+            (
+                before.size,
+                before.links,
+                before.generation,
+                before.mode,
+                before.uid,
+                before.gid
+            )
+        );
+        assert_eq!(
+            head.seek(&cx, 4, BLOCK as u64, ffs_core::SeekWhence::Data)
+                .unwrap(),
+            4 * BLOCK as u64
+        );
+        assert_eq!(
+            head.seek(&cx, 4, 0, ffs_core::SeekWhence::Hole).unwrap(),
+            BLOCK as u64
+        );
+
+        let tail = expected.len() - 19;
+        let (size, _) = engine
+            .edit_file_range(
+                &cx,
+                &dataset,
+                4,
+                tail as u64,
+                2 * BLOCK as u64,
+                ZeroRange { keep_size: true },
+                edited_time,
+                ZfsDataChecksum::Fletcher4,
+            )
+            .into_result()
+            .unwrap();
+        assert_eq!(size, expected.len() as u64);
+        expected[tail..].fill(0);
+        let extend_at = expected.len() + 17;
+        let (size, _) = engine
+            .edit_file_range(
+                &cx,
+                &dataset,
+                4,
+                extend_at as u64,
+                (BLOCK + 23) as u64,
+                ZeroRange { keep_size: false },
+                edited_time,
+                ZfsDataChecksum::Fletcher4,
+            )
+            .into_result()
+            .unwrap();
+        expected.resize(extend_at + BLOCK + 23, 0);
+        assert_eq!(size, expected.len() as u64);
+        assert_eq!(
+            file_range_head(&cx, &engine)
+                .read(&cx, 4, 0, expected.len())
+                .unwrap(),
+            expected
+        );
+
+        let stable = file_range_head(&cx, &engine).stat(&cx, 4).unwrap();
+        engine
+            .edit_file_range(
+                &cx,
+                &dataset,
+                4,
+                size + 100,
+                512,
+                PunchHole,
+                timestamp,
+                ZfsDataChecksum::Fletcher4,
+            )
+            .into_result()
+            .unwrap();
+        let unchanged = file_range_head(&cx, &engine).stat(&cx, 4).unwrap();
+        assert_eq!(unchanged.0.times, stable.0.times);
+        assert_eq!((unchanged.0.size, unchanged.1), (stable.0.size, stable.1));
+
+        engine
+            .edit_file_range(
+                &cx,
+                &dataset,
+                4,
+                0,
+                size,
+                PunchHole,
+                edited_time,
+                ZfsDataChecksum::Fletcher4,
+            )
+            .into_result()
+            .unwrap();
+        let slot = engine.committed_slot();
+        drop(engine);
+        let fresh: Vec<_> = devices
+            .iter()
+            .map(FaultableMemberDevice::fresh_from_durable)
+            .collect();
+        let reopened =
+            open_engine_on_devices(&cx, &fresh, default_write_opts(POOL_GUID, slot)).unwrap();
+        let mut head = file_range_head(&cx, &reopened);
+        assert_eq!(head.stat(&cx, 4).unwrap().0.size, size);
+        assert_eq!(
+            head.read(&cx, 4, 0, expected.len()).unwrap(),
+            vec![0; expected.len()]
+        );
+        assert_eq!(
+            head.seek(&cx, 4, 0, ffs_core::SeekWhence::Data)
+                .unwrap_err()
+                .to_errno(),
+            libc::ENXIO
+        );
+        let mut snapshot = head.open_snapshot(&cx, b"range-base").unwrap();
+        assert_eq!(snapshot.read(&cx, 4, 0, payload.len()).unwrap(), payload);
+        assert_eq!(snapshot.stat(&cx, 4).unwrap().0.size, payload.len() as u64);
+        assert_pool_scrub_and_allocation_clean(&cx, &fresh, POOL_GUID, Some(slot));
+    }
+}
+
+#[test]
+fn file_range_large_sparse_edits_skip_holes_and_extend_without_allocation() {
+    use ffs_zfs::ZfsFileRangeOperation::{PunchHole, ZeroRange};
+
+    const FAR: u64 = 1_u64 << 42;
+    const NEW_EOF: u64 = (1_u64 << 50) + 4096;
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    let timestamp = Timestamp {
+        seconds: 1_730_000_001,
+        nanos: 0,
+    };
+    let (mut engine, devices) = file_range_fixture(
+        &cx,
+        &PoolFixtureSpec {
+            zpl_version: 4,
+            data_properties: vec![(b"recordsize", 4096)],
+            ..PoolFixtureSpec::default()
+        },
+    );
+    let prefix = vec![0x45; 4096];
+    engine
+        .write_file_data(
+            &cx,
+            &dataset,
+            4,
+            0,
+            &prefix,
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    engine
+        .write_file_data(
+            &cx,
+            &dataset,
+            4,
+            FAR,
+            b"TAIL",
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    let used = file_range_head(&cx, &engine).stat(&cx, 4).unwrap().1;
+    engine
+        .edit_file_range(
+            &cx,
+            &dataset,
+            4,
+            4096,
+            FAR - 4096,
+            PunchHole,
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    let mut head = file_range_head(&cx, &engine);
+    assert_eq!(head.read(&cx, 4, 0, 4096).unwrap(), prefix);
+    assert_eq!(head.read(&cx, 4, FAR, 4).unwrap(), b"TAIL");
+    assert_eq!(head.stat(&cx, 4).unwrap().1, used);
+    engine
+        .edit_file_range(
+            &cx,
+            &dataset,
+            4,
+            1024,
+            FAR + 3 - 1024,
+            PunchHole,
+            timestamp,
+            ZfsDataChecksum::Sha256,
+        )
+        .into_result()
+        .unwrap();
+    let mut head = file_range_head(&cx, &engine);
+    assert_eq!(head.read(&cx, 4, 0, 1024).unwrap(), vec![0x45; 1024]);
+    assert_eq!(head.read(&cx, 4, 1024, 4096).unwrap(), vec![0; 4096]);
+    assert_eq!(head.read(&cx, 4, FAR, 4).unwrap(), b"\0\0\0L");
+    assert_eq!(
+        head.seek(&cx, 4, 4096, ffs_core::SeekWhence::Data).unwrap(),
+        FAR
+    );
+    let used = head.stat(&cx, 4).unwrap().1;
+    let (size, _) = engine
+        .edit_file_range(
+            &cx,
+            &dataset,
+            4,
+            NEW_EOF - 4096,
+            4096,
+            ZeroRange { keep_size: false },
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    let mut head = file_range_head(&cx, &engine);
+    assert_eq!(size, NEW_EOF);
+    assert_eq!(head.stat(&cx, 4).unwrap().1, used);
+    assert_eq!(
+        head.read(&cx, 4, NEW_EOF - 4096, 4096).unwrap(),
+        vec![0; 4096]
+    );
+    engine
+        .edit_file_range(
+            &cx,
+            &dataset,
+            4,
+            0,
+            NEW_EOF,
+            PunchHole,
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    let mut head = file_range_head(&cx, &engine);
+    assert_eq!(head.stat(&cx, 4).unwrap().1, 0);
+    assert_eq!(head.stat(&cx, 4).unwrap().0.size, NEW_EOF);
+    assert_eq!(head.seek(&cx, 4, 0, ffs_core::SeekWhence::Hole).unwrap(), 0);
+    assert_eq!(
+        head.seek(&cx, 4, 0, ffs_core::SeekWhence::Data)
+            .unwrap_err()
+            .to_errno(),
+        libc::ENXIO
+    );
+    assert_pool_scrub_and_allocation_clean(&cx, &devices, POOL_GUID, None);
+}
+
+#[test]
+fn file_range_reclaims_project_quota_bytes_without_changing_object_counts() {
+    use ffs_zfs::ZfsFileRangeOperation::PunchHole;
+
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    let timestamp = Timestamp {
+        seconds: 1_730_000_002,
+        nanos: 0,
+    };
+    let (mut engine, devices) = file_range_fixture(
+        &cx,
+        &PoolFixtureSpec {
+            project_accounting: true,
+            sa_project_id: Some(42),
+            additional_write_features: vec![(b"org.zfsonlinux:project_quota", 1)],
+            data_properties: vec![(b"recordsize", 4096)],
+            deadlist_mode: DeadlistMode::NativeDeadlist,
+            ..PoolFixtureSpec::default()
+        },
+    );
+    engine
+        .write_file_data(
+            &cx,
+            &dataset,
+            4,
+            0,
+            &vec![0x61; 6 * 4096],
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    let (before_node, before) = native_accounting_snapshot(&cx, &engine, &devices[0]);
+    engine
+        .edit_file_range(
+            &cx,
+            &dataset,
+            4,
+            4096,
+            2 * 4096,
+            PunchHole,
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    let (after_node, after) = native_accounting_snapshot(&cx, &engine, &devices[0]);
+    assert_eq!(
+        after_node.unwrap().used_bytes(),
+        before_node.unwrap().used_bytes() - 8192
+    );
+    for (index, owner) in [b"3e8".as_slice(), b"3e8".as_slice(), b"2a".as_slice()]
+        .into_iter()
+        .enumerate()
+    {
+        let mut expected = before[index].clone();
+        *expected.get_mut(owner).unwrap() -= 8192;
+        assert_eq!(
+            after[index], expected,
+            "only the file owner's physical-byte charge may change"
+        );
+    }
+    assert_pool_scrub_and_allocation_clean(&cx, &devices, POOL_GUID, None);
+}
+
+#[test]
+fn file_range_invalid_bounds_times_and_native_flags_refuse_before_writes() {
+    use ffs_zfs::ZfsFileRangeOperation::{PunchHole, ZeroRange};
+
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    let timestamp = Timestamp {
+        seconds: 1_730_000_003,
+        nanos: 0,
+    };
+    let (mut engine, devices) = file_range_fixture(&cx, &PoolFixtureSpec::default());
+    for (offset, length) in [
+        (0, 0),
+        (u64::MAX, 1),
+        (i64::MAX as u64, 1),
+        (1, i64::MAX as u64),
+    ] {
+        assert_native_write_refused(&mut engine, &devices, libc::EINVAL, |writer| {
+            writer.edit_file_range(
+                &cx,
+                &dataset,
+                4,
+                offset,
+                length,
+                PunchHole,
+                timestamp,
+                ZfsDataChecksum::Fletcher4,
+            )
+        });
+    }
+    assert_native_write_refused(&mut engine, &devices, libc::EINVAL, |writer| {
+        writer.edit_file_range(
+            &cx,
+            &dataset,
+            4,
+            0,
+            1,
+            PunchHole,
+            Timestamp {
+                nanos: 1_000_000_000,
+                ..timestamp
+            },
+            ZfsDataChecksum::Fletcher4,
+        )
+    });
+    assert_native_write_refused(&mut engine, &devices, libc::EISDIR, |writer| {
+        writer.edit_file_range(
+            &cx,
+            &dataset,
+            6,
+            0,
+            1,
+            PunchHole,
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+    });
+    for flag in [1_u64 << 32, 1_u64 << 36, 1_u64 << 38] {
+        let (mut protected, devices) = file_range_fixture(
+            &cx,
+            &PoolFixtureSpec {
+                zpl_flags: BTreeMap::from([(4, 0x408 | flag)]),
+                ..PoolFixtureSpec::default()
+            },
+        );
+        for operation in [PunchHole, ZeroRange { keep_size: false }] {
+            assert_native_write_refused(&mut protected, &devices, libc::EPERM, |writer| {
+                writer.edit_file_range(
+                    &cx,
+                    &dataset,
+                    4,
+                    0,
+                    17,
+                    operation,
+                    timestamp,
+                    ZfsDataChecksum::Fletcher4,
+                )
+            });
+        }
+    }
+}
+
+#[test]
+fn file_range_persistence_cuts_keep_exact_old_or_new_bytes_and_snapshot_ownership() {
+    use ffs_zfs::ZfsFileRangeOperation::{PunchHole, ZeroRange};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    let timestamp = Timestamp {
+        seconds: 1_730_000_004,
+        nanos: 0,
+    };
+    let edited_time = Timestamp {
+        seconds: timestamp.seconds + 1,
+        nanos: 17,
+    };
+    let payload = vec![0x5A; 5 * 4096 + 17];
+    let (mut seed, seed_devices) = file_range_fixture(
+        &cx,
+        &PoolFixtureSpec {
+            data_properties: vec![(b"recordsize", 4096)],
+            deadlist_mode: DeadlistMode::NativeDeadlist,
+            user_accounting: true,
+            ..PoolFixtureSpec::default()
+        },
+    );
+    seed.write_file_data(
+        &cx,
+        &dataset,
+        4,
+        0,
+        &payload,
+        timestamp,
+        ZfsDataChecksum::Fletcher4,
+    )
+    .into_result()
+    .unwrap();
+    seed.create_snapshot(&cx, &dataset, b"range-cut", timestamp)
+        .into_result()
+        .unwrap();
+    let pre_slot = seed.committed_slot();
+    let pre_txg = seed.committed_txg();
+    let old_used = file_range_head(&cx, &seed).stat(&cx, 4).unwrap().1;
+    let initial: Vec<_> = seed_devices
+        .iter()
+        .map(FaultableMemberDevice::durable_snapshot)
+        .collect();
+    drop(seed);
+    drop(seed_devices);
+
+    for operation in [PunchHole, ZeroRange { keep_size: false }] {
+        let length = if operation == PunchHole {
+            3 * 4096 + 400
+        } else {
+            payload.len() + 4096
+        };
+        let mut expected = payload.clone();
+        if operation != PunchHole {
+            expected.resize(101 + length, 0);
+        }
+        expected[101..101 + length].fill(0);
+        let released = if operation == PunchHole {
+            2 * 4096
+        } else {
+            5 * 4096
+        };
+        for stage in 0..7_u8 {
+            let devices: Vec<_> = initial
+                .iter()
+                .cloned()
+                .map(FaultableMemberDevice::new)
+                .collect();
+            let mut engine =
+                open_engine_on_devices(&cx, &devices, default_write_opts(POOL_GUID, pre_slot))
+                    .unwrap();
+            let tripped = Arc::new(AtomicBool::new(false));
+            let hook_tripped = Arc::clone(&tripped);
+            engine.with_fault_hook(move |event| {
+                let cut = matches!(
+                    (stage, event.stage),
+                    (0, ZfsPersistenceStage::ChildBlocksWrite { .. })
+                        | (1, ZfsPersistenceStage::DatasetMetadataBarrier { .. })
+                        | (2, ZfsPersistenceStage::MosSpaceMapBarrier { .. })
+                        | (3, ZfsPersistenceStage::MosRootBarrier { .. })
+                        | (4, ZfsPersistenceStage::UberblockBarrier { wave: 1, .. })
+                        | (5, ZfsPersistenceStage::UberblockWrite { label: 2, .. })
+                        | (6, ZfsPersistenceStage::BeforeAcknowledge)
+                );
+                if cut {
+                    hook_tripped.store(true, Ordering::SeqCst);
+                    Err(FfsError::Cancelled)
+                } else {
+                    Ok(())
+                }
+            });
+            let outcome = engine.edit_file_range(
+                &cx,
+                &dataset,
+                4,
+                101,
+                length as u64,
+                operation,
+                edited_time,
+                ZfsDataChecksum::Sha256,
+            );
+            assert!(
+                tripped.load(Ordering::SeqCst),
+                "range operation missed stage {stage}"
+            );
+            let published = stage >= 5;
+            let target_slot = match outcome {
+                ZfsTxOutcome::NotCommitted(FfsError::Cancelled) if stage < 4 => None,
+                ZfsTxOutcome::Uncertain {
+                    target_txg,
+                    target_slot,
+                    ..
+                } if (4..=5).contains(&stage) => {
+                    assert_eq!(target_txg, pre_txg + 1);
+                    assert!(engine.requires_recovery());
+                    Some(target_slot)
+                }
+                ZfsTxOutcome::Committed { value, token } if stage == 6 => {
+                    assert_eq!(value, expected.len() as u64);
+                    assert_eq!(token.committed_txg(), pre_txg + 1);
+                    Some(token.published_slot())
+                }
+                other => panic!("unexpected range outcome at stage {stage}: {other:?}"),
+            };
+            drop(engine);
+            let crashed: Vec<_> = devices
+                .iter()
+                .map(FaultableMemberDevice::fresh_from_durable)
+                .collect();
+            if stage == 4 {
+                let mut absent = default_write_opts(POOL_GUID, target_slot.unwrap());
+                absent.reconcile_torn_uberblocks = true;
+                assert!(
+                    open_engine_on_devices(&cx, &crashed, absent).is_err(),
+                    "first-wave pre-barrier target is not durable"
+                );
+            }
+            let slot = if published {
+                target_slot.unwrap()
+            } else {
+                pre_slot
+            };
+            let mut options = default_write_opts(POOL_GUID, slot);
+            options.reconcile_torn_uberblocks = (4..=5).contains(&stage);
+            let recovered = open_engine_on_devices(&cx, &crashed, options).unwrap();
+            assert_eq!(recovered.committed_txg(), pre_txg + u64::from(published));
+            let mut head = file_range_head(&cx, &recovered);
+            let bytes = if published { &expected } else { &payload };
+            assert_eq!(head.read(&cx, 4, 0, bytes.len() + 1).unwrap(), *bytes);
+            let (metadata, used) = head.stat(&cx, 4).unwrap();
+            assert_eq!(metadata.size, bytes.len() as u64);
+            assert_eq!(
+                metadata.times[1],
+                if published { edited_time } else { timestamp }
+            );
+            assert_eq!(used, old_used - if published { released } else { 0 });
+            let mut snapshot = head.open_snapshot(&cx, b"range-cut").unwrap();
+            assert_eq!(snapshot.read(&cx, 4, 0, payload.len()).unwrap(), payload);
+            assert_eq!(snapshot.stat(&cx, 4).unwrap().1, old_used);
+            assert_pool_scrub_and_allocation_clean(&cx, &crashed, POOL_GUID, Some(slot));
+        }
+    }
+}

@@ -555,6 +555,39 @@ impl NtfsFs {
         Ok(size)
     }
 
+    pub(super) fn fallocate_locked(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        offset: u64,
+        length: u64,
+        mode: i32,
+    ) -> Result<()> {
+        // These are the Linux fallocate ABI flags, independent of host libc.
+        const KEEP_SIZE: i32 = 0x01;
+        const PUNCH_HOLE: i32 = 0x02;
+        self.ensure_writable()?;
+        if length == 0 || mode & PUNCH_HOLE != 0 && mode & KEEP_SIZE == 0 {
+            return Err(invalid_argument());
+        }
+        if mode != (KEEP_SIZE | PUNCH_HOLE) {
+            return Err(unsupported(
+                "NTFS fallocate supports only PUNCH_HOLE with KEEP_SIZE",
+            ));
+        }
+        if offset
+            .checked_add(length)
+            .is_none_or(|end| end > i64::MAX as u64)
+        {
+            return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EFBIG)));
+        }
+        let (target, stream) = self.data_target(cx, ino)?;
+        let now = system_time_to_filetime(SystemTime::now())?;
+        self.transact(cx, |engine| {
+            engine.punch_hole_at(cx, target, &stream, offset, length, now)
+        })
+    }
+
     fn user_ea_name(name: &str) -> Result<()> {
         if name.len() > MAX_EA_NAME_BYTES {
             return Err(FfsError::NameTooLong);

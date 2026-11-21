@@ -3,6 +3,7 @@
 //! and companion CLI operations.
 
 mod ea;
+mod sparse;
 
 pub use ea::NtfsEaSetMode;
 

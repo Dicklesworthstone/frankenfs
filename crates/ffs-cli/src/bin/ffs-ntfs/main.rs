@@ -226,6 +226,44 @@ fn select_named_write_stream(text: Option<&str>, native: Option<StreamName>) -> 
     Ok(stream)
 }
 
+fn punch_hole_command(
+    cx: &Cx,
+    target: &TxWriteArgs,
+    path: &str,
+    stream: &StreamName,
+    start: u64,
+    bytes: u64,
+) -> Result<()> {
+    // Validate before opening the writer: recovery itself can change the image.
+    ensure!(bytes != 0, "hole-punch length must be nonzero");
+    ensure!(
+        start
+            .checked_add(bytes)
+            .is_some_and(|end| i64::try_from(end).is_ok()),
+        "hole-punch range exceeds the signed native size limit"
+    );
+    let mut engine = target.open(cx, false)?;
+    let reference = engine.resolve_path_reference(cx, path)?;
+    let outcome = engine.punch_hole_at(
+        cx,
+        reference,
+        stream.as_units(),
+        start,
+        bytes,
+        ffs_ntfs::DEFAULT_NTFS_FILETIME,
+    );
+    emit_tx_outcome("tx_punch_hole", &engine, outcome, |()| {
+        serde_json::json!({
+            "record": reference.record,
+            "sequence": reference.sequence,
+            "stream_name_utf16": stream.as_units(),
+            "start": start,
+            "bytes": bytes,
+            "keep_size": true,
+        })
+    })
+}
+
 #[derive(Debug, Args)]
 pub(crate) struct PayloadArgs {
     /// Exact UTF-8 payload string.
@@ -547,6 +585,24 @@ enum Command {
         /// New stream size in bytes. Non-sparse growth may initialize at most 16 MiB per transaction; the native size and allocation limits also apply.
         #[arg(long, value_parser = clap::value_parser!(u64).range(..=i64::MAX as u64))]
         size: u64,
+    },
+    /// Reclaim full clusters and zero partial edges in a DATA range while preserving EOF.
+    TxPunchHole {
+        #[command(flatten)]
+        target: TxWriteArgs,
+        path: String,
+        /// Exact existing Unicode stream name. Omit both selectors for unnamed DATA.
+        #[arg(long, conflicts_with = "stream_utf16")]
+        stream: Option<String>,
+        /// Exact UTF-16 units, comma-separated four-digit hex.
+        #[arg(long, value_parser = StreamName::parse, conflicts_with = "stream")]
+        stream_utf16: Option<StreamName>,
+        /// Byte offset in the stream, distinct from the volume's --offset.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(..=i64::MAX as u64))]
+        start: u64,
+        /// Number of stream bytes to punch, distinct from the volume's --length.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=i64::MAX as u64))]
+        bytes: u64,
     },
     /// Create a named DATA stream without replacing an existing stream or the unnamed data.
     TxCreateStream {
@@ -1553,6 +1609,17 @@ fn main() -> Result<()> {
                     "size": size,
                 })
             })?;
+        }
+        Command::TxPunchHole {
+            target,
+            path,
+            stream,
+            stream_utf16,
+            start,
+            bytes,
+        } => {
+            let stream = select_write_stream(stream.as_deref(), stream_utf16)?;
+            punch_hole_command(&cx, &target, &path, &stream, start, bytes)?;
         }
         Command::TxCreateStream {
             target,
@@ -2662,6 +2729,16 @@ mod tests {
                 "--size",
                 "0",
             ],
+            &[
+                "ffs-ntfs",
+                "tx-punch-hole",
+                "disk.img",
+                "/a.txt",
+                "--start",
+                "4096",
+                "--bytes",
+                "4096",
+            ],
             &["ffs-ntfs", "tx-rename", "disk.img", "/a.txt", "/b.txt"],
             &["ffs-ntfs", "tx-unlink", "disk.img", "/a.txt"],
             &["ffs-ntfs", "tx-grow-mft", "disk.img", "--records", "8"],
@@ -2930,10 +3007,80 @@ mod tests {
     }
 
     #[test]
+    fn cli_hole_punch_preserves_volume_selection_and_rejects_invalid_ranges_before_open() {
+        let base = [
+            "ffs-ntfs",
+            "tx-punch-hole",
+            "/definitely-absent-ntfs-hole-image",
+            "/large.bin",
+            "--offline-image",
+            "--allow-write",
+            "--recover-dirty",
+            "--offset",
+            "1048576",
+            "--length",
+            "67108864",
+        ];
+        assert!(Cli::try_parse_from(base).is_err());
+        let cli = Cli::try_parse_from(base.into_iter().chain([
+            "--start",
+            "33554432",
+            "--bytes",
+            "1099511627776",
+        ]))
+        .unwrap();
+        let Command::TxPunchHole {
+            target,
+            path,
+            stream,
+            stream_utf16,
+            start,
+            bytes,
+        } = cli.command
+        else {
+            panic!("tx-punch-hole");
+        };
+        assert_eq!(path, "/large.bin");
+        assert_eq!((start, bytes), (33_554_432, 1_u64 << 40));
+        assert_eq!(
+            (target.offset, target.length),
+            (1_048_576, Some(67_108_864))
+        );
+        assert!(target.offline_image && target.allow_write && target.recover_dirty);
+        let stream = select_write_stream(stream.as_deref(), stream_utf16).unwrap();
+        assert_eq!(stream.as_units(), [] as [u16; 0]);
+        for (start, bytes) in [
+            ("0", "0"),
+            ("-1", "1"),
+            ("0", "-1"),
+            ("9223372036854775808", "1"),
+            ("0", "9223372036854775808"),
+        ] {
+            assert!(
+                Cli::try_parse_from(
+                    base.into_iter()
+                        .chain(["--start", start, "--bytes", bytes,])
+                )
+                .is_err()
+            );
+        }
+        let cx = Cx::for_testing();
+        for (start, bytes, expected) in [
+            (0, 0, "nonzero"),
+            (i64::MAX as u64, 1, "signed native size limit"),
+            (1, u64::MAX, "signed native size limit"),
+        ] {
+            let error = punch_hole_command(&cx, &target, &path, &stream, start, bytes).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
+    }
+
+    #[test]
     fn cli_stream_edits_preserve_exact_selectors_and_refuse_conflicts() {
         for (command, edit) in [
             ("tx-write-range", vec!["--start", "3", "--data", "payload"]),
             ("tx-truncate", vec!["--size", "7"]),
+            ("tx-punch-hole", vec!["--start", "3", "--bytes", "7"]),
         ] {
             let mut base = vec![
                 "ffs-ntfs",
@@ -2955,6 +3102,11 @@ mod tests {
                     ..
                 }
                 | Command::TxTruncate {
+                    stream,
+                    stream_utf16,
+                    ..
+                }
+                | Command::TxPunchHole {
                     stream,
                     stream_utf16,
                     ..

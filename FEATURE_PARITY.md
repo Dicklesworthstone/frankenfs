@@ -1,5 +1,39 @@
 # FEATURE_PARITY
 
+> **ZFS native sparse range edits (2026-11-20):**
+> `ZfsTransactionEngine::edit_file_range`, writable FsOps and the companion
+> `tx-punch-hole` / `tx-zero-range` commands publish sparse edits through the
+> existing native COW/TXG path. Full blocks become holes; edge bytes, snapshot
+> ownership, deadlists and user/group/project charges retain their existing
+> contracts. Zero-range follows native OpenZFS sparse behavior without a space
+> reservation guarantee; optional KEEP_SIZE controls EOF extension.
+> Traversal skips logical holes and bounds allocated leaves and metadata work.
+> Authored regressions cover ZPL v4/v5, SA spill metadata, mirrors, both deadlist
+> formats, quota deltas, multi-terabyte holes, sparse EOF extension, invalid
+> requests, cancellation and seven persistence cut points. Formatting and the
+> workspace all-target compiler/strict-Clippy checks excluding `ffs-harness`
+> pass. The full workspace check was killed by memory exhaustion in the existing
+> harness lib-test; full gates and runtime qualification remain pending.
+> Native OpenZFS interchange,
+> mounted-syscall qualification and the broader ZFS writer roadmap stay open.
+
+> **NTFS logged hole punching (2026-11-20):**
+> `NtfsTransactionEngine::punch_hole_at`, writable FsOps
+> `PUNCH_HOLE | KEEP_SIZE`, and `ffs-ntfs tx-punch-hole` edit unnamed DATA or an
+> exact UTF-16 named stream without changing EOF or initialized length.
+> Full clusters become native sparse holes; at most two partial initialized
+> boundary clusters are copied, so large logical ranges do not require a
+> range-sized buffer. Allocation, unnamed-DATA sparse flags, hard-link metadata
+> copies and mounted caches publish through the existing WAL transaction.
+> Authored regressions cover native allocation, ADS isolation, uninitialized
+> tails, large ranges, rejected operations, ENOSPC, committed cancellation,
+> failed barriers and durable/reordered persistence cuts. Formatting and the
+> workspace all-target compiler/strict-Clippy checks excluding `ffs-harness`
+> pass. The full workspace check was killed by memory exhaustion in the existing
+> harness lib-test. Full gates, runtime and independent native-image
+> qualification for this increment remain pending;
+> no Windows-interchange or mounted-syscall qualification is claimed.
+
 > **Extent read-cache lifetime bounds (2026-11-20):**
 > The S3-FIFO cache bounds invalidation tombstones relative to live residents,
 > even when payload pressure never triggers eviction. Generation-tagged resident
