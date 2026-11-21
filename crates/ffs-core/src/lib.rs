@@ -75863,10 +75863,42 @@ mod tests {
                 .has_htree_index()
         );
 
+        // The FUSE root alias and an ordinary directory stay byte-exact;
+        // the indexed child advertises the matching semantics lookup uses.
+        for root_alias in [InodeNumber(1), root] {
+            assert!(
+                !FsOps::directory_has_name_aliases(
+                    &fs,
+                    &cx,
+                    &mut RequestScope::empty(),
+                    root_alias,
+                )
+                .unwrap()
+            );
+        }
+        assert!(
+            FsOps::directory_has_name_aliases(
+                &fs,
+                &cx,
+                &mut RequestScope::empty(),
+                dir_ino,
+            )
+            .unwrap()
+        );
+
         // 1. create + casefold NFD lookup (precomposed vs decomposed + upper).
         let cafe = fs
             .create(&cx, dir_ino, OsStr::new("café.txt"), 0o644, 0, 0)
             .expect("non-ASCII create in casefold htree dir");
+        assert!(matches!(
+            FsOps::directory_has_name_aliases(
+                &fs,
+                &cx,
+                &mut RequestScope::empty(),
+                cafe.ino,
+            ),
+            Err(FfsError::NotDirectory)
+        ));
         assert_eq!(
             fs.lookup(&cx, dir_ino, OsStr::new("CAFE\u{0301}.TXT"))
                 .expect("decomposed uppercase lookup")

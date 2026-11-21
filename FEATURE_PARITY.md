@@ -3611,3 +3611,22 @@ object in an empty fixture. Refusal coverage verifies absent objects separately
 from directories and immutable/read-only files. The large sparse test retains
 its range, allocation and seek assertions and adds a fresh durable reopen.
 These corrected scenarios also await hosted execution at this checkpoint.
+
+## Writable native namespace cache coherence (2026-11-21)
+
+FsOps now exposes directory name-alias semantics through the backend and wrapper
+interfaces. Ext4 checks the actual parent inode's CASEFOLD flag; FAT and NTFS
+advertise their folded and alternate-name namespaces. Writable FUSE mounts use
+zero entry-cache validity for these directories in positive/negative lookup,
+create, mkdir, mknod, symlink, link and READDIRPLUS replies. This prevents a
+cached spelling or cached miss from outliving a mutation through another alias.
+Exact-byte directories and read-only mounts retain the existing cache policy.
+
+Cache policy is selected in the request scope before mutation; an error cannot
+turn an already committed namespace operation into a failed response. Entry
+responses share the transport's attribute lifetime, so both lifetimes are zero
+there; attribute-only getattr behavior is unchanged. Wrapper, backend and wire
+regressions cover policy forwarding, parent/root identity, reply lifetimes,
+lookup references and errors before mutation. The pre-existing mounted ext4
+casefold htree regression is unchanged. These tests await hosted execution at
+publication; no mounted qualification or bead closure is claimed.

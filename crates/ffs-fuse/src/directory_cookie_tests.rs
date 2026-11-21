@@ -15,9 +15,20 @@ const READDIRPLUS: u32 = 44;
 struct CookieFs {
     entries: Vec<FfsDirEntry>,
     offsets: Arc<Mutex<Vec<u64>>>,
+    name_aliases: bool,
 }
 
 impl FsOps for CookieFs {
+    fn directory_has_name_aliases(
+        &self,
+        _cx: &Cx,
+        _scope: &mut RequestScope,
+        parent: InodeNumber,
+    ) -> ffs_error::Result<bool> {
+        assert_eq!(parent, InodeNumber(1));
+        Ok(self.name_aliases)
+    }
+
     fn getattr(
         &self,
         _cx: &Cx,
@@ -174,6 +185,15 @@ fn with_directory(
     cookies: &[u64],
     run: impl FnOnce(&mut Wire, &LookupRefcounts, &Mutex<Vec<u64>>),
 ) {
+    with_directory_cache_policy(cookies, false, true, run);
+}
+
+fn with_directory_cache_policy(
+    cookies: &[u64],
+    name_aliases: bool,
+    read_only: bool,
+    run: impl FnOnce(&mut Wire, &LookupRefcounts, &Mutex<Vec<u64>>),
+) {
     let offsets = Arc::new(Mutex::new(Vec::new()));
     let entries = cookies
         .iter()
@@ -185,10 +205,17 @@ fn with_directory(
             name: format!("f{index}").into_bytes(),
         })
         .collect();
-    let fuse = FrankenFuse::new(Box::new(CookieFs {
-        entries,
-        offsets: Arc::clone(&offsets),
-    }));
+    let fuse = FrankenFuse::with_options(
+        Box::new(CookieFs {
+            entries,
+            offsets: Arc::clone(&offsets),
+            name_aliases,
+        }),
+        &MountOptions {
+            read_only,
+            ..MountOptions::default()
+        },
+    );
     let lookups = fuse.inner.lookup_refcounts.clone();
     std::thread::scope(|scope| {
         // The peer closes during assertion unwind before the scoped join, so
@@ -320,6 +347,36 @@ fn wire_directory_maximum_signed_cookie_round_trips_to_real_eof() {
             assert_eq!(*offsets.lock().unwrap(), vec![0, LAST_COOKIE]);
             for ino in [2, 3] {
                 assert_eq!(lookups.count(ino), u64::from(opcode == READDIRPLUS));
+            }
+        });
+    }
+}
+
+#[test]
+fn wire_readdirplus_cannot_reintroduce_cached_aliases_on_writable_mounts() {
+    for (name_aliases, read_only, ttl) in [
+        (false, false, ATTR_TTL),
+        (false, true, ATTR_TTL),
+        (true, false, Duration::ZERO),
+        (true, true, ATTR_TTL),
+    ] {
+        with_directory_cache_policy(&[1, 2], name_aliases, read_only, |wire, lookups, _| {
+            let response = wire.readdir(READDIRPLUS, 0, 4096);
+            assert_eq!(
+                entries(&response, READDIRPLUS),
+                vec![(2, 1, b"f0".to_vec()), (3, 2, b"f1".to_vec())]
+            );
+            for start in [0, 160] {
+                assert_eq!(u64_at(&response.body, start + 16), ttl.as_secs());
+                assert_eq!(u64_at(&response.body, start + 24), ttl.as_secs());
+                assert_eq!(
+                    &response.body[start + 32..start + 40],
+                    &[0; 8],
+                    "entry and attribute nanosecond lifetimes"
+                );
+            }
+            for ino in [2, 3] {
+                assert_eq!(lookups.count(ino), 1, "zero TTL still owns a lookup reference");
             }
         });
     }

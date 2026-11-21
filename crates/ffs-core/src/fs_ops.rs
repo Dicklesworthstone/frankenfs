@@ -999,6 +999,28 @@ impl FsOps for OpenFs {
         }
     }
 
+    fn directory_has_name_aliases(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        parent: InodeNumber,
+    ) -> ffs_error::Result<bool> {
+        match &self.flavor {
+            FsFlavor::Ext4(_) => {
+                let inode = self.read_inode_metadata_with_scope(
+                    cx,
+                    scope,
+                    Self::ext4_canonical_inode(parent),
+                )?;
+                if !inode.is_dir() {
+                    return Err(FfsError::NotDirectory);
+                }
+                Ok(inode.flags & ffs_types::EXT4_CASEFOLD_FL != 0)
+            }
+            FsFlavor::Btrfs(_) => Ok(false),
+        }
+    }
+
     fn lookup(
         &self,
         cx: &Cx,
