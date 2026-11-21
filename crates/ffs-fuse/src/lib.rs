@@ -4734,6 +4734,32 @@ impl AtimeFresh {
     }
 }
 
+/// Per-directory memo of `EXT4_CASEFOLD_FL` (`bd-vsuni.3`).
+///
+/// Linux FUSE indexes its kernel dcache by raw byte name and cannot invalidate
+/// arbitrary Unicode-folded aliases when a file is unlinked or renamed via a
+/// different spelling. Directories with `EXT4_CASEFOLD_FL` therefore return
+/// `Duration::ZERO` as their entry TTL (and uncached `ENOENT` on miss) so every
+/// path walk revalidates against userspace.
+#[derive(Default)]
+struct CasefoldDirCache {
+    dirs: parking_lot::RwLock<std::collections::HashMap<u64, bool>>,
+}
+
+impl CasefoldDirCache {
+    fn get(&self, dir_ino: u64) -> Option<bool> {
+        self.dirs.read().get(&dir_ino).copied()
+    }
+
+    fn remember(&self, dir_ino: u64, is_casefold: bool) {
+        self.dirs.write().insert(dir_ino, is_casefold);
+    }
+
+    fn forget(&self, dir_ino: u64) {
+        self.dirs.write().remove(&dir_ino);
+    }
+}
+
 /// Directory handles and the end-of-listing cap each one took on its first read.
 ///
 /// A listing reads only the entries present when it started (or was rewound):
@@ -4851,6 +4877,8 @@ struct FuseInner {
     /// oracle (unlink/rmdir/rename-overwrite) and the finalize at the last
     /// FORGET. Clones share one map.
     lookup_refcounts: LookupRefcounts,
+    /// bd-vsuni.3: per-directory `EXT4_CASEFOLD_FL` memo for entry-TTL selection.
+    casefold_dirs: CasefoldDirCache,
 }
 
 impl FuseInner {
@@ -6876,6 +6904,7 @@ impl Filesystem for FrankenFuse {
         self.inner.missing_capability_xattr.forget(inode);
         self.inner.readdirplus_attr_memo.forget(inode);
         self.inner.atime_fresh.forget(ino);
+        self.inner.casefold_dirs.forget(ino);
         self.forget_and_finalize(ino, nlookup);
     }
 
@@ -6893,6 +6922,7 @@ impl Filesystem for FrankenFuse {
             self.inner.missing_capability_xattr.forget(inode);
             self.inner.readdirplus_attr_memo.forget(inode);
             self.inner.atime_fresh.forget(node.nodeid);
+            self.inner.casefold_dirs.forget(node.nodeid);
             self.forget_and_finalize(node.nodeid, node.nlookup);
         }
     }
@@ -7253,6 +7283,7 @@ impl Filesystem for FrankenFuse {
                 // cost is per REPLY rather than per directory entry.
                 let mut census_served: u64 = 0;
                 let mut census_inline: u64 = 0;
+                let entry_ttl = self.entry_ttl_for_parent(&cx, ino);
                 let visible = self.inner.dir_handles.visible_len(fh, fs_offset, &entries);
                 for (index, entry) in entries.iter().take(visible).enumerate() {
                     // bd-xfe7z: time the whole loop body so loop_ns - scope_ns -
@@ -7309,7 +7340,7 @@ impl Filesystem for FrankenFuse {
                         entry.ino.0,
                         next_offset,
                         name,
-                        &ATTR_TTL,
+                        &entry_ttl,
                         &attr,
                         // bd-q0xnl: report the REAL generation, as `lookup`, `mknod`,
                         // `mkdir` and `create` all already do. This was a literal `0`
@@ -7421,8 +7452,9 @@ impl Filesystem for FrankenFuse {
             Ok(attr)
         }) {
             Ok(attr) => {
+                let entry_ttl = self.entry_ttl_for_parent(&cx, parent);
                 self.inner.lookup_refcounts.retain(attr.ino.0);
-                reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation);
+                reply.entry(&entry_ttl, &to_file_attr(&attr), attr.generation);
                 self.notify_created_entry_invalidation(parent, name);
                 self.notify_parent_invalidation(parent);
             }
@@ -7679,11 +7711,13 @@ impl Filesystem for FrankenFuse {
         rdev: u32,
         reply: ReplyEntry,
     ) {
-        let mode = self.create_mode(&self.cx_for_request(), parent, mode, umask);
+        let cx = self.cx_for_request();
+        let mode = self.create_mode(&cx, parent, mode, umask);
         match self.dispatch_mknod(parent, name, mode, rdev, req.uid(), req.gid()) {
             Ok(attr) => {
+                let entry_ttl = self.entry_ttl_for_parent(&cx, parent);
                 self.inner.lookup_refcounts.retain(attr.ino.0);
-                reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation);
+                reply.entry(&entry_ttl, &to_file_attr(&attr), attr.generation);
                 self.notify_created_entry_invalidation(parent, name);
                 self.notify_parent_invalidation(parent);
             }
@@ -7712,11 +7746,13 @@ impl Filesystem for FrankenFuse {
         umask: u32,
         reply: ReplyEntry,
     ) {
-        let mode = self.create_mode(&self.cx_for_request(), parent, mode, umask);
+        let cx = self.cx_for_request();
+        let mode = self.create_mode(&cx, parent, mode, umask);
         match self.dispatch_mkdir(parent, name, mode as u16, req.uid(), req.gid()) {
             Ok(attr) => {
+                let entry_ttl = self.entry_ttl_for_parent(&cx, parent);
                 self.inner.lookup_refcounts.retain(attr.ino.0);
-                reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation);
+                reply.entry(&entry_ttl, &to_file_attr(&attr), attr.generation);
                 self.notify_created_entry_invalidation(parent, name);
                 self.notify_parent_invalidation(parent);
             }
@@ -7869,8 +7905,9 @@ impl Filesystem for FrankenFuse {
             Ok(attr)
         }) {
             Ok(attr) => {
+                let entry_ttl = self.entry_ttl_for_parent(&cx, newparent);
                 self.inner.lookup_refcounts.retain(attr.ino.0);
-                reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation);
+                reply.entry(&entry_ttl, &to_file_attr(&attr), attr.generation);
                 self.notify_created_entry_invalidation(newparent, newname);
                 self.notify_parent_invalidation(newparent);
                 self.notify_inode_invalidation(ino);
@@ -8102,10 +8139,11 @@ impl Filesystem for FrankenFuse {
                 // A flags change moves ctime, and the kernel keeps the inode's
                 // attributes cached across a FUSE ioctl: drop them, or stat
                 // shows the old ctime (xfstests generic/277).
-                if matches!(cmd, EXT4_IOC_SETFLAGS | FS_IOC_FSSETXATTR)
-                    && let Some(notifier) = self.kernel_notifier()
-                {
-                    notifier.inode(ino);
+                if matches!(cmd, EXT4_IOC_SETFLAGS | FS_IOC_FSSETXATTR) {
+                    self.inner.casefold_dirs.forget(ino);
+                    if let Some(notifier) = self.kernel_notifier() {
+                        notifier.inode(ino);
+                    }
                 }
                 reply.ioctl(0, &data);
             }
@@ -8538,13 +8576,42 @@ impl FrankenFuse {
         }
     }
 
+    fn parent_is_casefold_in_scope(&self, cx: &Cx, scope: &mut RequestScope, parent: u64) -> bool {
+        if let Some(cached) = self.inner.casefold_dirs.get(parent) {
+            return cached;
+        }
+        let is_casefold = self
+            .inner
+            .ops
+            .get_inode_flags(cx, scope, InodeNumber(parent))
+            .is_ok_and(|flags| (flags & ffs_types::EXT4_CASEFOLD_FL) != 0);
+        self.inner.casefold_dirs.remember(parent, is_casefold);
+        is_casefold
+    }
+
+    fn entry_ttl_for_parent(&self, cx: &Cx, parent: u64) -> Duration {
+        let is_casefold = if let Some(cached) = self.inner.casefold_dirs.get(parent) {
+            cached
+        } else {
+            let mut scope = RequestScope::empty();
+            self.parent_is_casefold_in_scope(cx, &mut scope, parent)
+        };
+        if is_casefold {
+            Duration::ZERO
+        } else {
+            ATTR_TTL
+        }
+    }
+
     /// The `lookup` handler body, minus the `Request` it never reads.
     ///
     /// Kept separately so the FUSE protocol reply for a negative dentry can be
     /// tested without a live kernel request.
     fn lookup_impl(&self, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let cx = self.cx_for_request();
+        let mut parent_casefold = false;
         match self.with_request_scope(&cx, RequestOp::Lookup, |cx, scope| {
+            parent_casefold = self.parent_is_casefold_in_scope(cx, scope, parent);
             // FUSE_EXPORT_SUPPORT: the kernel turns a file handle back into an
             // inode with LOOKUP(nodeid, ".") and finds a directory's parent
             // with LOOKUP(dir, ".."). Answer both for either format: "." is
@@ -8579,16 +8646,25 @@ impl FrankenFuse {
             self.inner.ops.lookup(cx, scope, InodeNumber(parent), name)
         }) {
             Ok(attr) => {
+                let entry_ttl = if parent_casefold {
+                    Duration::ZERO
+                } else {
+                    ATTR_TTL
+                };
                 self.inner.lookup_refcounts.retain(attr.ino.0);
-                reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation);
+                reply.entry(&entry_ttl, &to_file_attr(&attr), attr.generation);
             }
             Err(FfsError::NotFound(_)) => {
-                if crate::entry_invalidation_enabled()
-                    && let Some(notifier) = self.kernel_notifier()
-                {
-                    notifier.remember_negative_entry(parent, name);
+                if parent_casefold {
+                    reply.error(libc::ENOENT);
+                } else {
+                    if crate::entry_invalidation_enabled()
+                        && let Some(notifier) = self.kernel_notifier()
+                    {
+                        notifier.remember_negative_entry(parent, name);
+                    }
+                    Self::reply_negative_entry(reply);
                 }
-                Self::reply_negative_entry(reply);
             }
             Err(e) => {
                 Self::reply_error_entry(
@@ -10322,6 +10398,7 @@ mod tests {
             dir_handles: DirHandles::default(),
             dont_mask: std::sync::atomic::AtomicBool::new(false),
             lookup_refcounts: LookupRefcounts::default(),
+            casefold_dirs: CasefoldDirCache::default(),
         };
         let ino = InodeNumber(404);
         let mut stale = make_test_attr(FfsFileType::RegularFile, 4096);
@@ -10368,6 +10445,7 @@ mod tests {
             dir_handles: DirHandles::default(),
             dont_mask: std::sync::atomic::AtomicBool::new(false),
             lookup_refcounts: LookupRefcounts::default(),
+            casefold_dirs: CasefoldDirCache::default(),
         };
         let fuse = FrankenFuse {
             inner: Arc::new(inner),
@@ -11571,17 +11649,26 @@ mod tests {
             dir_handles: DirHandles::default(),
             dont_mask: std::sync::atomic::AtomicBool::new(false),
             lookup_refcounts: LookupRefcounts::default(),
+            casefold_dirs: CasefoldDirCache::default(),
             inode_locks: Arc::new(FuseInodeLocks::default()),
             writeback: WritebackBatch::from_env(),
         };
         let inode = InodeNumber(42);
         inner.missing_capability_xattr.remember(inode);
+        inner.casefold_dirs.remember(inode.0, true);
         assert!(inner.missing_capability_xattr.contains(inode));
+        assert_eq!(inner.casefold_dirs.get(inode.0), Some(true));
 
         // Exactly what `forget`/`batch_forget` do for one inode.
         inner.readahead.invalidate_inode(inode);
         inner.access_predictor.invalidate_inode(inode);
         inner.missing_capability_xattr.forget(inode);
+        inner.casefold_dirs.forget(inode.0);
+
+        assert!(
+            inner.casefold_dirs.get(inode.0).is_none(),
+            "a forgotten inode must not carry a stale casefold flag into the next directory that reuses its number"
+        );
 
         assert!(
             !inner.missing_capability_xattr.contains(inode),
@@ -25749,6 +25836,7 @@ mod tests {
             dir_handles: DirHandles::default(),
             dont_mask: std::sync::atomic::AtomicBool::new(false),
             lookup_refcounts: LookupRefcounts::default(),
+            casefold_dirs: CasefoldDirCache::default(),
             inode_locks: Arc::new(FuseInodeLocks::default()),
             writeback: WritebackBatch::from_env(),
         });
@@ -28400,6 +28488,7 @@ AllowOther"#;
             dir_handles: DirHandles::default(),
             dont_mask: std::sync::atomic::AtomicBool::new(false),
             lookup_refcounts: LookupRefcounts::default(),
+            casefold_dirs: CasefoldDirCache::default(),
             inode_locks: Arc::new(FuseInodeLocks::default()),
             writeback: WritebackBatch::from_env(),
         };

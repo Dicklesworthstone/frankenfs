@@ -68,6 +68,7 @@ impl FrankenFuse {
                 dir_handles: crate::DirHandles::default(),
                 dont_mask: std::sync::atomic::AtomicBool::new(false),
                 lookup_refcounts,
+                casefold_dirs: crate::CasefoldDirCache::default(),
             }),
             final_flush_errno: Arc::new(std::sync::atomic::AtomicI32::new(0)),
             mount_scope,
@@ -752,9 +753,10 @@ impl FrankenFuse {
             flags,
         ) {
             Ok((attr, fh, open_flags)) => {
+                let entry_ttl = self.entry_ttl_for_parent(&cx, parent);
                 self.inner.lookup_refcounts.retain(attr.ino.0);
                 reply.created(
-                    &ATTR_TTL,
+                    &entry_ttl,
                     &to_file_attr(&attr),
                     attr.generation,
                     fh,
