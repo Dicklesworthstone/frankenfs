@@ -1913,7 +1913,16 @@ impl NtfsTransactionEngine {
         stream: &[u16],
         data: &[u8],
     ) -> NtfsTxOutcome<NtfsReference> {
-        self.edit_named_stream(cx, path, stream, Some(data))
+        let outcome = self.edit_named_stream(cx, path, stream, Some(data));
+        if matches!(
+            outcome,
+            NtfsTxOutcome::NotCommitted(FfsError::UnsupportedFeature(_) | FfsError::NoSpace)
+        ) && !self.requires_recovery()
+            && let Ok(reference) = self.resolve_path_reference(cx, path)
+        {
+            return self.create_stream_at(cx, reference, stream, data, DEFAULT_NTFS_FILETIME);
+        }
+        outcome
     }
 
     /// Remove exactly the named DATA attribute and reclaim its admitted native
