@@ -5192,13 +5192,16 @@ impl FsOps for OpenFs {
             let ssi_read_tx = (read_snapshot_pinned
                 && isolation_mode == crate::vfs::MvccIsolationMode::Serializable)
                 .then(|| self.mvcc_store.begin_registered());
-            let snapshot = if let Some(read_tx) = &ssi_read_tx {
-                read_tx.snapshot()
-            } else if read_snapshot_pinned {
-                self.mvcc_store.register_current_snapshot()
-            } else {
-                self.current_snapshot()
-            };
+            let snapshot = ssi_read_tx.as_ref().map_or_else(
+                || {
+                    if read_snapshot_pinned {
+                        self.mvcc_store.register_current_snapshot()
+                    } else {
+                        self.current_snapshot()
+                    }
+                },
+                ffs_mvcc::Transaction::snapshot,
+            );
             trace!(
                 target: "ffs::mvcc",
                 op = ?op,
