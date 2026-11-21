@@ -5,7 +5,7 @@ use super::{
     NtfsTransactionEngine, NtfsTxOutcome, PreparedTxPlan, TxWorkspace, checkpoint,
     physical_spans_of_runs,
 };
-use crate::transaction::catalog::PreservedValue;
+use crate::transaction::catalog::{PreservedAttribute, PreservedValue};
 use crate::transaction::parse_err;
 use asupersync::Cx;
 use ffs_error::{FfsError, Result};
@@ -177,16 +177,19 @@ impl NtfsTransactionEngine {
         }
         cat.preserved
             .retain(|attribute| !matches!(attribute.kind, EA | EA_INFORMATION));
-        // One on-disk $EA. The transform writer publishes `ea_pair`, and the
-        // merged catalog loader keeps $EA there rather than in `preserved`.
-        // Leaving the loaded pair in place would emit those stale bytes beside
-        // this logged update. Filename sync reads the same pair for the
-        // packed size at FILE_NAME offset 60.
-        cat.ea_pair = if entries.is_empty() {
-            None
-        } else {
-            Some((information.encode().to_vec(), bytes))
-        };
+        if !entries.is_empty() {
+            for (kind, bytes) in [(EA_INFORMATION, information.encode().to_vec()), (EA, bytes)] {
+                cat.preserved.push(PreservedAttribute {
+                    kind,
+                    flags: 0,
+                    name: Vec::new(),
+                    raw_without_id: PreservedValue::Resident {
+                        indexed: false,
+                        bytes,
+                    },
+                });
+            }
+        }
         // Offset 60 is the packed EA size on ordinary FILE_NAME values, and a
         // reparse tag only on reparse records.
         let usn_snap = {
