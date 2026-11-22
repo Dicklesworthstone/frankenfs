@@ -281,7 +281,7 @@ impl NtfsTransactionEngine {
     /// zeroing partial cluster edges via COW and deallocating full interior clusters into
     /// sparse holes (`lcn = None`). Returns the number of clusters reclaimed.
     #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-    pub fn punch_hole_at(
+    pub fn punch_hole_with_options(
         &mut self,
         cx: &Cx,
         target_ref: NtfsReference,

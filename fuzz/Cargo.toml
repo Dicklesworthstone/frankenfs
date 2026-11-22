@@ -13,16 +13,16 @@ path = "src/lib.rs"
 doc = false
 
 [dependencies]
-anyhow = "1.0.102"
-asupersync = { version = "=0.5.0", features = ["simd-intrinsics", "test-internals"] }
-blake3 = "1.8.5"
-brotli = "8.0"
-crc32c = "0.6.8"
-libc = "0.2.185"
+anyhow = "1.0.104"
+asupersync = { version = "=0.7.0", features = ["simd-intrinsics", "test-internals"] }
+blake3 = "1.8.7"
+brotli = "8.0.4"
+crc32c = "0.6.9"
+libc = "0.2.191"
 libfuzzer-sys = "0.4"
-serde_json = "1.0.149"
-sha2 = "0.11.0"
-zstd = "0.13"
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+zstd = "0.14.4"
 
 [dev-dependencies]
 proptest = "1.6"

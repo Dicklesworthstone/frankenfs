@@ -138,7 +138,7 @@ fn ntfs_sparse_toggle_large_tail_and_hole_punch_fiemap_seek_roundtrip() {
 
     // 2. Punch middle 4 KiB cluster of the 12 KiB run -> reclaims 1 cluster!
     let (reclaimed, _) = engine
-        .punch_hole_at(
+        .punch_hole_with_options(
             &cx,
             file_ref,
             &[],

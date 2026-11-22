@@ -157,6 +157,8 @@ fn punch_nonresident(
     let EditableStreamStorage::NonResident {
         runs,
         sparse,
+        compressed,
+        encrypted,
         compression_unit,
         data_bytes,
         initialized_bytes,
@@ -164,6 +166,16 @@ fn punch_nonresident(
     else {
         return Err(corrupt(0, "hole-punch source is not nonresident"));
     };
+    if *compressed {
+        return Err(unsupported(
+            "punch_hole is not supported directly on LZNT1-compressed streams",
+        ));
+    }
+    if *encrypted {
+        return Err(unsupported(
+            "punch_hole is not supported on encrypted NTFS streams",
+        ));
+    }
     if *compression_unit != 0 && !(*sparse && *compression_unit == 4) {
         return Err(unsupported(
             "unsupported NTFS sparse compression-unit encoding",
@@ -198,6 +210,8 @@ fn punch_nonresident(
     Ok(EditableStreamStorage::NonResident {
         runs: working,
         sparse,
+        compressed: false,
+        encrypted: false,
         compression_unit: *compression_unit,
         data_bytes: *data_bytes,
         initialized_bytes: *initialized_bytes,

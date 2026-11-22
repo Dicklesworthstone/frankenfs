@@ -121,11 +121,11 @@ We only use **Cargo** in this project, NEVER any other package manager.
 
 ### Release Profile
 
-The release build optimizes for size (this is a filesystem, size matters for embedded/mount contexts):
+The release build optimizes for throughput (`opt-level = 3`) with LTO and single-codegen-unit optimization:
 
 ```toml
 [profile.release]
-opt-level = "z"       # Size-optimized
+opt-level = 3         # Max runtime performance
 lto = true            # Link-time optimization
 codegen-units = 1     # Single codegen unit for better optimization
 panic = "abort"       # No unwinding overhead

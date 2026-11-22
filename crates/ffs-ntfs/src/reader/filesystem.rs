@@ -1183,20 +1183,6 @@ impl FsOps for NtfsFs {
         op.complete(attr)
     }
 
-    fn fallocate(
-        &self,
-        cx: &Cx,
-        _scope: &mut RequestScope,
-        ino: InodeNumber,
-        offset: u64,
-        length: u64,
-        mode: i32,
-    ) -> Result<()> {
-        let op = self.operation(cx, true)?;
-        self.fallocate_locked(cx, ino, offset, length, mode)?;
-        op.complete(())
-    }
-
     fn rename(
         &self,
         cx: &Cx,
