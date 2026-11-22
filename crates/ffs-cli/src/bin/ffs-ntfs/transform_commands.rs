@@ -151,24 +151,6 @@ pub struct TxSetSparseArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct TxPunchHoleArgs {
-    #[command(flatten)]
-    pub target: TxWriteArgs,
-    pub path: String,
-    #[arg(long, conflicts_with = "stream_utf16")]
-    pub stream: Option<String>,
-    #[arg(long, value_parser = StreamName::parse, conflicts_with = "stream")]
-    pub stream_utf16: Option<StreamName>,
-    #[arg(long)]
-    pub start: u64,
-    #[arg(long)]
-    pub length: u64,
-    /// Automatically enable the SPARSE flag if not already set on the stream.
-    #[arg(long)]
-    pub auto_sparse: bool,
-}
-
-#[derive(Debug, Args)]
 pub struct TxSetCompressionArgs {
     #[command(flatten)]
     pub target: TxWriteArgs,
@@ -366,31 +348,6 @@ pub fn run_tx_set_sparse(cx: &Cx, args: &TxSetSparseArgs) -> Result<()> {
         serde_json::json!({
             "path": args.path,
             "sparse": args.enable,
-        })
-    })
-}
-
-pub fn run_tx_punch_hole(cx: &Cx, args: &TxPunchHoleArgs) -> Result<()> {
-    let stream = select_write_stream(args.stream.as_deref(), args.stream_utf16.clone())?;
-    let mut engine = args.target.open(cx, false)?;
-    let outcome = match engine.resolve_path_reference(cx, &args.path) {
-        Ok(r) => engine.punch_hole_at(
-            cx,
-            r,
-            stream.as_units(),
-            args.start,
-            args.length,
-            args.auto_sparse,
-            DEFAULT_NTFS_FILETIME,
-        ),
-        Err(err) => NtfsTxOutcome::NotCommitted(err),
-    };
-    emit_tx_outcome("tx_punch_hole", &engine, outcome, |reclaimed_clusters| {
-        serde_json::json!({
-            "path": args.path,
-            "start": args.start,
-            "length": args.length,
-            "reclaimed_clusters": reclaimed_clusters,
         })
     })
 }

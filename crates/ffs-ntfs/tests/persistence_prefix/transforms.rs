@@ -137,19 +137,23 @@ fn ntfs_sparse_toggle_large_tail_and_hole_punch_fiemap_seek_roundtrip() {
     }
 
     // 2. Punch middle 4 KiB cluster of the 12 KiB run -> reclaims 1 cluster!
-    let (reclaimed, _) = engine
+    engine
         .punch_hole_at(
             &cx,
             file_ref,
             &[],
             write_off + 4096,
             4096,
-            false,
             DEFAULT_NTFS_FILETIME,
         )
         .into_result()
         .unwrap();
-    assert_eq!(reclaimed, 1);
+    {
+        let vol = engine.volume_view(&cx).unwrap();
+        let rec = vol.resolve(&cx, "/sparse.bin").unwrap();
+        let st = vol.data_stream(&cx, &rec, &[]).unwrap();
+        assert_eq!(st.allocated, 3 * 4096); // 1 head cluster + 2 remaining clusters at 20 MiB
+    }
 
     // Verify hole zeros + intact surrounding clusters + FIEMAP/SEEK_HOLE/SEEK_DATA via NtfsFs.
     let fs = NtfsFs::from_engine(&cx, engine, 1000, 1000).unwrap();
@@ -361,12 +365,12 @@ fn ntfs_wof_decompression_on_write_materializes_plaintext_and_cleans_reparse() {
     let mut engine = open_clean_engine(&cx, &dev, vol_bytes);
     let root = engine.resolve_path_reference(&cx, "/").unwrap();
 
-    // Build an authentic single-chunk WOF XPRESS4K file (uncompressed single chunk stored
-    // verbatim in `WofCompressedData`, sparse 2048-byte placeholder unnamed `$DATA`, and
+    // Build an authentic single-chunk WOF XPRESS4K file (uncompressed single 4096-byte chunk stored
+    // verbatim in `WofCompressedData`, sparse 4096-byte initialized placeholder unnamed `$DATA`, and
     // WOF reparse tag `0x8000_0017` installed on the base record).
-    let wof_initial = b"WOF-INITIAL-PLAINTEXT-PAYLOAD-0123456789".repeat(50); // 2000 bytes (< 4096)
+    let wof_initial = b"WOF-INITIAL-PLAINTEXT-PAYLOAD-01".repeat(128); // exact 4096 bytes
     let (wof_ref, _) = engine
-        .create_file_at(&cx, root, &utf16("wof.bin"), &[])
+        .create_file_at(&cx, root, &utf16("wof.bin"), &wof_initial)
         .into_result()
         .unwrap();
     engine
@@ -374,13 +378,7 @@ fn ntfs_wof_decompression_on_write_materializes_plaintext_and_cleans_reparse() {
         .into_result()
         .unwrap();
     engine
-        .truncate_stream_at(
-            &cx,
-            wof_ref,
-            &[],
-            wof_initial.len() as u64,
-            DEFAULT_NTFS_FILETIME,
-        )
+        .punch_hole_at(&cx, wof_ref, &[], 0, 4096, DEFAULT_NTFS_FILETIME)
         .into_result()
         .unwrap();
     engine
@@ -676,8 +674,8 @@ fn ntfs_secure_intern_dedup_multistripe_256k_inheritance_hardlink_dacl_sacl_and_
         .create_file_at(&cx, root, &utf16("stripe_driver.bin"), b"x")
         .into_result()
         .unwrap();
-    // Each descriptor has 60 distinct ACEs (~2.2 KiB); 130 distinct descriptors => > 280 KiB > 256 KiB!
-    for round in 0_u32..130 {
+    // Each descriptor has 60 distinct ACEs (~1.76 KiB); 170 distinct descriptors => ~300 KiB > 256 KiB!
+    for round in 0_u32..170 {
         let mut aces = Vec::with_capacity(60);
         for k in 0_u32..60 {
             aces.push(build_simple_ace(
@@ -836,7 +834,7 @@ fn ntfs_secure_intern_dedup_multistripe_256k_inheritance_hardlink_dacl_sacl_and_
         &cx,
         Arc::clone(&dev30) as Arc<dyn ByteDevice>,
         0,
-        vol30_bytes,
+        dev30.len_bytes(),
         NtfsCheckLimits::default(),
     )
     .unwrap();
@@ -913,7 +911,13 @@ fn ntfs_reparse_symlink_junction_opaque_objid_usnjrnl_ea_and_refusals() {
     // Ordinary $DATA read & write MUST fail closed while metadata/rename preserve opaque payload!
     {
         let vol = engine.volume_view(&cx).unwrap();
-        let rec = vol.resolve(&cx, "/cloud_placeholder.bin").unwrap();
+        assert!(matches!(
+            vol.resolve(&cx, "/cloud_placeholder.bin"),
+            Err(FfsError::UnsupportedFeature(_))
+        ));
+        let rec = vol
+            .resolve_no_follow(&cx, "/cloud_placeholder.bin")
+            .unwrap();
         assert!(matches!(
             vol.data_stream(&cx, &rec, &[]),
             Err(FfsError::UnsupportedFeature(_))
@@ -937,7 +941,7 @@ fn ntfs_reparse_symlink_junction_opaque_objid_usnjrnl_ea_and_refusals() {
         .unwrap();
     {
         let vol = engine.volume_view(&cx).unwrap();
-        let rec = vol.resolve(&cx, "/cloud_moved.bin").unwrap();
+        let rec = vol.resolve_no_follow(&cx, "/cloud_moved.bin").unwrap();
         let rp = vol.reparse_point(&cx, &rec).unwrap().unwrap();
         assert_eq!(rp, opaque_rp);
     }
@@ -962,10 +966,11 @@ fn ntfs_reparse_symlink_junction_opaque_objid_usnjrnl_ea_and_refusals() {
         .into_result()
         .unwrap();
     // Duplicate GUID on a different file MUST fail with Exists!
-    assert!(matches!(
-        engine.set_object_id_at(&cx, f2, oid, DEFAULT_NTFS_FILETIME),
-        NtfsTxOutcome::NotCommitted(FfsError::Exists)
-    ));
+    let dup_oid = engine.set_object_id_at(&cx, f2, oid, DEFAULT_NTFS_FILETIME);
+    assert!(
+        matches!(dup_oid, NtfsTxOutcome::NotCommitted(FfsError::Exists)),
+        "expected duplicate object ID to fail with Exists, got {dup_oid:?}"
+    );
     {
         let vol = engine.volume_view(&cx).unwrap();
         let rec = vol.resolve(&cx, "/obj1.bin").unwrap();
@@ -1074,7 +1079,7 @@ fn ntfs_reparse_symlink_junction_opaque_objid_usnjrnl_ea_and_refusals() {
         &cx,
         Arc::clone(&dev) as Arc<dyn ByteDevice>,
         0,
-        vol_bytes,
+        dev.len_bytes(),
         NtfsCheckLimits::default(),
     )
     .unwrap();

@@ -272,13 +272,13 @@ impl NtfsFs {
         if writing {
             self.ensure_writable()?;
             self.data_target(cx, ino)?;
-            if !is_ads_ino(ino) {
+            if self.enforces_acl() && !is_ads_ino(ino) {
                 let rec = self.record(cx, ino)?;
                 self.enforce_dacl(cx, &rec, FILE_WRITE_DATA)?;
             }
         } else if self.describe(cx, ino)?.kind == FileType::Directory {
             return Err(FfsError::IsDirectory);
-        } else if !is_ads_ino(ino) {
+        } else if self.enforces_acl() && !is_ads_ino(ino) {
             let rec = self.record(cx, ino)?;
             self.enforce_dacl(cx, &rec, FILE_READ_DATA)?;
         }
@@ -543,7 +543,7 @@ impl NtfsFs {
         data: &[u8],
     ) -> Result<u32> {
         self.ensure_writable()?;
-        if !is_ads_ino(ino) {
+        if self.enforces_acl() && !is_ads_ino(ino) {
             let rec = self.record(cx, ino)?;
             self.enforce_dacl(cx, &rec, FILE_WRITE_DATA)?;
         }
@@ -580,6 +580,10 @@ impl NtfsFs {
             .is_none_or(|end| end > i64::MAX as u64)
         {
             return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EFBIG)));
+        }
+        if self.enforces_acl() && !is_ads_ino(ino) {
+            let rec = self.record(cx, ino)?;
+            self.enforce_dacl(cx, &rec, FILE_WRITE_DATA)?;
         }
         let (target, stream) = self.data_target(cx, ino)?;
         let now = system_time_to_filetime(SystemTime::now())?;
@@ -1274,49 +1278,5 @@ impl NtfsFs {
             )
         })?;
         cx.masked(|| self.describe(cx, self.inode(child_ref)?))
-    }
-
-    pub(super) fn fallocate_locked(
-        &self,
-        cx: &Cx,
-        ino: InodeNumber,
-        offset: u64,
-        length: u64,
-        mode: i32,
-    ) -> Result<()> {
-        self.ensure_writable()?;
-        if !is_ads_ino(ino) {
-            let rec = self.record(cx, ino)?;
-            self.enforce_dacl(cx, &rec, FILE_WRITE_DATA)?;
-        }
-        let (target, stream) = self.data_target(cx, ino)?;
-        let punch_keep = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
-        if mode == punch_keep {
-            let _ = self.transact(cx, |engine| {
-                engine.punch_hole_at(
-                    cx,
-                    target,
-                    &stream,
-                    offset,
-                    length,
-                    true,
-                    DEFAULT_NTFS_FILETIME,
-                )
-            })?;
-            return Ok(());
-        }
-        if mode == 0 {
-            let current = self.describe(cx, ino)?;
-            let end = offset.checked_add(length).ok_or_else(invalid_argument)?;
-            if end > current.size {
-                self.transact(cx, |engine| {
-                    engine.truncate_stream(cx, target, &stream, end)
-                })?;
-            }
-            return Ok(());
-        }
-        Err(unsupported(format!(
-            "NTFS fallocate mode {mode:#x} is not supported (admits 0 or PUNCH_HOLE|KEEP_SIZE)"
-        )))
     }
 }

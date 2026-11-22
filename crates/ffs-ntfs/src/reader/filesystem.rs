@@ -631,6 +631,13 @@ impl NtfsFs {
         })
     }
 
+    pub(super) const fn enforces_acl(&self) -> bool {
+        matches!(
+            &self.sid_policy,
+            NtfsSidPolicy::Mapped { map, .. } if map.enforce_acl
+        )
+    }
+
     pub(super) fn enforce_dacl(
         &self,
         cx: &Cx,
@@ -1003,7 +1010,7 @@ impl FsOps for NtfsFs {
         size: u32,
     ) -> Result<Vec<u8>> {
         let _op = self.operation(cx, false)?;
-        if !is_ads_ino(ino) {
+        if self.enforces_acl() && !is_ads_ino(ino) {
             let record = self.record(cx, ino)?;
             self.enforce_dacl(cx, &record, FILE_READ_DATA)?;
         }
@@ -1181,20 +1188,6 @@ impl FsOps for NtfsFs {
         let op = self.operation(cx, true)?;
         let attr = self.symlink_locked(cx, parent, name, target)?;
         op.complete(attr)
-    }
-
-    fn fallocate(
-        &self,
-        cx: &Cx,
-        _scope: &mut RequestScope,
-        ino: InodeNumber,
-        offset: u64,
-        length: u64,
-        mode: i32,
-    ) -> Result<()> {
-        let op = self.operation(cx, true)?;
-        self.fallocate_locked(cx, ino, offset, length, mode)?;
-        op.complete(())
     }
 
     fn rename(

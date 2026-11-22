@@ -1140,9 +1140,12 @@ def native_transforms_security_cases(
     command(binary, "tx-create", img, "/", "sparse.bin", *tx_flags, "--data-file", sparse_src)
     command(binary, "tx-set-sparse", img, "/sparse.bin", *tx_flags, "--enable")
     punch_rep = json.loads(command(
-        binary, "tx-punch-hole", img, "/sparse.bin", *tx_flags, "--start", "4096", "--length", "4096"
+        binary, "tx-punch-hole", img, "/sparse.bin", *tx_flags, "--start", "4096", "--bytes", "4096"
     ))
-    require(punch_rep["result"]["reclaimed_clusters"] == 1, "expected 1 reclaimed sparse cluster")
+    require(
+        punch_rep["outcome"] == "committed" and punch_rep["result"]["bytes"] == 4096,
+        "expected committed 4096-byte sparse hole punch",
+    )
     require(
         command("ntfscat", img, "/sparse.bin") == (b"S" * 4096) + (b"\x00" * 4096) + (b"S" * 4096),
         "ntfscat mismatch after sparse hole-punch",

@@ -701,11 +701,6 @@ enum Command {
         #[command(flatten)]
         options: transform_commands::TxSetSparseArgs,
     },
-    /// Punch a sparse hole and reclaim full interior clusters via a native logged transaction.
-    TxPunchHole {
-        #[command(flatten)]
-        options: transform_commands::TxPunchHoleArgs,
-    },
     /// Enable or disable native NTFS LZNT1 compression on a file or directory.
     TxSetCompression {
         #[command(flatten)]
@@ -1756,7 +1751,6 @@ fn main() -> Result<()> {
             })?;
         }
         Command::TxSetSparse { options } => transform_commands::run_tx_set_sparse(&cx, &options)?,
-        Command::TxPunchHole { options } => transform_commands::run_tx_punch_hole(&cx, &options)?,
         Command::TxSetCompression { options } => {
             transform_commands::run_tx_set_compression(&cx, &options)?;
         }

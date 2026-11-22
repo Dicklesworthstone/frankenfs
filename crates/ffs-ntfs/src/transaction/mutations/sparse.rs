@@ -1,16 +1,16 @@
 //! Logged hole punching without reading or rewriting untouched DATA extents.
 
 use super::{
-    EditableDataStream, EditableStreamStorage, MIN_USER_MFT_SLOT, NtfsTransactionEngine,
-    NtfsTxOutcome, PreparedTxPlan, TxWorkspace, checkpoint, corrupt, read_editable_stream_prefix,
-    splice_vcn_interval, stage_runs_writes, unsupported, validate_ntfs_stream_name_utf16,
+    EditableDataStream, EditableStreamStorage, FILE_ATTR_ENCRYPTED, FILE_ATTR_SPARSE_FILE,
+    MIN_USER_MFT_SLOT, NtfsTransactionEngine, NtfsTxOutcome, PreparedTxPlan, TxWorkspace,
+    checkpoint, corrupt, read_editable_stream_prefix, splice_vcn_interval, stage_runs_writes,
+    unsupported, validate_ntfs_stream_name_utf16,
 };
 use asupersync::Cx;
 use ffs_error::{FfsError, Result};
+use ffs_ondisk::ntfs::usn::{USN_REASON_CLOSE, USN_REASON_DATA_OVERWRITE};
 use ffs_ondisk::ntfs::{NtfsReference, NtfsRun};
 use std::ops::Range;
-
-const FILE_ATTR_SPARSE_FILE: u32 = 0x0000_0200;
 
 fn invalid_range(errno: i32, detail: &'static str) -> FfsError {
     FfsError::RequestRejected {
@@ -99,6 +99,12 @@ impl NtfsTransactionEngine {
         if target.record < MIN_USER_MFT_SLOT {
             return Err(FfsError::PermissionDenied);
         }
+        if stream_utf16.is_empty() && (catalog.std_flags() & FILE_ATTR_ENCRYPTED) != 0 {
+            return Err(unsupported("cannot punch hole in an encrypted NTFS file"));
+        }
+        if stream_utf16.is_empty() && catalog.reparse_point.is_some() {
+            return Err(unsupported("cannot punch hole in an NTFS reparse point"));
+        }
         let stream_index = catalog
             .data_streams
             .iter()
@@ -134,14 +140,22 @@ impl NtfsTransactionEngine {
             &storage,
             EditableStreamStorage::NonResident { sparse: true, .. }
         );
-        let catalog = ws.catalog_mut(self, cx, target)?;
-        catalog.data_streams[stream_index].storage = storage;
-        // Native FILE flags describe unnamed DATA, not independent ADS flags.
-        // Preserve an existing sparse bit even if a resident value was edited.
-        if stream_utf16.is_empty() && sparse {
-            catalog.set_std_flags(catalog.std_flags() | FILE_ATTR_SPARSE_FILE);
-        }
-        catalog.set_std_times(None, Some(now_ticks), Some(now_ticks), None);
+        let usn_snap = {
+            let catalog = ws.catalog_mut(self, cx, target)?;
+            catalog.data_streams[stream_index].storage = storage;
+            // Native FILE flags describe unnamed DATA, not independent ADS flags.
+            // Preserve an existing sparse bit even if a resident value was edited.
+            if stream_utf16.is_empty() && sparse {
+                catalog.set_std_flags(catalog.std_flags() | FILE_ATTR_SPARSE_FILE);
+            }
+            catalog.set_std_times(None, Some(now_ticks), Some(now_ticks), None);
+            catalog.clone()
+        };
+        ws.push_usn_event_for_catalog(
+            &usn_snap,
+            USN_REASON_DATA_OVERWRITE | USN_REASON_CLOSE,
+            now_ticks,
+        );
         ws.sync_target_into_parent_dirs(self, cx, target)?;
         ws.finalize(self, cx, "punch_hole_at", digest, ())
     }
@@ -157,6 +171,8 @@ fn punch_nonresident(
     let EditableStreamStorage::NonResident {
         runs,
         sparse,
+        compressed,
+        encrypted,
         compression_unit,
         data_bytes,
         initialized_bytes,
@@ -164,6 +180,16 @@ fn punch_nonresident(
     else {
         return Err(corrupt(0, "hole-punch source is not nonresident"));
     };
+    if *compressed {
+        return Err(unsupported(
+            "punch_hole is not supported directly on LZNT1-compressed streams",
+        ));
+    }
+    if *encrypted {
+        return Err(unsupported(
+            "punch_hole is not supported on encrypted NTFS streams",
+        ));
+    }
     if *compression_unit != 0 && !(*sparse && *compression_unit == 4) {
         return Err(unsupported(
             "unsupported NTFS sparse compression-unit encoding",
@@ -198,6 +224,8 @@ fn punch_nonresident(
     Ok(EditableStreamStorage::NonResident {
         runs: working,
         sparse,
+        compressed: false,
+        encrypted: false,
         compression_unit: *compression_unit,
         data_bytes: *data_bytes,
         initialized_bytes: *initialized_bytes,
