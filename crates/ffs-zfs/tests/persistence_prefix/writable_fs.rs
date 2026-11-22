@@ -2746,7 +2746,14 @@ fn file_range_fsops_late_cancellation_preserves_success_and_refreshes_next_reque
         .into_result()
         .unwrap();
     engine
-        .truncate_file(&cx, &dataset, object, 9, timestamp, ZfsDataChecksum::Fletcher4)
+        .truncate_file(
+            &cx,
+            &dataset,
+            object,
+            9,
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
         .into_result()
         .unwrap();
     let pre_txg = engine.committed_txg();

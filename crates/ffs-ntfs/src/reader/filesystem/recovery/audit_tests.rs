@@ -74,13 +74,17 @@ impl AuditLog {
     }
 
     fn audit(&self) -> Result<NtfsLogStateSummary> {
-        inspect_logfile(&Cx::for_testing(), self.bytes.len() as u64, |offset, size| {
-            let start = usize::try_from(offset).unwrap();
-            self.bytes
-                .get(start..start + size)
-                .map(<[u8]>::to_vec)
-                .ok_or_else(|| corrupt(offset, "audit fixture read beyond journal"))
-        })
+        inspect_logfile(
+            &Cx::for_testing(),
+            self.bytes.len() as u64,
+            |offset, size| {
+                let start = usize::try_from(offset).unwrap();
+                self.bytes
+                    .get(start..start + size)
+                    .map(<[u8]>::to_vec)
+                    .ok_or_else(|| corrupt(offset, "audit fixture read beyond journal"))
+            },
+        )
     }
 }
 
@@ -108,11 +112,9 @@ fn checkpoint_with_tables(forget: bool) -> (AuditLog, AppendedLogRecord) {
     let mut log = AuditLog::new(PAGE, (1, 1), LOG);
     let entry = encode_open_attribute_entry(0x80, 0, (1_u64 << 48) | 16, 0);
     let attributes = encode_restart_table(40, &BTreeMap::from([(24, entry.to_vec())])).unwrap();
-    let names = encode_attribute_names_dump(&BTreeMap::from([(
-        24,
-        "stream".encode_utf16().collect(),
-    )]))
-    .unwrap();
+    let names =
+        encode_attribute_names_dump(&BTreeMap::from([(24, "stream".encode_utf16().collect())]))
+            .unwrap();
     let attribute_len = u32::try_from(attributes.len()).unwrap();
     let names_len = u32::try_from(names.len()).unwrap();
     let attribute_record = log.append(
@@ -179,12 +181,16 @@ fn audit_keeps_the_full_formatter_journal_limit_with_bounded_reads() {
     let mut log = AuditLog::new(PAGE, (1, 1), ERASED_SCAN_LIMIT as usize);
     log.checkpoint(&empty_checkpoint(), true);
     let mut read_bytes = 0_u64;
-    let state = inspect_logfile(&Cx::for_testing(), log.bytes.len() as u64, |offset, size| {
-        assert!(size <= 65_536);
-        read_bytes += size as u64;
-        let start = usize::try_from(offset).unwrap();
-        Ok(log.bytes[start..start + size].to_vec())
-    })
+    let state = inspect_logfile(
+        &Cx::for_testing(),
+        log.bytes.len() as u64,
+        |offset, size| {
+            assert!(size <= 65_536);
+            read_bytes += size as u64;
+            let start = usize::try_from(offset).unwrap();
+            Ok(log.bytes[start..start + size].to_vec())
+        },
+    )
     .unwrap();
     assert!(state.clean);
     assert_eq!(state.file_size, ERASED_SCAN_LIMIT);
@@ -205,7 +211,10 @@ fn audit_decodes_open_attribute_and_name_tables_before_reporting_clean() {
 #[test]
 fn clean_flag_cannot_hide_checkpoint_damage_or_unfinished_transactions() {
     let (unfinished, _) = checkpoint_with_tables(false);
-    assert!(matches!(unfinished.audit(), Err(FfsError::Corruption { .. })));
+    assert!(matches!(
+        unfinished.audit(),
+        Err(FfsError::Corruption { .. })
+    ));
 
     let (mut bad_reference, checkpoint) = checkpoint_with_tables(true);
     bad_reference.edit_page(checkpoint.page_vbo as usize, b"RCRD", |page| {
@@ -213,7 +222,10 @@ fn clean_flag_cannot_hide_checkpoint_damage_or_unfinished_transactions() {
         // A table length without its LSN must not be ignored by a flat scan.
         page[payload + 16..payload + 24].fill(0);
     });
-    assert!(matches!(bad_reference.audit(), Err(FfsError::Corruption { .. })));
+    assert!(matches!(
+        bad_reference.audit(),
+        Err(FfsError::Corruption { .. })
+    ));
 
     let (mut torn, checkpoint) = checkpoint_with_tables(true);
     torn.bytes[checkpoint.page_vbo as usize + 511] ^= 1;

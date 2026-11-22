@@ -285,8 +285,7 @@ fn assess(cx: &Cx, length: u64, read: impl FnMut(u64, usize) -> Result<Vec<u8>>)
 }
 
 fn restart(cx: &Cx, page: Vec<u8>, stream_length: u64) -> Result<Restart> {
-    restart_state(cx, page, stream_length)?
-        .ok_or_else(|| corrupt(0, "torn $LogFile restart page"))
+    restart_state(cx, page, stream_length)?.ok_or_else(|| corrupt(0, "torn $LogFile restart page"))
 }
 
 /// Only a failed USA trailer is a torn copy. Unsupported layouts and every

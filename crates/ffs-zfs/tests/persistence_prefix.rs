@@ -8052,7 +8052,8 @@ fn file_range_large_sparse_edits_skip_holes_and_extend_without_allocation() {
     assert_eq!(head.read(&cx, file, 1024, 4096).unwrap(), vec![0; 4096]);
     assert_eq!(head.read(&cx, file, FAR, 4).unwrap(), b"\0\0\0L");
     assert_eq!(
-        head.seek(&cx, file, 4096, ffs_core::SeekWhence::Data).unwrap(),
+        head.seek(&cx, file, 4096, ffs_core::SeekWhence::Data)
+            .unwrap(),
         FAR
     );
     let used = head.stat(&cx, file).unwrap().1;
@@ -8092,7 +8093,10 @@ fn file_range_large_sparse_edits_skip_holes_and_extend_without_allocation() {
     let mut head = file_range_head(&cx, &engine);
     assert_eq!(head.stat(&cx, file).unwrap().1, 0);
     assert_eq!(head.stat(&cx, file).unwrap().0.size, NEW_EOF);
-    assert_eq!(head.seek(&cx, file, 0, ffs_core::SeekWhence::Hole).unwrap(), 0);
+    assert_eq!(
+        head.seek(&cx, file, 0, ffs_core::SeekWhence::Hole).unwrap(),
+        0
+    );
     assert_eq!(
         head.seek(&cx, file, 0, ffs_core::SeekWhence::Data)
             .unwrap_err()

@@ -376,7 +376,11 @@ fn wire_readdirplus_cannot_reintroduce_cached_aliases_on_writable_mounts() {
                 );
             }
             for ino in [2, 3] {
-                assert_eq!(lookups.count(ino), 1, "zero TTL still owns a lookup reference");
+                assert_eq!(
+                    lookups.count(ino),
+                    1,
+                    "zero TTL still owns a lookup reference"
+                );
             }
         });
     }

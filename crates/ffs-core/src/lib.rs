@@ -75877,13 +75877,8 @@ mod tests {
             );
         }
         assert!(
-            FsOps::directory_has_name_aliases(
-                &fs,
-                &cx,
-                &mut RequestScope::empty(),
-                dir_ino,
-            )
-            .unwrap()
+            FsOps::directory_has_name_aliases(&fs, &cx, &mut RequestScope::empty(), dir_ino,)
+                .unwrap()
         );
 
         // 1. create + casefold NFD lookup (precomposed vs decomposed + upper).
@@ -75891,12 +75886,7 @@ mod tests {
             .create(&cx, dir_ino, OsStr::new("café.txt"), 0o644, 0, 0)
             .expect("non-ASCII create in casefold htree dir");
         assert!(matches!(
-            FsOps::directory_has_name_aliases(
-                &fs,
-                &cx,
-                &mut RequestScope::empty(),
-                cafe.ino,
-            ),
+            FsOps::directory_has_name_aliases(&fs, &cx, &mut RequestScope::empty(), cafe.ino,),
             Err(FfsError::NotDirectory)
         ));
         assert_eq!(

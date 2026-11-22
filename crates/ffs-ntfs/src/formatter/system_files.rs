@@ -448,14 +448,16 @@ fn build_clean_logfile(cx: &Cx, logfile_bytes: u64) -> Result<Vec<u8>> {
     copy_page(&mut out, rstr1.page_vbo, &rstr1.bytes)?;
     copy_page(&mut out, appended.page_vbo, &appended.protected_page)?;
 
-    let verified = crate::reader::filesystem::inspect_logfile(cx, logfile_bytes, |offset, size| {
-        let start = usize::try_from(offset).map_err(|_| format_err("logfile offset overflow"))?;
-        let end = start
-            .checked_add(size)
-            .filter(|end| *end <= out.len())
-            .ok_or_else(|| format_err("logfile audit read exceeds serialized bytes"))?;
-        Ok(out[start..end].to_vec())
-    })?;
+    let verified =
+        crate::reader::filesystem::inspect_logfile(cx, logfile_bytes, |offset, size| {
+            let start =
+                usize::try_from(offset).map_err(|_| format_err("logfile offset overflow"))?;
+            let end = start
+                .checked_add(size)
+                .filter(|end| *end <= out.len())
+                .ok_or_else(|| format_err("logfile audit read exceeds serialized bytes"))?;
+            Ok(out[start..end].to_vec())
+        })?;
     if !verified.clean
         || verified.erased
         || verified.current_lsn != appended.lsn
