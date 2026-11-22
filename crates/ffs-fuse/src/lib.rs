@@ -8622,12 +8622,10 @@ impl FrankenFuse {
     }
 
     fn entry_ttl_for_parent(&self, cx: &Cx, parent: u64) -> Duration {
-        let is_casefold = if let Some(cached) = self.inner.casefold_dirs.get(parent) {
-            cached
-        } else {
+        let is_casefold = self.inner.casefold_dirs.get(parent).unwrap_or_else(|| {
             let mut scope = RequestScope::empty();
             self.parent_is_casefold_in_scope(cx, &mut scope, parent)
-        };
+        });
         if is_casefold {
             Duration::ZERO
         } else {
@@ -8691,11 +8689,7 @@ impl FrankenFuse {
             }
         }) {
             Ok((attr, ttl)) => {
-                let entry_ttl = if parent_casefold {
-                    Duration::ZERO
-                } else {
-                    ttl
-                };
+                let entry_ttl = if parent_casefold { Duration::ZERO } else { ttl };
                 self.inner.lookup_refcounts.retain(attr.ino.0);
                 reply.entry(&entry_ttl, &to_file_attr(&attr), attr.generation);
             }
@@ -12623,10 +12617,7 @@ mod tests {
     #[test]
     fn immutable_aliased_namespace_preserves_entry_caching() {
         let (fuse, _) = name_alias_test_fuse(true);
-        for (name, node, ttl) in [
-            ("present", 7, ATTR_TTL),
-            ("missing", 0, NEGATIVE_ENTRY_TTL),
-        ] {
+        for (name, node, ttl) in [("present", 7, ATTR_TTL), ("missing", 0, NEGATIVE_ENTRY_TTL)] {
             let sender = RecordingSender::default();
             fuse.lookup_impl(
                 2,
