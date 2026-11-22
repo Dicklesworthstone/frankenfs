@@ -67,8 +67,8 @@ impl AuditLog {
         record
     }
 
-    fn edit_page(&mut self, offset: usize, signature: &[u8; 4], edit: impl FnOnce(&mut [u8])) {
-        let mut page = restore_record(&self.bytes[offset..offset + self.page], signature).unwrap();
+    fn edit_page(&mut self, offset: usize, signature: [u8; 4], edit: impl FnOnce(&mut [u8])) {
+        let mut page = restore_record(&self.bytes[offset..offset + self.page], &signature).unwrap();
         edit(&mut page);
         self.bytes[offset..offset + self.page].copy_from_slice(&protect_record(&page).unwrap());
     }
@@ -217,7 +217,7 @@ fn clean_flag_cannot_hide_checkpoint_damage_or_unfinished_transactions() {
     ));
 
     let (mut bad_reference, checkpoint) = checkpoint_with_tables(true);
-    bad_reference.edit_page(checkpoint.page_vbo as usize, b"RCRD", |page| {
+    bad_reference.edit_page(checkpoint.page_vbo as usize, *b"RCRD", |page| {
         let payload = usize::from(checkpoint.record_offset) + 48;
         // A table length without its LSN must not be ignored by a flat scan.
         page[payload + 16..payload + 24].fill(0);
@@ -285,7 +285,7 @@ fn only_a_real_restart_trailer_tear_is_reported_as_a_torn_copy() {
     for field in 0..4 {
         let mut log = AuditLog::new(PAGE, (1, 1), LOG);
         log.checkpoint(&empty_checkpoint(), true);
-        log.edit_page(PAGE, b"RSTR", |page| {
+        log.edit_page(PAGE, *b"RSTR", |page| {
             let area = usize::from(u16_at(page, 24).unwrap());
             let client = area + usize::from(u16_at(page, area + 22).unwrap());
             match field {
@@ -307,7 +307,7 @@ fn only_a_real_restart_trailer_tear_is_reported_as_a_torn_copy() {
 fn equal_lsn_restart_disagreement_is_not_an_empty_or_clean_journal() {
     let mut log = AuditLog::new(PAGE, (1, 1), LOG);
     log.checkpoint(&empty_checkpoint(), true);
-    log.edit_page(PAGE, b"RSTR", |page| {
+    log.edit_page(PAGE, *b"RSTR", |page| {
         let area = usize::from(u16_at(page, 24).unwrap());
         page[area + 14..area + 16].copy_from_slice(&0_u16.to_le_bytes());
     });

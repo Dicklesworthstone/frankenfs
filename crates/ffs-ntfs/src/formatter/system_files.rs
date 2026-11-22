@@ -458,11 +458,16 @@ fn build_clean_logfile(cx: &Cx, logfile_bytes: u64) -> Result<Vec<u8>> {
                 .ok_or_else(|| format_err("logfile audit read exceeds serialized bytes"))?;
             Ok(out[start..end].to_vec())
         })?;
+    let expected_lsn = appended.lsn;
     if !verified.clean
         || verified.erased
-        || verified.current_lsn != appended.lsn
-        || verified.oldest_lsn != appended.lsn
-        || verified.client_restart_lsn != appended.lsn
+        || [
+            verified.current_lsn,
+            verified.oldest_lsn,
+            verified.client_restart_lsn,
+        ]
+        .iter()
+        .any(|&lsn| lsn != expected_lsn)
     {
         return Err(format_err(
             "freshly formatted $LogFile failed clean self-check",

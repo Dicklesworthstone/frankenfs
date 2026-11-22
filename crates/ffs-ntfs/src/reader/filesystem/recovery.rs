@@ -64,7 +64,7 @@ pub(super) fn admit(cx: &Cx, volume: &NtfsVolume) -> Result<()> {
 /// Inspect a journal without replay or write authority. Clean active journals
 /// must carry a fully validated native checkpoint; the flat physical-action
 /// parser deliberately cannot supply this checkpoint-aware audit.
-pub(crate) fn inspect_logfile(
+pub fn inspect_logfile(
     cx: &Cx,
     length: u64,
     mut read: impl FnMut(u64, usize) -> Result<Vec<u8>>,

@@ -21,7 +21,6 @@ pub use mutations::{
     validate_ntfs_stream_name_utf16,
 };
 pub use ops::DEFAULT_NTFS_FILETIME;
-pub(crate) use recovery::audit_logfile_buffer;
 pub use secondary::{NtfsObjectIdData, NtfsUsnSummary};
 
 use std::collections::BTreeMap;
