@@ -2719,11 +2719,25 @@ fn file_range_fsops_late_cancellation_preserves_success_and_refreshes_next_reque
         seconds: 1_730_000_005,
         nanos: 0,
     };
+    let (object, _) = engine
+        .create_file(
+            &cx,
+            &dataset,
+            2,
+            b"hello.txt",
+            0o644,
+            1000,
+            1000,
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .expect("create the file before exercising committed cancellation");
     engine
         .write_file_data(
             &cx,
             &dataset,
-            4,
+            object,
             0,
             b"abcdefghi",
             timestamp,
@@ -2732,7 +2746,7 @@ fn file_range_fsops_late_cancellation_preserves_success_and_refreshes_next_reque
         .into_result()
         .unwrap();
     engine
-        .truncate_file(&cx, &dataset, 4, 9, timestamp, ZfsDataChecksum::Fletcher4)
+        .truncate_file(&cx, &dataset, object, 9, timestamp, ZfsDataChecksum::Fletcher4)
         .into_result()
         .unwrap();
     let pre_txg = engine.committed_txg();

@@ -10,6 +10,8 @@ mod lifetime;
 mod recovery;
 mod writable;
 
+pub(crate) use recovery::inspect_logfile;
+
 use super::{
     Cx, DATA, FfsError, NtfsFileRecord, NtfsReference, NtfsValue, NtfsVolume, Result, Stream,
     checkpoint, corrupt, parse, relative_link_target, unsupported,
@@ -881,6 +883,17 @@ impl NtfsFs {
 }
 
 impl FsOps for NtfsFs {
+    fn directory_has_name_aliases(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        _parent: InodeNumber,
+    ) -> Result<bool> {
+        checkpoint(cx)?;
+        // $UpCase matching, DOS aliases and ADS spellings share entry identities.
+        Ok(true)
+    }
+
     fn requires_stateful_open(&self) -> bool {
         self.is_writable()
     }

@@ -1111,6 +1111,28 @@ pub trait FsOps: Send + Sync {
             .collect()
     }
 
+    /// Whether distinct byte spellings can address one directory entry.
+    ///
+    /// Case folding, normalization and short-name aliases require this to
+    /// return true. A transport whose name cache compares raw bytes cannot
+    /// invalidate every alias after a mutation, including cached misses for a
+    /// newly created entry. Such a transport must revalidate names in writable
+    /// directories that return true. Attribute and file-data caching are
+    /// independent of this policy.
+    ///
+    /// The default describes an exact-byte namespace. Backends may
+    /// conservatively return true without resolving the parent; the directory
+    /// operation itself still validates its arguments. Errors must propagate
+    /// before a namespace mutation, never be interpreted as an exact match.
+    fn directory_has_name_aliases(
+        &self,
+        _cx: &Cx,
+        _scope: &mut RequestScope,
+        _parent: InodeNumber,
+    ) -> ffs_error::Result<bool> {
+        Ok(false)
+    }
+
     /// Look up a directory entry by name.
     ///
     /// Returns the attributes of the child inode named `name` within the
@@ -3242,6 +3264,15 @@ impl<T: FsOps + ?Sized> FsOps for Arc<T> {
         self.as_ref().getattr(cx, scope, ino)
     }
 
+    fn directory_has_name_aliases(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        parent: InodeNumber,
+    ) -> ffs_error::Result<bool> {
+        self.as_ref().directory_has_name_aliases(cx, scope, parent)
+    }
+
     fn lookup(
         &self,
         cx: &Cx,
@@ -4470,6 +4501,15 @@ macro_rules! delegate_fs_ops {
             ino: $crate::vfs::__delegate_support::InodeNumber,
         ) -> $crate::vfs::__delegate_support::Result<$crate::vfs::__delegate_support::InodeAttr> {
             ($target).getattr(cx, scope, ino)
+        }
+
+        fn directory_has_name_aliases(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            parent: $crate::vfs::__delegate_support::InodeNumber,
+        ) -> $crate::vfs::__delegate_support::Result<bool> {
+            ($target).directory_has_name_aliases(cx, scope, parent)
         }
 
         fn lookup(
@@ -6445,6 +6485,15 @@ mod fs_ops_wrapper_completeness_pins {
             self.record("getattr");
             Ok(Self::dummy_attr(ino))
         }
+        fn directory_has_name_aliases(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _parent: InodeNumber,
+        ) -> ffs_error::Result<bool> {
+            self.record("directory_has_name_aliases");
+            Ok(true)
+        }
         fn lookup(
             &self,
             _cx: &Cx,
@@ -7669,6 +7718,7 @@ mod fs_ops_wrapper_completeness_pins {
         ops.install_open_handle_oracle(Arc::new(|_| 0));
         let _ = ops.finalize_unlinked_inode(&cx, &mut s, ino);
         let _ = ops.getattr(&cx, &mut s, ino);
+        assert!(ops.directory_has_name_aliases(&cx, &mut s, ino).unwrap());
         let _ = ops.lookup(&cx, &mut s, ino, name);
         let _ = ops.readdir(&cx, &mut s, ino, 0);
         let _ = ops.read(&cx, &mut s, ino, 0, 16);

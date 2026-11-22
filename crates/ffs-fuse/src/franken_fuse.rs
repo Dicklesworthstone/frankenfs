@@ -752,8 +752,15 @@ impl FrankenFuse {
             gid,
             flags,
         ) {
-            Ok((attr, fh, open_flags)) => {
-                let entry_ttl = self.entry_ttl_for_parent(&cx, parent);
+            Ok((attr, fh, open_flags, ttl)) => {
+                let entry_ttl = {
+                    let parent_ttl = self.entry_ttl_for_parent(&cx, parent);
+                    if parent_ttl.is_zero() {
+                        parent_ttl
+                    } else {
+                        ttl
+                    }
+                };
                 self.inner.lookup_refcounts.retain(attr.ino.0);
                 reply.created(
                     &entry_ttl,
@@ -789,16 +796,17 @@ impl FrankenFuse {
         uid: u32,
         gid: u32,
         flags: i32,
-    ) -> ffs_error::Result<(InodeAttr, u64, u32)> {
+    ) -> ffs_error::Result<(InodeAttr, u64, u32, Duration)> {
         let mut opened = None;
         let result = self.with_request_scope(cx, RequestOp::Create, |cx, scope| {
+            let ttl = self.entry_reply_ttl(cx, scope, parent)?;
             let reply = self
                 .inner
                 .ops
                 .create_open(cx, scope, parent, name, mode, uid, gid, flags)?;
             opened = Some((reply.0.ino, reply.1));
             self.inner.ops.commit_request_scope(cx, scope)?;
-            Ok(reply)
+            Ok((reply.0, reply.1, reply.2, ttl))
         });
         if result.is_err()
             && let Some((ino, fh)) = opened
@@ -893,6 +901,7 @@ impl FrankenFuse {
         let name = owned_name.as_os_str();
 
         self.dispatch_mkdir(parent, name, mode, uid, gid)
+            .map(|(attr, _ttl)| attr)
             .map_err(|error| match error {
                 MutationDispatchError::Errno(errno) => errno,
                 MutationDispatchError::Operation { error, .. } => error.to_errno(),
@@ -965,6 +974,7 @@ impl FrankenFuse {
         let name = owned_name.as_os_str();
 
         self.dispatch_mknod(parent, name, mode, rdev, uid, gid)
+            .map(|(attr, _ttl)| attr)
             .map_err(|error| match error {
                 MutationDispatchError::Errno(errno) => errno,
                 MutationDispatchError::Operation { error, .. } => error.to_errno(),
@@ -1182,13 +1192,28 @@ impl FrankenFuse {
         reply.error(ctx.log_and_errno());
     }
 
+    /// Raw-byte kernel dentries cannot track casefolded or short-name aliases.
+    /// Select the policy in the operation's own scope, before any mutation.
+    fn entry_reply_ttl(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        parent: InodeNumber,
+    ) -> ffs_error::Result<Duration> {
+        if self.inner.read_only || !self.inner.ops.directory_has_name_aliases(cx, scope, parent)? {
+            Ok(ATTR_TTL)
+        } else {
+            Ok(Duration::ZERO)
+        }
+    }
+
     /// Reply to `LOOKUP` with a protocol negative entry, not merely `ENOENT`.
     ///
     /// Linux caches a `fuse_entry_out` whose node id is zero for `entry_valid`.
     /// `ReplyEntry::error(ENOENT)` deliberately carries no such validity, so it
     /// makes every repeated miss cross FUSE again. The remaining attribute
     /// fields are ignored for a zero node id.
-    fn reply_negative_entry(reply: ReplyEntry) {
+    fn reply_negative_entry(reply: ReplyEntry, ttl: Duration) {
         let negative = FileAttr {
             ino: 0,
             size: 0,
@@ -1206,7 +1231,7 @@ impl FrankenFuse {
             blksize: 0,
             flags: 0,
         };
-        reply.entry(&NEGATIVE_ENTRY_TTL, &negative, 0);
+        reply.entry(&ttl.min(NEGATIVE_ENTRY_TTL), &negative, 0);
     }
 
     fn reply_error_data(ctx: &FuseErrorContext<'_>, reply: ReplyData) {
@@ -3814,18 +3839,19 @@ impl FrankenFuse {
         mode: u16,
         uid: u32,
         gid: u32,
-    ) -> Result<InodeAttr, MutationDispatchError> {
+    ) -> Result<(InodeAttr, Duration), MutationDispatchError> {
         let cx = self.cx_for_request();
         self.enforce_mutation_guards(&cx, RequestOp::Mkdir, parent)?;
         {
             let _inode_guards = self.acquire_mutation_inode_guards(&[InodeNumber(parent)]);
             self.with_request_scope(&cx, RequestOp::Mkdir, |cx, scope| {
+                let ttl = self.entry_reply_ttl(cx, scope, InodeNumber(parent))?;
                 let attr =
                     self.inner
                         .ops
                         .mkdir(cx, scope, InodeNumber(parent), name, mode, uid, gid)?;
                 self.inner.ops.commit_request_scope(cx, scope)?;
-                Ok(attr)
+                Ok((attr, ttl))
             })
         }
         .map_err(|error| MutationDispatchError::Operation {
@@ -3881,7 +3907,7 @@ impl FrankenFuse {
         rdev: u32,
         uid: u32,
         gid: u32,
-    ) -> Result<InodeAttr, MutationDispatchError> {
+    ) -> Result<(InodeAttr, Duration), MutationDispatchError> {
         let cx = self.cx_for_request();
         self.enforce_mutation_guards(&cx, RequestOp::Create, parent)?;
 
@@ -3896,6 +3922,7 @@ impl FrankenFuse {
             return {
                 let _inode_guards = self.acquire_mutation_inode_guards(&[InodeNumber(parent)]);
                 self.with_request_scope(&cx, RequestOp::Create, |cx, scope| {
+                    let ttl = self.entry_reply_ttl(cx, scope, InodeNumber(parent))?;
                     let attr = self.inner.ops.create(
                         cx,
                         scope,
@@ -3906,7 +3933,7 @@ impl FrankenFuse {
                         gid,
                     )?;
                     self.inner.ops.commit_request_scope(cx, scope)?;
-                    Ok(attr)
+                    Ok((attr, ttl))
                 })
             }
             .map_err(|error| MutationDispatchError::Operation {
@@ -3931,6 +3958,7 @@ impl FrankenFuse {
         {
             let _inode_guards = self.acquire_mutation_inode_guards(&[InodeNumber(parent)]);
             self.with_request_scope(&cx, RequestOp::Create, |cx, scope| {
+                let ttl = self.entry_reply_ttl(cx, scope, InodeNumber(parent))?;
                 let attr = self.inner.ops.mknod(
                     cx,
                     scope,
@@ -3942,7 +3970,7 @@ impl FrankenFuse {
                     gid,
                 )?;
                 self.inner.ops.commit_request_scope(cx, scope)?;
-                Ok(attr)
+                Ok((attr, ttl))
             })
         }
         .map_err(|error| MutationDispatchError::Operation {

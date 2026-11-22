@@ -3,6 +3,7 @@
 
 use std::cmp::Ordering;
 
+use asupersync::Cx;
 use ffs_error::{FfsError, Result};
 use ffs_ondisk::ntfs::index::{NtfsFileName, NtfsIndexRoot, encode_index_entry, parse_index_block};
 use ffs_ondisk::ntfs::logfile_writer::{
@@ -420,7 +421,7 @@ fn build_leaf_indx_block(index_bytes: u32, leaf_entries: &[Vec<u8>]) -> Result<V
     Ok(protected)
 }
 
-fn build_clean_logfile(logfile_bytes: u64) -> Result<Vec<u8>> {
+fn build_clean_logfile(cx: &Cx, logfile_bytes: u64) -> Result<Vec<u8>> {
     let total = usize::try_from(logfile_bytes).map_err(|_| format_err("logfile_bytes overflow"))?;
     let mut ring = NtfsLogRingWriter::new_fresh(4_096, (1, 1), logfile_bytes, 1, 1)
         .map_err(|e| parse_err(&e))?;
@@ -447,11 +448,19 @@ fn build_clean_logfile(logfile_bytes: u64) -> Result<Vec<u8>> {
     copy_page(&mut out, rstr1.page_vbo, &rstr1.bytes)?;
     copy_page(&mut out, appended.page_vbo, &appended.protected_page)?;
 
-    let verified = crate::transaction::audit_logfile_buffer(&out)?;
-    if !verified.summary.clean
-        || verified.flags & 0x0002 == 0
-        || verified.redo_actions != 0
-        || verified.undo_actions != 0
+    let verified = crate::reader::filesystem::inspect_logfile(cx, logfile_bytes, |offset, size| {
+        let start = usize::try_from(offset).map_err(|_| format_err("logfile offset overflow"))?;
+        let end = start
+            .checked_add(size)
+            .filter(|end| *end <= out.len())
+            .ok_or_else(|| format_err("logfile audit read exceeds serialized bytes"))?;
+        Ok(out[start..end].to_vec())
+    })?;
+    if !verified.clean
+        || verified.erased
+        || verified.current_lsn != appended.lsn
+        || verified.oldest_lsn != appended.lsn
+        || verified.client_restart_lsn != appended.lsn
     {
         return Err(format_err(
             "freshly formatted $LogFile failed clean self-check",
@@ -476,6 +485,7 @@ fn mark_bitmap_span(bitmap: &mut [u8], start: u64, count: u64) {
 /// `$I30` index, or `FILE` record fails round-trip self-verification.
 #[allow(clippy::too_many_lines)]
 pub fn build_bootstrap_volume(
+    cx: &Cx,
     layout: &NtfsFormatLayout,
     label: &str,
     filetime: u64,
@@ -526,7 +536,7 @@ pub fn build_bootstrap_volume(
     )
     .map_err(|e| parse_err(&e))?;
 
-    let logfile_bytes = build_clean_logfile(layout.logfile_bytes)?;
+    let logfile_bytes = build_clean_logfile(cx, layout.logfile_bytes)?;
 
     // 3. $Bitmap covering exact allocated bootstrap runs.
     let mut bitmap_bytes = vec![

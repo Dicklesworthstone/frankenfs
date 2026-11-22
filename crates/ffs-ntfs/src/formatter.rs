@@ -529,7 +529,7 @@ pub fn format_device(
 
     let label_str = opts.label.clone().unwrap_or_default();
     let filetime = opts.timestamp_100ns.unwrap_or(DEFAULT_NTFS_FILETIME);
-    let built = system_files::build_bootstrap_volume(&layout, &label_str, filetime)?;
+    let built = system_files::build_bootstrap_volume(cx, &layout, &label_str, filetime)?;
 
     // Ensure offset 0..sector_bytes is explicitly zeroed while writing (primary VBR withheld).
     let zero_vbr = vec![0_u8; built.vbr_sector.len()];

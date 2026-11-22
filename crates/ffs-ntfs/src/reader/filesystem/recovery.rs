@@ -14,6 +14,9 @@
 mod record;
 mod selection;
 
+#[cfg(test)]
+mod audit_tests;
+
 use super::super::Storage;
 use super::{Cx, NtfsVolume, Result, Stream, checkpoint, corrupt, unsupported};
 
@@ -56,6 +59,100 @@ pub(super) fn admit(cx: &Cx, volume: &NtfsVolume) -> Result<()> {
         |offset, size| volume.read(cx, &stream, offset, size),
         Some(volume),
     )
+}
+
+/// Inspect a journal without replay or write authority. Clean active journals
+/// must carry a fully validated native checkpoint; the flat physical-action
+/// parser deliberately cannot supply this checkpoint-aware audit.
+pub(crate) fn inspect_logfile(
+    cx: &Cx,
+    length: u64,
+    mut read: impl FnMut(u64, usize) -> Result<Vec<u8>>,
+) -> Result<crate::transaction::NtfsLogStateSummary> {
+    checkpoint(cx)?;
+    if !(MIN_LOG..=MAX_LOG).contains(&length) || !length.is_multiple_of(SECTOR as u64) {
+        return Err(corrupt(0, "invalid $LogFile initialized length"));
+    }
+    if length > ERASED_SCAN_LIMIT {
+        return Err(unsupported("$LogFile read-only audit exceeds 64 MiB"));
+    }
+    let prefix = read_exact(cx, length, 0, SECTOR, &mut read)?;
+    if prefix.iter().all(|byte| *byte == 0xFF) {
+        let mut offset = SECTOR as u64;
+        while offset < length {
+            let size = (length - offset).min(MAX_PAGE as u64) as usize;
+            let part = read_exact(cx, length, offset, size, &mut read)?;
+            if part.iter().any(|byte| *byte != 0xFF) {
+                return Err(corrupt(offset, "partially erased $LogFile"));
+            }
+            offset += size as u64;
+        }
+        return Ok(crate::transaction::NtfsLogStateSummary {
+            erased: true,
+            clean: true,
+            version: (0, 0),
+            page_size: 4096,
+            file_size: length,
+            oldest_lsn: 0,
+            current_lsn: 0,
+            client_restart_lsn: 0,
+            torn_rstr_slot: None,
+        });
+    }
+
+    let system_page = page_size(u32_at(&prefix, 16)?)?;
+    let primary = if system_page == SECTOR {
+        prefix
+    } else {
+        read_exact(cx, length, 0, system_page, &mut read)?
+    };
+    let first = restart_state(cx, primary, length)?;
+    let second = restart_state(
+        cx,
+        read_exact(cx, length, system_page as u64, system_page, &mut read)?,
+        length,
+    )?;
+    match (first, second) {
+        (Some(first), Some(second)) => inspect_selected(
+            cx,
+            selection::choose(&first, &second)?,
+            length,
+            None,
+            &mut read,
+        ),
+        (Some(valid), None) => inspect_selected(cx, &valid, length, Some(1), &mut read),
+        (None, Some(valid)) => inspect_selected(cx, &valid, length, Some(0), &mut read),
+        (None, None) => Err(corrupt(0, "both $LogFile restart pages are torn")),
+    }
+}
+
+fn inspect_selected(
+    cx: &Cx,
+    selected: &Restart,
+    length: u64,
+    torn_rstr_slot: Option<usize>,
+    read: &mut impl FnMut(u64, usize) -> Result<Vec<u8>>,
+) -> Result<crate::transaction::NtfsLogStateSummary> {
+    let mut current_lsn = selected.current_lsn;
+    if selected.active_client_seq.is_some() {
+        if selected.clean {
+            record::validate_clean_checkpoint(cx, selected, length, read)?;
+        } else {
+            current_lsn = record::validate_dirty_audit(cx, selected, length, read)?;
+        }
+    }
+    checkpoint(cx)?;
+    Ok(crate::transaction::NtfsLogStateSummary {
+        erased: false,
+        clean: selected.clean && torn_rstr_slot.is_none(),
+        version: selected.version,
+        page_size: selected.log_page,
+        file_size: selected.file_size,
+        oldest_lsn: selected.active_client_oldest_lsn.unwrap_or(0),
+        current_lsn,
+        client_restart_lsn: selected.active_client_restart_lsn.unwrap_or(0),
+        torn_rstr_slot,
+    })
 }
 
 fn validate_storage(stream: &Stream) -> Result<()> {
@@ -187,7 +284,14 @@ fn assess(cx: &Cx, length: u64, read: impl FnMut(u64, usize) -> Result<Vec<u8>>)
     assess_volume(cx, length, read, None)
 }
 
-fn restart(cx: &Cx, mut page: Vec<u8>, stream_length: u64) -> Result<Restart> {
+fn restart(cx: &Cx, page: Vec<u8>, stream_length: u64) -> Result<Restart> {
+    restart_state(cx, page, stream_length)?
+        .ok_or_else(|| corrupt(0, "torn $LogFile restart page"))
+}
+
+/// Only a failed USA trailer is a torn copy. Unsupported layouts and every
+/// semantic error in a protected restart remain errors, never repair authority.
+fn restart_state(cx: &Cx, mut page: Vec<u8>, stream_length: u64) -> Result<Option<Restart>> {
     checkpoint(cx)?;
     if bytes::<4>(&page, 0)? != *b"RSTR" || u64_at(&page, 8)? != 0 {
         return Err(corrupt(
@@ -230,7 +334,7 @@ fn restart(cx: &Cx, mut page: Vec<u8>, stream_length: u64) -> Result<Restart> {
     for sector in 1..count {
         checkpoint(cx)?;
         if bytes::<2>(&page, sector * SECTOR - 2)? != token {
-            return Err(corrupt(0, "torn $LogFile restart page"));
+            return Ok(None);
         }
     }
     for sector in 1..count {
@@ -322,7 +426,7 @@ fn restart(cx: &Cx, mut page: Vec<u8>, stream_length: u64) -> Result<Restart> {
         }
     }
     checkpoint(cx)?;
-    Ok(Restart {
+    Ok(Some(Restart {
         system_page,
         log_page,
         version,
@@ -337,7 +441,7 @@ fn restart(cx: &Cx, mut page: Vec<u8>, stream_length: u64) -> Result<Restart> {
         active_client_oldest_lsn,
         active_client_restart_lsn,
         area: area.to_vec(),
-    })
+    }))
 }
 
 #[cfg(test)]

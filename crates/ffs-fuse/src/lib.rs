@@ -7255,11 +7255,13 @@ impl Filesystem for FrankenFuse {
             reply.error(libc::EINVAL);
             return;
         };
+        let mut entry_ttl = Duration::ZERO;
         // bd-xfe7z census: counted at handler entry, BEFORE the prefetch gate,
         // so `prefetch_calls` can be read as a fraction of the readdirplus calls
         // that actually happened rather than of a number nobody measured.
         let phase_timer = crossings::PhaseTimer::start(crossings::CrossingOp::Readdirplus);
         match self.with_request_scope(&cx, RequestOp::Readdir, |cx, scope| {
+            entry_ttl = self.entry_reply_ttl(cx, scope, InodeNumber(ino))?;
             self.inner
                 .ops
                 .readdir(cx, scope, InodeNumber(ino), fs_offset)
@@ -7439,6 +7441,7 @@ impl Filesystem for FrankenFuse {
             return;
         }
         match self.with_request_scope(&cx, RequestOp::Symlink, |cx, scope| {
+            let ttl = self.entry_reply_ttl(cx, scope, InodeNumber(parent))?;
             let attr = self.inner.ops.symlink(
                 cx,
                 scope,
@@ -7449,10 +7452,17 @@ impl Filesystem for FrankenFuse {
                 req.gid(),
             )?;
             self.inner.ops.commit_request_scope(cx, scope)?;
-            Ok(attr)
+            Ok((attr, ttl))
         }) {
-            Ok(attr) => {
-                let entry_ttl = self.entry_ttl_for_parent(&cx, parent);
+            Ok((attr, ttl)) => {
+                let entry_ttl = {
+                    let parent_ttl = self.entry_ttl_for_parent(&cx, parent);
+                    if parent_ttl.is_zero() {
+                        parent_ttl
+                    } else {
+                        ttl
+                    }
+                };
                 self.inner.lookup_refcounts.retain(attr.ino.0);
                 reply.entry(&entry_ttl, &to_file_attr(&attr), attr.generation);
                 self.notify_created_entry_invalidation(parent, name);
@@ -7714,8 +7724,15 @@ impl Filesystem for FrankenFuse {
         let cx = self.cx_for_request();
         let mode = self.create_mode(&cx, parent, mode, umask);
         match self.dispatch_mknod(parent, name, mode, rdev, req.uid(), req.gid()) {
-            Ok(attr) => {
-                let entry_ttl = self.entry_ttl_for_parent(&cx, parent);
+            Ok((attr, ttl)) => {
+                let entry_ttl = {
+                    let parent_ttl = self.entry_ttl_for_parent(&cx, parent);
+                    if parent_ttl.is_zero() {
+                        parent_ttl
+                    } else {
+                        ttl
+                    }
+                };
                 self.inner.lookup_refcounts.retain(attr.ino.0);
                 reply.entry(&entry_ttl, &to_file_attr(&attr), attr.generation);
                 self.notify_created_entry_invalidation(parent, name);
@@ -7749,8 +7766,15 @@ impl Filesystem for FrankenFuse {
         let cx = self.cx_for_request();
         let mode = self.create_mode(&cx, parent, mode, umask);
         match self.dispatch_mkdir(parent, name, mode as u16, req.uid(), req.gid()) {
-            Ok(attr) => {
-                let entry_ttl = self.entry_ttl_for_parent(&cx, parent);
+            Ok((attr, ttl)) => {
+                let entry_ttl = {
+                    let parent_ttl = self.entry_ttl_for_parent(&cx, parent);
+                    if parent_ttl.is_zero() {
+                        parent_ttl
+                    } else {
+                        ttl
+                    }
+                };
                 self.inner.lookup_refcounts.retain(attr.ino.0);
                 reply.entry(&entry_ttl, &to_file_attr(&attr), attr.generation);
                 self.notify_created_entry_invalidation(parent, name);
@@ -7894,6 +7918,7 @@ impl Filesystem for FrankenFuse {
             return;
         }
         match self.with_request_scope(&cx, RequestOp::Link, |cx, scope| {
+            let ttl = self.entry_reply_ttl(cx, scope, InodeNumber(newparent))?;
             let attr = self.inner.ops.link(
                 cx,
                 scope,
@@ -7902,10 +7927,17 @@ impl Filesystem for FrankenFuse {
                 newname,
             )?;
             self.inner.ops.commit_request_scope(cx, scope)?;
-            Ok(attr)
+            Ok((attr, ttl))
         }) {
-            Ok(attr) => {
-                let entry_ttl = self.entry_ttl_for_parent(&cx, newparent);
+            Ok((attr, ttl)) => {
+                let entry_ttl = {
+                    let parent_ttl = self.entry_ttl_for_parent(&cx, newparent);
+                    if parent_ttl.is_zero() {
+                        parent_ttl
+                    } else {
+                        ttl
+                    }
+                };
                 self.inner.lookup_refcounts.retain(attr.ino.0);
                 reply.entry(&entry_ttl, &to_file_attr(&attr), attr.generation);
                 self.notify_created_entry_invalidation(newparent, newname);
@@ -8610,8 +8642,12 @@ impl FrankenFuse {
     fn lookup_impl(&self, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let cx = self.cx_for_request();
         let mut parent_casefold = false;
+        let mut negative_ttl = Duration::ZERO;
         match self.with_request_scope(&cx, RequestOp::Lookup, |cx, scope| {
             parent_casefold = self.parent_is_casefold_in_scope(cx, scope, parent);
+            // Only a backend miss in the final attempt may cache a negative.
+            // Conflicts leave zero here even if the next scope cannot begin.
+            negative_ttl = Duration::ZERO;
             // FUSE_EXPORT_SUPPORT: the kernel turns a file handle back into an
             // inode with LOOKUP(nodeid, ".") and finds a directory's parent
             // with LOOKUP(dir, ".."). Answer both for either format: "." is
@@ -8626,7 +8662,7 @@ impl FrankenFuse {
                 Ok(attr)
             };
             if name == "." {
-                return entry_for(scope, InodeNumber(parent));
+                return entry_for(scope, InodeNumber(parent)).map(|attr| (attr, ATTR_TTL));
             }
             if name == ".." {
                 let page = self.inner.ops.readdir(cx, scope, InodeNumber(parent), 0)?;
@@ -8641,15 +8677,24 @@ impl FrankenFuse {
                 if up == self.inner.ops.getattr(cx, scope, InodeNumber(1))?.ino {
                     up = InodeNumber(1);
                 }
-                return entry_for(scope, up);
+                return entry_for(scope, up).map(|attr| (attr, ATTR_TTL));
             }
-            self.inner.ops.lookup(cx, scope, InodeNumber(parent), name)
+            let ttl = self.entry_reply_ttl(cx, scope, InodeNumber(parent))?;
+            match self.inner.ops.lookup(cx, scope, InodeNumber(parent), name) {
+                Ok(attr) => Ok((attr, ttl)),
+                Err(error) => {
+                    if matches!(&error, FfsError::NotFound(_)) {
+                        negative_ttl = ttl;
+                    }
+                    Err(error)
+                }
+            }
         }) {
-            Ok(attr) => {
+            Ok((attr, ttl)) => {
                 let entry_ttl = if parent_casefold {
                     Duration::ZERO
                 } else {
-                    ATTR_TTL
+                    ttl
                 };
                 self.inner.lookup_refcounts.retain(attr.ino.0);
                 reply.entry(&entry_ttl, &to_file_attr(&attr), attr.generation);
@@ -8657,13 +8702,14 @@ impl FrankenFuse {
             Err(FfsError::NotFound(_)) => {
                 if parent_casefold {
                     reply.error(libc::ENOENT);
-                } else {
-                    if crate::entry_invalidation_enabled()
-                        && let Some(notifier) = self.kernel_notifier()
-                    {
-                        notifier.remember_negative_entry(parent, name);
-                    }
-                    Self::reply_negative_entry(reply);
+                } else if !negative_ttl.is_zero()
+                    && crate::entry_invalidation_enabled()
+                    && let Some(notifier) = self.kernel_notifier()
+                {
+                    notifier.remember_negative_entry(parent, name);
+                }
+                if !parent_casefold {
+                    Self::reply_negative_entry(reply, negative_ttl);
                 }
             }
             Err(e) => {
@@ -12347,6 +12393,326 @@ mod tests {
         assert_eq!(read_u64(FUSE_OUT_HEADER_SIZE), 1);
         assert_eq!(read_u64(FUSE_OUT_HEADER_SIZE + 16), ATTR_TTL.as_secs());
         assert_eq!(read_u64(FUSE_OUT_HEADER_SIZE + 24), ATTR_TTL.as_secs());
+    }
+
+    #[derive(Default)]
+    struct NameAliasTestFs {
+        mutations: Arc<AtomicUsize>,
+        lookup_attempts: AtomicUsize,
+        retry_scope_not_found: bool,
+    }
+
+    impl FsOps for NameAliasTestFs {
+        fn begin_request_scope(&self, _cx: &Cx, op: RequestOp) -> ffs_error::Result<RequestScope> {
+            if op == RequestOp::Lookup
+                && self.retry_scope_not_found
+                && self.lookup_attempts.load(Ordering::Relaxed) != 0
+            {
+                return Err(FfsError::NotFound("retry scope unavailable".into()));
+            }
+            Ok(RequestScope::empty())
+        }
+
+        fn directory_has_name_aliases(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            parent: InodeNumber,
+        ) -> ffs_error::Result<bool> {
+            match parent.0 {
+                3 => Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EIO))),
+                4 => Err(FfsError::NotFound("missing parent".into())),
+                5 if self.lookup_attempts.load(Ordering::Relaxed) != 0 => {
+                    Err(FfsError::NotFound("retry parent unavailable".into()))
+                }
+                _ => Ok(parent.0 == 2),
+            }
+        }
+
+        fn getattr(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            ino: InodeNumber,
+        ) -> ffs_error::Result<InodeAttr> {
+            Ok(test_inode_attr(ino.0, FfsFileType::RegularFile, 0o644))
+        }
+
+        fn lookup(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            parent: InodeNumber,
+            name: &OsStr,
+        ) -> ffs_error::Result<InodeAttr> {
+            if parent.0 == 5 || self.retry_scope_not_found {
+                self.lookup_attempts.fetch_add(1, Ordering::Relaxed);
+                return Err(FfsError::MvccConflict { tx: 1, block: 7 });
+            }
+            if name == "missing" {
+                Err(FfsError::NotFound("missing entry".into()))
+            } else {
+                Ok(test_inode_attr(7, FfsFileType::RegularFile, 0o644))
+            }
+        }
+
+        fn readdir(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+            _offset: u64,
+        ) -> ffs_error::Result<ReaddirPage> {
+            Ok(ReaddirPage::new(Vec::new()))
+        }
+
+        fn read(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+            _offset: u64,
+            _size: u32,
+        ) -> ffs_error::Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+
+        fn readlink(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+        ) -> ffs_error::Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+
+        fn create(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _parent: InodeNumber,
+            _name: &OsStr,
+            _mode: u16,
+            _uid: u32,
+            _gid: u32,
+        ) -> ffs_error::Result<InodeAttr> {
+            self.mutations.fetch_add(1, Ordering::Relaxed);
+            Ok(test_inode_attr(7, FfsFileType::RegularFile, 0o644))
+        }
+
+        fn mkdir(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _parent: InodeNumber,
+            _name: &OsStr,
+            _mode: u16,
+            _uid: u32,
+            _gid: u32,
+        ) -> ffs_error::Result<InodeAttr> {
+            self.mutations.fetch_add(1, Ordering::Relaxed);
+            Ok(test_inode_attr(8, FfsFileType::Directory, 0o755))
+        }
+
+        fn mknod(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _parent: InodeNumber,
+            _name: &OsStr,
+            _mode: u16,
+            _rdev: u32,
+            _uid: u32,
+            _gid: u32,
+        ) -> ffs_error::Result<InodeAttr> {
+            self.mutations.fetch_add(1, Ordering::Relaxed);
+            Ok(test_inode_attr(9, FfsFileType::Fifo, 0o644))
+        }
+    }
+
+    fn name_alias_test_fuse(read_only: bool) -> (FrankenFuse, Arc<AtomicUsize>) {
+        let mutations = Arc::new(AtomicUsize::new(0));
+        // Match production's Box<Arc<backend>> so a missing Arc forwarding
+        // method cannot silently select the exact-byte default.
+        let backend = Arc::new(NameAliasTestFs {
+            mutations: Arc::clone(&mutations),
+            ..NameAliasTestFs::default()
+        });
+        let fuse = FrankenFuse::with_options(
+            Box::new(backend),
+            &MountOptions {
+                read_only,
+                ..MountOptions::default()
+            },
+        );
+        (fuse, mutations)
+    }
+
+    fn recorded_entry_validity(sender: &RecordingSender) -> (u64, Duration, Duration) {
+        assert_eq!(sender.errno(), None);
+        let response = sender.bytes();
+        let read64 = |offset| u64::from_ne_bytes(response[offset..offset + 8].try_into().unwrap());
+        let read32 = |offset| u32::from_ne_bytes(response[offset..offset + 4].try_into().unwrap());
+        // fuse_out_header (16 bytes) followed by fuse_entry_out.
+        (
+            read64(16),
+            Duration::new(read64(32), read32(48)),
+            Duration::new(read64(40), read32(52)),
+        )
+    }
+
+    #[test]
+    fn aliased_directory_lookup_revalidates_positive_and_negative_spellings() {
+        let (fuse, _) = name_alias_test_fuse(false);
+        for (parent, positive_ttl) in [(1, ATTR_TTL), (2, Duration::ZERO)] {
+            for (name, node, ttl) in [
+                ("present", 7, positive_ttl),
+                ("missing", 0, positive_ttl.min(NEGATIVE_ENTRY_TTL)),
+            ] {
+                let sender = RecordingSender::default();
+                fuse.lookup_impl(
+                    parent,
+                    OsStr::new(name),
+                    <ReplyEntry as fuser::Reply>::new(1, sender.clone()),
+                );
+                assert_eq!(recorded_entry_validity(&sender), (node, ttl, ttl));
+            }
+        }
+        let missing_parent = RecordingSender::default();
+        fuse.lookup_impl(
+            4,
+            OsStr::new("missing"),
+            <ReplyEntry as fuser::Reply>::new(2, missing_parent.clone()),
+        );
+        assert_eq!(
+            recorded_entry_validity(&missing_parent),
+            (0, Duration::ZERO, Duration::ZERO),
+            "a failed policy query cannot authorize a cached negative"
+        );
+    }
+
+    #[test]
+    fn failed_lookup_retry_cannot_reuse_a_previous_cache_policy() {
+        for (parent, retry_scope_not_found) in [(5, false), (1, true)] {
+            let backend = Arc::new(NameAliasTestFs {
+                retry_scope_not_found,
+                ..NameAliasTestFs::default()
+            });
+            let fuse = FrankenFuse::with_options(
+                Box::new(Arc::clone(&backend)),
+                &MountOptions {
+                    read_only: false,
+                    ..MountOptions::default()
+                },
+            );
+            let sender = RecordingSender::default();
+            fuse.lookup_impl(
+                parent,
+                OsStr::new("present"),
+                <ReplyEntry as fuser::Reply>::new(8, sender.clone()),
+            );
+            assert_eq!(
+                recorded_entry_validity(&sender),
+                (0, Duration::ZERO, Duration::ZERO),
+                "a retry policy or scope failure must not cache a miss"
+            );
+            assert_eq!(backend.lookup_attempts.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[test]
+    fn immutable_aliased_namespace_preserves_entry_caching() {
+        let (fuse, _) = name_alias_test_fuse(true);
+        for (name, node, ttl) in [
+            ("present", 7, ATTR_TTL),
+            ("missing", 0, NEGATIVE_ENTRY_TTL),
+        ] {
+            let sender = RecordingSender::default();
+            fuse.lookup_impl(
+                2,
+                OsStr::new(name),
+                <ReplyEntry as fuser::Reply>::new(3, sender.clone()),
+            );
+            assert_eq!(recorded_entry_validity(&sender), (node, ttl, ttl));
+        }
+    }
+
+    #[test]
+    fn aliased_directory_create_replies_and_mknod_mkdir_revalidate_names() {
+        let (fuse, mutations) = name_alias_test_fuse(false);
+        for (parent, ttl) in [(1, ATTR_TTL), (2, Duration::ZERO)] {
+            let sender = RecordingSender::default();
+            fuse.create_impl(
+                parent,
+                OsStr::new("Created"),
+                0o644,
+                0,
+                libc::O_RDWR,
+                0,
+                0,
+                <ReplyCreate as fuser::Reply>::new(4, sender.clone()),
+            );
+            assert_eq!(recorded_entry_validity(&sender), (7, ttl, ttl));
+            let (attr, mkdir_ttl) = fuse
+                .dispatch_mkdir(parent, OsStr::new("Directory"), 0o755, 0, 0)
+                .unwrap();
+            assert_eq!((attr.ino.0, mkdir_ttl), (8, ttl));
+            for (mode, ino) in [(libc::S_IFREG, 7), (libc::S_IFIFO, 9)] {
+                let (attr, mknod_ttl) = fuse
+                    .dispatch_mknod(parent, OsStr::new("Node"), mode | 0o644, 0, 0, 0)
+                    .unwrap();
+                assert_eq!((attr.ino.0, mknod_ttl), (ino, ttl));
+            }
+        }
+        assert_eq!(mutations.load(Ordering::Relaxed), 8);
+    }
+
+    #[test]
+    fn entry_alias_policy_errors_precede_mutation_and_preserve_export_lookup() {
+        let (fuse, mutations) = name_alias_test_fuse(false);
+        let lookup = RecordingSender::default();
+        fuse.lookup_impl(
+            3,
+            OsStr::new("present"),
+            <ReplyEntry as fuser::Reply>::new(5, lookup.clone()),
+        );
+        assert_eq!(lookup.errno(), Some(libc::EIO));
+
+        let create = RecordingSender::default();
+        fuse.create_impl(
+            3,
+            OsStr::new("Created"),
+            0o644,
+            0,
+            libc::O_RDWR,
+            0,
+            0,
+            <ReplyCreate as fuser::Reply>::new(6, create.clone()),
+        );
+        assert_eq!(create.errno(), Some(libc::EIO));
+        for result in [
+            fuse.dispatch_mkdir(3, OsStr::new("Directory"), 0o755, 0, 0),
+            fuse.dispatch_mknod(3, OsStr::new("Node"), libc::S_IFIFO | 0o644, 0, 0, 0),
+        ] {
+            assert!(matches!(
+                result,
+                Err(MutationDispatchError::Operation { error, .. })
+                    if error.to_errno() == libc::EIO
+            ));
+        }
+        assert_eq!(mutations.load(Ordering::Relaxed), 0);
+
+        let export = RecordingSender::default();
+        fuse.lookup_impl(
+            3,
+            OsStr::new("."),
+            <ReplyEntry as fuser::Reply>::new(7, export.clone()),
+        );
+        assert_eq!(
+            recorded_entry_validity(&export),
+            (3, ATTR_TTL, ATTR_TTL),
+            "LOOKUP(file, dot) exports an inode without querying directory policy"
+        );
     }
 
     /// bd-ha71t: THE OBSERVATION THAT WAS MISSING.
@@ -25066,9 +25432,10 @@ mod tests {
             &options,
         );
 
-        let attr = fuse
+        let (attr, ttl) = fuse
             .dispatch_mkdir(2, OsStr::new("logs"), 0o755, 123, 456)
             .expect("dispatch mkdir");
+        assert_eq!(ttl, ATTR_TTL);
         assert_eq!(attr.ino, InodeNumber(101));
         assert_eq!(attr.kind, FfsFileType::Directory);
         assert_eq!(attr.perm, 0o755);

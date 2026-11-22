@@ -21,6 +21,25 @@ use std::collections::BTreeMap;
 const MAX_PAGES: u64 = 4096;
 const IO_BUDGET: u64 = 64 * 1024 * 1024;
 
+#[derive(Clone, Copy)]
+struct ScanLimits {
+    max_pages: u64,
+    io_budget: u64,
+}
+
+const RECOVERY_LIMITS: ScanLimits = ScanLimits {
+    max_pages: MAX_PAGES,
+    io_budget: IO_BUDGET,
+};
+
+// The structural checker and formatter already admit journals up to 64 MiB.
+// Inspecting every page and then validating its checkpoint needs a separate
+// analysis allowance. This read-only lane does not enlarge recovery limits.
+const AUDIT_LIMITS: ScanLimits = ScanLimits {
+    max_pages: IO_BUDGET / 512,
+    io_budget: 2 * IO_BUDGET,
+};
+
 struct Page {
     raw: Vec<u8>,
     fixed: RecordPage,
@@ -312,11 +331,22 @@ fn generation(restart: &Restart, lsn: u64, oldest: u64) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn discover(
     cx: &Cx,
     restart: &Restart,
     stream_length: u64,
     read: &mut impl FnMut(u64, usize) -> Result<Vec<u8>>,
+) -> Result<View> {
+    discover_with_limits(cx, restart, stream_length, read, RECOVERY_LIMITS)
+}
+
+fn discover_with_limits(
+    cx: &Cx,
+    restart: &Restart,
+    stream_length: u64,
+    read: &mut impl FnMut(u64, usize) -> Result<Vec<u8>>,
+    limits: ScanLimits,
 ) -> Result<View> {
     checkpoint(cx)?;
     let page_bytes = u64::from(restart.log_page);
@@ -343,7 +373,7 @@ fn discover(
     }
     let reserved = if restart.version.0 == 2 { 34_u64 } else { 4 };
     let total_pages = restart.file_size / page_bytes;
-    if total_pages <= reserved || total_pages > MAX_PAGES || restart.file_size > IO_BUDGET {
+    if total_pages <= reserved || total_pages > limits.max_pages || restart.file_size > IO_BUDGET {
         return Err(unsupported(
             "$LogFile tail discovery exceeds its page or byte scan budget",
         ));
@@ -489,6 +519,29 @@ pub(super) fn with_latest<T>(
     read: &mut impl FnMut(u64, usize) -> Result<Vec<u8>>,
     finish: impl FnOnce(&Restart, &mut dyn FnMut(u64, usize) -> Result<Vec<u8>>) -> Result<T>,
 ) -> Result<T> {
+    with_latest_limits(cx, restart, stream_length, read, finish, RECOVERY_LIMITS)
+}
+
+/// Run the same tail/anchor checks within the structural audit's larger
+/// read-only scan envelope, without changing recovery admission or its budget.
+pub(super) fn with_latest_for_audit<T>(
+    cx: &Cx,
+    restart: &Restart,
+    stream_length: u64,
+    read: &mut impl FnMut(u64, usize) -> Result<Vec<u8>>,
+    finish: impl FnOnce(&Restart, &mut dyn FnMut(u64, usize) -> Result<Vec<u8>>) -> Result<T>,
+) -> Result<T> {
+    with_latest_limits(cx, restart, stream_length, read, finish, AUDIT_LIMITS)
+}
+
+fn with_latest_limits<T>(
+    cx: &Cx,
+    restart: &Restart,
+    stream_length: u64,
+    read: &mut impl FnMut(u64, usize) -> Result<Vec<u8>>,
+    finish: impl FnOnce(&Restart, &mut dyn FnMut(u64, usize) -> Result<Vec<u8>>) -> Result<T>,
+    limits: ScanLimits,
+) -> Result<T> {
     checkpoint(cx)?;
     for (reference, label) in [
         (restart.active_client_oldest_lsn, "oldest-client"),
@@ -498,10 +551,13 @@ pub(super) fn with_latest<T>(
             validate_lsn_reference(restart, lsn, label)?;
         }
     }
-    let remaining = Cell::new(IO_BUDGET);
+    let remaining = Cell::new(limits.io_budget);
     let charge = |size: usize| -> Result<()> {
         let left = remaining.get().checked_sub(size as u64).ok_or_else(|| {
-            unsupported("$LogFile tail and preflight exceed the 64 MiB read budget")
+            unsupported(format!(
+                "$LogFile tail and preflight exceed the {} MiB read budget",
+                limits.io_budget / (1024 * 1024)
+            ))
         })?;
         remaining.set(left);
         Ok(())
@@ -511,7 +567,7 @@ pub(super) fn with_latest<T>(
         charge(size)?;
         read(offset, size)
     };
-    let view = discover(cx, restart, stream_length, &mut bounded)?;
+    let view = discover_with_limits(cx, restart, stream_length, &mut bounded, limits)?;
     // The old checkpoint's current record is still an anchor. A newer page or
     // copy must not erase its advertised record or change its declared length.
     let mut restored = |offset, size| {

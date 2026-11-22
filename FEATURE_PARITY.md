@@ -3588,3 +3588,71 @@ memory pressure cleared; executable code generation then exhausted writable
 storage. The existing integrity validation workflows retain the runtime gates.
 No mounted or native Windows qualification, broad bd-h8n46 closure, or parity-score
 increase is claimed.
+
+## Native stream API integration (2026-11-21)
+
+NTFS path-addressed named-stream creation/removal and positioned write/truncate
+now use the same sequence-bound catalog operations as mounted/reference-addressed
+callers. Sparse DATA and MFT extension records retain their complete catalogs;
+plain base-record edits retain the existing planner. Native compression,
+encryption and unsupported metadata admission remain unchanged.
+
+The unchanged large sparse ADS hole-punch regression failed during stream
+creation on `d6b4dcbef` in CI run `44871480052`, before reaching hole punching.
+The routing fix is accompanied by path-based sparse/extension lifecycle,
+cold-reopen, exact UTF-16 identity and no-write refusal regressions in
+`crates/ffs-ntfs/tests/persistence_prefix/punch.rs`. At publication these new
+regressions are authored and statically reviewed; hosted execution is pending.
+They do not establish Windows interchange or hardware power-loss qualification.
+
+The ZFS sparse-range and committed-cancellation regressions now create their
+target files through native transactions rather than assuming an allocated
+object in an empty fixture. Refusal coverage verifies absent objects separately
+from directories and immutable/read-only files. The large sparse test retains
+its range, allocation and seek assertions and adds a fresh durable reopen.
+These corrected scenarios also await hosted execution at this checkpoint.
+
+## Writable native namespace cache coherence (2026-11-21)
+
+FsOps now exposes directory name-alias semantics through the backend and wrapper
+interfaces. Ext4 checks the actual parent inode's CASEFOLD flag; FAT and NTFS
+advertise their folded and alternate-name namespaces. Writable FUSE mounts use
+zero entry-cache validity for these directories in positive/negative lookup,
+create, mkdir, mknod, symlink, link and READDIRPLUS replies. This prevents a
+cached spelling or cached miss from outliving a mutation through another alias.
+Exact-byte directories and read-only mounts retain the existing cache policy.
+
+Cache policy is selected in the request scope before mutation; an error cannot
+turn an already committed namespace operation into a failed response. Entry
+responses share the transport's attribute lifetime, so both lifetimes are zero
+there; attribute-only getattr behavior is unchanged. Wrapper, backend and wire
+regressions cover policy forwarding, parent/root identity, reply lifetimes,
+lookup references and errors before mutation. The pre-existing mounted ext4
+casefold htree regression is unchanged. These tests await hosted execution at
+publication; no mounted qualification or bead closure is claimed.
+
+## Native NTFS format/check checkpoint integration (2026-11-21)
+
+The native formatter and structural checker now validate $LogFile through the
+shared checkpoint-aware read-only audit. Native CLIENT_RESTART records are no
+longer passed to the flat physical-action parser, which correctly refuses that
+record class. This addresses the formatter self-check failure that blocked the
+facade, six-format CLI and format/check/resize integration scenarios in CI run
+44871480052 on d6b4dcbef.
+
+Before reporting a clean active journal, the audit validates native checkpoint
+tables, transaction completion, dirty-target claims and retained/tail-copy log
+work. Erased journals require a complete stream scan. Only actual USA trailer
+tears are reported as torn restart copies; unsupported layouts and semantic
+errors retain their refusal status. Read and cancellation errors propagate.
+The formatter audits its serialized journal before its first device write and
+requires the checkpoint's current, oldest and client-restart LSNs to agree.
+
+Nine focused regressions cover native empty and table checkpoints, the 64 MiB
+journal envelope, unfinished transactions, corrupt and torn records/restarts,
+newer retained work, unsupported restart metadata, partially erased streams
+and operational read failures. The audit has no write interface. Mounted
+admission and recovery budgets remain unchanged; the structural audit's bounded
+scan allowance does not widen recovery or native-format compatibility claims.
+At publication these changes are statically reviewed; hosted compilation and
+execution remain pending. The broader bd-h7cme work package stays open.

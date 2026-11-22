@@ -792,6 +792,17 @@ fn fat_fiemap(
 }
 
 impl FsOps for FatFs {
+    fn directory_has_name_aliases(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        _parent: InodeNumber,
+    ) -> Result<bool> {
+        checkpoint(cx)?;
+        // Long names, 8.3 aliases and folded spellings share entry identities.
+        Ok(true)
+    }
+
     fn supports_posix_acl(&self) -> bool {
         false
     }

@@ -393,6 +393,146 @@ fn hole_punch_large_sparse_ads_preserves_valid_tail_and_extension_streams() {
 }
 
 #[test]
+fn path_stream_edits_preserve_sparse_data_and_extension_catalogs_after_reopen() {
+    let cx = Cx::for_testing();
+    let cb = CLUSTER_BYTES as u64;
+    let (device, mut engine, file, sparse_name) = large_sparse_stream_fixture();
+    let sentinels = [vec![u16::from(b'a'); 240], vec![u16::from(b'z'); 240]];
+    for name in &sentinels {
+        let (created, _) = engine
+            .create_file_stream(&cx, "/SPARSE.BIN", name, b"sentinel payload")
+            .into_result()
+            .unwrap();
+        assert_eq!(created, file);
+    }
+    let (_, record) = view(&engine, file);
+    assert!(
+        record
+            .attributes()
+            .unwrap()
+            .iter()
+            .any(|attribute| attribute.kind == ATTRIBUTE_LIST)
+    );
+
+    // The path API must retain the catalog engine's ValidDataLength rules:
+    // old allocated bytes after the initialized prefix are logically zero.
+    let (written, _) = engine
+        .write_file_stream_range(&cx, "/SPARSE.BIN", &sparse_name, cb + 7, b"X")
+        .into_result()
+        .unwrap();
+    assert_eq!(written, file);
+    let (truncated, _) = engine
+        .truncate_file_stream(&cx, "/sparse.bin", &sparse_name, 2 * cb)
+        .into_result()
+        .unwrap();
+    assert_eq!(truncated, file);
+
+    // A lossless non-Unicode ADS also uses the path-based catalog operation.
+    let raw_name = [0xD800, u16::from(b'x')];
+    engine
+        .create_file_stream(&cx, "/sparse.bin", &raw_name, b"raw stream")
+        .into_result()
+        .unwrap();
+    let (removed, _) = engine
+        .remove_file_stream(&cx, "/SPARSE.BIN", &sentinels[0])
+        .into_result()
+        .unwrap();
+    assert_eq!(removed, file);
+    engine.check_clean_consistency(&cx).unwrap();
+
+    let durable = device.snapshot_durable_only();
+    let length = durable.len() as u64 - SECTOR_BYTES as u64;
+    let reopened_device = FaultInjectingNtfsDevice::new(durable);
+    let reopened = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&reopened_device) as Arc<dyn ByteDevice>,
+        0,
+        length,
+        write_options_clean(),
+    )
+    .unwrap();
+    let mut expected = vec![0; 2 * CLUSTER_BYTES];
+    expected[..5].fill(0xA6);
+    expected[CLUSTER_BYTES + 7] = b'X';
+    assert_stream(&reopened, file, &sparse_name, &expected, 2 * cb, cb + 8);
+    assert_stream(&reopened, file, &[], b"BASE", 4, 4);
+    assert_stream(&reopened, file, &sentinels[1], b"sentinel payload", 16, 16);
+    assert_stream(&reopened, file, &raw_name, b"raw stream", 10, 10);
+    let (volume, record) = view(&reopened, file);
+    assert!(matches!(
+        volume.data_stream(&cx, &record, &sentinels[0]),
+        Err(FfsError::NotFound(_))
+    ));
+    assert_eq!(standard_flags(&record) & 0x200, 0);
+    reopened.check_clean_consistency(&cx).unwrap();
+    assert_eq!(reopened_device.write_bytes_total(), 0);
+}
+
+#[test]
+fn path_stream_refusals_on_sparse_catalogs_do_not_write() {
+    let cx = Cx::for_testing();
+    let (device, mut engine, _, name) = large_sparse_stream_fixture();
+    let folded: Vec<_> = "SPARSE".encode_utf16().collect();
+    let missing: Vec<_> = "missing".encode_utf16().collect();
+    let before = device.snapshot_durable_only();
+    let writes = device.write_bytes_total();
+    let events = engine.persistence_trace().len();
+    for (outcome, errno) in [
+        (
+            engine.create_file_stream(&cx, "/sparse.bin", &folded, b"collision"),
+            libc::EEXIST,
+        ),
+        (
+            engine.remove_file_stream(&cx, "/sparse.bin", &folded),
+            libc::ENOENT,
+        ),
+        (
+            engine.write_file_stream_range(&cx, "/sparse.bin", &folded, 0, b"wrong"),
+            libc::ENOENT,
+        ),
+        (
+            engine.truncate_file_stream(&cx, "/sparse.bin", &missing, 0),
+            libc::ENOENT,
+        ),
+        (
+            engine.create_file_stream(&cx, "/sparse.bin", &[], b"unnamed"),
+            libc::EINVAL,
+        ),
+        (
+            engine.remove_file_stream(&cx, "/sparse.bin", &[]),
+            libc::EINVAL,
+        ),
+        (
+            engine.create_file_stream(&cx, "/sparse.bin", &[0x3A], b"invalid"),
+            libc::EINVAL,
+        ),
+        (
+            engine.write_file_stream_range(&cx, "/missing", &name, 0, b"missing"),
+            libc::ENOENT,
+        ),
+        (
+            engine.truncate_file_stream(&cx, "/", &name, 0),
+            libc::EISDIR,
+        ),
+    ] {
+        let NtfsTxOutcome::NotCommitted(error) = outcome else {
+            panic!("path stream refusal must precede publication: {outcome:?}");
+        };
+        assert_eq!(error.to_errno(), errno, "{error}");
+    }
+    let cancelled = Cx::for_testing();
+    cancelled.set_cancel_requested(true);
+    assert!(matches!(
+        engine.create_file_stream(&cancelled, "/sparse.bin", &missing, b"cancelled"),
+        NtfsTxOutcome::NotCommitted(FfsError::Cancelled)
+    ));
+    assert_eq!(engine.persistence_trace().len(), events);
+    assert_eq!(device.write_bytes_total(), writes);
+    assert_eq!(device.snapshot_live(), before);
+    assert_eq!(device.snapshot_durable_only(), before);
+}
+
+#[test]
 fn hole_punch_large_dense_range_stages_only_partial_boundary_clusters() {
     let cx = Cx::for_testing();
     let cb = CLUSTER_BYTES as u64;
