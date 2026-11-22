@@ -8696,13 +8696,13 @@ impl FrankenFuse {
             Err(FfsError::NotFound(_)) => {
                 if parent_casefold {
                     reply.error(libc::ENOENT);
-                } else if !negative_ttl.is_zero()
-                    && crate::entry_invalidation_enabled()
-                    && let Some(notifier) = self.kernel_notifier()
-                {
-                    notifier.remember_negative_entry(parent, name);
-                }
-                if !parent_casefold {
+                } else {
+                    if !negative_ttl.is_zero()
+                        && crate::entry_invalidation_enabled()
+                        && let Some(notifier) = self.kernel_notifier()
+                    {
+                        notifier.remember_negative_entry(parent, name);
+                    }
                     Self::reply_negative_entry(reply, negative_ttl);
                 }
             }
