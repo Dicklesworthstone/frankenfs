@@ -586,6 +586,10 @@ impl NtfsFs {
             self.enforce_dacl(cx, &rec, FILE_WRITE_DATA)?;
         }
         let (target, stream) = self.data_target(cx, ino)?;
+        if !is_ads_ino(ino) {
+            let rec = self.record(cx, ino)?;
+            self.enforce_dacl(cx, &rec, FILE_WRITE_DATA)?;
+        }
         let now = system_time_to_filetime(SystemTime::now())?;
         self.transact(cx, |engine| {
             engine.punch_hole_at(cx, target, &stream, offset, length, now)

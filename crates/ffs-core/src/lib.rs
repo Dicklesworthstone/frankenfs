@@ -221,16 +221,20 @@ const BTRFS_TREE_LOG_OBJECTID: u64 = ffs_btrfs::BTRFS_TREE_LOG_OBJECTID;
 /// implicit "." and ".." entries.
 const BTRFS_DIR_START_INDEX: u64 = 2;
 
-/// Tag bit of the synthetic VFS inode presented for a nested-subvolume link
-/// (`OpenFs::btrfs_dir_child_ino`). fs-tree inode objectids are allocated
-/// upward from `BTRFS_FIRST_FREE_OBJECTID` and never reach 2^63.
+/// Preferred tag bit for uncommitted nested-subvolume link placeholders when
+/// that value does not collide with an existing ordinary inode or synthetic
+/// nested VFS inode.
 const BTRFS_SUBVOL_LINK_INO_BIT: u64 = 1 << 63;
 
-/// VFS inodes of a nested subvolume (bd-2ryx9) carry its slot in bits 48..62:
-/// `slot << 48 | objectid`. Slot 0 is the mounted subvolume itself, and bit 63
-/// stays free for [`BTRFS_SUBVOL_LINK_INO_BIT`].
-const BTRFS_NESTED_SLOT_SHIFT: u32 = 48;
-const BTRFS_NESTED_OBJECTID_MASK: u64 = (1 << BTRFS_NESTED_SLOT_SHIFT) - 1;
+/// Base synthetic VFS inode for nested subvolume entries.
+///
+/// Valid Btrfs inode objectids span the full `256..=BTRFS_LAST_FREE_OBJECTID`
+/// range with no 48-bit ceiling. Bit-packing `(slot << 48) | objectid` aliases
+/// high ordinary objectids in the mounted subvolume and truncates high objectids
+/// inside nested subvolumes. Instead, [`BtrfsNestedState`] assigns each
+/// presented `(slot, full_u64_objectid)` a unique synthetic VFS inode after
+/// verifying it does not collide with any ordinary inode in the mounted tree.
+const BTRFS_NESTED_VFS_INO_BASE: u64 = 1 << 62;
 const BTRFS_NESTED_MAX_SLOTS: usize = (1 << 15) - 1;
 
 /// A nested subvolume presented through a mount (bd-2ryx9).
@@ -242,6 +246,30 @@ struct BtrfsNestedSlot {
     root_dirid: u64,
     /// VFS inode of the directory holding the link: the root's `..`.
     parent: InodeNumber,
+}
+
+/// Collision-free bijective identity table for nested subvolume inodes and
+/// uncommitted subvolume-link placeholders.
+struct BtrfsNestedState {
+    slots: Vec<BtrfsNestedSlot>,
+    to_vfs: std::collections::HashMap<(usize, u64), InodeNumber>,
+    from_vfs: std::collections::HashMap<InodeNumber, (usize, u64)>,
+    link_to_vfs: std::collections::HashMap<u64, InodeNumber>,
+    link_from_vfs: std::collections::HashMap<InodeNumber, u64>,
+    next_vfs_ino: u64,
+}
+
+impl Default for BtrfsNestedState {
+    fn default() -> Self {
+        Self {
+            slots: Vec::new(),
+            to_vfs: std::collections::HashMap::new(),
+            from_vfs: std::collections::HashMap::new(),
+            link_to_vfs: std::collections::HashMap::new(),
+            link_from_vfs: std::collections::HashMap::new(),
+            next_vfs_ino: BTRFS_NESTED_VFS_INO_BASE,
+        }
+    }
 }
 
 /// Highest objectid an inode can have (-256). Above it are reserved
@@ -3282,13 +3310,17 @@ pub struct OpenFs {
     /// silently. Staying read-only preserves the log for a kernel mount, which
     /// can replay it.
     btrfs_foreign_tree_log: bool,
-    /// Nested subvolumes this mount presents (bd-2ryx9): slot `i` is a
-    /// read-only instance of one subvolume reached through a directory entry,
-    /// and its inodes appear as `(i + 1) << 48 | objectid`. Only the instance
-    /// a mount was opened as presents them; nested instances report their own
-    /// subvolume links upward, so a subvolume nested inside a nested one gets
-    /// a slot here too.
-    btrfs_nested: Mutex<Vec<BtrfsNestedSlot>>,
+    /// Nested subvolumes and collision-free synthetic VFS inode tables
+    /// presented through this mount. Only the root mount instance enables
+    /// nested presentation; nested instances report subvolume links upward.
+    btrfs_nested: Mutex<BtrfsNestedState>,
+    /// Fast-path atomic guard: true once `btrfs_nested.from_vfs` is non-empty,
+    /// avoiding mutex acquisition on hot Btrfs paths when no nested subvolume
+    /// has been entered.
+    btrfs_nested_has_entries: AtomicBool,
+    /// Fast-path atomic guard: true once `btrfs_nested.link_from_vfs` is
+    /// non-empty, avoiding mutex acquisition on directories without subvolume links.
+    btrfs_subvol_links_active: AtomicBool,
     btrfs_nested_enabled: bool,
     /// Raw block publication cannot update the captured chunk map, tree-log
     /// overlay, allocator and every semantic cache atomically. Such publication
@@ -8656,7 +8688,9 @@ impl OpenFs {
             extent_cache: ffs_extent::ExtentCache::new(),
             ext4_write_extent_snapshot: Mutex::new(None),
             readdir_snapshot: ReaddirSnapshots::new(),
-            btrfs_nested: Mutex::new(Vec::new()),
+            btrfs_nested: Mutex::new(BtrfsNestedState::default()),
+            btrfs_nested_has_entries: AtomicBool::new(false),
+            btrfs_subvol_links_active: AtomicBool::new(false),
             btrfs_nested_enabled: true,
             btrfs_semantic_view_stale,
             dir_name_index: (0..DIR_NAME_INDEX_SHARDS)
@@ -11012,11 +11046,79 @@ impl OpenFs {
         Ok(applied)
     }
 
-    /// Mark what the replayed fast commits allocated — each live inode and the
-    /// blocks its ADD_RANGE records map — in the bitmaps and group counters,
-    /// as the kernel's ext4_fc_set_bitmaps_and_counters does. Without it a
-    /// file the fast commit created is readable but its inode and blocks are
-    /// still free, and the next allocation hands them out again.
+    /// Collect physical block ranges from `AddRange` operations that survive in
+    /// the final state after applying later `AddRange`/`DelRange` operations in
+    /// log order (walked in reverse, mirroring `verify_fast_commit_recovered_ranges`).
+    fn fast_commit_surviving_add_ranges(
+        operations: &[ffs_journal::FcOperation],
+        live_inodes: &BTreeSet<u32>,
+    ) -> Result<Vec<(u64, u32)>, FfsError> {
+        let mut covered: BTreeMap<u32, BTreeMap<u64, u64>> = BTreeMap::new();
+        let mut surviving = Vec::new();
+        for op in operations.iter().rev() {
+            let (ino, logical, len, phys_opt) = match op {
+                ffs_journal::FcOperation::AddRange(r) => {
+                    (r.ino, r.logical_block, r.len, Some(r.physical_block))
+                }
+                ffs_journal::FcOperation::DelRange(r) => (r.ino, r.logical_block, r.len, None),
+                _ => continue,
+            };
+            if !live_inodes.contains(&ino) || len == 0 {
+                continue;
+            }
+            let start = u64::from(logical);
+            let end = start + u64::from(len);
+            if end > u64::from(u32::MAX) + 1 {
+                return Err(FfsError::Format(
+                    "fast-commit logical range overflow".into(),
+                ));
+            }
+            let intervals = covered.entry(ino).or_default();
+            let first = intervals
+                .range(..=start)
+                .next_back()
+                .filter(|(_, previous_end)| **previous_end > start)
+                .map_or(start, |(previous_start, _)| *previous_start);
+            let overlaps: Vec<(u64, u64)> = intervals
+                .range(first..end)
+                .map(|(&lo, &hi)| (lo, hi))
+                .collect();
+            if let Some(phys) = phys_opt {
+                let mut cursor = start;
+                for &(lo, hi) in &overlaps {
+                    if cursor < lo {
+                        let gap_len = u32::try_from(lo - cursor).map_err(|_| {
+                            FfsError::Format("fast-commit range length overflow".into())
+                        })?;
+                        surviving.push((phys + (cursor - start), gap_len));
+                    }
+                    cursor = cursor.max(hi);
+                }
+                if cursor < end {
+                    let gap_len = u32::try_from(end - cursor).map_err(|_| {
+                        FfsError::Format("fast-commit range length overflow".into())
+                    })?;
+                    surviving.push((phys + (cursor - start), gap_len));
+                }
+            }
+            let mut merged_start = start;
+            let mut merged_end = end;
+            for (lo, hi) in overlaps {
+                intervals.remove(&lo);
+                merged_start = merged_start.min(lo);
+                merged_end = merged_end.max(hi);
+            }
+            intervals.insert(merged_start, merged_end);
+        }
+        Ok(surviving)
+    }
+
+    /// Mark what the replayed fast commits actually own in the final recovered
+    /// state — each live inode and every data/extent-tree block mapped by its
+    /// recovered inode — in the bitmaps and group counters, as the kernel's
+    /// `ext4_fc_set_bitmaps_and_counters` does. Deriving block claims from the
+    /// final recovered extent trees rather than every historical `AddRange`
+    /// prevents superseded or `DelRange`-deleted blocks from leaking.
     fn claim_fast_commit_allocations(
         &self,
         cx: &Cx,
@@ -11054,27 +11156,35 @@ impl OpenFs {
                 is_dir,
             )?;
         }
-        // Every block each live inode now maps, as ext4_fc_set_bitmaps_and_
-        // counters marks them: its ADD_RANGE records AND what its recovered
-        // inode maps directly — a directory the fast commit created carries
-        // its block only in its INODE record.
-        let mut ranges: Vec<(u64, u32)> = operations
-            .iter()
-            .filter_map(|op| match op {
-                ffs_journal::FcOperation::AddRange(range) if live.contains_key(&range.ino) => {
-                    Some((range.physical_block, range.len))
-                }
-                _ => None,
-            })
-            .collect();
+        // Claim only blocks mapped by each live inode's final recovered state
+        // (both data extents and external extent-tree nodes), bypassing any
+        // pre-recovery read cache.
+        let mut ranges: Vec<(u64, u32)> = Vec::new();
         for &ino in live.keys() {
-            let inode = self.read_inode(cx, InodeNumber(u64::from(ino)))?;
+            let inode = self.recovery_read_inode(cx, InodeNumber(u64::from(ino)))?;
             if inode.flags & EXT4_EXTENTS_FL != 0 {
-                ranges.extend(
-                    self.collect_extents(cx, &inode)?
-                        .iter()
-                        .map(|extent| (extent.physical_start, u32::from(extent.actual_len()))),
-                );
+                let root_bytes = Self::extent_root(&inode);
+                ffs_btree::walk(cx, &block_dev, &root_bytes, &mut |extent| {
+                    ranges.push((extent.physical_start, u32::from(extent.actual_len())));
+                    Ok(())
+                })?;
+                let mut pending: Vec<(u64, u16)> = Vec::new();
+                if let Ok((header, ffs_ondisk::ext4::ExtentTree::Index(indexes))) =
+                    ffs_ondisk::ext4::parse_extent_tree(&root_bytes)
+                {
+                    pending.extend(indexes.iter().map(|i| (i.leaf_block, header.depth - 1)));
+                }
+                while let Some((node, depth)) = pending.pop() {
+                    ranges.push((node, 1));
+                    if depth > 0 {
+                        let buf = block_dev.read_block(cx, BlockNumber(node))?;
+                        if let Ok((_, ffs_ondisk::ext4::ExtentTree::Index(indexes))) =
+                            ffs_ondisk::ext4::parse_extent_tree(buf.as_slice())
+                        {
+                            pending.extend(indexes.iter().map(|i| (i.leaf_block, depth - 1)));
+                        }
+                    }
+                }
             }
         }
         for (start, len) in ranges {
@@ -12358,15 +12468,8 @@ impl OpenFs {
                 }
             }
         }
-        let mut excluded: Vec<(u64, u32)> = operations
-            .iter()
-            .filter_map(|op| match op {
-                ffs_journal::FcOperation::AddRange(r) if live.contains_key(&r.ino) => {
-                    Some((r.physical_block, r.len))
-                }
-                _ => None,
-            })
-            .collect();
+        let live_set: BTreeSet<u32> = live.keys().copied().collect();
+        let mut excluded = Self::fast_commit_surviving_add_ranges(operations, &live_set)?;
         for (&ino, raw) in &live {
             let is_dir = u16::from_le_bytes([raw[0], raw[1]]) & 0xF000 == 0x4000;
             if is_dir && self.fast_commit_existing_dir(cx, ino)? {
@@ -12536,6 +12639,26 @@ impl OpenFs {
                 len,
             )?;
         }
+        // Temporarily reserve any AddRange blocks of this inode not already
+        // claimed so extent-tree growth cannot allocate them before replay and
+        // a later DelRange punching them won't double-free.
+        let mut temp_reserved: Vec<(u64, u32)> = Vec::new();
+        for range in ranges {
+            if let FcRangeOp::Add(ext) = range {
+                let len = u32::from(ext.actual_len());
+                if ffs_alloc::claim_blocks(
+                    cx,
+                    &block_dev,
+                    &alloc.geo,
+                    &mut alloc.groups,
+                    BlockNumber(ext.physical_start),
+                    len,
+                )? > 0
+                {
+                    temp_reserved.push((ext.physical_start, len));
+                }
+            }
+        }
         let generation = u32::from_le_bytes([
             inode_raw[0x64],
             inode_raw[0x65],
@@ -12610,10 +12733,42 @@ impl OpenFs {
 
         // i_blocks: every mapped block plus every external tree node.
         let mut blocks = 0_u64;
+        let mut final_mapped: BTreeSet<u64> = BTreeSet::new();
         ffs_btree::walk(cx, &block_dev, &root_bytes, &mut |e: &Ext4Extent| {
-            blocks += u64::from(e.actual_len());
+            let len = u64::from(e.actual_len());
+            blocks += len;
+            for offset in 0..len {
+                final_mapped.insert(e.physical_start + offset);
+            }
             Ok(())
         })?;
+        // Release any temporarily reserved AddRange block that did not survive
+        // in the final extent tree and wasn't already freed by a DelRange punch.
+        for (start, len) in temp_reserved {
+            for offset in 0..u64::from(len) {
+                let blk = start + offset;
+                if final_mapped.contains(&blk) {
+                    continue;
+                }
+                let (group, rel) = alloc.geo.absolute_to_group_block(BlockNumber(blk));
+                let gidx = group.0 as usize;
+                let Some(group_desc) = alloc.groups.get(gidx) else {
+                    continue;
+                };
+                let bm_buf = block_dev.read_block(cx, group_desc.block_bitmap_block)?;
+                if bitmap_get(bm_buf.as_slice(), rel) {
+                    ffs_alloc::free_blocks_persist(
+                        cx,
+                        &block_dev,
+                        &alloc.geo,
+                        &mut alloc.groups,
+                        BlockNumber(blk),
+                        1,
+                        &alloc.persist_ctx,
+                    )?;
+                }
+            }
+        }
         let mut pending: Vec<(u64, u16)> = Vec::new();
         if let (header, ffs_ondisk::ext4::ExtentTree::Index(indexes)) =
             ffs_ondisk::ext4::parse_extent_tree(&root_bytes).map_err(|e| parse_to_ffs_error(&e))?
@@ -16786,7 +16941,7 @@ impl OpenFs {
     fn btrfs_canonical_inode(&self, ino: InodeNumber) -> Result<u64, FfsError> {
         // Reads of a nested subvolume are routed to its own instance before
         // they get here; anything else on one (every mutation) is refused.
-        if self.btrfs_nested_enabled && Self::btrfs_nested_split(ino).0 != 0 {
+        if self.btrfs_nested_enabled && self.btrfs_is_nested_vfs_ino(ino) {
             return Err(FfsError::ReadOnly);
         }
         if ino.0 == 1 {
@@ -16798,62 +16953,313 @@ impl OpenFs {
         }
     }
 
+    fn btrfs_is_nested_vfs_ino(&self, ino: InodeNumber) -> bool {
+        if !self.btrfs_nested_has_entries.load(Ordering::Acquire) {
+            return false;
+        }
+        let state = self.btrfs_nested.lock();
+        state.from_vfs.contains_key(&ino)
+    }
+
+    fn btrfs_subvol_link_id(&self, ino: InodeNumber) -> Option<u64> {
+        if !self.btrfs_subvol_links_active.load(Ordering::Acquire) {
+            return None;
+        }
+        let state = self.btrfs_nested.lock();
+        state.link_from_vfs.get(&ino).copied()
+    }
+
+    fn btrfs_subvol_link_id_in_slot(&self, slot: usize, ino: InodeNumber) -> Option<u64> {
+        if slot == 0 {
+            return self.btrfs_subvol_link_id(ino);
+        }
+        let nested = {
+            let state = self.btrfs_nested.lock();
+            state.slots.get(slot - 1).map(|entry| Arc::clone(&entry.fs))
+        }?;
+        nested.btrfs_subvol_link_id(ino)
+    }
+
+    fn btrfs_root_inode_exists_in_alloc(
+        alloc: &BtrfsAllocState,
+        oid: u64,
+    ) -> Result<bool, FfsError> {
+        if oid <= 1 {
+            return Ok(true);
+        }
+        let key = BtrfsKey {
+            objectid: oid,
+            item_type: BTRFS_ITEM_INODE_ITEM,
+            offset: 0,
+        };
+        Ok(!alloc
+            .fs_tree
+            .range(&key, &key)
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?
+            .is_empty())
+    }
+
+    fn btrfs_root_inode_exists_readonly(&self, cx: &Cx, oid: u64) -> Result<bool, FfsError> {
+        if oid <= 1 {
+            return Ok(true);
+        }
+        if let Some(index) = self.btrfs_cached_read_plan_index() {
+            return Ok(index.inodes.contains_key(&oid));
+        }
+        match self.btrfs_read_ondisk_inode_item(cx, oid) {
+            Ok(_) => Ok(true),
+            Err(FfsError::NotFound(_)) => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn btrfs_next_free_synthetic_candidate(state: &mut BtrfsNestedState) -> u64 {
+        loop {
+            let cand = state.next_vfs_ino;
+            state.next_vfs_ino = cand.checked_add(1).unwrap_or(2);
+            if cand <= 1 {
+                continue;
+            }
+            let ino = InodeNumber(cand);
+            if !state.from_vfs.contains_key(&ino) && !state.link_from_vfs.contains_key(&ino) {
+                return cand;
+            }
+        }
+    }
+
+    /// Allocate the next inode objectid from `alloc.next_objectid`, skipping
+    /// any value currently assigned as a synthetic VFS inode for a nested
+    /// subvolume or subvolume-link placeholder.
+    fn btrfs_take_next_objectid(&self, alloc: &mut BtrfsAllocState) -> u64 {
+        let has_synthetic = self.btrfs_nested_has_entries.load(Ordering::Acquire)
+            || self.btrfs_subvol_links_active.load(Ordering::Acquire);
+        if !has_synthetic {
+            let oid = alloc.next_objectid;
+            alloc.next_objectid = alloc.next_objectid.saturating_add(1);
+            return oid;
+        }
+        let state = self.btrfs_nested.lock();
+        loop {
+            let oid = alloc.next_objectid;
+            alloc.next_objectid = alloc.next_objectid.saturating_add(1);
+            let ino = InodeNumber(oid);
+            if !state.from_vfs.contains_key(&ino) && !state.link_from_vfs.contains_key(&ino) {
+                return oid;
+            }
+        }
+    }
+
+    /// Assign (or reuse) a collision-free synthetic VFS inode for an
+    /// uncommitted subvolume-link placeholder pointing to `subvol_id`.
+    ///
+    /// Callers must not hold `self.btrfs_alloc_state` when calling this so
+    /// lock ordering stays strictly `btrfs_alloc_state` -> `btrfs_nested`.
+    fn btrfs_register_subvol_link(&self, cx: &Cx, subvol_id: u64) -> Result<InodeNumber, FfsError> {
+        if self.btrfs_subvol_links_active.load(Ordering::Acquire) {
+            let state = self.btrfs_nested.lock();
+            if let Some(&existing) = state.link_to_vfs.get(&subvol_id) {
+                return Ok(existing);
+            }
+        }
+        let preferred = BTRFS_SUBVOL_LINK_INO_BIT | subvol_id;
+        if let Some(alloc_mutex) = self.btrfs_alloc_state.as_ref() {
+            let alloc = alloc_mutex.read();
+            let mut state = self.btrfs_nested.lock();
+            if let Some(&existing) = state.link_to_vfs.get(&subvol_id) {
+                return Ok(existing);
+            }
+            let mut try_pref = Some(preferred);
+            let vfs_ino = loop {
+                let cand = match try_pref.take() {
+                    Some(pref)
+                        if pref > 1
+                            && !state.from_vfs.contains_key(&InodeNumber(pref))
+                            && !state.link_from_vfs.contains_key(&InodeNumber(pref)) =>
+                    {
+                        pref
+                    }
+                    _ => Self::btrfs_next_free_synthetic_candidate(&mut state),
+                };
+                if !Self::btrfs_root_inode_exists_in_alloc(&alloc, cand)? {
+                    break InodeNumber(cand);
+                }
+            };
+            state.link_to_vfs.insert(subvol_id, vfs_ino);
+            state.link_from_vfs.insert(vfs_ino, subvol_id);
+            self.btrfs_subvol_links_active
+                .store(true, Ordering::Release);
+            drop(state);
+            drop(alloc);
+            return Ok(vfs_ino);
+        }
+
+        let mut try_pref = Some(preferred);
+        loop {
+            let cand = {
+                let mut state = self.btrfs_nested.lock();
+                if let Some(&existing) = state.link_to_vfs.get(&subvol_id) {
+                    return Ok(existing);
+                }
+                match try_pref.take() {
+                    Some(pref)
+                        if pref > 1
+                            && !state.from_vfs.contains_key(&InodeNumber(pref))
+                            && !state.link_from_vfs.contains_key(&InodeNumber(pref)) =>
+                    {
+                        pref
+                    }
+                    _ => Self::btrfs_next_free_synthetic_candidate(&mut state),
+                }
+            };
+            if self.btrfs_root_inode_exists_readonly(cx, cand)? {
+                continue;
+            }
+            let vfs_ino = InodeNumber(cand);
+            let mut state = self.btrfs_nested.lock();
+            if let Some(&existing) = state.link_to_vfs.get(&subvol_id) {
+                return Ok(existing);
+            }
+            if state.from_vfs.contains_key(&vfs_ino) || state.link_from_vfs.contains_key(&vfs_ino) {
+                continue;
+            }
+            state.link_to_vfs.insert(subvol_id, vfs_ino);
+            state.link_from_vfs.insert(vfs_ino, subvol_id);
+            self.btrfs_subvol_links_active
+                .store(true, Ordering::Release);
+            drop(state);
+            return Ok(vfs_ino);
+        }
+    }
+
     /// VFS inode number presented for a directory entry.
     ///
     /// A `DIR_ITEM`/`DIR_INDEX` whose child key is a `ROOT_ITEM` links a
-    /// nested subvolume: its `child_objectid` is the SUBVOLUME id, not an
-    /// inode of the tree being read, so presenting it as an inode would alias
-    /// whatever inode happens to share that number (subvolume 257 vs the
-    /// tree's first file, objectid 257). Such links get a synthetic inode in
-    /// [`BTRFS_SUBVOL_LINK_INO_BIT`] space instead.
-    const fn btrfs_dir_child_ino(child_key_type: u8, child_objectid: u64) -> InodeNumber {
+    /// nested subvolume: its `child_objectid` is the subvolume id, not an
+    /// inode of the tree being read, so presenting it directly would alias
+    /// whatever inode happens to share that number. Such links receive a
+    /// collision-free synthetic VFS inode registered in [`BtrfsNestedState`].
+    fn btrfs_dir_child_ino(
+        &self,
+        cx: &Cx,
+        child_key_type: u8,
+        child_objectid: u64,
+    ) -> Result<InodeNumber, FfsError> {
         if child_key_type == BTRFS_ITEM_ROOT_ITEM {
-            InodeNumber(BTRFS_SUBVOL_LINK_INO_BIT | child_objectid)
+            self.btrfs_register_subvol_link(cx, child_objectid)
         } else {
-            InodeNumber(child_objectid)
+            Ok(InodeNumber(child_objectid))
         }
     }
 
-    /// (slot, inode within that subvolume) of a VFS inode; slot 0 is the
-    /// mounted subvolume (bd-2ryx9).
-    const fn btrfs_nested_split(ino: InodeNumber) -> (usize, InodeNumber) {
-        if ino.0 & BTRFS_SUBVOL_LINK_INO_BIT != 0 {
-            return (0, ino);
-        }
-        (
-            (ino.0 >> BTRFS_NESTED_SLOT_SHIFT) as usize,
-            InodeNumber(ino.0 & BTRFS_NESTED_OBJECTID_MASK),
-        )
-    }
-
-    const fn btrfs_nested_tag(slot: usize, ino: InodeNumber) -> InodeNumber {
+    /// Assign (or reuse) a collision-free synthetic VFS inode for `(slot, ino)`
+    /// preserving the full 64-bit nested objectid without truncation or
+    /// aliasing against ordinary inodes in the mounted subvolume.
+    fn btrfs_nested_tag(
+        &self,
+        cx: &Cx,
+        slot: usize,
+        ino: InodeNumber,
+    ) -> Result<InodeNumber, FfsError> {
         if slot == 0 {
-            ino
-        } else {
-            InodeNumber(
-                ((slot as u64) << BTRFS_NESTED_SLOT_SHIFT) | (ino.0 & BTRFS_NESTED_OBJECTID_MASK),
-            )
+            return Ok(ino);
+        }
+        let key = (slot, ino.0);
+        {
+            let state = self.btrfs_nested.lock();
+            if slot > state.slots.len() {
+                return Err(FfsError::NotFound(format!(
+                    "nested btrfs subvolume slot {slot}"
+                )));
+            }
+            if let Some(&existing) = state.to_vfs.get(&key) {
+                return Ok(existing);
+            }
+        }
+
+        if let Some(alloc_mutex) = self.btrfs_alloc_state.as_ref() {
+            let alloc = alloc_mutex.read();
+            let mut state = self.btrfs_nested.lock();
+            if slot > state.slots.len() {
+                return Err(FfsError::NotFound(format!(
+                    "nested btrfs subvolume slot {slot}"
+                )));
+            }
+            if let Some(&existing) = state.to_vfs.get(&key) {
+                return Ok(existing);
+            }
+            let vfs_ino = loop {
+                let cand = Self::btrfs_next_free_synthetic_candidate(&mut state);
+                if !Self::btrfs_root_inode_exists_in_alloc(&alloc, cand)? {
+                    break InodeNumber(cand);
+                }
+            };
+            state.to_vfs.insert(key, vfs_ino);
+            state.from_vfs.insert(vfs_ino, key);
+            self.btrfs_nested_has_entries.store(true, Ordering::Release);
+            drop(state);
+            drop(alloc);
+            return Ok(vfs_ino);
+        }
+
+        loop {
+            let cand = {
+                let mut state = self.btrfs_nested.lock();
+                if slot > state.slots.len() {
+                    return Err(FfsError::NotFound(format!(
+                        "nested btrfs subvolume slot {slot}"
+                    )));
+                }
+                if let Some(&existing) = state.to_vfs.get(&key) {
+                    return Ok(existing);
+                }
+                Self::btrfs_next_free_synthetic_candidate(&mut state)
+            };
+            if self.btrfs_root_inode_exists_readonly(cx, cand)? {
+                continue;
+            }
+            let vfs_ino = InodeNumber(cand);
+            let mut state = self.btrfs_nested.lock();
+            if slot > state.slots.len() {
+                return Err(FfsError::NotFound(format!(
+                    "nested btrfs subvolume slot {slot}"
+                )));
+            }
+            if let Some(&existing) = state.to_vfs.get(&key) {
+                return Ok(existing);
+            }
+            if state.from_vfs.contains_key(&vfs_ino) || state.link_from_vfs.contains_key(&vfs_ino) {
+                continue;
+            }
+            state.to_vfs.insert(key, vfs_ino);
+            state.from_vfs.insert(vfs_ino, key);
+            self.btrfs_nested_has_entries.store(true, Ordering::Release);
+            drop(state);
+            return Ok(vfs_ino);
         }
     }
 
-    /// The nested-subvolume instance serving VFS inode `ino`, with the inode
-    /// as that instance knows it, or `None` for this mount's own inodes.
+    /// The nested-subvolume instance serving VFS inode `ino`, with the full
+    /// 64-bit inode as that instance knows it, or `None` for this mount's own
+    /// inodes.
     fn btrfs_nested_route(
         &self,
         ino: InodeNumber,
     ) -> Result<Option<(usize, Arc<Self>, InodeNumber)>, FfsError> {
-        if !self.btrfs_nested_enabled || !self.is_btrfs() {
+        if !self.btrfs_nested_enabled
+            || !self.is_btrfs()
+            || !self.btrfs_nested_has_entries.load(Ordering::Acquire)
+        {
             return Ok(None);
         }
-        let (slot, inner) = Self::btrfs_nested_split(ino);
-        if slot == 0 {
+        let state = self.btrfs_nested.lock();
+        let Some(&(slot, inner_oid)) = state.from_vfs.get(&ino) else {
             return Ok(None);
-        }
-        let slots = self.btrfs_nested.lock();
-        let entry = slots
+        };
+        let entry = state
+            .slots
             .get(slot - 1)
             .ok_or_else(|| FfsError::NotFound(format!("nested btrfs subvolume slot {slot}")))?;
-        Ok(Some((slot, Arc::clone(&entry.fs), inner)))
+        Ok(Some((slot, Arc::clone(&entry.fs), InodeNumber(inner_oid))))
     }
 
     /// Slot and root objectid of nested subvolume `subvol_id`, opening a
@@ -16864,11 +17270,15 @@ impl OpenFs {
         subvol_id: u64,
         parent: InodeNumber,
     ) -> Result<(usize, u64), FfsError> {
-        let mut slots = self.btrfs_nested.lock();
-        if let Some(index) = slots.iter().position(|slot| slot.subvol_id == subvol_id) {
-            return Ok((index + 1, slots[index].root_dirid));
+        let mut state = self.btrfs_nested.lock();
+        if let Some(index) = state
+            .slots
+            .iter()
+            .position(|slot| slot.subvol_id == subvol_id)
+        {
+            return Ok((index + 1, state.slots[index].root_dirid));
         }
-        if slots.len() >= BTRFS_NESTED_MAX_SLOTS {
+        if state.slots.len() >= BTRFS_NESTED_MAX_SLOTS {
             return Err(FfsError::UnsupportedFeature(format!(
                 "more than {BTRFS_NESTED_MAX_SLOTS} nested btrfs subvolumes in one mount"
             )));
@@ -16900,13 +17310,15 @@ impl OpenFs {
         {
             return Err(FfsError::NotDirectory);
         }
-        slots.push(BtrfsNestedSlot {
+        state.slots.push(BtrfsNestedSlot {
             subvol_id,
             fs: Arc::new(nested),
             root_dirid,
             parent,
         });
-        Ok((slots.len(), root_dirid))
+        let slot_id = state.slots.len();
+        drop(state);
+        Ok((slot_id, root_dirid))
     }
 
     /// The VFS inode for an inode reported by slot `slot` (0 = this mount)
@@ -16923,10 +17335,9 @@ impl OpenFs {
         if !self.btrfs_nested_enabled {
             return Ok(ino);
         }
-        if ino.0 & BTRFS_SUBVOL_LINK_INO_BIT != 0 {
-            let subvol_id = ino.0 & !BTRFS_SUBVOL_LINK_INO_BIT;
+        if let Some(subvol_id) = self.btrfs_subvol_link_id_in_slot(slot, ino) {
             return match self.btrfs_nested_slot_for(cx, subvol_id, dir) {
-                Ok((child, root)) => Ok(Self::btrfs_nested_tag(child, InodeNumber(root))),
+                Ok((child, root)) => self.btrfs_nested_tag(cx, child, InodeNumber(root)),
                 // Attached-device mounts are read-only: a failed child read
                 // cannot be an uncommitted subvolume awaiting publication.
                 Err(err) if self.btrfs_devices.is_some() => Err(err),
@@ -16935,15 +17346,19 @@ impl OpenFs {
                 // empty placeholder.
                 Err(err) => {
                     debug!(subvol_id, error = %err, "nested btrfs subvolume not presented");
-                    Ok(ino)
+                    if slot == 0 {
+                        Ok(ino)
+                    } else {
+                        self.btrfs_nested_tag(cx, slot, ino)
+                    }
                 }
             };
         }
         if slot != 0 && ino.0 == 1 {
-            let root = self.btrfs_nested.lock()[slot - 1].root_dirid;
-            return Ok(Self::btrfs_nested_tag(slot, InodeNumber(root)));
+            let root = self.btrfs_nested.lock().slots[slot - 1].root_dirid;
+            return self.btrfs_nested_tag(cx, slot, InodeNumber(root));
         }
-        Ok(Self::btrfs_nested_tag(slot, ino))
+        self.btrfs_nested_tag(cx, slot, ino)
     }
 
     /// `..` of a nested subvolume's root: the directory holding its link.
@@ -16951,8 +17366,8 @@ impl OpenFs {
         if slot == 0 {
             return None;
         }
-        let slots = self.btrfs_nested.lock();
-        let entry = slots.get(slot - 1)?;
+        let state = self.btrfs_nested.lock();
+        let entry = state.slots.get(slot - 1)?;
         (inner_dir.0 == entry.root_dirid || inner_dir.0 == 1).then_some(entry.parent)
     }
 
@@ -16969,7 +17384,8 @@ impl OpenFs {
             Some((slot, nested, inner)) => (slot, nested.btrfs_lookup_child(cx, inner, name)?),
             None => (0, self.btrfs_lookup_child(cx, parent, name)?),
         };
-        if self.btrfs_nested_enabled && attr.ino.0 & BTRFS_SUBVOL_LINK_INO_BIT != 0 {
+        if self.btrfs_nested_enabled && self.btrfs_subvol_link_id_in_slot(slot, attr.ino).is_some()
+        {
             let root = self.btrfs_nested_present(cx, slot, attr.ino, parent)?;
             let Some((_, nested, inner)) = self.btrfs_nested_route(root)? else {
                 return Ok(attr); // still the placeholder
@@ -16994,10 +17410,14 @@ impl OpenFs {
         page: crate::vfs::ReaddirPage,
     ) -> Result<crate::vfs::ReaddirPage, FfsError> {
         if !self.btrfs_nested_enabled
-            || (slot == 0
-                && !page
-                    .iter()
-                    .any(|entry| entry.ino.0 & BTRFS_SUBVOL_LINK_INO_BIT != 0))
+            || (slot == 0 && !self.btrfs_subvol_links_active.load(Ordering::Acquire))
+        {
+            return Ok(page);
+        }
+        if slot == 0
+            && !page
+                .iter()
+                .any(|entry| self.btrfs_subvol_link_id(entry.ino).is_some())
         {
             return Ok(page);
         }
@@ -17695,7 +18115,7 @@ impl OpenFs {
     fn btrfs_read_inode_attr(&self, cx: &Cx, ino: InodeNumber) -> Result<InodeAttr, FfsError> {
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         let canonical = self.btrfs_canonical_inode(ino)?;
-        if canonical & BTRFS_SUBVOL_LINK_INO_BIT != 0 {
+        if self.btrfs_subvol_link_id(ino).is_some() {
             return Ok(self.btrfs_subvol_link_attr(ino));
         }
 
@@ -17797,7 +18217,7 @@ impl OpenFs {
     ) -> Result<InodeAttr, FfsError> {
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         let canonical_parent = self.btrfs_canonical_inode(parent)?;
-        if canonical_parent & BTRFS_SUBVOL_LINK_INO_BIT != 0 {
+        if self.btrfs_subvol_link_id(parent).is_some() {
             // A nested-subvolume link is presented as an empty directory.
             return Err(FfsError::NotFound(
                 String::from_utf8_lossy(name).into_owned(),
@@ -17814,9 +18234,10 @@ impl OpenFs {
             }
             let alloc = alloc_mutex.read();
             let dir_item = Self::btrfs_lookup_dir_entry(&alloc, canonical_parent, name)?;
-            let child_ino =
-                Self::btrfs_dir_child_ino(dir_item.child_key_type, dir_item.child_objectid);
+            let (child_key_type, child_objectid) =
+                (dir_item.child_key_type, dir_item.child_objectid);
             drop(alloc);
+            let child_ino = self.btrfs_dir_child_ino(cx, child_key_type, child_objectid)?;
             return self.btrfs_read_inode_attr(cx, child_ino);
         }
 
@@ -17887,8 +18308,11 @@ impl OpenFs {
             let dir_items = parse_dir_items(&item.data).map_err(|e| parse_to_ffs_error(&e))?;
             for dir_item in dir_items {
                 if dir_item.name == name {
-                    let child_ino =
-                        Self::btrfs_dir_child_ino(dir_item.child_key_type, dir_item.child_objectid);
+                    let child_ino = self.btrfs_dir_child_ino(
+                        cx,
+                        dir_item.child_key_type,
+                        dir_item.child_objectid,
+                    )?;
                     return self.btrfs_read_inode_attr(cx, child_ino);
                 }
             }
@@ -17914,8 +18338,11 @@ impl OpenFs {
             let dir_items = parse_dir_items(&item.data).map_err(|e| parse_to_ffs_error(&e))?;
             for dir_item in dir_items {
                 if dir_item.name == name {
-                    let child_ino =
-                        Self::btrfs_dir_child_ino(dir_item.child_key_type, dir_item.child_objectid);
+                    let child_ino = self.btrfs_dir_child_ino(
+                        cx,
+                        dir_item.child_key_type,
+                        dir_item.child_objectid,
+                    )?;
                     return self.btrfs_read_inode_attr(cx, child_ino);
                 }
             }
@@ -17968,7 +18395,7 @@ impl OpenFs {
         trace!(inode = %ino, "btrfs readdir_start");
 
         let canonical_dir = self.btrfs_canonical_inode(ino)?;
-        if canonical_dir & BTRFS_SUBVOL_LINK_INO_BIT != 0 {
+        if self.btrfs_subvol_link_id(ino).is_some() {
             // A nested-subvolume link is presented as an empty directory. Its
             // parent is not recoverable from the synthetic inode, so ".."
             // names the link itself, as for any directory with no INODE_REF.
@@ -17994,6 +18421,7 @@ impl OpenFs {
             ]);
         }
         let mut rows: Vec<(u64, DirEntry)> = Vec::new();
+        let mut subvol_link_rows: Vec<(usize, u64)> = Vec::new();
 
         // Parent objectid for the synthetic ".." entry, captured from the same
         // read-only walk below so it needs no separate (full-tree) walk
@@ -18029,8 +18457,13 @@ impl OpenFs {
                     if cb_err.is_some() {
                         return;
                     }
-                    if let Err(e) = Self::btrfs_push_dir_rows(canonical_dir, &key, data, &mut rows)
-                    {
+                    if let Err(e) = Self::btrfs_push_dir_rows(
+                        canonical_dir,
+                        &key,
+                        data,
+                        &mut rows,
+                        &mut subvol_link_rows,
+                    ) {
                         cb_err = Some(e);
                     }
                 })
@@ -18049,7 +18482,13 @@ impl OpenFs {
             readonly_parent_oid = index.parents.get(&canonical_dir).copied();
             if let Some(items) = index.dir_items.get(&canonical_dir) {
                 for (key, data) in items.iter() {
-                    Self::btrfs_push_dir_rows(canonical_dir, key, data.as_slice(), &mut rows)?;
+                    Self::btrfs_push_dir_rows(
+                        canonical_dir,
+                        key,
+                        data.as_slice(),
+                        &mut rows,
+                        &mut subvol_link_rows,
+                    )?;
                 }
             }
         } else {
@@ -18082,8 +18521,15 @@ impl OpenFs {
                     &item.key,
                     item.data.as_slice(),
                     &mut rows,
+                    &mut subvol_link_rows,
                 )?;
             }
+        }
+
+        // Assign collision-free synthetic VFS inodes for any subvolume-link
+        // entries after dropping `alloc` so lock ordering stays acyclic.
+        for (row_idx, subvol_id) in subvol_link_rows {
+            rows[row_idx].1.ino = self.btrfs_register_subvol_link(cx, subvol_id)?;
         }
 
         rows.sort_by_key(|(k, _)| *k);
@@ -18182,6 +18628,7 @@ impl OpenFs {
         key: &BtrfsKey,
         data: &[u8],
         rows: &mut Vec<(u64, DirEntry)>,
+        subvol_link_rows: &mut Vec<(usize, u64)>,
     ) -> Result<(), FfsError> {
         // Prefer DIR_INDEX ordering when available. DIR_ITEM entries get a
         // high-bit bias so they naturally sort after DIR_INDEX.
@@ -18191,6 +18638,7 @@ impl OpenFs {
             key.offset | (1_u64 << 63)
         };
         let rows_start = rows.len();
+        let links_start = subvol_link_rows.len();
         let mut local_idx = 0_u64;
         let parsed = visit_dir_items(data, |dir_item| {
             trace!(
@@ -18201,13 +18649,16 @@ impl OpenFs {
                 "btrfs dir_item_found"
             );
 
+            let ino = if dir_item.child_key_type == BTRFS_ITEM_ROOT_ITEM {
+                subvol_link_rows.push((rows.len(), dir_item.child_objectid));
+                InodeNumber(0)
+            } else {
+                InodeNumber(dir_item.child_objectid)
+            };
             rows.push((
                 base.saturating_add(local_idx),
                 DirEntry {
-                    ino: Self::btrfs_dir_child_ino(
-                        dir_item.child_key_type,
-                        dir_item.child_objectid,
-                    ),
+                    ino,
                     offset: 0,
                     kind: Self::btrfs_dir_type_to_file_type(dir_item.file_type),
                     name: dir_item.name.to_vec(),
@@ -18219,6 +18670,7 @@ impl OpenFs {
             // The owned parser returned no entries on any malformed payload;
             // preserve that all-or-nothing projection contract.
             rows.truncate(rows_start);
+            subvol_link_rows.truncate(links_start);
             warn!(
                 inode = canonical_dir,
                 item_type = key.item_type,
@@ -46652,8 +47104,7 @@ impl OpenFs {
         let (dir_item_key, dir_item_collision) =
             Self::btrfs_create_dir_entry_check(&alloc, parent_oid, name)?;
 
-        let new_oid = alloc.next_objectid;
-        alloc.next_objectid = alloc.next_objectid.saturating_add(1);
+        let new_oid = self.btrfs_take_next_objectid(&mut alloc);
 
         // Create the INODE_ITEM.
         let inode = BtrfsInodeItem {
@@ -46865,8 +47316,7 @@ impl OpenFs {
         let (dir_item_key, dir_item_collision) =
             Self::btrfs_create_dir_entry_check(&alloc, parent_oid, name)?;
 
-        let new_oid = alloc.next_objectid;
-        alloc.next_objectid = alloc.next_objectid.saturating_add(1);
+        let new_oid = self.btrfs_take_next_objectid(&mut alloc);
 
         let inode = BtrfsInodeItem {
             generation: alloc.generation,
@@ -47446,8 +47896,7 @@ impl OpenFs {
         // per-op insert path, so the collision flag is unused here) (bd-btrcreate-dedup).
         Self::btrfs_create_dir_entry_check(&alloc, parent_oid, name)?;
 
-        let new_oid = alloc.next_objectid;
-        alloc.next_objectid = alloc.next_objectid.saturating_add(1);
+        let new_oid = self.btrfs_take_next_objectid(&mut alloc);
 
         let inode = BtrfsInodeItem {
             generation: alloc.generation,
@@ -48328,8 +48777,7 @@ impl OpenFs {
         let (secs, nanos) = Self::btrfs_now_timestamp();
         let mut alloc = alloc_mutex.write();
         self.btrfs_require_directory_inode(&alloc, parent_oid)?;
-        let new_oid = alloc.next_objectid;
-        alloc.next_objectid = alloc.next_objectid.saturating_add(1);
+        let new_oid = self.btrfs_take_next_objectid(&mut alloc);
         let inode = BtrfsInodeItem {
             generation: alloc.generation,
             size: 0,
@@ -48391,8 +48839,7 @@ impl OpenFs {
         // per-op insert path, so the collision flag is unused here) (bd-btrcreate-dedup).
         Self::btrfs_create_dir_entry_check(&alloc, parent_oid, name)?;
 
-        let new_oid = alloc.next_objectid;
-        alloc.next_objectid = alloc.next_objectid.saturating_add(1);
+        let new_oid = self.btrfs_take_next_objectid(&mut alloc);
 
         let target_len = u64::try_from(target_bytes.len()).map_err(|_| {
             FfsError::InvalidGeometry("symlink target length does not fit u64".into())
@@ -69916,7 +70363,7 @@ mod tests {
         let (slot, _) = fs
             .btrfs_nested_slot_for(&cx, BTRFS_FS_TREE_OBJECTID, InodeNumber(1))
             .unwrap();
-        let tagged = OpenFs::btrfs_nested_tag(slot, InodeNumber(257));
+        let tagged = fs.btrfs_nested_tag(&cx, slot, InodeNumber(257)).unwrap();
         let (_, nested, inner) = fs.btrfs_nested_route(tagged).unwrap().unwrap();
         assert_eq!(fs.read(&cx, tagged, 0, 6).unwrap(), b"before");
         assert_eq!(OpenFs::read(&nested, &cx, inner, 0, 6).unwrap(), b"before");
@@ -114970,13 +115417,13 @@ pub(crate) mod scrub;\n";
                 let (slot, _) = fs
                     .btrfs_nested_slot_for(&cx, BTRFS_FS_TREE_OBJECTID, InodeNumber(1))
                     .unwrap();
-                let nested_fs = Arc::clone(&fs.btrfs_nested.lock()[slot - 1].fs);
+                let nested_fs = Arc::clone(&fs.btrfs_nested.lock().slots[slot - 1].fs);
                 assert!(!nested_fs.write_authority);
                 assert!(matches!(
                     nested_fs.require_repair_write_access(),
                     Err(FfsError::ReadOnly)
                 ));
-                let nested = OpenFs::btrfs_nested_tag(slot, file.ino);
+                let nested = fs.btrfs_nested_tag(&cx, slot, file.ino).unwrap();
                 assert_eq!(
                     fs.read(&cx, nested, 0, 128).unwrap(),
                     b"hello from btrfs fsops"
@@ -115036,7 +115483,7 @@ pub(crate) mod scrub;\n";
         let (slot, _) = fs
             .btrfs_nested_slot_for(&cx, BTRFS_FS_TREE_OBJECTID, InodeNumber(1))
             .unwrap();
-        let tagged = OpenFs::btrfs_nested_tag(slot, file.ino);
+        let tagged = fs.btrfs_nested_tag(&cx, slot, file.ino).unwrap();
         assert_eq!(
             fs.read(&cx, tagged, 0, 128).unwrap(),
             b"hello from btrfs fsops"
@@ -121995,18 +122442,25 @@ pub(crate) mod scrub;\n";
             assert!(ok, "btrfs check after refused mutations:\n{output}");
         }
         let ro = OpenFs::open_with_options(&cx, &image, &OpenOptions::default()).expect("open ro");
-        check_reads(
-            &ro,
-            "read-only",
-            InodeNumber((1 << BTRFS_NESTED_SLOT_SHIFT) | u64::from(BTRFS_FIRST_FREE_OBJECTID)),
-        );
+        let ro_link = ro
+            .lookup(&cx, InodeNumber(1), OsStr::new("nested"))
+            .expect("ro lookup nested");
+        assert_ne!(ro_link.ino, InodeNumber(subvol_id));
+        let (ro_slot, _, ro_inner) = ro
+            .btrfs_nested_route(ro_link.ino)
+            .expect("ro route nested")
+            .expect("ro nested slot");
+        assert_eq!(ro_slot, 1);
+        assert_eq!(ro_inner, InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID)));
+        check_reads(&ro, "read-only", ro_link.ino);
         let nested = ro.btrfs_nested.lock();
         assert!(
-            !nested.is_empty(),
+            !nested.slots.is_empty(),
             "nested lookup must populate its child reader"
         );
         assert!(
             nested
+                .slots
                 .iter()
                 .all(|slot| !slot.fs.write_authority && !slot.fs.is_writable())
         );
@@ -122159,7 +122613,7 @@ pub(crate) mod scrub;\n";
                     assert!(link.is_err(), "{fault} child must not become a placeholder");
                     assert!(fs.readdir(&cx, InodeNumber(1), 0).is_err());
                     assert!(
-                        fs.btrfs_nested.lock().is_empty(),
+                        fs.btrfs_nested.lock().slots.is_empty(),
                         "invalid child was cached"
                     );
                     continue;
@@ -122220,7 +122674,7 @@ pub(crate) mod scrub;\n";
                     Err(FfsError::IsDirectory)
                 ));
                 assert_eq!(out, [0xA5; 128]);
-                let invalid = OpenFs::btrfs_nested_tag(slot + 1, InodeNumber(257));
+                let invalid = InodeNumber(BTRFS_NESTED_VFS_INO_BASE + 9999);
                 assert!(matches!(
                     fs.read_into(&cx, invalid, 0, &mut out),
                     Err(FfsError::NotFound(_))
@@ -122379,14 +122833,17 @@ pub(crate) mod scrub;\n";
                 .lookup(&cx, InodeNumber(1), OsStr::new("sv"))
                 .expect("sv");
             let inner = fs.lookup(&cx, sv.ino, OsStr::new("inner")).expect("inner");
+            let (sv_slot, _, _) = fs
+                .btrfs_nested_route(sv.ino)
+                .expect("route sv")
+                .expect("{label}: sv is nested");
+            let (inner_slot, _, _) = fs
+                .btrfs_nested_route(inner.ino)
+                .expect("route inner")
+                .expect("{label}: inner is nested");
+            assert_ne!(sv_slot, 0, "{label}: sv is nested");
             assert_ne!(
-                sv.ino.0 >> BTRFS_NESTED_SLOT_SHIFT,
-                0,
-                "{label}: sv is nested"
-            );
-            assert_ne!(
-                inner.ino.0 >> BTRFS_NESTED_SLOT_SHIFT,
-                sv.ino.0 >> BTRFS_NESTED_SLOT_SHIFT,
+                inner_slot, sv_slot,
                 "{label}: inner is a subvolume of its own"
             );
             assert_eq!(fs.getattr(&cx, sv.ino).expect("getattr sv").ino, sv.ino);
@@ -146240,6 +146697,585 @@ pub(crate) mod scrub;\n";
                 "e2fsck must accept image after {RENAMES} clobbering renames:\n{output}"
             );
         }
+    }
+
+    #[test]
+    fn btrfs_default_high_objectid_ordinary_inodes_remain_accessible() {
+        let high_ids: &[(&[u8], u64)] = &[
+            (b"low.txt", 257),
+            (b"slot1_high.txt", (1_u64 << 48) + 257),
+            (b"vfs_base.txt", 1_u64 << 62),
+            (b"vfs_base_plus_1.txt", (1_u64 << 62) + 1),
+            (b"bit63_high.txt", (1_u64 << 63) + 257),
+            (b"last_free.txt", BTRFS_LAST_FREE_OBJECTID),
+        ];
+        let entries: Vec<(&[u8], u64, u8, u32)> = high_ids
+            .iter()
+            .map(|&(name, oid)| (name, oid, ffs_btrfs::BTRFS_FT_REG_FILE, 0o100_644))
+            .collect();
+        let image = build_btrfs_readdir_image(&entries);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(image)),
+            &OpenOptions::default(),
+        )
+        .expect("open btrfs image with default options");
+
+        let dir_entries = fs.readdir(&cx, InodeNumber(1), 0).expect("readdir root");
+        for &(name, expected_oid) in high_ids {
+            let entry = dir_entries
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "readdir missing {} (oid {expected_oid})",
+                        String::from_utf8_lossy(name)
+                    )
+                });
+            assert_eq!(
+                entry.ino,
+                InodeNumber(expected_oid),
+                "readdir must preserve full-width objectid for {}",
+                String::from_utf8_lossy(name)
+            );
+            let attr = fs.getattr(&cx, entry.ino).unwrap_or_else(|err| {
+                panic!(
+                    "getattr failed for {} (oid {expected_oid}): {err:?}",
+                    String::from_utf8_lossy(name)
+                )
+            });
+            assert_eq!(attr.kind, FileType::RegularFile);
+            assert_eq!(attr.ino, InodeNumber(expected_oid));
+
+            let looked = fs
+                .lookup(
+                    &cx,
+                    InodeNumber(1),
+                    OsStr::new(std::str::from_utf8(name).unwrap()),
+                )
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "lookup failed for {} (oid {expected_oid}): {err:?}",
+                        String::from_utf8_lossy(name)
+                    )
+                });
+            assert_eq!(looked.ino, InodeNumber(expected_oid));
+            assert_eq!(looked.kind, FileType::RegularFile);
+        }
+    }
+
+    #[test]
+    fn btrfs_nested_subvolume_collision_free_with_high_ordinary_and_nested_objectids() {
+        const NESTED_ROOT: usize = 0x3_0000;
+        const NESTED_ID: u64 = 256;
+        const HIGH_SLOT1_OID: u64 = (1_u64 << 48) + 257;
+        const HIGH_BASE_OID: u64 = 1_u64 << 62;
+        const HIGH_BASE1_OID: u64 = (1_u64 << 62) + 1;
+        const HIGH_BIT63_OID: u64 = (1_u64 << 63) + 257;
+        const NESTED_HIGH_OID: u64 = (1_u64 << 48) + 257;
+        const NESTED_VERY_HIGH_OID: u64 = (1_u64 << 60) + 999;
+
+        let image_size: usize = 512 * 1024;
+        let mut image = vec![0_u8; image_size];
+        let sb_off = BTRFS_SUPER_INFO_OFFSET;
+        let root_tree_logical = 0x4_000_u64;
+        let fs_tree_logical = 0x20_000_u64;
+        let nodesize = 16384_usize;
+
+        image[sb_off + 0x40..sb_off + 0x48].copy_from_slice(&BTRFS_MAGIC.to_le_bytes());
+        image[sb_off + 0x48..sb_off + 0x50].copy_from_slice(&1_u64.to_le_bytes());
+        image[sb_off + 0x50..sb_off + 0x58].copy_from_slice(&root_tree_logical.to_le_bytes());
+        image[sb_off + 0x70..sb_off + 0x78].copy_from_slice(&(image_size as u64).to_le_bytes());
+        image[sb_off + 0x80..sb_off + 0x88].copy_from_slice(&256_u64.to_le_bytes());
+        image[sb_off + 0x88..sb_off + 0x90].copy_from_slice(&1_u64.to_le_bytes());
+        image[sb_off + 0x90..sb_off + 0x94].copy_from_slice(&4096_u32.to_le_bytes());
+        image[sb_off + 0x94..sb_off + 0x98].copy_from_slice(&(nodesize as u32).to_le_bytes());
+        image[sb_off + 0x9C..sb_off + 0xA0].copy_from_slice(&4096_u32.to_le_bytes());
+
+        let mut chunk_array = Vec::new();
+        chunk_array.extend_from_slice(&256_u64.to_le_bytes());
+        chunk_array.push(228_u8);
+        chunk_array.extend_from_slice(&0_u64.to_le_bytes());
+        chunk_array.extend_from_slice(&(image_size as u64).to_le_bytes());
+        chunk_array.extend_from_slice(&2_u64.to_le_bytes());
+        chunk_array.extend_from_slice(&0x1_0000_u64.to_le_bytes());
+        chunk_array.extend_from_slice(&2_u64.to_le_bytes());
+        chunk_array.extend_from_slice(&4096_u32.to_le_bytes());
+        chunk_array.extend_from_slice(&4096_u32.to_le_bytes());
+        chunk_array.extend_from_slice(&4096_u32.to_le_bytes());
+        chunk_array.extend_from_slice(&1_u16.to_le_bytes());
+        chunk_array.extend_from_slice(&0_u16.to_le_bytes());
+        chunk_array.extend_from_slice(&1_u64.to_le_bytes());
+        chunk_array.extend_from_slice(&0_u64.to_le_bytes());
+        chunk_array.extend_from_slice(&[0_u8; 16]);
+        image[sb_off + 0xA0..sb_off + 0xA4]
+            .copy_from_slice(&(chunk_array.len() as u32).to_le_bytes());
+        image[sb_off + 0x32B..sb_off + 0x32B + chunk_array.len()].copy_from_slice(&chunk_array);
+
+        let root_leaf = root_tree_logical as usize;
+        image[root_leaf + 0x30..root_leaf + 0x38].copy_from_slice(&root_tree_logical.to_le_bytes());
+        image[root_leaf + 0x50..root_leaf + 0x58].copy_from_slice(&1_u64.to_le_bytes());
+        image[root_leaf + 0x58..root_leaf + 0x60].copy_from_slice(&1_u64.to_le_bytes());
+        image[root_leaf + 0x60..root_leaf + 0x64].copy_from_slice(&2_u32.to_le_bytes());
+        for (idx, (oid, bytenr)) in [
+            (BTRFS_FS_TREE_OBJECTID, fs_tree_logical),
+            (NESTED_ID, NESTED_ROOT as u64),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let off = 3000 - (idx as u32) * 300;
+            write_btrfs_leaf_item(
+                &mut image,
+                root_leaf,
+                idx,
+                oid,
+                BTRFS_ITEM_ROOT_ITEM,
+                0,
+                off,
+                239,
+            );
+            let mut ri = vec![0_u8; 239];
+            ri[168..176].copy_from_slice(&256_u64.to_le_bytes());
+            ri[176..184].copy_from_slice(&bytenr.to_le_bytes());
+            let dst = root_leaf + off as usize;
+            image[dst..dst + 239].copy_from_slice(&ri);
+        }
+        stamp_btrfs_test_tree_block_crc32c(&mut image, root_leaf);
+
+        let build_leaf = |img: &mut [u8],
+                          leaf_off: usize,
+                          owner: u64,
+                          files: &[(&[u8], u64, &[u8])],
+                          subvol_link: Option<(&[u8], u64)>| {
+            img[leaf_off + 0x30..leaf_off + 0x38].copy_from_slice(&(leaf_off as u64).to_le_bytes());
+            img[leaf_off + 0x50..leaf_off + 0x58].copy_from_slice(&1_u64.to_le_bytes());
+            img[leaf_off + 0x58..leaf_off + 0x60].copy_from_slice(&owner.to_le_bytes());
+            img[leaf_off + 0x64] = 0;
+            let mut items: Vec<(u64, u8, u64, Vec<u8>)> = Vec::new();
+            items.push((
+                256,
+                BTRFS_ITEM_INODE_ITEM,
+                0,
+                encode_btrfs_inode_item(0o040_755, 4096, 4096, 2).to_vec(),
+            ));
+            let mut seq = 2_u64;
+            if let Some((link_name, sv_id)) = subvol_link {
+                let mut di =
+                    encode_btrfs_dir_index_entry(link_name, sv_id, ffs_btrfs::BTRFS_FT_DIR);
+                di[8] = BTRFS_ITEM_ROOT_ITEM;
+                items.push((256, BTRFS_ITEM_DIR_INDEX, seq, di));
+                seq += 1;
+            }
+            for &(name, oid, payload) in files {
+                let di = encode_btrfs_dir_index_entry(name, oid, ffs_btrfs::BTRFS_FT_REG_FILE);
+                items.push((256, BTRFS_ITEM_DIR_INDEX, seq, di));
+                seq += 1;
+                items.push((
+                    oid,
+                    BTRFS_ITEM_INODE_ITEM,
+                    0,
+                    encode_btrfs_inode_item(
+                        0o100_644,
+                        payload.len() as u64,
+                        payload.len() as u64,
+                        1,
+                    )
+                    .to_vec(),
+                ));
+                items.push((
+                    oid,
+                    BTRFS_ITEM_EXTENT_DATA,
+                    0,
+                    encode_btrfs_extent_inline(payload),
+                ));
+            }
+            items.sort_by_key(|(o, t, off, _)| (*o, *t, *off));
+            img[leaf_off + 0x60..leaf_off + 0x64]
+                .copy_from_slice(&(items.len() as u32).to_le_bytes());
+            let mut data_cursor = nodesize;
+            for (idx, (oid, ty, offset, payload)) in items.into_iter().enumerate() {
+                data_cursor -= payload.len();
+                write_btrfs_leaf_item(
+                    img,
+                    leaf_off,
+                    idx,
+                    oid,
+                    ty,
+                    offset,
+                    data_cursor as u32,
+                    payload.len() as u32,
+                );
+                img[leaf_off + data_cursor..leaf_off + data_cursor + payload.len()]
+                    .copy_from_slice(&payload);
+            }
+            stamp_btrfs_test_tree_block_crc32c(img, leaf_off);
+        };
+
+        let parent_files: &[(&[u8], u64, &[u8])] = &[
+            (b"p_low", 257, b"parent-low-data"),
+            (b"p_slot1", HIGH_SLOT1_OID, b"parent-slot1-data"),
+            (b"p_base", HIGH_BASE_OID, b"parent-base-data"),
+            (b"p_base1", HIGH_BASE1_OID, b"parent-base1-data"),
+            (b"p_bit63", HIGH_BIT63_OID, b"parent-bit63-data"),
+        ];
+        let nested_files: &[(&[u8], u64, &[u8])] = &[
+            (b"n_low", 257, b"nested-low-data"),
+            (b"n_high", NESTED_HIGH_OID, b"nested-high-data"),
+            (b"n_vhigh", NESTED_VERY_HIGH_OID, b"nested-vhigh-data"),
+        ];
+        build_leaf(
+            &mut image,
+            fs_tree_logical as usize,
+            BTRFS_FS_TREE_OBJECTID,
+            parent_files,
+            Some((b"nested", NESTED_ID)),
+        );
+        build_leaf(&mut image, NESTED_ROOT, NESTED_ID, nested_files, None);
+        let csum = ffs_types::crc32c(&image[sb_off + 0x20..sb_off + 4096]);
+        image[sb_off..sb_off + 4].copy_from_slice(&csum.to_le_bytes());
+
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(image)),
+            &OpenOptions::default(),
+        )
+        .expect("open nested high-objectid btrfs image");
+
+        let nested_dir = fs
+            .lookup(&cx, InodeNumber(1), OsStr::new("nested"))
+            .expect("lookup nested subvolume");
+        assert_eq!(nested_dir.kind, FileType::Directory);
+
+        let mut all_vfs_inos = std::collections::BTreeSet::new();
+        assert!(all_vfs_inos.insert(nested_dir.ino));
+
+        let nested_entries = fs.readdir(&cx, nested_dir.ino, 0).expect("readdir nested");
+        for &(name, _oid, expected_data) in nested_files {
+            let name_str = std::str::from_utf8(name).unwrap();
+            let dir_entry = nested_entries
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("nested readdir missing {name_str}"));
+            let looked = fs
+                .lookup(&cx, nested_dir.ino, OsStr::new(name_str))
+                .unwrap_or_else(|e| panic!("nested lookup {name_str}: {e:?}"));
+            let attr = fs
+                .getattr(&cx, dir_entry.ino)
+                .unwrap_or_else(|e| panic!("nested getattr {name_str}: {e:?}"));
+            assert_eq!(
+                dir_entry.ino, looked.ino,
+                "readdir/lookup stability {name_str}"
+            );
+            assert_eq!(attr.ino, looked.ino, "getattr stability {name_str}");
+            assert!(
+                all_vfs_inos.insert(attr.ino),
+                "duplicate VFS inode {:?} for nested {name_str}",
+                attr.ino
+            );
+            assert_eq!(
+                fs.read(&cx, attr.ino, 0, 128).expect("read nested file"),
+                expected_data,
+                "nested payload mismatch for {name_str}"
+            );
+            assert_eq!(
+                fs.lookup(&cx, nested_dir.ino, OsStr::new(name_str))
+                    .unwrap()
+                    .ino,
+                attr.ino
+            );
+        }
+
+        let parent_entries = fs.readdir(&cx, InodeNumber(1), 0).expect("readdir parent");
+        for &(name, expected_oid, expected_data) in parent_files {
+            let name_str = std::str::from_utf8(name).unwrap();
+            let dir_entry = parent_entries
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("parent readdir missing {name_str}"));
+            assert_eq!(
+                dir_entry.ino,
+                InodeNumber(expected_oid),
+                "parent readdir must keep exact oid for {name_str}"
+            );
+            assert!(
+                all_vfs_inos.insert(dir_entry.ino),
+                "parent high oid {:?} collided with a nested VFS inode",
+                dir_entry.ino
+            );
+            let attr = fs
+                .getattr(&cx, dir_entry.ino)
+                .unwrap_or_else(|e| panic!("parent getattr {name_str}: {e:?}"));
+            assert_eq!(attr.ino, InodeNumber(expected_oid));
+            assert_eq!(
+                fs.read(&cx, attr.ino, 0, 128).expect("read parent file"),
+                expected_data,
+                "parent payload mismatch (aliased to nested?) for {name_str}"
+            );
+            assert_eq!(
+                fs.lookup(&cx, InodeNumber(1), OsStr::new(name_str))
+                    .unwrap()
+                    .ino,
+                InodeNumber(expected_oid)
+            );
+        }
+    }
+
+    #[test]
+    fn ext4_fast_commit_superseded_add_range_does_not_claim_freed_block() {
+        let mut image = build_ext4_image_with_extents();
+        let bm = 2 * 4096;
+        image[bm] = 0xFF;
+        image[bm + 1] = 0xFF;
+        let gd_off = 4096;
+        let expected_free = 48_u16;
+        image[gd_off + 0x0C..gd_off + 0x0E].copy_from_slice(&expected_free.to_le_bytes());
+
+        let ino11_off: usize = 4 * 4096 + 10 * 256;
+        image[ino11_off + 4..ino11_off + 8].copy_from_slice(&0_u32.to_le_bytes());
+        image[ino11_off + 0x1C..ino11_off + 0x20].copy_from_slice(&0_u32.to_le_bytes());
+        let e = ino11_off + 0x28;
+        image[e + 2..e + 4].copy_from_slice(&0_u16.to_le_bytes());
+        image[e + 12..e + 24].fill(0);
+
+        let empty_raw = image[ino11_off..ino11_off + 256].to_vec();
+        let mut mapped_raw = empty_raw.clone();
+        mapped_raw[4..8].copy_from_slice(&4096_u32.to_le_bytes());
+        mapped_raw[0x1C..0x20].copy_from_slice(&8_u32.to_le_bytes());
+        mapped_raw[0x28 + 2..0x28 + 4].copy_from_slice(&1_u16.to_le_bytes());
+        mapped_raw[0x28 + 12..0x28 + 16].copy_from_slice(&0_u32.to_le_bytes());
+        mapped_raw[0x28 + 16..0x28 + 18].copy_from_slice(&1_u16.to_le_bytes());
+        mapped_raw[0x28 + 18..0x28 + 20].copy_from_slice(&0_u16.to_le_bytes());
+        mapped_raw[0x28 + 20..0x28 + 24].copy_from_slice(&60_u32.to_le_bytes());
+
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default())
+            .expect("open ext4 fixture");
+        let ops = vec![
+            ffs_journal::FcOperation::AddRange(ffs_journal::FcExtentRange {
+                ino: 11,
+                logical_block: 0,
+                len: 1,
+                physical_block: 60,
+                unwritten: false,
+            }),
+            ffs_journal::FcOperation::InodeUpdate(11, mapped_raw),
+            ffs_journal::FcOperation::DelRange(ffs_journal::FcDelRange {
+                ino: 11,
+                logical_block: 0,
+                len: 1,
+            }),
+            ffs_journal::FcOperation::InodeUpdate(11, empty_raw),
+        ];
+
+        for pass in 1..=2 {
+            fs.apply_fast_commit_operations(&cx, &ops, true)
+                .unwrap_or_else(|err| panic!("fc apply pass {pass}: {err:?}"));
+            let reopened = OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default())
+                .expect("reopen after fc apply");
+            let inode = reopened
+                .read_inode(&cx, InodeNumber(11))
+                .expect("read ino 11");
+            assert_eq!(inode.links_count, 1, "pass {pass}: inode stays live");
+            assert_eq!(inode.size, 0, "pass {pass}: final size is 0");
+            assert_eq!(inode.blocks, 0, "pass {pass}: final blocks is 0");
+            assert!(
+                reopened.collect_extents(&cx, &inode).unwrap().is_empty(),
+                "pass {pass}: final extent mapping must be empty"
+            );
+            let alloc = reopened.load_ext4_alloc_state(&cx).expect("load alloc");
+            let bdev = reopened.direct_block_device_adapter();
+            let bm_buf = bdev
+                .read_block(&cx, alloc.groups[0].block_bitmap_block)
+                .expect("read block bitmap");
+            assert!(
+                !bitmap_get(bm_buf.as_slice(), 60),
+                "pass {pass}: superseded AddRange block 60 must remain FREE in bitmap"
+            );
+            assert_eq!(
+                alloc.groups[0].free_blocks,
+                u32::from(expected_free),
+                "pass {pass}: group free_blocks must stay {expected_free}"
+            );
+        }
+    }
+
+    #[test]
+    fn ext4_fast_commit_partial_del_range_and_live_add_range_claim_only_surviving_blocks() {
+        let mut image = build_ext4_image_with_extents();
+        let bm = 2 * 4096;
+        image[bm] = 0xFF;
+        image[bm + 1] = 0xFF;
+        let gd_off = 4096;
+        let initial_free = 48_u16;
+        image[gd_off + 0x0C..gd_off + 0x0E].copy_from_slice(&initial_free.to_le_bytes());
+
+        let ino11_off: usize = 4 * 4096 + 10 * 256;
+        image[ino11_off + 4..ino11_off + 8].copy_from_slice(&0_u32.to_le_bytes());
+        image[ino11_off + 0x1C..ino11_off + 0x20].copy_from_slice(&0_u32.to_le_bytes());
+        image[ino11_off + 0x28 + 2..ino11_off + 0x28 + 4].copy_from_slice(&0_u16.to_le_bytes());
+        image[ino11_off + 0x28 + 12..ino11_off + 0x28 + 24].fill(0);
+        let base_raw = image[ino11_off..ino11_off + 256].to_vec();
+
+        let make_mapped = |phys: u32, len: u16| -> Vec<u8> {
+            let mut raw = base_raw.clone();
+            raw[4..8].copy_from_slice(&(u32::from(len) * 4096).to_le_bytes());
+            raw[0x1C..0x20].copy_from_slice(&(u32::from(len) * 8).to_le_bytes());
+            raw[0x28 + 2..0x28 + 4].copy_from_slice(&1_u16.to_le_bytes());
+            raw[0x28 + 12..0x28 + 16].copy_from_slice(&0_u32.to_le_bytes());
+            raw[0x28 + 16..0x28 + 18].copy_from_slice(&len.to_le_bytes());
+            raw[0x28 + 18..0x28 + 20].copy_from_slice(&0_u16.to_le_bytes());
+            raw[0x28 + 20..0x28 + 24].copy_from_slice(&phys.to_le_bytes());
+            raw
+        };
+
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default())
+            .expect("open ext4 fixture");
+        let ops = vec![
+            ffs_journal::FcOperation::AddRange(ffs_journal::FcExtentRange {
+                ino: 11,
+                logical_block: 0,
+                len: 2,
+                physical_block: 60,
+                unwritten: false,
+            }),
+            ffs_journal::FcOperation::InodeUpdate(11, make_mapped(60, 2)),
+            ffs_journal::FcOperation::DelRange(ffs_journal::FcDelRange {
+                ino: 11,
+                logical_block: 1,
+                len: 1,
+            }),
+            ffs_journal::FcOperation::InodeUpdate(11, make_mapped(60, 1)),
+            ffs_journal::FcOperation::InodeUpdate(13, make_mapped(62, 1)),
+            ffs_journal::FcOperation::AddRange(ffs_journal::FcExtentRange {
+                ino: 13,
+                logical_block: 0,
+                len: 1,
+                physical_block: 62,
+                unwritten: false,
+            }),
+        ];
+
+        for pass in 1..=2 {
+            fs.apply_fast_commit_operations(&cx, &ops, true)
+                .unwrap_or_else(|err| panic!("fc apply pass {pass}: {err:?}"));
+            let alloc = fs.load_ext4_alloc_state(&cx).expect("load alloc");
+            let bdev = fs.direct_block_device_adapter();
+            let bm_buf = bdev
+                .read_block(&cx, alloc.groups[0].block_bitmap_block)
+                .expect("read block bitmap");
+            assert!(
+                bitmap_get(bm_buf.as_slice(), 60),
+                "pass {pass}: surviving block 60 must be claimed"
+            );
+            assert!(
+                !bitmap_get(bm_buf.as_slice(), 61),
+                "pass {pass}: truncated block 61 must remain FREE"
+            );
+            assert!(
+                bitmap_get(bm_buf.as_slice(), 62),
+                "pass {pass}: live block 62 must be claimed"
+            );
+            assert_eq!(
+                alloc.groups[0].free_blocks,
+                u32::from(initial_free) - 2,
+                "pass {pass}: exactly 2 surviving blocks claimed"
+            );
+        }
+    }
+
+    #[test]
+    fn ext4_fast_commit_default_open_stream_superseded_add_range_leaves_block_free() {
+        let mut image = build_ext4_image_with_fast_commit_evidence();
+        let bm = 2 * 4096;
+        image[bm] = 0xFF;
+        image[bm + 1] = 0xFF;
+        for b in 20_usize..27 {
+            image[bm + (b / 8)] |= 1_u8 << (b % 8);
+        }
+        let gd_off = 4096;
+        let expected_free = 41_u16;
+        image[gd_off + 0x0C..gd_off + 0x0E].copy_from_slice(&expected_free.to_le_bytes());
+
+        let ino11_off: usize = 4 * 4096 + 10 * 256;
+        image[ino11_off + 4..ino11_off + 8].copy_from_slice(&0_u32.to_le_bytes());
+        image[ino11_off + 0x1C..ino11_off + 0x20].copy_from_slice(&0_u32.to_le_bytes());
+        image[ino11_off + 0x28 + 2..ino11_off + 0x28 + 4].copy_from_slice(&0_u16.to_le_bytes());
+        image[ino11_off + 0x28 + 12..ino11_off + 0x28 + 24].fill(0);
+
+        let empty_raw = image[ino11_off..ino11_off + 256].to_vec();
+        let mut mapped_raw = empty_raw.clone();
+        mapped_raw[4..8].copy_from_slice(&4096_u32.to_le_bytes());
+        mapped_raw[0x1C..0x20].copy_from_slice(&8_u32.to_le_bytes());
+        mapped_raw[0x28 + 2..0x28 + 4].copy_from_slice(&1_u16.to_le_bytes());
+        mapped_raw[0x28 + 12..0x28 + 16].copy_from_slice(&0_u32.to_le_bytes());
+        mapped_raw[0x28 + 16..0x28 + 18].copy_from_slice(&1_u16.to_le_bytes());
+        mapped_raw[0x28 + 18..0x28 + 20].copy_from_slice(&0_u16.to_le_bytes());
+        mapped_raw[0x28 + 20..0x28 + 24].copy_from_slice(&60_u32.to_le_bytes());
+
+        let mut fc_stream = build_fc_head(TEST_FC_TID);
+        let mut add_payload = Vec::with_capacity(16);
+        add_payload.extend_from_slice(&11_u32.to_le_bytes());
+        add_payload.extend_from_slice(&0_u32.to_le_bytes());
+        add_payload.extend_from_slice(&1_u16.to_le_bytes());
+        add_payload.extend_from_slice(&0_u16.to_le_bytes());
+        add_payload.extend_from_slice(&60_u32.to_le_bytes());
+        fc_stream.extend(build_fc_tag(0x01, &add_payload));
+        let mut ino_mapped_payload = 11_u32.to_le_bytes().to_vec();
+        ino_mapped_payload.extend_from_slice(&mapped_raw);
+        fc_stream.extend(build_fc_tag(0x06, &ino_mapped_payload));
+        seal_fc_transaction(&mut fc_stream, TEST_FC_TID);
+
+        let mut txn2 = Vec::new();
+        let mut del_payload = Vec::with_capacity(12);
+        del_payload.extend_from_slice(&11_u32.to_le_bytes());
+        del_payload.extend_from_slice(&0_u32.to_le_bytes());
+        del_payload.extend_from_slice(&1_u32.to_le_bytes());
+        txn2.extend(build_fc_tag(0x02, &del_payload));
+        let mut ino_empty_payload = 11_u32.to_le_bytes().to_vec();
+        ino_empty_payload.extend_from_slice(&empty_raw);
+        txn2.extend(build_fc_tag(0x06, &ino_empty_payload));
+        seal_fc_transaction(&mut txn2, TEST_FC_TID);
+        fc_stream.extend(txn2);
+
+        image[TEST_FC_AREA_OFFSET..TEST_FC_AREA_OFFSET + 2 * 4096].fill(0);
+        image[TEST_FC_AREA_OFFSET..TEST_FC_AREA_OFFSET + fc_stream.len()]
+            .copy_from_slice(&fc_stream);
+
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default())
+            .expect("default open must admit and replay fast-commit stream");
+        let evidence = fs
+            .ext4_fast_commit_replay()
+            .expect("fast-commit evidence must be present");
+        assert_eq!(evidence.replay.transactions_found, 2);
+        assert_eq!(evidence.verified_operations, 4);
+
+        let inode = fs.read_inode(&cx, InodeNumber(11)).expect("read ino 11");
+        assert_eq!(inode.links_count, 1);
+        assert_eq!(inode.size, 0);
+        assert!(fs.collect_extents(&cx, &inode).unwrap().is_empty());
+
+        let alloc = fs.load_ext4_alloc_state(&cx).expect("load alloc");
+        let bdev = fs.direct_block_device_adapter();
+        let bm_buf = bdev
+            .read_block(&cx, alloc.groups[0].block_bitmap_block)
+            .expect("read block bitmap");
+        assert!(
+            !bitmap_get(bm_buf.as_slice(), 60),
+            "default open replay must leave superseded AddRange block 60 FREE"
+        );
+        assert_eq!(
+            alloc.groups[0].free_blocks,
+            u32::from(expected_free),
+            "default open replay must preserve group free_blocks"
+        );
     }
 }
 
