@@ -1151,6 +1151,146 @@ fn cached_streams_keep_data_io_and_cancellation_live() {
 }
 
 #[test]
+fn mapped_security_failures_never_become_permissive_cached_attributes() {
+    use crate::security_policy::NtfsSidMap;
+
+    let cx = Cx::for_testing();
+    for shape in 0..3 {
+        let mut bytes = image();
+        let mut standard_attribute = standard();
+        let mut attributes = vec![
+            resident(DATA, 0, "", b"hello"),
+            resident(0x30, 2, "", &filename(5, "hello.txt", 1)),
+            resident(0x30, 3, "", &filename(5, "HELLO~1.TXT", 2)),
+            resident(0x30, 4, "", &filename(27, "link.txt", 1)),
+        ];
+        if shape == 0 {
+            // A present legacy descriptor with revision zero is corrupt,
+            // not permission to use the synthetic ownership fallback.
+            attributes.push(resident(0x50, 6, "", &[0; 20]));
+        } else {
+            // A nonzero security ID requires the shared store. Missing $SDS
+            // must not look like an optional absent per-file descriptor.
+            standard_attribute[24 + 52..24 + 56].copy_from_slice(&256_u32.to_le_bytes());
+            put(&mut bytes, 9, &record(9, false, 1, &[standard()]));
+        }
+        attributes.insert(0, standard_attribute);
+        put(&mut bytes, 24, &record(24, false, 3, &attributes));
+        let reads: Reads = Arc::default();
+        let fail_at = (shape == 2).then_some((BASE + 4 * 512 + 9 * 1024) as u64);
+        let volume = NtfsVolume::from_device(
+            &cx,
+            Box::new(Memory {
+                bytes,
+                reads: Arc::clone(&reads),
+                fail_at,
+            }),
+            BASE as u64,
+            LENGTH as u64,
+        )
+        .unwrap();
+        let fs = NtfsFs::new_with_policy(
+            &cx,
+            volume,
+            NtfsSidPolicy::Mapped {
+                caller_uid: 123,
+                caller_gid: 456,
+                map: NtfsSidMap::default(),
+            },
+        )
+        .unwrap();
+        let ino = fs
+            .inode(NtfsReference {
+                record: 24,
+                sequence: SEQUENCE,
+            })
+            .unwrap();
+        let mut scope = RequestScope::empty();
+        let expected_error = |error: &FfsError| {
+            if shape == 2 {
+                matches!(error, FfsError::Cancelled)
+            } else {
+                matches!(error, FfsError::Corruption { .. })
+            }
+        };
+        for _ in 0..2 {
+            let result = fs.getattr(&cx, &mut scope, ino);
+            assert!(
+                result.as_ref().is_err_and(expected_error),
+                "invalid security metadata must not grant attributes: shape={shape}, {result:?}"
+            );
+            assert!(!fs.cache().unwrap().attributes.contains_key(&ino));
+        }
+        let result = fs.read(&cx, &mut scope, ino, 0, 5);
+        assert!(
+            result.as_ref().is_err_and(expected_error),
+            "invalid security metadata must not grant DATA access: shape={shape}, {result:?}"
+        );
+        assert!(!fs.cache().unwrap().streams.contains_key(&ino));
+    }
+}
+
+#[test]
+fn mapped_security_preserves_absent_legacy_descriptor_and_explicit_null_dacl() {
+    use crate::security_policy::NtfsSidMap;
+
+    let cx = Cx::for_testing();
+    for explicit_descriptor in [false, true] {
+        let mut bytes = image();
+        if explicit_descriptor {
+            // Self-relative revision-1 descriptor with a null DACL grants access.
+            let mut descriptor = [0; 20];
+            descriptor[0] = 1;
+            descriptor[2..4].copy_from_slice(&0x8004_u16.to_le_bytes());
+            put(
+                &mut bytes,
+                24,
+                &record(
+                    24,
+                    false,
+                    3,
+                    &[
+                        standard(),
+                        resident(DATA, 0, "", b"hello"),
+                        resident(0x30, 2, "", &filename(5, "hello.txt", 1)),
+                        resident(0x30, 3, "", &filename(5, "HELLO~1.TXT", 2)),
+                        resident(0x30, 4, "", &filename(27, "link.txt", 1)),
+                        resident(0x50, 6, "", &descriptor),
+                    ],
+                ),
+            );
+        }
+        let volume = NtfsVolume::from_device(
+            &cx,
+            Box::new(Memory {
+                bytes,
+                reads: Arc::default(),
+                fail_at: None,
+            }),
+            BASE as u64,
+            LENGTH as u64,
+        )
+        .unwrap();
+        let fs = NtfsFs::new_with_policy(
+            &cx,
+            volume,
+            NtfsSidPolicy::Mapped {
+                caller_uid: 123,
+                caller_gid: 456,
+                map: NtfsSidMap::default(),
+            },
+        )
+        .unwrap();
+        let mut scope = RequestScope::empty();
+        let file = fs
+            .lookup(&cx, &mut scope, ROOT, OsStr::new("hello.txt"))
+            .unwrap();
+        assert_eq!(file.perm, if explicit_descriptor { 0o555 } else { 0o444 });
+        assert_eq!(fs.read(&cx, &mut scope, file.ino, 0, 5).unwrap(), b"hello");
+    }
+}
+
+#[test]
 fn root_aliases_and_inconsistent_directory_parents_refuse_mounting() {
     let mut bytes = image();
     put(

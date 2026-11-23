@@ -564,7 +564,12 @@ impl NtfsFs {
                 (*uid, *gid, perm)
             }
             NtfsSidPolicy::Mapped { map, .. } => {
-                if let Ok(sec_info) = volume.security_descriptor(cx, &record) {
+                let security = match volume.security_descriptor(cx, &record) {
+                    Ok(info) => Some(info),
+                    Err(FfsError::NotFound(_)) => None,
+                    Err(error) => return Err(error),
+                };
+                if let Some(sec_info) = security {
                     let sd = &sec_info.descriptor;
                     let mapped_uid = sd
                         .owner

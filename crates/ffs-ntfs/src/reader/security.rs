@@ -232,7 +232,18 @@ impl NtfsVolume {
         };
         let legacy_attribute_present = attributes.iter().any(|attribute| attribute.kind == 0x50);
         if let Some(security_id) = standard_security_id.filter(|id| *id != 0) {
-            return self.shared_security_descriptor(cx, security_id, legacy_attribute_present);
+            // This ID makes the shared metadata mandatory. A missing store,
+            // stream or index is corruption, not an absent legacy descriptor
+            // that callers may project with synthetic ownership.
+            return self
+                .shared_security_descriptor(cx, security_id, legacy_attribute_present)
+                .map_err(|error| match error {
+                    super::FfsError::NotFound(_) => corrupt(
+                        0,
+                        format!("missing shared metadata for NTFS security ID {security_id}"),
+                    ),
+                    other => other,
+                });
         }
 
         // NTFS permits the legacy attribute on upgraded/repaired files,
