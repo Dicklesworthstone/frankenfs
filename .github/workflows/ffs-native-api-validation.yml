@@ -1,0 +1,240 @@
+name: Native API validation
+on:
+  push:
+    branches: [validation/ffs-native-api-20261123]
+permissions:
+  contents: read
+concurrency:
+  group: ffs-native-api-20261123
+  cancel-in-progress: true
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_BUILD_JOBS: "2"
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  RUSTFLAGS: "-Z threads=1"
+  CARGO_HTTP_USER_AGENT: "frankenfs-agent (+https://github.com/Dicklesworthstone/frankenfs)"
+  FFS_SOURCE_PATHS: |
+    crates/ffs-ntfs/src/reader/filesystem/writable.rs
+    crates/ffs-ntfs/tests/persistence_prefix/transforms.rs
+  FFS_VALIDATION_WORKFLOW: .github/workflows/ffs-native-api-validation.yml
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    outputs:
+      tree: ${{ steps.source.outputs.tree }}
+      base: ${{ steps.source.outputs.base }}
+      sources: ${{ steps.source.outputs.sources }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Install pinned formatter
+        run: rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
+      - name: Normalize and publish exact source blobs
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cargo fmt --all
+          cargo fmt --check
+          git diff --check
+          python3 - <<'PY'
+          import base64, hashlib, json, os, pathlib, subprocess, urllib.request
+          def git(*args):
+              return subprocess.check_output(["git", *args], text=True).strip()
+          paths = os.environ["FFS_SOURCE_PATHS"].split()
+          assert len(paths) == len(set(paths)) == 2
+          allowed = set(paths)
+          workflow = os.environ["FFS_VALIDATION_WORKFLOW"]
+          candidate = git("rev-parse", "HEAD")
+          assert candidate == os.environ["GITHUB_SHA"]
+          base = git("rev-parse", "HEAD^")
+          changes = set(git("diff", "--name-only", base, "HEAD").splitlines())
+          assert changes <= allowed | {workflow}, sorted(changes - allowed - {workflow})
+          formatted = set(git("diff", "--name-only", "HEAD").splitlines())
+          assert formatted <= allowed, sorted(formatted - allowed)
+          records = []
+          for name in paths:
+              path = pathlib.Path(name)
+              assert path.is_file() and not path.is_symlink(), name
+              raw = path.read_bytes()
+              blob = git("hash-object", name)
+              digest = hashlib.sha256(raw).hexdigest()
+              payload = json.dumps({"encoding": "base64", "content": base64.b64encode(raw).decode("ascii")}).encode()
+              request = urllib.request.Request(
+                  "https://api.github.com/repos/" + os.environ["GITHUB_REPOSITORY"] + "/git/blobs",
+                  data=payload,
+                  headers={
+                      "Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "User-Agent": "frankenfs-agent (+https://github.com/Dicklesworthstone/frankenfs)",
+                      "Content-Type": "application/json",
+                  },
+                  method="POST",
+              )
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  result = json.load(response)
+              assert result["sha"] == blob, (name, result["sha"], blob)
+              records.append({"path": name, "blob": blob, "sha256": digest})
+              print(f"FFS_FORMATTED_BLOB|{name}|{blob}|{digest}", flush=True)
+          subprocess.run(["git", "add", "--", *paths], check=True)
+          tree = git("write-tree")
+          subprocess.run(["git", "diff", "--exit-code"], check=True)
+          print(f"FFS_TESTED_COMMIT|{candidate}")
+          print(f"FFS_TESTED_BASE|{base}")
+          print(f"FFS_TESTED_TREE|{tree}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              print("tree=" + tree, file=output)
+              print("base=" + base, file=output)
+              print("sources=" + json.dumps(records, separators=(",", ":")), file=output)
+          PY
+
+  workspace-gates:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      FFS_EXPECTED_TREE: ${{ needs.prepare.outputs.tree }}
+      FFS_EXPECTED_SOURCES: ${{ needs.prepare.outputs.sources }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Prepare pinned compiler and runner resources
+        run: |
+          set -euo pipefail
+          rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libfuse3-dev
+          validation_swap=$(sudo mktemp /mnt/ffs-native-gates-XXXXXX.swap)
+          sudo fallocate -l 12G "$validation_swap"
+          sudo chmod 0600 "$validation_swap"
+          sudo mkswap "$validation_swap"
+          sudo swapon "$validation_swap"
+          free -h
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ntfs-writer-integrity
+          cache-on-failure: "true"
+          cache-workspace-crates: "true"
+      - name: Verify exact normalized source
+        run: |
+          set -euo pipefail
+          cargo fmt --all
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, subprocess
+          records = json.loads(os.environ["FFS_EXPECTED_SOURCES"])
+          paths = os.environ["FFS_SOURCE_PATHS"].split()
+          assert {r["path"] for r in records} == set(paths)
+          for record in records:
+              path = pathlib.Path(record["path"])
+              assert path.is_file() and not path.is_symlink()
+              assert hashlib.sha256(path.read_bytes()).hexdigest() == record["sha256"], str(path)
+              actual = subprocess.check_output(["git", "hash-object", str(path)], text=True).strip()
+              assert actual == record["blob"], str(path)
+          subprocess.run(["git", "add", "--", *paths], check=True)
+          tree = subprocess.check_output(["git", "write-tree"], text=True).strip()
+          assert tree == os.environ["FFS_EXPECTED_TREE"], tree
+          subprocess.run(["git", "diff", "--exit-code"], check=True)
+          print("FFS_SOURCE_VERIFIED|workspace-gates|" + tree)
+          PY
+          cargo fmt --check
+          git diff --check
+      - name: Workspace compiler gate
+        run: cargo check --locked --workspace --all-targets
+      - name: Workspace strict Clippy gate
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Verify tested source stayed unchanged
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          test "$(git write-tree)" = "$FFS_EXPECTED_TREE"
+          echo "FFS_GATES_PASS|$FFS_EXPECTED_TREE"
+
+  ntfs-regressions:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      FFS_EXPECTED_TREE: ${{ needs.prepare.outputs.tree }}
+      FFS_EXPECTED_SOURCES: ${{ needs.prepare.outputs.sources }}
+      FFS_REQUIRE_ORACLES: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Prepare pinned compiler and native oracles
+        run: |
+          set -euo pipefail
+          rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
+          sudo apt-get update
+          sudo apt-get install -y e2fsprogs btrfs-progs ntfs-3g dosfstools mtools fuse3 pkg-config libfuse3-dev
+          validation_swap=$(sudo mktemp /mnt/ffs-native-tests-XXXXXX.swap)
+          sudo fallocate -l 12G "$validation_swap"
+          sudo chmod 0600 "$validation_swap"
+          sudo mkswap "$validation_swap"
+          sudo swapon "$validation_swap"
+          command -v mkfs.ntfs
+          command -v ntfscat
+          free -h
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ntfs-writer-integrity
+          cache-on-failure: "true"
+          cache-workspace-crates: "true"
+      - name: Verify exact normalized source
+        run: |
+          set -euo pipefail
+          cargo fmt --all
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, subprocess
+          records = json.loads(os.environ["FFS_EXPECTED_SOURCES"])
+          paths = os.environ["FFS_SOURCE_PATHS"].split()
+          assert {r["path"] for r in records} == set(paths)
+          for record in records:
+              path = pathlib.Path(record["path"])
+              assert path.is_file() and not path.is_symlink()
+              assert hashlib.sha256(path.read_bytes()).hexdigest() == record["sha256"], str(path)
+              actual = subprocess.check_output(["git", "hash-object", str(path)], text=True).strip()
+              assert actual == record["blob"], str(path)
+          subprocess.run(["git", "add", "--", *paths], check=True)
+          tree = subprocess.check_output(["git", "write-tree"], text=True).strip()
+          assert tree == os.environ["FFS_EXPECTED_TREE"], tree
+          subprocess.run(["git", "diff", "--exit-code"], check=True)
+          print("FFS_SOURCE_VERIFIED|ntfs-regressions|" + tree)
+          PY
+          cargo fmt --check
+          git diff --check
+      - name: All three namespace ACL regressions
+        run: |
+          set -euo pipefail
+          cargo test --locked -p ffs-ntfs --test persistence_prefix ntfs_mapped_namespace_acl -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/ffs-acl-regressions.log"
+          grep -Eq 'test result: ok[.] 3 passed; 0 failed;' "$RUNNER_TEMP/ffs-acl-regressions.log"
+          python3 - "$RUNNER_TEMP/ffs-acl-regressions.log" <<'PY'
+          import pathlib, sys
+          text = pathlib.Path(sys.argv[1]).read_text()
+          names = [
+              "ntfs_mapped_namespace_acl_denials_leave_names_streams_and_storage_unchanged",
+              "ntfs_mapped_namespace_acl_accepts_object_or_parent_delete_authority",
+              "ntfs_mapped_namespace_acl_does_not_replace_security_read_errors_with_parent_permission",
+          ]
+          for name in names:
+              assert any(line.startswith("test ") and name + " ... ok" in line for line in text.splitlines()), name
+          print("FFS_ACL_REGRESSIONS_PASS|3")
+          PY
+      - name: Complete NTFS library and integration tests
+        run: cargo test --locked -p ffs-ntfs -- --test-threads=1
+      - name: Verify tested source stayed unchanged
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          test "$(git write-tree)" = "$FFS_EXPECTED_TREE"
+          echo "FFS_NTFS_TESTS_PASS|$FFS_EXPECTED_TREE"
