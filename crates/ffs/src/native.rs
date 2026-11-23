@@ -100,7 +100,13 @@ impl ResourceTracker {
     }
 
     pub fn charge_operation(&self) -> Result<()> {
-        charge_u64(&self.operations, 1, self.budget.max_operations, "operations").map(|_| ())
+        charge_u64(
+            &self.operations,
+            1,
+            self.budget.max_operations,
+            "operations",
+        )
+        .map(|_| ())
     }
 
     pub fn charge_physical_io(&self, bytes: u64) -> Result<()> {

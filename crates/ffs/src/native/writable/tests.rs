@@ -80,7 +80,15 @@ fn fat_and_ntfs_writers_preserve_bounds_and_reopen_native_namespace_and_data() {
             .unwrap();
         let file = opened
             .filesystem
-            .create(&cx, &mut scope, root, OsStr::new("payload"), 0o644, 123, 456)
+            .create(
+                &cx,
+                &mut scope,
+                root,
+                OsStr::new("payload"),
+                0o644,
+                123,
+                456,
+            )
             .unwrap();
         assert_eq!(
             opened
@@ -152,7 +160,9 @@ fn fat_and_ntfs_writers_preserve_bounds_and_reopen_native_namespace_and_data() {
                 .is_err()
         );
         assert!(matches!(
-            reader.filesystem.write(&cx, &mut scope, file.ino, 0, b"bad"),
+            reader
+                .filesystem
+                .write(&cx, &mut scope, file.ino, 0, b"bad"),
             Err(FfsError::ReadOnly)
         ));
         drop(reader);
@@ -181,7 +191,10 @@ fn fat_and_ntfs_writers_preserve_bounds_and_reopen_native_namespace_and_data() {
         );
         let after = fs::read(&path).unwrap();
         assert_eq!(&after[..4096], &container[..4096]);
-        assert_eq!(&after[4096 + native.len()..], &container[4096 + native.len()..]);
+        assert_eq!(
+            &after[4096 + native.len()..],
+            &container[4096 + native.len()..]
+        );
     }
 }
 
@@ -472,7 +485,10 @@ fn mbr_partition_writer_does_not_mutate_partition_table_or_adjacent_storage() {
     opened.sync(&cx).unwrap();
     let after = device.bytes.lock().unwrap();
     assert_eq!(&after[..start], &bytes[..start]);
-    assert_eq!(&after[start + native.len()..], &bytes[start + native.len()..]);
+    assert_eq!(
+        &after[start + native.len()..],
+        &bytes[start + native.len()..]
+    );
 }
 
 fn native_command(program: &str, args: &[&OsStr]) -> Vec<u8> {
@@ -597,7 +613,11 @@ fn native_ext4_and_btrfs_writers_reopen_and_pass_independent_checkers() {
             fs::create_dir(&restored).unwrap();
             native_command(
                 "btrfs",
-                &[OsStr::new("restore"), path.as_os_str(), restored.as_os_str()],
+                &[
+                    OsStr::new("restore"),
+                    path.as_os_str(),
+                    restored.as_os_str(),
+                ],
             );
             assert_eq!(fs::read(restored.join("from-facade")).unwrap(), payload);
         }

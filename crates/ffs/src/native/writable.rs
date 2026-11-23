@@ -2,9 +2,9 @@
 
 use super::{
     BtrfsMountSelection, ByteDevice, ByteOffset, Cx, DetectedFilesystem, DetectionError,
-    FatOemCodePage, FfsError, FileByteDevice, FsFormatKind, FsOps, ImageSource, OpenFs, OpenOptions,
-    PartitionEntry, PartitionParseOptions, PartitionSelector, Path, RequestScope, Result,
-    VolumeAccess, VolumeDevice, checkpoint, detect_all_filesystems_on_device,
+    FatOemCodePage, FfsError, FileByteDevice, FsFormatKind, FsOps, ImageSource, OpenFs,
+    OpenOptions, PartitionEntry, PartitionParseOptions, PartitionSelector, Path, RequestScope,
+    Result, VolumeAccess, VolumeDevice, checkpoint, detect_all_filesystems_on_device,
     select_partition_device,
 };
 use std::sync::Arc;
@@ -143,10 +143,9 @@ fn bounded_device(
 ) -> Result<VolumeDevice> {
     let length = match length {
         Some(length) => length,
-        None => inner
-            .len_bytes()
-            .checked_sub(offset)
-            .ok_or_else(|| FfsError::InvalidGeometry("volume base exceeds backing length".into()))?,
+        None => inner.len_bytes().checked_sub(offset).ok_or_else(|| {
+            FfsError::InvalidGeometry("volume base exceeds backing length".into())
+        })?,
     };
     VolumeDevice::new(inner, ByteOffset(offset), length, VolumeAccess::ReadWrite)
 }

@@ -222,12 +222,7 @@ impl FsOps for BoundedTestFs {
             .collect())
     }
 
-    fn readlink(
-        &self,
-        _cx: &Cx,
-        _scope: &mut RequestScope,
-        _ino: InodeNumber,
-    ) -> Result<Vec<u8>> {
+    fn readlink(&self, _cx: &Cx, _scope: &mut RequestScope, _ino: InodeNumber) -> Result<Vec<u8>> {
         self.calls.symlinks.fetch_add(1, Ordering::SeqCst);
         let BoundedLayout::Symlink(size) = self.layout else {
             return Err(FfsError::Format("not a symlink".to_owned()));
@@ -432,8 +427,7 @@ fn bounded_walk_refuses_cycles_and_releases_depth_and_memory() {
         assert_eq!(fs.resource_usage().current_reference_depth, 0);
         assert_eq!(fs.resource_usage().retained_bytes, 0);
     }
-    let (fs, _) =
-        bounded_fixture(BoundedLayout::NonmonotoneCookies, ResourceBudget::default());
+    let (fs, _) = bounded_fixture(BoundedLayout::NonmonotoneCookies, ResourceBudget::default());
     assert_eq!(
         fs.walk_bounded(&Cx::for_testing(), false)
             .unwrap()
@@ -492,7 +486,10 @@ fn bounded_native_fat_walk_reads_real_payload_under_a_small_memory_cap() {
     let walk = opened.walk_bounded(&cx, true).unwrap();
     assert_eq!(walk.directories_visited, 1);
     assert_eq!(walk.files_visited, 1);
-    assert_eq!(walk.decoded_file_bytes, b"native facade payload\0".len() as u64);
+    assert_eq!(
+        walk.decoded_file_bytes,
+        b"native facade payload\0".len() as u64
+    );
     assert_eq!(walk.usage.retained_bytes, 0);
     assert_eq!(walk.usage.current_reference_depth, 0);
 }

@@ -610,3 +610,87 @@ fn catalog_preserves_an_unnamed_root_with_zero_native_links() {
     );
     assert_native_hard_links(&durable, reference, &["/child"], b"native child");
 }
+
+#[test]
+fn path_stream_mutations_preserve_strict_failure_for_corrupt_sibling() {
+    let cx = Cx::for_testing();
+    let image = build_clean_ntfs_image(256, 64, 0xCA7A_1000_0000_0005);
+    let length = image.len() as u64 - SECTOR_BYTES as u64;
+    let device = FaultInjectingNtfsDevice::new(image);
+    let mut engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        length,
+        write_options_clean(),
+    )
+    .unwrap();
+    let (good, _) = engine
+        .create_file(&cx, "/", "good", b"kept")
+        .into_result()
+        .unwrap();
+    let stream = [u16::from(b'x')];
+    engine
+        .create_stream(&cx, good, &stream, b"kept stream")
+        .into_result()
+        .unwrap();
+    let (bad, _) = engine
+        .create_file(&cx, "/", "bad", b"unrelated")
+        .into_result()
+        .unwrap();
+    let clean = device.snapshot_durable_only();
+    let offset = CLUSTER_BYTES + usize::try_from(bad.record).unwrap() * RECORD_BYTES;
+    let mut attributes = copied_test_record_attributes(&clean[offset..offset + RECORD_BYTES]);
+    let name = attributes
+        .iter_mut()
+        .find(|attribute| attribute[..4] == 0x30_u32.to_le_bytes())
+        .unwrap();
+    let value_at = usize::from(u16::from_le_bytes(name[20..22].try_into().unwrap()));
+    // Keep a structurally valid name, but break its identity against $I30.
+    // The selected /good FILE and every one of its attributes remain intact.
+    name[value_at + 65] ^= 1;
+    let changed = build_file_record(bad.record as u32, bad.sequence, 1, false, &attributes);
+    device
+        .write_all_at(&cx, ByteOffset(offset as u64), &changed)
+        .unwrap();
+    device.sync(&cx).unwrap();
+    let before = device.snapshot_durable_only();
+    let writes = device.write_bytes_total();
+    let events = engine.persistence_trace().len();
+    let expected_detail = "directory index does not match target FILE_NAME";
+    assert!(matches!(
+        engine.resolve_path_reference(&cx, "/good"),
+        Err(FfsError::Corruption { detail, .. }) if detail == expected_detail
+    ));
+
+    for operation in [
+        "range",
+        "empty range",
+        "truncate",
+        "same size",
+        "create",
+        "remove",
+    ] {
+        let outcome = match operation {
+            "range" => engine.write_file_range(&cx, "/good", 0, b"bad"),
+            "empty range" => engine.write_file_range(&cx, "/good", 0, b""),
+            "truncate" => engine.truncate_file(&cx, "/good", 0),
+            "same size" => engine.truncate_file(&cx, "/good", 4),
+            "create" => engine.create_file_stream(&cx, "/good", &[u16::from(b'y')], b"new"),
+            "remove" => engine.remove_file_stream(&cx, "/good", &stream),
+            _ => unreachable!(),
+        };
+        assert!(
+            matches!(
+                &outcome,
+                NtfsTxOutcome::NotCommitted(FfsError::Corruption { detail, .. })
+                    if detail == expected_detail
+            ),
+            "{operation} must retain the strict lookup failure: {outcome:?}"
+        );
+        assert_eq!(device.write_bytes_total(), writes, "{operation}");
+        assert_eq!(device.snapshot_live(), before, "{operation}");
+        assert_eq!(device.snapshot_durable_only(), before, "{operation}");
+        assert_eq!(engine.persistence_trace().len(), events, "{operation}");
+    }
+}

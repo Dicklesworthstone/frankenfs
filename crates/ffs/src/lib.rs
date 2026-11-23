@@ -9,13 +9,13 @@ pub use ffs_core::*;
 pub use ffs_types::InodeNumber;
 
 mod native;
-pub use native::writable::{
-    ReadWriteBackend, ReadWriteFs, ReadWriteOpenOptions, ZfsWriteSelection, open_read_write,
-    open_read_write_device, open_read_write_devices,
-};
 pub use ffs_ondisk::partition::{
     PartUuid, PartitionEntry, PartitionParseError, PartitionParseOptions, PartitionScheme,
     PartitionSelector, PartitionTable, SyntheticGptPartitionSpec, write_gpt_partition_table,
+};
+pub use native::writable::{
+    ReadWriteBackend, ReadWriteFs, ReadWriteOpenOptions, ZfsWriteSelection, open_read_write,
+    open_read_write_device, open_read_write_devices,
 };
 pub use native::{
     BoundedByteDevice, BoundedWalkSummary, ImageSource, PartitionByteDevice, ReadOnlyBackend,
