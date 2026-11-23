@@ -34,8 +34,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::symbol::repair_seed;
 
 const RQ_DECODE_WAVEFRONT_BATCH: usize = 4;
-const DIRECT_SMALL_ERASURE_MAX_CORRUPT: usize = 2;
-const DIRECT_SMALL_ERASURE_MAX_SOURCE_BLOCKS: usize = 64;
+// Solve only for missing source symbols when a few blocks in an ordinary
+// repair group are damaged. Bound the source-coefficient basis and the erased
+// subsystem separately; larger problems retain the full decoder below.
+const DIRECT_SMALL_ERASURE_MAX_CORRUPT: usize = 16;
+const DIRECT_SMALL_ERASURE_MAX_SOURCE_BLOCKS: usize = 1024;
 const SOURCE_COEFFICIENT_ENCODER_CACHE_CAPACITY: usize = 16;
 const PROJECTED_REPAIR_BATCH_SYMBOLS: usize = 8;
 const PROJECTED_SOURCE_TILE_BLOCKS: usize = 8;
@@ -44,8 +47,8 @@ const PROJECTED_SOURCE_TILE_BLOCKS: usize = 8;
 /// (`128 MiB` = `32,768 × 4 KiB`) block groups.
 ///
 /// Sizing each stripe at `64` blocks (`256 KiB`) keeps the entire stripe hot in
-/// L2 cache during SIMD `GF(256)` projection AND ensures 1–2 erasures per
-/// stripe hit [`try_direct_small_erasure_decode`] (`DIRECT_SMALL_ERASURE_MAX_SOURCE_BLOCKS = 64`).
+/// L2 cache during SIMD `GF(256)` projection and keeps ordinary erasures within
+/// the bounded source-domain recovery path in [`try_direct_small_erasure_decode`].
 pub const DEFAULT_MAX_STRIPE_SOURCE_BLOCKS: u32 = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1160,8 +1163,8 @@ impl BlockDevice for StripeSliceDevice {
 /// Reconstruct corrupt blocks in a block-interleaved [`StripedEncodedGroup`].
 ///
 /// Only stripes containing at least one corrupt block perform device reads or
-/// erasure solving; stripes with 1–2 erasures and `K_s <= 64` automatically hit
-/// the direct O(`K_s`) solver.
+/// erasure solving; stripes with up to 16 erasures and `K_s <= 1024` can use
+/// the bounded source-domain solver.
 ///
 /// # Errors
 ///
@@ -1691,6 +1694,10 @@ struct DirectRepairPlan {
 enum DirectRepairSelection {
     One(usize),
     Two(usize, usize),
+    Many {
+        rows: [usize; DIRECT_SMALL_ERASURE_MAX_CORRUPT],
+        count: usize,
+    },
 }
 
 struct OwnedDirectDecodeAttempt {
@@ -1748,10 +1755,9 @@ fn try_direct_small_erasure_decode(
         corrupt_set,
         block_size,
     )?;
-    project_known_source_contributions_source_major(&mut plan.rows, &known_source, block_size)
-        .expect("known source symbols were read at the device block size");
+    project_known_source_contributions_source_major(cx, &mut plan.rows, &known_source, block_size)?;
 
-    let Some(solved) = solve_direct_repair_rows(&plan.rows, plan.selection)? else {
+    let Some(solved) = solve_direct_repair_rows(cx, &plan.rows, plan.selection)? else {
         return Ok(None);
     };
 
@@ -1829,12 +1835,10 @@ fn try_direct_small_erasure_decode_owned(
         corrupt_set,
         block_size,
     )?;
-    project_known_source_contributions_source_major(&mut rows, &known_source, block_size)
-        .expect("known source symbols were read at the device block size");
+    project_known_source_contributions_source_major(cx, &mut rows, &known_source, block_size)?;
 
-    let Some(solved) = solve_direct_repair_rows(&rows, selection)? else {
-        restore_known_source_contributions_source_major(&mut rows, &known_source, block_size)
-            .expect("known source projection should be reversible");
+    let Some(solved) = solve_direct_repair_rows(cx, &rows, selection)? else {
+        restore_known_source_contributions_source_major(cx, &mut rows, &known_source, block_size)?;
         return Ok(OwnedDirectDecodeAttempt {
             outcome: None,
             fallback: repair_symbols_from_direct_rows(rows),
@@ -1998,7 +2002,13 @@ fn select_direct_repair_plan(
         source_count,
         source_coefficient_encoder,
     )?;
-    project_known_source_contributions_source_major(&mut plan.rows, known_source, block_size)?;
+    project_known_source_contributions_source_major(
+        &Cx::for_testing(),
+        &mut plan.rows,
+        known_source,
+        block_size,
+    )
+    .ok()?;
     Some(plan)
 }
 
@@ -2122,27 +2132,82 @@ fn select_direct_repair_rows(
             .map(DirectRepairSelection::One),
         2 => select_full_rank_pair(rows)
             .map(|(row_a, row_b)| DirectRepairSelection::Two(row_a, row_b)),
+        3..=DIRECT_SMALL_ERASURE_MAX_CORRUPT => select_full_rank_rows(rows, missing_count),
         _ => None,
     }
 }
 
+/// Select independent repair equations using only their missing-source
+/// coefficients. No source payload is read until full rank is established.
+fn select_full_rank_rows(
+    rows: &[DirectRepairRow],
+    missing_count: usize,
+) -> Option<DirectRepairSelection> {
+    let mut basis =
+        [[Gf256::ZERO; DIRECT_SMALL_ERASURE_MAX_CORRUPT]; DIRECT_SMALL_ERASURE_MAX_CORRUPT];
+    let mut selected = [0; DIRECT_SMALL_ERASURE_MAX_CORRUPT];
+    let mut rank = 0;
+    for (row_index, row) in rows.iter().enumerate() {
+        let mut coefficients = row.coefficients;
+        for pivot in 0..missing_count {
+            let factor = coefficients[pivot];
+            if factor.is_zero() {
+                continue;
+            }
+            if basis[pivot][pivot].is_zero() {
+                let inverse = factor.inv();
+                for coefficient in &mut coefficients[pivot..missing_count] {
+                    *coefficient *= inverse;
+                }
+                basis[pivot] = coefficients;
+                selected[rank] = row_index;
+                rank += 1;
+                if rank == missing_count {
+                    return Some(DirectRepairSelection::Many {
+                        rows: selected,
+                        count: missing_count,
+                    });
+                }
+                break;
+            }
+            for (coefficient, basis_coefficient) in coefficients[pivot..missing_count]
+                .iter_mut()
+                .zip(&basis[pivot][pivot..missing_count])
+            {
+                *coefficient += factor * *basis_coefficient;
+            }
+        }
+    }
+    None
+}
+
 fn project_known_source_contributions_source_major(
+    cx: &Cx,
     rows: &mut [DirectRepairRow],
     known_source: &[KnownSourceSymbol],
     block_size: usize,
-) -> Option<()> {
+) -> Result<()> {
+    cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
     if rows.is_empty() {
-        return Some(());
+        return Ok(());
     }
 
     let source_count = rows[0].source_count;
-    if rows.iter().any(|row| row.source_count != source_count) {
-        return None;
+    if rows
+        .iter()
+        .any(|row| row.source_count != source_count || row.residual.len() != block_size)
+    {
+        return Err(FfsError::RepairFailed(
+            "decode_group: inconsistent direct repair row geometry".to_owned(),
+        ));
     }
 
     for source_symbol in known_source {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         if source_symbol.source_index >= source_count || source_symbol.data.len() != block_size {
-            return None;
+            return Err(FfsError::RepairFailed(
+                "decode_group: invalid intact source block geometry".to_owned(),
+            ));
         }
         for row in rows.iter_mut() {
             let coefficient = Gf256::new(row.source_coefficients[source_symbol.source_index]);
@@ -2151,15 +2216,16 @@ fn project_known_source_contributions_source_major(
             }
         }
     }
-    Some(())
+    Ok(())
 }
 
 fn restore_known_source_contributions_source_major(
+    cx: &Cx,
     rows: &mut [DirectRepairRow],
     known_source: &[KnownSourceSymbol],
     block_size: usize,
-) -> Option<()> {
-    project_known_source_contributions_source_major(rows, known_source, block_size)
+) -> Result<()> {
+    project_known_source_contributions_source_major(cx, rows, known_source, block_size)
 }
 
 fn select_full_rank_pair(rows: &[DirectRepairRow]) -> Option<(usize, usize)> {
@@ -2225,47 +2291,123 @@ fn solve_two_erasures(
 }
 
 fn solve_direct_repair_rows(
+    cx: &Cx,
     rows: &[DirectRepairRow],
     selection: DirectRepairSelection,
 ) -> Result<Option<Vec<Vec<u8>>>> {
-    match selection {
+    cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+    let solved = match selection {
         DirectRepairSelection::One(row_index) => {
             let row = &rows[row_index];
-            let Some(solved) = solve_one_erasure(row) else {
-                return Ok(None);
-            };
-            if !direct_solution_satisfies_all_repairs(rows, &solved) {
-                return Ok(None);
-            }
-            Ok(Some(solved))
+            solve_one_erasure(row)
         }
         DirectRepairSelection::Two(pivot_index, companion_index) => {
             let row_a = &rows[pivot_index];
             let row_b = &rows[companion_index];
-            let Some(solved) = solve_two_erasures(row_a, row_b)? else {
-                return Ok(None);
-            };
-            if !direct_solution_satisfies_all_repairs(rows, &solved) {
-                return Ok(None);
-            }
-            Ok(Some(solved))
+            solve_two_erasures(row_a, row_b)?
         }
+        DirectRepairSelection::Many {
+            rows: selected,
+            count,
+        } => solve_many_erasures(cx, rows, &selected[..count])?,
+    };
+    let Some(solved) = solved else {
+        return Ok(None);
+    };
+    if !direct_solution_satisfies_all_repairs(cx, rows, &solved)? {
+        return Ok(None);
     }
+    Ok(Some(solved))
 }
 
-fn direct_solution_satisfies_all_repairs(rows: &[DirectRepairRow], solved: &[Vec<u8>]) -> bool {
+/// Reduce the selected m-by-m system after intact source contributions have
+/// been removed. Full RaptorQ constraints are unchanged: source-domain rows
+/// come from the same systematic encoder, and the caller checks all surplus
+/// equations before accepting any reconstructed bytes.
+fn solve_many_erasures(
+    cx: &Cx,
+    rows: &[DirectRepairRow],
+    selected: &[usize],
+) -> Result<Option<Vec<Vec<u8>>>> {
+    let count = selected.len();
+    let mut coefficients: Vec<_> = selected
+        .iter()
+        .map(|&index| rows[index].coefficients)
+        .collect();
+    let mut solved: Vec<_> = selected
+        .iter()
+        .map(|&index| rows[index].residual.clone())
+        .collect();
+    let block_size = solved[0].len();
+    if solved.iter().any(|row| row.len() != block_size) {
+        return Err(FfsError::RepairFailed(
+            "decode_group: direct residual length mismatch".to_owned(),
+        ));
+    }
+
+    for pivot in 0..count {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        let Some(pivot_row) = (pivot..count).find(|&row| !coefficients[row][pivot].is_zero())
+        else {
+            return Ok(None);
+        };
+        coefficients.swap(pivot, pivot_row);
+        solved.swap(pivot, pivot_row);
+        let inverse = coefficients[pivot][pivot].inv();
+        for coefficient in &mut coefficients[pivot][pivot..count] {
+            *coefficient *= inverse;
+        }
+        gf256_mul_slice(&mut solved[pivot], inverse);
+        let pivot_coefficients = coefficients[pivot];
+        let (leading, trailing) = solved.split_at_mut(pivot + 1);
+        let pivot_data = &leading[pivot];
+        for (row, data) in coefficients[pivot + 1..].iter_mut().zip(trailing) {
+            let factor = row[pivot];
+            if factor.is_zero() {
+                continue;
+            }
+            for (coefficient, pivot_coefficient) in row[pivot..count]
+                .iter_mut()
+                .zip(&pivot_coefficients[pivot..count])
+            {
+                *coefficient += factor * *pivot_coefficient;
+            }
+            gf256_addmul_slice(data, pivot_data, factor);
+        }
+    }
+
+    for pivot in (0..count).rev() {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        let (leading, trailing) = solved.split_at_mut(pivot);
+        let pivot_data = &trailing[0];
+        for (row, data) in coefficients[..pivot].iter().zip(leading) {
+            let factor = row[pivot];
+            if !factor.is_zero() {
+                gf256_addmul_slice(data, pivot_data, factor);
+            }
+        }
+    }
+    Ok(Some(solved))
+}
+
+fn direct_solution_satisfies_all_repairs(
+    cx: &Cx,
+    rows: &[DirectRepairRow],
+    solved: &[Vec<u8>],
+) -> Result<bool> {
     let Some(first_row) = rows.first() else {
-        return true;
+        return Ok(true);
     };
     let block_size = first_row.residual.len();
     if solved.iter().any(|recovered| recovered.len() != block_size)
         || rows.iter().any(|row| row.residual.len() != block_size)
     {
-        return false;
+        return Ok(false);
     }
 
     let mut expected = vec![0; block_size];
     for row in rows {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         expected.fill(0);
         for (missing_position, recovered) in solved.iter().enumerate() {
             let coefficient = row.coefficients[missing_position];
@@ -2274,10 +2416,10 @@ fn direct_solution_satisfies_all_repairs(rows: &[DirectRepairRow], solved: &[Vec
             }
         }
         if row.residual.as_slice() != expected.as_slice() {
-            return false;
+            return Ok(false);
         }
     }
-    true
+    Ok(true)
 }
 
 fn recover_from_direct_solution(
@@ -2358,6 +2500,37 @@ mod tests {
 
         fn read_count(&self) -> usize {
             self.read_count.load(Ordering::Relaxed)
+        }
+    }
+
+    struct CancelOnRead {
+        device: MemBlockDevice,
+        cancel_at: BlockNumber,
+    }
+
+    impl BlockDevice for CancelOnRead {
+        fn read_block(&self, cx: &Cx, block: BlockNumber) -> Result<BlockBuf> {
+            let row = self.device.read_block(cx, block)?;
+            if block == self.cancel_at {
+                cx.set_cancel_requested(true);
+            }
+            Ok(row)
+        }
+
+        fn write_block(&self, _cx: &Cx, _block: BlockNumber, _data: &[u8]) -> Result<()> {
+            Err(FfsError::ReadOnly)
+        }
+
+        fn block_size(&self) -> u32 {
+            self.device.block_size()
+        }
+
+        fn block_count(&self) -> u64 {
+            self.device.block_count()
+        }
+
+        fn sync(&self, _cx: &Cx) -> Result<()> {
+            Err(FfsError::ReadOnly)
         }
     }
 
@@ -2671,37 +2844,6 @@ mod tests {
 
     #[test]
     fn encode_group_direct_observes_cancellation_before_and_during_reads() {
-        struct CancelOnRead {
-            device: MemBlockDevice,
-            cancel_at: BlockNumber,
-        }
-
-        impl BlockDevice for CancelOnRead {
-            fn read_block(&self, cx: &Cx, block: BlockNumber) -> Result<BlockBuf> {
-                let row = self.device.read_block(cx, block)?;
-                if block == self.cancel_at {
-                    cx.set_cancel_requested(true);
-                }
-                Ok(row)
-            }
-
-            fn write_block(&self, _cx: &Cx, _block: BlockNumber, _data: &[u8]) -> Result<()> {
-                Err(FfsError::ReadOnly)
-            }
-
-            fn block_size(&self) -> u32 {
-                self.device.block_size()
-            }
-
-            fn block_count(&self) -> u64 {
-                self.device.block_count()
-            }
-
-            fn sync(&self, _cx: &Cx) -> Result<()> {
-                Err(FfsError::ReadOnly)
-            }
-        }
-
         let request = DirectEncodeRequest {
             group: GroupNumber(0),
             first_block: BlockNumber(0),
@@ -3458,10 +3600,11 @@ mod tests {
         rows
     }
 
-    fn direct_selection_signature(selection: &DirectRepairSelection) -> (usize, Option<usize>) {
+    fn direct_selection_signature(selection: &DirectRepairSelection) -> Vec<usize> {
         match *selection {
-            DirectRepairSelection::One(row) => (row, None),
-            DirectRepairSelection::Two(first, second) => (first, Some(second)),
+            DirectRepairSelection::One(row) => vec![row],
+            DirectRepairSelection::Two(first, second) => vec![first, second],
+            DirectRepairSelection::Many { rows, count } => rows[..count].to_vec(),
         }
     }
 
@@ -3663,6 +3806,291 @@ mod tests {
         assert_eq!(outcome.recovered[1].block, BlockNumber(1));
         assert_eq!(outcome.recovered[0].data, original_first);
         assert_eq!(outcome.recovered[1].data, original_second);
+    }
+
+    #[test]
+    fn direct_multi_erasure_matches_full_decoder_on_larger_groups() {
+        let cx = Cx::for_testing();
+        let k = 96_u32;
+        let block_size = 64_u32;
+        let device = setup_device(k, block_size);
+        let uuid = test_uuid();
+        let group = GroupNumber(31);
+        let seed = repair_seed(&uuid, group);
+        let source: Vec<_> = (0..k)
+            .map(|index| make_deterministic_block(u64::from(index), block_size))
+            .collect();
+        // Independent producer: encode real payloads through the full
+        // systematic encoder, without the source-coefficient projection path.
+        let mut encoder = SystematicEncoder::new(&source, block_size as usize, seed).unwrap();
+        let repair_data: Vec<_> = encoder
+            .emit_repair(32)
+            .into_iter()
+            .map(|symbol| (symbol.esi, symbol.data))
+            .collect();
+        let decoder = InactivationDecoder::new(k as usize, block_size as usize, seed);
+
+        for missing_count in [3_u32, 5, 16] {
+            let mut corrupt: Vec<_> = (0..missing_count).map(|index| 7 + index * 5).collect();
+            for &index in &corrupt {
+                device.write(
+                    BlockNumber(u64::from(index)),
+                    vec![0xE3; block_size as usize],
+                );
+            }
+            let mut received = decoder.constraint_symbols();
+            for (index, bytes) in source.iter().enumerate() {
+                if !corrupt.contains(&(index as u32)) {
+                    received.push(ReceivedSymbol::source(index as u32, bytes.clone()));
+                }
+            }
+            for (esi, bytes) in &repair_data {
+                let (columns, coefficients) = decoder.repair_equation(*esi).unwrap();
+                received.push(ReceivedSymbol::repair(
+                    *esi,
+                    columns,
+                    coefficients,
+                    bytes.clone(),
+                ));
+            }
+            let reference = decoder
+                .decode_wavefront(&received, RQ_DECODE_WAVEFRONT_BATCH)
+                .expect("full decoder control must recover the same erased symbols");
+
+            // Caller order and duplicate requests must survive normalization.
+            corrupt.reverse();
+            corrupt.push(corrupt[0]);
+            let reads_before = device.read_count();
+            let borrowed = decode_group(
+                &cx,
+                &device,
+                &uuid,
+                group,
+                BlockNumber(0),
+                k,
+                &corrupt,
+                &repair_data,
+            )
+            .unwrap();
+            let owned = decode_group_with_owned_repair_symbols(
+                &cx,
+                &device,
+                &uuid,
+                group,
+                BlockNumber(0),
+                k,
+                &corrupt,
+                repair_data.clone(),
+            )
+            .unwrap();
+            assert_eq!(
+                device.read_count() - reads_before,
+                2 * (k - missing_count) as usize
+            );
+            for outcome in [borrowed, owned] {
+                assert!(outcome.complete);
+                assert_eq!(outcome.stats.policy_mode, Some("small_erasure_direct"));
+                assert_eq!(outcome.recovered.len(), corrupt.len());
+                for (recovered, &index) in outcome.recovered.iter().zip(&corrupt) {
+                    assert_eq!(recovered.block, BlockNumber(u64::from(index)));
+                    assert_eq!(recovered.data, source[index as usize]);
+                    assert_eq!(recovered.data, reference.source[index as usize]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn direct_multi_erasure_preserves_singular_and_tampered_owned_fallbacks() {
+        let cx = Cx::for_testing();
+        let k = 96_u32;
+        let block_size = 64_u32;
+        let device = setup_device(k, block_size);
+        let uuid = test_uuid();
+        let group = GroupNumber(31);
+        let encoded = encode_group(&cx, &device, &uuid, group, BlockNumber(0), k, 32).unwrap();
+        let repair_data: Vec<_> = encoded
+            .repair_symbols
+            .into_iter()
+            .map(|symbol| (symbol.esi, symbol.data))
+            .collect();
+        let corrupt = [7, 12, 17, 22, 27];
+        let corrupt_set = CorruptIndexSet::new(&corrupt, k, group).unwrap();
+        let decoder = InactivationDecoder::new(k as usize, block_size as usize, encoded.seed);
+
+        let singular = vec![repair_data[0].clone(); repair_data.len()];
+        let reads_before = device.read_count();
+        let attempt = try_direct_small_erasure_decode_owned(
+            &cx,
+            &device,
+            &decoder,
+            BlockNumber(0),
+            k,
+            &corrupt,
+            &corrupt_set,
+            singular.clone(),
+            encoded.seed,
+            block_size as usize,
+        )
+        .unwrap();
+        assert!(attempt.outcome.is_none());
+        assert_eq!(
+            attempt.fallback, singular,
+            "rank refusal must retain exact input symbols"
+        );
+        assert_eq!(
+            device.read_count(),
+            reads_before,
+            "rank refusal must precede payload reads"
+        );
+
+        let mut tampered = repair_data;
+        tampered.last_mut().unwrap().1[block_size as usize - 1] ^= 0x5A;
+        let attempt = try_direct_small_erasure_decode_owned(
+            &cx,
+            &device,
+            &decoder,
+            BlockNumber(0),
+            k,
+            &corrupt,
+            &corrupt_set,
+            tampered.clone(),
+            encoded.seed,
+            block_size as usize,
+        )
+        .unwrap();
+        assert!(
+            attempt.outcome.is_none(),
+            "a late inconsistent equation must reject the solve"
+        );
+        assert_eq!(
+            attempt.fallback, tampered,
+            "projection must be undone before full-decoder fallback"
+        );
+        assert_eq!(
+            device.read_count() - reads_before,
+            k as usize - corrupt.len()
+        );
+    }
+
+    #[test]
+    fn direct_multi_erasure_preserves_read_errors_and_cancellation() {
+        let cx = Cx::for_testing();
+        let k = 96_u32;
+        let block_size = 64_u32;
+        let device = setup_device(k, block_size);
+        let uuid = test_uuid();
+        let group = GroupNumber(31);
+        let encoded = encode_group(&cx, &device, &uuid, group, BlockNumber(0), k, 32).unwrap();
+        let repair_data: Vec<_> = encoded
+            .repair_symbols
+            .into_iter()
+            .map(|symbol| (symbol.esi, symbol.data))
+            .collect();
+        let corrupt = [7, 12, 17, 22, 27];
+
+        let failing = FailingReadDevice::new(block_size, vec![2]);
+        let error = decode_group(
+            &cx,
+            &failing,
+            &uuid,
+            group,
+            BlockNumber(0),
+            k,
+            &corrupt,
+            &repair_data,
+        )
+        .unwrap_err();
+        assert!(matches!(error, FfsError::Io(_)));
+        assert_eq!(*failing.reads.lock(), vec![0, 1, 2]);
+
+        let cancelled = Cx::for_testing();
+        cancelled.set_cancel_requested(true);
+        let reads_before = device.read_count();
+        assert!(matches!(
+            decode_group(
+                &cancelled,
+                &device,
+                &uuid,
+                group,
+                BlockNumber(0),
+                k,
+                &corrupt,
+                &repair_data,
+            ),
+            Err(FfsError::Cancelled)
+        ));
+        assert_eq!(device.read_count(), reads_before);
+
+        // Cancellation during the final intact-source read must still abort
+        // before projection/solve publishes a successful decoded result.
+        let cancelling = CancelOnRead {
+            device: setup_device(k, block_size),
+            cancel_at: BlockNumber(u64::from(k - 1)),
+        };
+        assert!(matches!(
+            decode_group_with_owned_repair_symbols(
+                &cx,
+                &cancelling,
+                &uuid,
+                group,
+                BlockNumber(0),
+                k,
+                &corrupt,
+                repair_data,
+            ),
+            Err(FfsError::Cancelled)
+        ));
+        assert_eq!(cancelling.device.read_count(), k as usize - corrupt.len());
+    }
+
+    #[test]
+    fn direct_recovery_repairs_five_blocks_in_960_source_group() {
+        let cx = Cx::for_testing();
+        let k = 960_u32;
+        let block_size = 4096_u32;
+        let device = setup_device(k, block_size);
+        let uuid = test_uuid();
+        let group = GroupNumber(0);
+        let encoded = encode_group(&cx, &device, &uuid, group, BlockNumber(0), k, 52).unwrap();
+        let repair_data: Vec<_> = encoded
+            .repair_symbols
+            .into_iter()
+            .map(|symbol| (symbol.esi, symbol.data))
+            .collect();
+        let corrupt = [1, 35, 105, 106, 119];
+        for &index in &corrupt {
+            device.write(
+                BlockNumber(u64::from(index)),
+                vec![0xE3; block_size as usize],
+            );
+        }
+        let reads_before = device.read_count();
+        let outcome = decode_group_with_owned_repair_symbols(
+            &cx,
+            &device,
+            &uuid,
+            group,
+            BlockNumber(0),
+            k,
+            &corrupt,
+            repair_data,
+        )
+        .unwrap();
+        assert!(outcome.complete);
+        assert_eq!(outcome.stats.policy_mode, Some("small_erasure_direct"));
+        assert_eq!(
+            device.read_count() - reads_before,
+            k as usize - corrupt.len()
+        );
+        assert_eq!(outcome.recovered.len(), corrupt.len());
+        for (recovered, &index) in outcome.recovered.iter().zip(&corrupt) {
+            assert_eq!(recovered.block, BlockNumber(u64::from(index)));
+            assert_eq!(
+                recovered.data,
+                make_deterministic_block(u64::from(index), block_size)
+            );
+        }
     }
 
     #[test]
