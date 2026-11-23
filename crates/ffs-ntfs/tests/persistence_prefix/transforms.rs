@@ -172,7 +172,9 @@ fn ntfs_mapped_chmod_preserves_denies_and_refuses_partial_compound_updates() {
         .unwrap();
     let mut owner_denied =
         NtfsSecurityDescriptor::parse(&stream_acl_descriptor(FILE_READ_DATA)).unwrap();
-    owner_denied.dacl.aces[0].sid.clone_from(&owner_denied.owner);
+    owner_denied.dacl.aces[0]
+        .sid
+        .clone_from(&owner_denied.owner);
     engine
         .set_security_at(
             &cx,
@@ -248,10 +250,7 @@ fn ntfs_mapped_chmod_preserves_denies_and_refuses_partial_compound_updates() {
     assert_eq!(dev.write_bytes_total(), writes);
     assert_eq!(dev.snapshot_live(), before);
     assert_eq!(dev.snapshot_durable_only(), before);
-    assert_eq!(
-        fs.getattr(&cx, &mut scope, restricted.ino).unwrap().size,
-        8
-    );
+    assert_eq!(fs.getattr(&cx, &mut scope, restricted.ino).unwrap().size, 8);
     fs.flush_on_destroy(&cx).unwrap();
     drop(fs);
 
@@ -263,7 +262,10 @@ fn ntfs_mapped_chmod_preserves_denies_and_refuses_partial_compound_updates() {
     let security = volume.security_descriptor(&cx, &file).unwrap();
     assert_eq!(
         security.descriptor.dacl.aces[0].encode().unwrap(),
-        NtfsSecurityDescriptor::parse(&descriptor).unwrap().dacl.aces[0]
+        NtfsSecurityDescriptor::parse(&descriptor)
+            .unwrap()
+            .dacl
+            .aces[0]
             .encode()
             .unwrap()
     );
@@ -390,7 +392,9 @@ fn ntfs_mapped_creation_publishes_security_in_one_transaction_and_recovers_atomi
                 mapped_create_fixture(&cx, version, FILE_WRITE_DATA, false);
             let events = Arc::new(Mutex::new(Vec::new()));
             let event_log = Arc::clone(&events);
-            let cuts = Arc::new(Mutex::new(Vec::<(NtfsPersistenceStage, bool, Vec<u8>)>::new()));
+            let cuts = Arc::new(Mutex::new(
+                Vec::<(NtfsPersistenceStage, bool, Vec<u8>)>::new(),
+            ));
             let saved = Arc::clone(&cuts);
             let storage = Arc::clone(&dev);
             let mut committed = false;
@@ -491,10 +495,13 @@ fn ntfs_mapped_creation_publishes_security_in_one_transaction_and_recovers_atomi
                     "{stage:?}"
                 );
                 assert!(
-                    info.descriptor.dacl.aces.iter().any(|ace| ace.kind
-                        == ACE_TYPE_ACCESS_DENIED
-                        && ace.flags & ACE_FLAG_INHERITED != 0
-                        && ace.sid == Some(map.sid_for_uid(1002).unwrap())),
+                    info.descriptor
+                        .dacl
+                        .aces
+                        .iter()
+                        .any(|ace| ace.kind == ACE_TYPE_ACCESS_DENIED
+                            && ace.flags & ACE_FLAG_INHERITED != 0
+                            && ace.sid == Some(map.sid_for_uid(1002).unwrap())),
                     "{stage:?}"
                 );
             }
@@ -575,7 +582,9 @@ fn ntfs_mapped_namespace_acl_denials_leave_names_streams_and_storage_unchanged()
     let victim = fs
         .lookup(&cx, &mut scope, root, OsStr::new("victim.bin"))
         .unwrap();
-    let (victim_handle, _) = fs.open(&cx, &mut scope, victim.ino, libc::O_RDONLY).unwrap();
+    let (victim_handle, _) = fs
+        .open(&cx, &mut scope, victim.ino, libc::O_RDONLY)
+        .unwrap();
     let before = dev.snapshot_live();
     let writes = dev.write_bytes_total();
     for operation in [
@@ -595,14 +604,15 @@ fn ntfs_mapped_namespace_acl_denials_leave_names_streams_and_storage_unchanged()
             "unlink" => fs.unlink(&cx, &mut scope, root, OsStr::new("restricted.bin")),
             "rmdir" => fs.rmdir(&cx, &mut scope, root, OsStr::new("restricted-dir")),
             "link destination" => fs
-                .link(&cx, &mut scope, available.ino, no_files, OsStr::new("linked"))
+                .link(
+                    &cx,
+                    &mut scope,
+                    available.ino,
+                    no_files,
+                    OsStr::new("linked"),
+                )
                 .map(|_| ()),
-            "unlink stream" => fs.unlink(
-                &cx,
-                &mut scope,
-                root,
-                OsStr::new("restricted.bin:audit"),
-            ),
+            "unlink stream" => fs.unlink(&cx, &mut scope, root, OsStr::new("restricted.bin:audit")),
             _ => {
                 let (source, parent, destination) = match operation {
                     "rename source file" => ("restricted.bin", root, "moved-file"),
@@ -663,7 +673,11 @@ fn ntfs_mapped_namespace_acl_denials_leave_names_streams_and_storage_unchanged()
         read_file_by_path(&cx, &engine, "/restricted.bin"),
         b"restricted.bin"
     );
-    assert!(engine.resolve_path_reference(&cx, "/restricted-dir").is_ok());
+    assert!(
+        engine
+            .resolve_path_reference(&cx, "/restricted-dir")
+            .is_ok()
+    );
     assert!(engine.resolve_path_reference(&cx, "/victim-dir").is_ok());
 }
 
@@ -674,13 +688,8 @@ fn ntfs_mapped_namespace_acl_accepts_object_or_parent_delete_authority() {
         (0, NtfsFormatVersion::V3_0, 0, FILE_DELETE_CHILD),
         (1, NtfsFormatVersion::V3_1, STANDARD_DELETE, 0),
     ] {
-        let (dev, vol_bytes) = format_to_fault_device(
-            &cx,
-            16,
-            4096,
-            version,
-            0xAC15_0007_0000_0001 + index,
-        );
+        let (dev, vol_bytes) =
+            format_to_fault_device(&cx, 16, 4096, version, 0xAC15_0007_0000_0001 + index);
         let mut engine = open_clean_engine(&cx, &dev, vol_bytes);
         let root = engine.resolve_path_reference(&cx, "/").unwrap();
         for (name, directory) in [
@@ -766,9 +775,18 @@ fn ntfs_mapped_namespace_acl_accepts_object_or_parent_delete_authority() {
         drop(fs);
         let engine = open_clean_engine(&cx, &dev, vol_bytes);
         engine.check_clean_consistency(&cx).unwrap();
-        assert_eq!(read_file_by_path(&cx, &engine, "/victim.bin"), b"source.bin");
-        assert_eq!(read_file_by_path(&cx, &engine, "/linked.bin"), b"source.bin");
-        assert_eq!(read_file_by_path(&cx, &engine, "/streams.bin"), b"streams.bin");
+        assert_eq!(
+            read_file_by_path(&cx, &engine, "/victim.bin"),
+            b"source.bin"
+        );
+        assert_eq!(
+            read_file_by_path(&cx, &engine, "/linked.bin"),
+            b"source.bin"
+        );
+        assert_eq!(
+            read_file_by_path(&cx, &engine, "/streams.bin"),
+            b"streams.bin"
+        );
         for path in ["/remove.bin", "/remove-dir", "/source.bin"] {
             assert!(matches!(
                 engine.resolve_path_reference(&cx, path),
@@ -2036,11 +2054,11 @@ fn ntfs_wof_decompression_on_write_materializes_plaintext_and_cleans_reparse() {
             "missing placeholder tag in rec {rec_no}"
         );
         if rec_no == wof_ref.record as usize {
-            // Sparse growth correctly leaves ValidDataLength at zero. WOF's
-            // provider data represents initialized logical bytes, so its
-            // unnamed sparse placeholder must declare that initialized span.
+            // Creating initialized data before punching the whole cluster keeps
+            // WOF's logical span valid while leaving its placeholder unallocated.
+            // Verify those native fields without changing the fixture's DATA.
             let mut at = u16::from_le_bytes(restored[20..22].try_into().unwrap()) as usize;
-            let mut initialized_data = false;
+            let mut checked_placeholder = false;
             while at + 24 <= restored.len() {
                 let kind = u32::from_le_bytes(restored[at..at + 4].try_into().unwrap());
                 if kind == u32::MAX {
@@ -2051,18 +2069,21 @@ fn ntfs_wof_decompression_on_write_materializes_plaintext_and_cleans_reparse() {
                 assert!(length >= 24 && at + length <= restored.len());
                 if kind == ffs_ondisk::ntfs::DATA && restored[at + 9] == 0 {
                     assert_eq!(restored[at + 8], 1);
-                    assert!(length >= 64);
-                    let logical = &restored[at + 48..at + 56];
-                    assert_eq!(logical, &(wof_initial.len() as u64).to_le_bytes());
-                    assert_eq!(&restored[at + 56..at + 64], &0_u64.to_le_bytes());
-                    restored[at + 56..at + 64]
-                        .copy_from_slice(&(wof_initial.len() as u64).to_le_bytes());
-                    initialized_data = true;
+                    assert!(length >= 72);
+                    assert_eq!(
+                        u16::from_le_bytes(restored[at + 12..at + 14].try_into().unwrap()),
+                        ffs_ondisk::ntfs::SPARSE
+                    );
+                    let logical_size = (wof_initial.len() as u64).to_le_bytes();
+                    assert_eq!(&restored[at + 48..at + 56], &logical_size);
+                    assert_eq!(&restored[at + 56..at + 64], &logical_size);
+                    assert_eq!(&restored[at + 64..at + 72], &0_u64.to_le_bytes());
+                    checked_placeholder = true;
                     break;
                 }
                 at += length;
             }
-            assert!(initialized_data, "missing unnamed sparse WOF DATA");
+            assert!(checked_placeholder, "missing unnamed sparse WOF DATA");
         }
         let usa_off = u16::from_le_bytes([restored[4], restored[5]]) as usize;
         let usa_cnt = u16::from_le_bytes([restored[6], restored[7]]) as usize;
@@ -2092,13 +2113,29 @@ fn ntfs_wof_decompression_on_write_materializes_plaintext_and_cleans_reparse() {
     assert_eq!(read_file_by_path(&cx, &engine, "/wof.bin"), expected);
 
     // Verify `WofCompressedData` AND `$REPARSE_POINT` are completely gone!
-    let vol = engine.volume_view(&cx).unwrap();
+    {
+        let vol = engine.volume_view(&cx).unwrap();
+        let rec = vol.resolve(&cx, "/wof.bin").unwrap();
+        assert!(vol.reparse_point(&cx, &rec).unwrap().is_none());
+        let streams = vol.data_streams(&cx, &rec).unwrap();
+        assert_eq!(streams.len(), 1);
+        assert_eq!(streams[0].name, [] as [u16; 0]);
+    }
+    engine.check_clean_consistency(&cx).unwrap();
+    drop(engine);
+
+    // Reopen only durable bytes so cached plaintext cannot hide a lost write
+    // or missing persistent cleanup of the WOF provider metadata.
+    let durable = FaultInjectingNtfsDevice::new(wof_dev.snapshot_durable_only());
+    let reopened = open_clean_engine(&cx, &durable, vol_bytes);
+    assert_eq!(read_file_by_path(&cx, &reopened, "/wof.bin"), expected);
+    let vol = reopened.volume_view(&cx).unwrap();
     let rec = vol.resolve(&cx, "/wof.bin").unwrap();
     assert!(vol.reparse_point(&cx, &rec).unwrap().is_none());
     let streams = vol.data_streams(&cx, &rec).unwrap();
     assert_eq!(streams.len(), 1);
     assert_eq!(streams[0].name, [] as [u16; 0]);
-    engine.check_clean_consistency(&cx).unwrap();
+    reopened.check_clean_consistency(&cx).unwrap();
 }
 
 #[test]

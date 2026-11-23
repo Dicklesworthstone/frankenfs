@@ -1967,8 +1967,10 @@ impl NtfsTransactionEngine {
         if !use_extended && let Ok(path) = self.resolve_reference_path(cx, reference) {
             let outcome =
                 self.edit_stream_data(cx, &path, stream, FileDataEdit::Write { offset, data });
-            if !matches!(outcome, NtfsTxOutcome::NotCommitted(FfsError::NoSpace))
-                || self.requires_recovery()
+            if !matches!(
+                outcome,
+                NtfsTxOutcome::NotCommitted(FfsError::UnsupportedFeature(_) | FfsError::NoSpace)
+            ) || self.requires_recovery()
             {
                 return outcome;
             }
@@ -2016,8 +2018,10 @@ impl NtfsTransactionEngine {
         };
         if !use_extended && let Ok(path) = self.resolve_reference_path(cx, reference) {
             let outcome = self.edit_stream_data(cx, &path, stream, FileDataEdit::Truncate { size });
-            if !matches!(outcome, NtfsTxOutcome::NotCommitted(FfsError::NoSpace))
-                || self.requires_recovery()
+            if !matches!(
+                outcome,
+                NtfsTxOutcome::NotCommitted(FfsError::UnsupportedFeature(_) | FfsError::NoSpace)
+            ) || self.requires_recovery()
             {
                 return outcome;
             }
@@ -2067,8 +2071,10 @@ impl NtfsTransactionEngine {
         };
         if !use_extended && let Ok(path) = self.resolve_reference_path(cx, reference) {
             let outcome = self.edit_named_stream(cx, &path, stream, Some(data));
-            if !matches!(outcome, NtfsTxOutcome::NotCommitted(FfsError::NoSpace))
-                || self.requires_recovery()
+            if !matches!(
+                outcome,
+                NtfsTxOutcome::NotCommitted(FfsError::UnsupportedFeature(_) | FfsError::NoSpace)
+            ) || self.requires_recovery()
             {
                 return outcome;
             }
@@ -2099,8 +2105,10 @@ impl NtfsTransactionEngine {
         };
         if !use_extended && let Ok(path) = self.resolve_reference_path(cx, reference) {
             let outcome = self.edit_named_stream(cx, &path, stream, None);
-            if !matches!(outcome, NtfsTxOutcome::NotCommitted(FfsError::NoSpace))
-                || self.requires_recovery()
+            if !matches!(
+                outcome,
+                NtfsTxOutcome::NotCommitted(FfsError::UnsupportedFeature(_) | FfsError::NoSpace)
+            ) || self.requires_recovery()
             {
                 return outcome;
             }
