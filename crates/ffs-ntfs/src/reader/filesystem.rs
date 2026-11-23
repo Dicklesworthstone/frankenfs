@@ -565,7 +565,7 @@ impl NtfsFs {
             }
             NtfsSidPolicy::Mapped { map, .. } => {
                 let security = match volume.security_descriptor(cx, &record) {
-                    Ok(info) => Some(info),
+                    Ok(security_info) => Some(security_info),
                     Err(FfsError::NotFound(_)) => None,
                     Err(error) => return Err(error),
                 };
