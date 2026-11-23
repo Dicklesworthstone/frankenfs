@@ -840,6 +840,11 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+// Each subcommand gets its own argument-construction frame. Building every
+// flag inline exhausts a normal 2 MiB thread stack in unoptimized CLI builds.
+// Nested command enums stay explicit subcommand variants so their names are
+// registered eagerly for `ffs help <command> <subcommand>`.
+#[command(defer = true)]
 #[expect(
     clippy::large_enum_variant,
     reason = "clap subcommands keep typed flag payloads inline for direct parsing"
@@ -1243,10 +1248,8 @@ enum Command {
         json: bool,
     },
     /// Dump low-level filesystem metadata.
-    Dump {
-        #[command(subcommand)]
-        command: DumpCommand,
-    },
+    #[command(subcommand)]
+    Dump(DumpCommand),
     /// Run offline filesystem checks.
     #[command(visible_alias = "check")]
     Fsck {
@@ -1781,15 +1784,11 @@ enum Command {
         json: bool,
     },
     /// Inspect read-only ZFS pool labels, uberblock candidates, and pool status.
-    Pool {
-        #[command(subcommand)]
-        command: cmd_six_format::PoolCommand,
-    },
+    #[command(subcommand)]
+    Pool(cmd_six_format::PoolCommand),
     /// Inspect read-only ZFS datasets, snapshots, and DMU scrub status.
-    Dataset {
-        #[command(subcommand)]
-        command: cmd_six_format::DatasetCommand,
-    },
+    #[command(subcommand)]
+    Dataset(cmd_six_format::DatasetCommand),
     /// Deterministically synthesize clean six-format + multi-partition GPT test fixtures.
     #[command(name = "synthesize-six-format-fixtures", hide = true)]
     SynthesizeSixFormatFixtures {
@@ -1889,7 +1888,7 @@ impl Command {
             Self::Walk { .. } => "walk",
             Self::MvccStats { .. } => "mvcc-stats",
             Self::Info { .. } => "info",
-            Self::Dump { .. } => "dump",
+            Self::Dump(_) => "dump",
             Self::Fsck { .. } => "fsck",
             Self::Repair { .. } => "repair",
             Self::NativePrepare { .. } => "native-prepare",
@@ -1907,8 +1906,8 @@ impl Command {
             Self::Ls { .. } => "ls",
             Self::Format { .. } => "format",
             Self::Streams { .. } => "streams",
-            Self::Pool { .. } => "pool",
-            Self::Dataset { .. } => "dataset",
+            Self::Pool(_) => "pool",
+            Self::Dataset(_) => "dataset",
             Self::SynthesizeSixFormatFixtures { .. } => "synthesize-six-format-fixtures",
         }
     }
@@ -2934,7 +2933,7 @@ fn execute_command(
                 Ok(())
             }
         }
-        Command::Dump { command } => dump_cmd(&command),
+        Command::Dump(command) => dump_cmd(&command),
         Command::Fsck {
             image,
             repair,
@@ -3281,8 +3280,8 @@ fn execute_command(
             json,
             six_format,
         ),
-        Command::Pool { command } => cmd_six_format::pool_cmd(&command, six_format),
-        Command::Dataset { command } => cmd_six_format::dataset_cmd(&command, six_format),
+        Command::Pool(command) => cmd_six_format::pool_cmd(&command, six_format),
+        Command::Dataset(command) => cmd_six_format::dataset_cmd(&command, six_format),
         Command::SynthesizeSixFormatFixtures { output_dir, json } => {
             cmd_six_format::synthesize_six_format_fixtures_cmd(&output_dir, json)
         }
@@ -17558,6 +17557,103 @@ mod tests {
     }
 
     #[test]
+    fn cli_parser_construction_and_help_fit_standard_thread_stack() {
+        std::thread::Builder::new()
+            .name("cli-parser-stack-regression".to_owned())
+            // The ordinary Rust test-thread budget, fixed here so an ambient
+            // RUST_MIN_STACK cannot hide the original debug-build overflow.
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                <Cli as clap::CommandFactory>::command().debug_assert();
+                <Cli as clap::CommandFactory>::command_for_update().debug_assert();
+
+                let mut cli = Cli::try_parse_from([
+                    "ffs",
+                    "mount",
+                    "test.img",
+                    "/mnt/ffs",
+                    "--rw",
+                    "--max-dirty-mib",
+                    "128",
+                    "--log-format",
+                    "json",
+                    "--offline-image",
+                ])
+                .expect("mount and global flags should parse on a normal stack");
+                assert!(matches!(
+                    cli.command,
+                    Command::Mount {
+                        rw: true,
+                        max_dirty_mib: Some(128),
+                        ..
+                    }
+                ));
+                assert_eq!(cli.log_format, Some(LogFormat::Json));
+                assert!(cli.six_format.offline_image);
+                cli.try_update_from([
+                    "ffs",
+                    "mount",
+                    "test.img",
+                    "/mnt/ffs",
+                    "--max-dirty-mib",
+                    "64",
+                ])
+                .expect("deferred update parser should accept mount arguments");
+                let Command::Mount {
+                    image,
+                    mountpoint,
+                    max_dirty_mib,
+                    ..
+                } = cli.command
+                else {
+                    panic!("expected mount command");
+                };
+                assert_eq!(image, PathBuf::from("test.img"));
+                assert_eq!(mountpoint, PathBuf::from("/mnt/ffs"));
+                assert_eq!(max_dirty_mib, Some(64));
+
+                for args in [
+                    vec![
+                        "ffs",
+                        "mount",
+                        "test.img",
+                        "/mnt/ffs",
+                        "--max-dirty-mib",
+                        "0",
+                    ],
+                    vec![
+                        "ffs",
+                        "mount",
+                        "test.img",
+                        "/mnt/ffs",
+                        "--background-repair",
+                        "--no-background-scrub",
+                    ],
+                ] {
+                    assert!(Cli::try_parse_from(args).is_err());
+                }
+
+                for args in [
+                    vec!["ffs", "--help"],
+                    vec!["ffs", "mount", "--help"],
+                    vec!["ffs", "dump", "superblock", "--help"],
+                    vec!["ffs", "dataset", "scrub", "--help"],
+                    vec!["ffs", "help", "dump", "superblock"],
+                    vec!["ffs", "help", "pool", "status"],
+                    vec!["ffs", "help", "dataset", "scrub"],
+                ] {
+                    let Err(help) = Cli::try_parse_from(args) else {
+                        panic!("help should not execute a filesystem command");
+                    };
+                    assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+                }
+            })
+            .expect("spawn parser regression thread")
+            .join()
+            .expect("CLI parsing must fit the normal thread stack");
+    }
+
+    #[test]
     fn cli_mount_max_dirty_mib_parses_and_rejects_zero_bd_dj725() {
         let cli = Cli::try_parse_from([
             "ffs",
@@ -19103,7 +19199,7 @@ mod tests {
         .expect("dump superblock command should parse");
 
         match cli.command {
-            Command::Dump { command } => match command {
+            Command::Dump(command) => match command {
                 DumpCommand::Superblock { image, json, hex } => {
                     assert_eq!(image, std::path::PathBuf::from("/tmp/fs.img"));
                     assert!(json);
@@ -19114,10 +19210,7 @@ mod tests {
                     "expected dump superblock command"
                 ),
             },
-            other => assert!(
-                matches!(other, Command::Dump { .. }),
-                "expected dump command"
-            ),
+            other => assert!(matches!(other, Command::Dump(_)), "expected dump command"),
         }
     }
 
@@ -19127,7 +19220,7 @@ mod tests {
             .expect("dump group command should parse");
 
         match cli.command {
-            Command::Dump { command } => match command {
+            Command::Dump(command) => match command {
                 DumpCommand::Group {
                     group,
                     image,
@@ -19144,10 +19237,7 @@ mod tests {
                     "expected dump group command"
                 ),
             },
-            other => assert!(
-                matches!(other, Command::Dump { .. }),
-                "expected dump command"
-            ),
+            other => assert!(matches!(other, Command::Dump(_)), "expected dump command"),
         }
     }
 
@@ -19165,7 +19255,7 @@ mod tests {
         .expect("dump inode command should parse");
 
         match cli.command {
-            Command::Dump { command } => match command {
+            Command::Dump(command) => match command {
                 DumpCommand::Inode {
                     inode,
                     image,
@@ -19182,10 +19272,7 @@ mod tests {
                     "expected dump inode command"
                 ),
             },
-            other => assert!(
-                matches!(other, Command::Dump { .. }),
-                "expected dump command"
-            ),
+            other => assert!(matches!(other, Command::Dump(_)), "expected dump command"),
         }
     }
 
@@ -19195,7 +19282,7 @@ mod tests {
             .expect("dump extents command should parse");
 
         match cli.command {
-            Command::Dump { command } => match command {
+            Command::Dump(command) => match command {
                 DumpCommand::Extents {
                     inode,
                     image,
@@ -19212,10 +19299,7 @@ mod tests {
                     "expected dump extents command"
                 ),
             },
-            other => assert!(
-                matches!(other, Command::Dump { .. }),
-                "expected dump command"
-            ),
+            other => assert!(matches!(other, Command::Dump(_)), "expected dump command"),
         }
     }
 
@@ -19225,7 +19309,7 @@ mod tests {
             .expect("dump dir command should parse");
 
         match cli.command {
-            Command::Dump { command } => match command {
+            Command::Dump(command) => match command {
                 DumpCommand::Dir {
                     inode,
                     image,
@@ -19242,10 +19326,7 @@ mod tests {
                     "expected dump dir command"
                 ),
             },
-            other => assert!(
-                matches!(other, Command::Dump { .. }),
-                "expected dump command"
-            ),
+            other => assert!(matches!(other, Command::Dump(_)), "expected dump command"),
         }
     }
 
