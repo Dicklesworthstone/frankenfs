@@ -688,9 +688,23 @@ Native symlink creation is exposed through `ZfsTransactionEngine::create_symlink
 and writable `FsOps::symlink`. Target bytes and the namespace entry publish in
 one TXG, with short inline and longer data-backed legacy znodes on both ZPL v4
 and v5. The bounded Linux mount profile accepts nonempty, NUL-free targets up to
-4095 bytes and applies parent SGID group inheritance. Existing-node quota updates
-use the object's checked native project identity; project inheritance and changes
-to project ownership remain outside this increment.
+4095 bytes and applies parent SGID group inheritance. Existing-node usage updates
+use the object's checked native project identity.
+
+The bounded project-inheritance writer admits ZPL v5 SA directories with an
+already-active project_quota feature and complete native owner accounting.
+Regular files and directories inherit both project ID and inheritance flag;
+symlinks and children of non-inheriting directories retain the default project.
+Fresh child SA fields use native zfs_mknode order, including fixed quota-reader
+offsets, and registry/layout changes publish with namespace and usage counters
+in the same TXG. Hard links and renames into project trees require matching
+project IDs; renames also propagate the destination inheritance flag. Exchange
+conservatively checks both destinations. Project ownership reassignment,
+inheritable ACL propagation, owner quota-limit enforcement and the remaining
+dataset/shared-reference lifecycle are still required. Until limit enforcement
+exists, the native writer refuses datasets referencing any native user, group
+or project byte/object quota table. Creation under inheritable native ACLs also
+remains refused; usage accounting alone is not quota enforcement.
 
 Read snapshots at their selected immutable root. Enumerate datasets, properties,
 clones, and snapshots independently of which dataset is mounted. Parent/child

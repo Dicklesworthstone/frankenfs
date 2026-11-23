@@ -7,7 +7,8 @@ use asupersync::Cx;
 use ffs_error::{FfsError, Result};
 use ffs_ondisk::zfs::{BlockPointer, Endian, RegularBlockSpec};
 use ffs_ondisk::zfs_dmu::{
-    DMU_OT_DNODE, DNODE_BLOCK_BYTES, DNODE_BYTES, Dnode, DnodeSpec, ObjectSet,
+    DMU_OT_DNODE, DNODE_BLOCK_BYTES, DNODE_BYTES, Dnode, DnodeSpec, OBJSET_GROUPUSED_OFFSET,
+    OBJSET_PROJECTUSED_OFFSET, OBJSET_USERUSED_OFFSET, ObjectSet,
 };
 use ffs_ondisk::zfs_zap::Entry as RawZapEntry;
 use ffs_ondisk::zfs_zpl::{
@@ -62,6 +63,7 @@ pub struct ZfsObjectIdentity {
 // Dataset `readonly` is a separate, inherited DSL property.
 #[allow(dead_code)]
 const ZFS_XATTR: u64 = 0x1;
+const ZFS_INHERIT_ACE: u64 = 0x2;
 const ZFS_ACL_TRIVIAL: u64 = 0x4;
 const ZFS_NO_EXECS_DENIED: u64 = 0x100;
 const ZFS_READONLY: u64 = 0x0000_0001_0000_0000;
@@ -81,15 +83,57 @@ fn reject_flags(metadata: &Metadata, prohibited: u64) -> Result<()> {
     Ok(())
 }
 
-fn admit_directory_add(parent: &Metadata) -> Result<()> {
+fn admit_directory_add(
+    parent: &LoadedZplNode,
+    context: &DatasetContext,
+    write_features: &BTreeMap<String, u64>,
+) -> Result<()> {
     // Append-only directories may gain new names, but immutable directories
-    // cannot. Project inheritance requires preserving the native project ID
-    // and, for new directories, the inheritance flag itself.
-    reject_flags(parent, ZFS_IMMUTABLE)?;
-    if parent.flags & ZFS_PROJINHERIT != 0 {
+    // cannot. A project tree needs already active native accounting; creating
+    // entries must never silently enable a pool feature or incomplete counters.
+    reject_flags(&parent.metadata, ZFS_IMMUTABLE)?;
+    if parent.metadata.flags & ZFS_PROJINHERIT == 0 {
+        return Ok(());
+    }
+    if context.zpl_version < 5
+        || parent.dnode.bonus_type() != DMU_OT_SA
+        || parent.metadata.flags & ZFS_PROJID == 0
+        || context.os.flags & 0x07 != 0x07
+        || !write_features
+            .get("org.zfsonlinux:project_quota")
+            .is_some_and(|&references| references > 0)
+    {
         return Err(unsupported(
-            "mutations into project-inheriting directories require project-ID admission",
+            "project inheritance requires ZPL v5 SA and active, complete native project accounting",
         ));
+    }
+    for offset in [
+        OBJSET_USERUSED_OFFSET,
+        OBJSET_GROUPUSED_OFFSET,
+        OBJSET_PROJECTUSED_OFFSET,
+    ] {
+        if context
+            .os
+            .embedded_dnode(offset, context.os.meta.order())
+            .map_err(|error| parse_err(&error))?
+            .is_none()
+        {
+            return Err(corrupt(
+                "project inheritance lacks its native accounting object",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn admit_project_entry(parent: &LoadedZplNode, target: &LoadedZplNode) -> Result<()> {
+    // OpenZFS zfs-2.3.0 zfs_link/zfs_rename: linking or moving an existing
+    // object never changes its project owner to fit the destination tree.
+    if parent.metadata.flags & ZFS_PROJINHERIT != 0 && parent.project_id != target.project_id {
+        return Err(FfsError::RequestRejected {
+            errno: libc::EXDEV,
+            detail: "ZPL destination inherits a different native project ID".into(),
+        });
     }
     Ok(())
 }
@@ -475,6 +519,24 @@ fn open_head_dataset_context(
 
     let mut os_view = mos.open_objectset_view(os.meta.clone(), old_os_bp.birth(), mos.txg);
     let master = os_view.zap_values(cx, 1)?;
+    // OpenZFS stores per-owner byte and object limits in separate ZAPs
+    // referenced by these exact master-node keys. Updating the embedded *used
+    // counters does not enforce those limits. Keep the native writer closed
+    // to such datasets until it can enforce every applicable owner limit.
+    for key in [
+        b"userquota@".as_slice(),
+        b"groupquota@",
+        b"projectquota@",
+        b"userobjquota@",
+        b"groupobjquota@",
+        b"projectobjquota@",
+    ] {
+        if zap_optional_u64(&master, key)?.is_some_and(|object| object != 0) {
+            return Err(unsupported(
+                "native user, group, or project quota limits require owner-limit enforcement",
+            ));
+        }
+    }
     let root_dir = zap_required_u64(&master, b"ROOT")?;
     let unlinked_set = zap_optional_u64(&master, b"DELETE_QUEUE")?.filter(|&object| object != 0);
     let zpl_version = zap_required_u64(&master, b"VERSION")?;
@@ -941,17 +1003,50 @@ fn encode_symlink_acl(bonus: &mut [u8], order: Endian) {
 fn encode_new_zpl_bonus(
     parent_loaded: &LoadedZplNode,
     new_meta: &Metadata,
-    zpl_version: u64,
-    sa_registry: Option<&SaRegistry>,
+    context: &mut DatasetContext,
     order: Endian,
 ) -> Result<(u8, usize, Vec<u8>, u64)> {
+    // zfs_mknode inherits both ID and flag for regular files and directories.
+    // Symlinks keep the default project, even inside a project tree.
+    if matches!(new_meta.kind, Kind::Regular | Kind::Directory)
+        && parent_loaded.metadata.flags & ZFS_PROJINHERIT != 0
+    {
+        // Native ACL inheritance is independent of project inheritance. Until
+        // inherited ACEs are implemented, a fresh mode-only ACL must not replace
+        // the parent's inheritable access policy. Native symlinks inherit none.
+        if parent_loaded.metadata.flags & ZFS_INHERIT_ACE != 0 {
+            return Err(unsupported(
+                "project creation with inheritable native ACL entries is unavailable",
+            ));
+        }
+        let mut metadata = new_meta.clone();
+        metadata.flags |= ZFS_PROJID | ZFS_PROJINHERIT;
+        let registry = context
+            .sa_registry
+            .as_mut()
+            .ok_or_else(|| corrupt("project inheritance lacks an SA registry"))?;
+        let registry_len = context.sa_reg_entries.len();
+        let layouts_len = context.sa_lay_entries.len();
+        let bonus = registry
+            .encode_new_with_project(
+                &mut context.sa_reg_entries,
+                &mut context.sa_lay_entries,
+                parent_loaded.dnode.bonus(),
+                &metadata,
+                Some(parent_loaded.project_id),
+            )
+            .map_err(|error| parse_err(&error))?;
+        context.sa_reg_dirty |= context.sa_reg_entries.len() != registry_len;
+        context.sa_lay_dirty |= context.sa_lay_entries.len() != layouts_len;
+        return Ok((DMU_OT_SA, 1, bonus, parent_loaded.project_id));
+    }
     // Native ZPL v5 also admits legacy znodes. Creating a legacy symlink keeps
     // the target in its native inline/data form without inventing an SA layout
     // or changing the existing parent's SA registry and attributes.
     if new_meta.kind != Kind::Symlink
-        && zpl_version >= 5
+        && context.zpl_version >= 5
         && parent_loaded.dnode.bonus_type() == DMU_OT_SA
-        && let Some(reg) = sa_registry
+        && let Some(reg) = context.sa_registry.as_ref()
     {
         let bonus = reg
             .encode_new_from_template(parent_loaded.dnode.bonus(), new_meta)
@@ -1346,7 +1441,7 @@ pub(super) fn stage_zpl_mutation(
             if parent_loaded.metadata.kind != Kind::Directory {
                 return Err(FfsError::NotDirectory);
             }
-            admit_directory_add(&parent_loaded.metadata)?;
+            admit_directory_add(&parent_loaded, &ds_ctx, write_features)?;
             let mut entries = read_dir_entries(cx, &mut os_view, *parent_dir, &staged_dirs)?;
             if entries.iter().any(|e| e.name == *name) {
                 return Err(FfsError::Exists);
@@ -1386,13 +1481,8 @@ pub(super) fn stage_zpl_mutation(
                     .filter(|target| target.len() <= MAX_INLINE_SYMLINK_BYTES)
                     .cloned(),
             };
-            let (bonus_type, nblkptr, bonus, project_id) = encode_new_zpl_bonus(
-                &parent_loaded,
-                &clean_meta,
-                ds_ctx.zpl_version,
-                ds_ctx.sa_registry.as_ref(),
-                order,
-            )?;
+            let (bonus_type, nblkptr, bonus, project_id) =
+                encode_new_zpl_bonus(&parent_loaded, &clean_meta, &mut ds_ctx, order)?;
             let (data_bytes, file_contents) = match symlink_target {
                 Some(target) if clean_meta.inline_symlink.is_none() => {
                     let data_bytes = target.len().next_power_of_two().max(min_blk);
@@ -1520,7 +1610,7 @@ pub(super) fn stage_zpl_mutation(
             if parent_loaded.metadata.kind != Kind::Directory {
                 return Err(FfsError::NotDirectory);
             }
-            admit_directory_add(&parent_loaded.metadata)?;
+            admit_directory_add(&parent_loaded, &ds_ctx, write_features)?;
             let mut entries = read_dir_entries(cx, &mut os_view, *parent_dir, &staged_dirs)?;
             if entries.iter().any(|e| e.name == *name) {
                 return Err(FfsError::Exists);
@@ -1546,13 +1636,8 @@ pub(super) fn stage_zpl_mutation(
                 times: [*timestamp; 4],
                 inline_symlink: None,
             };
-            let (bonus_type, nblkptr, bonus, project_id) = encode_new_zpl_bonus(
-                &parent_loaded,
-                &dir_meta,
-                ds_ctx.zpl_version,
-                ds_ctx.sa_registry.as_ref(),
-                order,
-            )?;
+            let (bonus_type, nblkptr, bonus, project_id) =
+                encode_new_zpl_bonus(&parent_loaded, &dir_meta, &mut ds_ctx, order)?;
             let (bsize, blocks) =
                 encode_zap_blocks_for_dnode(cx, &mut os_view, None, &[], order, min_blk)?;
             let mut dir_dirty = BTreeMap::new();
@@ -1700,7 +1785,8 @@ pub(super) fn stage_zpl_mutation(
                 return Err(FfsError::NotDirectory);
             }
             reject_flags(&source.metadata, ZFS_IMMUTABLE | ZFS_APPENDONLY)?;
-            admit_directory_add(&parent.metadata)?;
+            admit_directory_add(&parent, &ds_ctx, write_features)?;
+            admit_project_entry(&parent, &source)?;
             let mut entries = read_dir_entries(cx, &mut os_view, *parent_dir, &staged_dirs)?;
             if entries.iter().any(|entry| entry.name == *name) {
                 return Err(FfsError::Exists);
@@ -2545,7 +2631,8 @@ pub(super) fn stage_zpl_mutation(
             )?;
             let is_dir = src_obj_loaded.metadata.kind == Kind::Directory;
             admit_directory_remove(&src_parent.metadata, &src_obj_loaded.metadata)?;
-            admit_directory_add(&dst_parent.metadata)?;
+            admit_directory_add(&dst_parent, &ds_ctx, write_features)?;
+            admit_project_entry(&dst_parent, &src_obj_loaded)?;
 
             // Cycle check if moving a directory across parents.
             if is_dir && *src_dir != *dst_dir {
@@ -2805,6 +2892,7 @@ pub(super) fn stage_zpl_mutation(
             let mut moved_meta = src_obj_loaded.metadata.clone();
             moved_meta.parent = *dst_dir;
             moved_meta.times[2] = *timestamp;
+            moved_meta.flags |= dst_parent.metadata.flags & ZFS_PROJINHERIT;
             let (m_bonus, m_spill) = encode_updated_zpl_bonus(
                 &src_obj_loaded,
                 &moved_meta,
@@ -2950,7 +3038,11 @@ pub(super) fn stage_zpl_mutation(
                 // Both names are removed and replaced. In particular, an
                 // append-only parent cannot accept an exchange as an insertion.
                 admit_directory_remove(&parents[index].metadata, &loaded.metadata)?;
-                admit_directory_add(&parents[1 - index].metadata)?;
+                admit_directory_add(&parents[1 - index], &ds_ctx, write_features)?;
+                // Preserve project-tree membership in both directions. This
+                // bounded profile also refuses the reverse mismatch that the
+                // pinned native implementation's one-sided check overlooks.
+                admit_project_entry(&parents[1 - index], &loaded)?;
                 positions[index] = position;
                 nodes.push(loaded);
             }
@@ -3060,6 +3152,7 @@ pub(super) fn stage_zpl_mutation(
                 let mut metadata = loaded.metadata.clone();
                 metadata.parent = [*dst_dir, *src_dir][index];
                 metadata.times[2] = *timestamp;
+                metadata.flags |= parents[1 - index].metadata.flags & ZFS_PROJINHERIT;
                 let (bonus, spill) = encode_updated_zpl_bonus(
                     loaded,
                     &metadata,

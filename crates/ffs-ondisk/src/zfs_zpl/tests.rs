@@ -380,6 +380,132 @@ fn project_accounting_owner_requires_a_scalar_and_preserves_native_byte_order() 
 }
 
 #[test]
+fn explicit_project_creation_builds_complete_metadata_without_parent_storage_owners() {
+    for order in [Endian::Little, Endian::Big] {
+        let mut core = attributes(order, 0o040_755, 2);
+        let mtime = core.remove(core.iter().position(|(id, _)| *id == 1).unwrap());
+        core.iter_mut().find(|(id, _)| *id == 11).unwrap().1 =
+            order.encode(0x0000_c000_0000_0000).to_vec();
+        core.push((9, order.encode(73).to_vec()));
+        let mut external_acl = vec![0_u8; 88];
+        external_acl[..8].copy_from_slice(&order.encode(99));
+        core.push((15, external_acl));
+        core.push((48, vec![0xab; 32]));
+        let spill = [mtime, (47, order.encode(42).to_vec())];
+        let mut registrations = vec![
+            registration("ZPL_PROJID", 47, 8, 0),
+            registration("ZPL_SCANSTAMP", 48, 32, 2),
+        ];
+        let mut layouts = vec![layout(2, &core), layout(3, &spill)];
+        let mut registry = SaRegistry::from_zaps(&registrations, &layouts).unwrap();
+        let parent_bonus = packed(2, &core, &[], order);
+        let parent_spill = packed(3, &spill, &[], order);
+        let original_parent = parent_bonus.clone();
+        let mut child = registry
+            .decode(&parent_bonus, Some(&parent_spill))
+            .unwrap()
+            .metadata()
+            .unwrap();
+        child.kind = Kind::Regular;
+        child.mode = 0o100_640;
+        child.size = 0;
+        child.links = 1;
+        child.parent = 17;
+        child.generation = 81;
+        // The encoder must supply PROJID even when the caller only carries
+        // the requested inheritance policy. Parent owners are never copied.
+        child.flags = 0x0000_4000_0000_0000;
+        let bonus = registry
+            .encode_new_with_project(
+                &mut registrations,
+                &mut layouts,
+                &parent_bonus,
+                &child,
+                Some(42),
+            )
+            .unwrap();
+        let persisted_registry = SaRegistry::from_zaps(&registrations, &layouts).unwrap();
+        let decoded = persisted_registry.decode(&bonus, None).unwrap();
+        child.flags |= 0x0000_8000_0000_0000;
+        assert_eq!(decoded.metadata().unwrap(), child);
+        assert_eq!(decoded.project_id().unwrap(), 42);
+        // Independent of our registry decoder: OpenZFS zfs-2.3.0
+        // zpl_get_file_info uses these fixed offsets from sys/zfs_sa.h.
+        let header_bytes = usize::from(word16(&bonus, 4, order).unwrap() >> 10) * 8;
+        for (offset, expected) in [
+            (16, child.generation),
+            (24, child.uid),
+            (32, child.gid),
+            (48, child.flags),
+            (128, 42),
+        ] {
+            assert_eq!(order.u64(&bonus, header_bytes + offset).unwrap(), expected);
+        }
+        assert_eq!(
+            decoded.reclamation_ownership().unwrap(),
+            ReclamationOwnership {
+                xattr_directory: 0,
+                external_acl_object: 0,
+                project_id: 42,
+            }
+        );
+        assert!(!decoded.values.contains_key(b"ZPL_SCANSTAMP".as_slice()));
+        assert!(!decoded.values.contains_key(b"ZPL_ZNODE_ACL".as_slice()));
+        assert!(decoded.values.contains_key(b"ZPL_DACL_ACES".as_slice()));
+        assert_eq!(parent_bonus, original_parent);
+        assert_eq!(
+            persisted_registry
+                .decode(&parent_bonus, Some(&parent_spill))
+                .unwrap()
+                .reclamation_ownership()
+                .unwrap(),
+            ReclamationOwnership {
+                xattr_directory: 73,
+                external_acl_object: 99,
+                project_id: 42,
+            }
+        );
+    }
+}
+
+#[test]
+fn explicit_project_creation_rejects_mistyped_registration_and_symlink_ownership() {
+    let order = Endian::Little;
+    let core = attributes(order, 0o040_755, 2);
+    let bonus = packed(2, &core, &[], order);
+    for (length, swap) in [(16, 0), (8, 3)] {
+        let mut registrations = vec![registration("ZPL_PROJID", 47, length, swap)];
+        let mut layouts = vec![layout(2, &core)];
+        let mut registry = SaRegistry::from_zaps(&registrations, &layouts).unwrap();
+        let metadata = registry.decode(&bonus, None).unwrap().metadata().unwrap();
+        assert!(
+            registry
+                .encode_new_with_project(
+                    &mut registrations,
+                    &mut layouts,
+                    &bonus,
+                    &metadata,
+                    Some(42),
+                )
+                .is_err()
+        );
+    }
+    let mut registrations = Vec::new();
+    let mut layouts = vec![layout(2, &core)];
+    let mut registry = SaRegistry::from_zaps(&registrations, &layouts).unwrap();
+    let mut link = registry.decode(&bonus, None).unwrap().metadata().unwrap();
+    link.kind = Kind::Symlink;
+    link.mode = 0o120_777;
+    link.size = 3;
+    link.inline_symlink = Some(b"dst".to_vec());
+    assert!(
+        registry
+            .encode_new_with_project(&mut registrations, &mut layouts, &bonus, &link, Some(42),)
+            .is_err()
+    );
+}
+
+#[test]
 fn invalid_registrations_layouts_and_ambiguous_catalogs_are_refused() {
     for entries in [
         vec![registration("ZPL_SIZE", 17, 8, 0)],

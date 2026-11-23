@@ -3474,8 +3474,9 @@ the existing regular file's native link count atomically within one admitted,
 case-sensitive ZPL v4/v5 head dataset. Metadata updates preserve data pointers,
 generation, ownership and mtime while updating ctime and the native parent
 hint. Directory, symlink and cross-dataset links are outside this write surface.
-Native immutable/append-only flags and unsupported project inheritance are
-checked before backing writes. Cancellation after every required
+Native immutable/append-only flags and project-profile admission are checked
+before backing writes; the later project-inheritance increment below admits
+matching owners and rejects cross-project destinations. Cancellation after every required
 uberblock/member barrier preserves the committed token and live writer state;
 incomplete publication retains the uncertain outcome.
 
@@ -3552,8 +3553,8 @@ Existing-node quota changes now use the checked project ID belonging to the
 native owner when its ZFS_PROJID flag is set, rather than charging every mutation
 to project 0. This covers changed SA spill allocation, file range writes and
 resize, directory changes, hard links, moves and final reclamation. New children
-default to project 0 when project inheritance is absent; inherited project
-creation remains explicitly unsupported. Nonfinal unlink accounts for any
+default to project 0 when project inheritance is absent; the later bounded
+project-inheritance increment below adds inherited creation. Nonfinal unlink accounts for any
 changed spill allocation as well as preserving the surviving owner's metadata.
 
 Regressions exercise inline/data boundaries, maximum-length and non-UTF-8
@@ -3572,6 +3573,55 @@ runs exposed an existing ZFS statfs lifecycle assertion, three NTFS persistence
 failures, Clippy diagnostics, and an AArch64-only harness probe build failure;
 those runs therefore do not establish an all-green workspace. These fixtures
 also do not establish native OpenZFS interchange or a real mounted syscall result.
+
+## ZFS project inheritance and owner-limit admission (2026-11-23)
+
+The native writer now supports inherited project ownership on regular-file and
+directory creation in an admitted ZPL v5 SA project tree. Both the project ID
+and inheritance flag propagate through newly created directories and files.
+Symlinks use project 0; a non-inheriting parent does not confer its own project
+ID. Fresh SA metadata includes a complete native core/ACL/project layout, uses
+OpenZFS zfs-2.3.0 zfs_mknode field order and registers missing attributes/layouts
+in the same TXG as namespace insertion and owner usage changes. Parent xattrs,
+external ACL ownership and unrelated attributes are not copied into the child.
+
+Hard links require destination/project agreement and preserve the target's
+flags. Rename preserves project ownership while acquiring the destination's
+inheritance flag. Both exchange destinations are checked; this deliberately
+refuses the reverse mismatch that the pinned native implementation's one-sided
+check permits. Existing identities, snapshots and usage owners remain stable.
+Cross-project insertions return EXDEV before backing writes.
+
+Admission requires the active native project_quota feature, all three complete
+accounting flags and embedded user/group/project accounting objects. Newly
+created regular files/directories with inheritable parent ACEs remain refused.
+The central native writer also refuses any nonzero master-node reference to
+userquota@, groupquota@, projectquota@, userobjquota@, groupobjquota@ or
+projectobjquota@. Maintaining used counters does not enforce limits; even an
+empty referenced limit table remains outside this bounded profile. Ordinary
+dataset reads remain available. Project reassignment, ACL inheritance and
+complete quota enforcement remain roadmap work.
+
+Two codec regressions cover split-parent metadata, fresh independent layout
+registration, absent-project preservation and raw native quota-reader offsets
+in both byte orders. Nine persistence regression sources cover nested creation,
+owner counters through write/truncate/unlink, matching and mismatched namespace
+operations, symlink ownership, stale references, fresh durable reopen, snapshots,
+six native owner-limit profiles and mirrored publication cuts with dropped or
+reordered writes. These authored tests do not establish native interchange,
+mounted qualification or completion of bd-jdned/bd-uetvl.
+
+The complete candidate passed workspace `cargo fmt --check` and
+`git diff --check`. UBS v5.5.26 scanned the exact seven project source/test
+files with exit 0, no critical findings and no failed modules; warnings were
+reviewed (test assertions/locks/clones and existing production code). This was
+static-only analysis. The full candidate ZPL unit-test build and owning
+all-targets check both ended with rustc SIGKILL before a completed result; no
+candidate codec or ZFS persistence test pass is claimed. Shared storage
+exhaustion and repeated executor loss also prevented the mandatory full
+workspace check and strict Clippy gate. The direct-to-main commit records the
+existing emergency gate exception. Native OpenZFS and mounted qualification,
+and the original broader Bead acceptance, remain open.
 
 ## ZFS mode-preserving trivial ACL encoding (2026-11-23)
 

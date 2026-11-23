@@ -798,8 +798,21 @@ continuation cookies become stale after a committed mutation, and
 removed-directory references cannot alias a reused object.
 Changing mode or ownership and creating/deleting datasets or snapshots remain
 outside this mount profile. Existing native project IDs are retained and charged
-to their own quota records through mutation and final reclamation; new children
-default to project 0 while project inheritance remains unsupported.
+to their own usage records through mutation and final reclamation. Regular files
+and directories created under an admitted project-inheriting directory inherit
+its project ID and inheritance flag; other new children and symlinks use project
+0. This profile requires ZPL v5 SA metadata, an already-active project_quota pool
+feature and complete native user/group/project accounting. Creating regular
+files or directories under a parent with inheritable native ACL entries remains
+refused until ACL inheritance is implemented.
+
+Hard links and moves into a project-inheriting directory require a matching
+project ID and return EXDEV on a mismatch. Links preserve the existing object's
+inheritance flag; moves acquire the destination's flag without changing the
+project owner. Exchange checks both destination boundaries. Project ownership
+reassignment remains unsupported. The native writer refuses datasets with
+nonzero user/group/project byte- or object-quota table references until those
+limits can be enforced; ordinary reads remain available.
 The writable FsOps adapter handles nonempty writes, file-range copies, truncation
 and supported sparse range edits by clearing native S_ISUID and executable
 S_ISGID bits in the same TXG as the data change. Non-executable S_ISGID is retained,
