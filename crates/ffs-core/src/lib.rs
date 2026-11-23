@@ -17291,7 +17291,7 @@ impl OpenFs {
             btrfs_verify_data_on_read: self.btrfs_verify_data_on_read,
             ..OpenOptions::default()
         };
-        let mut nested = Self::from_device_with_btrfs_devices(
+        let nested = Self::from_device_with_btrfs_devices(
             cx,
             Box::new(SharedByteDevice(Arc::clone(&self.dev))),
             &options,
@@ -17299,17 +17299,20 @@ impl OpenFs {
             None,
             Vec::new(),
             self.write_authority,
-        )?;
+        );
+        // Some metadata walkers expose read failures through ParseError.
+        // Preserve cancellation even when opening a child crossed that layer.
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        let mut nested = nested?;
         nested.btrfs_nested_enabled = false;
         nested.btrfs_semantic_view_stale = Arc::clone(&self.btrfs_semantic_view_stale);
         let root_dirid = nested
             .btrfs_context()
             .map_or(BTRFS_FIRST_FREE_OBJECTID, |ctx| ctx.subvol_root_dirid);
-        if self.btrfs_devices.is_some()
-            && nested
-                .btrfs_read_inode_attr(cx, InodeNumber(root_dirid))?
-                .kind
-                != FileType::Directory
+        if nested
+            .btrfs_read_inode_attr(cx, InodeNumber(root_dirid))?
+            .kind
+            != FileType::Directory
         {
             return Err(FfsError::NotDirectory);
         }
@@ -17322,6 +17325,29 @@ impl OpenFs {
         let slot_id = state.slots.len();
         drop(state);
         Ok((slot_id, root_dirid))
+    }
+
+    /// A zero root address is a pending subvolume only while this mount owns
+    /// the staged tree that the next full transaction will publish. An on-disk
+    /// `ROOT_ITEM` with a zero address has no such authority.
+    fn btrfs_subvolume_is_pending(&self, subvol_id: u64) -> Result<bool, FfsError> {
+        let Some(alloc_mutex) = self.btrfs_alloc_state.as_ref() else {
+            return Ok(false);
+        };
+        let alloc = alloc_mutex.read();
+        if !alloc
+            .extra_subvol_trees
+            .iter()
+            .any(|(id, _)| *id == subvol_id)
+        {
+            return Ok(false);
+        }
+        let Some((_, data)) = Self::btrfs_find_root_item(&alloc.root_tree, subvol_id)? else {
+            return Ok(false);
+        };
+        drop(alloc);
+        let root_item = parse_root_item(&data).map_err(|error| parse_to_ffs_error(&error))?;
+        Ok(root_item.bytenr == 0)
     }
 
     /// The VFS inode for an inode reported by slot `slot` (0 = this mount)
@@ -17339,23 +17365,13 @@ impl OpenFs {
             return Ok(ino);
         }
         if let Some(subvol_id) = self.btrfs_subvol_link_id_in_slot(slot, ino) {
-            return match self.btrfs_nested_slot_for(cx, subvol_id, dir) {
-                Ok((child, root)) => self.btrfs_nested_tag(cx, child, InodeNumber(root)),
-                // Attached-device mounts are read-only: a failed child read
-                // cannot be an uncommitted subvolume awaiting publication.
-                Err(err) if self.btrfs_devices.is_some() => Err(err),
-                // Not readable as a tree on the device (a subvolume created
-                // on this writable mount and not yet committed): it stays the
-                // empty placeholder.
-                Err(err) => {
-                    debug!(subvol_id, error = %err, "nested btrfs subvolume not presented");
-                    if slot == 0 {
-                        Ok(ino)
-                    } else {
-                        self.btrfs_nested_tag(cx, slot, ino)
-                    }
-                }
-            };
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            if slot == 0 && self.btrfs_subvolume_is_pending(subvol_id)? {
+                cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+                return Ok(ino);
+            }
+            let (child, root) = self.btrfs_nested_slot_for(cx, subvol_id, dir)?;
+            return self.btrfs_nested_tag(cx, child, InodeNumber(root));
         }
         if slot != 0 && ino.0 == 1 {
             let root = self.btrfs_nested.lock().slots[slot - 1].root_dirid;
@@ -122974,6 +122990,282 @@ pub(crate) mod scrub;\n";
                 .iter()
                 .all(|slot| !slot.fs.write_authority && !slot.fs.is_writable())
         );
+    }
+
+    #[test]
+    fn btrfs_nested_staged_subvolume_requires_live_pending_root() {
+        let (fs, cx) = open_writable_btrfs();
+        fs.set_btrfs_dirty_bytes_threshold(0);
+        let parent = InodeNumber(1);
+        let id = fs
+            .create_subvolume(&cx, parent, b"pending", 0, 0)
+            .expect("stage an empty subvolume");
+        let (key, data) = {
+            let alloc = fs.require_btrfs_alloc_state().unwrap().read();
+            assert!(alloc.extra_subvol_trees.iter().any(|(root, _)| *root == id));
+            OpenFs::btrfs_find_root_item(&alloc.root_tree, id)
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(parse_root_item(&data).unwrap().bytenr, 0);
+        let link = fs.lookup(&cx, parent, OsStr::new("pending")).unwrap();
+        assert_eq!(link.kind, FileType::Directory);
+        assert!(fs.btrfs_nested_route(link.ino).unwrap().is_none());
+        assert_eq!(
+            fs.readdir(&cx, link.ino, 0)
+                .unwrap()
+                .iter()
+                .map(|entry| entry.name.as_slice())
+                .collect::<Vec<_>>(),
+            vec![b".".as_slice(), b"..".as_slice()]
+        );
+        assert!(
+            fs.readdir(&cx, parent, 0)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.name == b"pending" && entry.ino == link.ino)
+        );
+
+        // A live zero ROOT_ITEM is insufficient without the actual tree
+        // staged for publication. No device-read error may stand in for it.
+        let pending = {
+            let mut alloc = fs.require_btrfs_alloc_state().unwrap().write();
+            std::mem::take(&mut alloc.extra_subvol_trees)
+        };
+        assert!(fs.lookup(&cx, parent, OsStr::new("pending")).is_err());
+        assert!(fs.readdir(&cx, parent, 0).is_err());
+        {
+            let mut alloc = fs.require_btrfs_alloc_state().unwrap().write();
+            alloc.extra_subvol_trees = pending;
+            alloc.root_tree.update(&key, &[0; 8]).unwrap();
+        }
+        assert!(
+            fs.lookup(&cx, parent, OsStr::new("pending")).is_err(),
+            "a staged tree cannot excuse its malformed ROOT_ITEM"
+        );
+        assert!(fs.readdir(&cx, parent, 0).is_err());
+        fs.require_btrfs_alloc_state()
+            .unwrap()
+            .write()
+            .root_tree
+            .update(&key, &data)
+            .unwrap();
+        assert_eq!(
+            fs.lookup(&cx, parent, OsStr::new("pending")).unwrap().ino,
+            link.ino
+        );
+        let cancelled = Cx::for_testing();
+        cancelled.set_cancel_requested(true);
+        assert!(matches!(
+            fs.btrfs_nested_present(&cancelled, 0, link.ino, parent),
+            Err(FfsError::Cancelled)
+        ));
+        assert!(
+            fs.btrfs_nested.lock().slots.is_empty(),
+            "pending roots and failed child opens must not populate the reader cache"
+        );
+    }
+
+    #[test]
+    fn btrfs_nested_existing_subvolume_failures_never_become_empty_directories() {
+        const CHILD_ROOT: usize = 0x3_0000;
+        const CHILD_ID: u64 = 256;
+        struct ChildOpenFault {
+            inner: TestDevice,
+            armed: Arc<AtomicBool>,
+            cancel: bool,
+        }
+        impl ByteDevice for ChildOpenFault {
+            fn len_bytes(&self) -> u64 {
+                self.inner.len_bytes()
+            }
+
+            fn read_exact_at(
+                &self,
+                cx: &Cx,
+                offset: ByteOffset,
+                buf: &mut [u8],
+            ) -> ffs_error::Result<()> {
+                let target = if self.cancel {
+                    BTRFS_TEST_ROOT_TREE_LOGICAL
+                } else {
+                    BTRFS_SUPER_INFO_OFFSET
+                };
+                if self.armed.load(Ordering::Relaxed) && offset.0 == target as u64 {
+                    if self.cancel {
+                        cx.set_cancel_requested(true);
+                        return Err(FfsError::Cancelled);
+                    }
+                    return Err(FfsError::Io(std::io::Error::other(
+                        "injected nested-subvolume open failure",
+                    )));
+                }
+                self.inner.read_exact_at(cx, offset, buf)
+            }
+
+            fn write_all_at(
+                &self,
+                cx: &Cx,
+                offset: ByteOffset,
+                buf: &[u8],
+            ) -> ffs_error::Result<()> {
+                self.inner.write_all_at(cx, offset, buf)
+            }
+
+            fn sync(&self, cx: &Cx) -> ffs_error::Result<()> {
+                self.inner.sync(cx)
+            }
+        }
+
+        for device_set in [false, true] {
+            let mut healthy = if device_set {
+                build_btrfs_device_inventory_image().0
+            } else {
+                build_btrfs_fsops_image()
+            };
+            let root = BTRFS_TEST_ROOT_TREE_LOGICAL;
+            let parent = BTRFS_TEST_FS_TREE_LOGICAL;
+            let mut root_item = healthy[root + 3000..root + 3239].to_vec();
+            root_item[176..184].copy_from_slice(&(CHILD_ROOT as u64).to_le_bytes());
+            healthy[root + 0x60..root + 0x64].copy_from_slice(&2_u32.to_le_bytes());
+            write_btrfs_leaf_item(
+                &mut healthy,
+                root,
+                1,
+                CHILD_ID,
+                BTRFS_ITEM_ROOT_ITEM,
+                0,
+                2700,
+                239,
+            );
+            healthy[root + 2700..root + 2939].copy_from_slice(&root_item);
+            stamp_btrfs_test_tree_block_crc32c(&mut healthy, root);
+            healthy.copy_within(parent..parent + BTRFS_TEST_NODESIZE, CHILD_ROOT);
+            healthy[CHILD_ROOT + 0x30..CHILD_ROOT + 0x38]
+                .copy_from_slice(&(CHILD_ROOT as u64).to_le_bytes());
+            healthy[CHILD_ROOT + 0x58..CHILD_ROOT + 0x60].copy_from_slice(&CHILD_ID.to_le_bytes());
+            stamp_btrfs_test_tree_block_crc32c(&mut healthy, CHILD_ROOT);
+
+            let header = parent + BTRFS_TEST_LEAF_HEADER_SIZE;
+            healthy.copy_within(
+                header + 2 * BTRFS_TEST_LEAF_ITEM_SIZE..header + 4 * BTRFS_TEST_LEAF_ITEM_SIZE,
+                header + 3 * BTRFS_TEST_LEAF_ITEM_SIZE,
+            );
+            let mut entry =
+                encode_btrfs_dir_index_entry(b"nested", CHILD_ID, ffs_btrfs::BTRFS_FT_DIR);
+            entry[8] = BTRFS_ITEM_ROOT_ITEM;
+            write_btrfs_leaf_item(
+                &mut healthy,
+                parent,
+                2,
+                256,
+                BTRFS_ITEM_DIR_INDEX,
+                3,
+                2600,
+                u32::try_from(entry.len()).unwrap(),
+            );
+            healthy[parent + 2600..parent + 2600 + entry.len()].copy_from_slice(&entry);
+            healthy[parent + 0x60..parent + 0x64].copy_from_slice(&5_u32.to_le_bytes());
+            stamp_btrfs_test_tree_block_crc32c(&mut healthy, parent);
+            let sb = BTRFS_SUPER_INFO_OFFSET;
+            let checksum = ffs_types::crc32c(&healthy[sb + 0x20..sb + 4096]);
+            healthy[sb..sb + 4].copy_from_slice(&checksum.to_le_bytes());
+
+            for fault in [
+                "healthy",
+                "zero_root",
+                "malformed_root",
+                "corrupt",
+                "not_directory",
+                "unreadable",
+                "cancelled",
+            ] {
+                let mut image = healthy.clone();
+                match fault {
+                    "zero_root" => image[root + 2700 + 176..root + 2700 + 184].fill(0),
+                    "malformed_root" => write_btrfs_leaf_item(
+                        &mut image,
+                        root,
+                        1,
+                        CHILD_ID,
+                        BTRFS_ITEM_ROOT_ITEM,
+                        0,
+                        2700,
+                        8,
+                    ),
+                    "corrupt" => image[CHILD_ROOT + 0x100] ^= 0xFF,
+                    "not_directory" => {
+                        image[CHILD_ROOT + 3200 + 52..CHILD_ROOT + 3200 + 56]
+                            .copy_from_slice(&0o100_644_u32.to_le_bytes());
+                        stamp_btrfs_test_tree_block_crc32c(&mut image, CHILD_ROOT);
+                    }
+                    _ => {}
+                }
+                stamp_btrfs_test_tree_block_crc32c(&mut image, root);
+                let cx = Cx::for_testing();
+                let dev = TestDevice::from_vec(image);
+                let armed = Arc::new(AtomicBool::new(false));
+                let fs = OpenFs::from_device(
+                    &cx,
+                    Box::new(ChildOpenFault {
+                        inner: dev.clone(),
+                        armed: Arc::clone(&armed),
+                        cancel: fault == "cancelled",
+                    }),
+                    &OpenOptions::default(),
+                )
+                .expect("valid parent trees must open without reading the child");
+                assert_eq!(fs.btrfs_devices.is_some(), device_set);
+                let link = fs.btrfs_register_subvol_link(&cx, CHILD_ID).unwrap();
+                armed.store(
+                    matches!(fault, "unreadable" | "cancelled"),
+                    Ordering::Relaxed,
+                );
+                if fault != "healthy" {
+                    let errors = [
+                        fs.btrfs_nested_present(&Cx::for_testing(), 0, link, InodeNumber(1))
+                            .expect_err("child presentation must report its failure"),
+                        fs.lookup(&Cx::for_testing(), InodeNumber(1), OsStr::new("nested"))
+                            .expect_err("lookup must not synthesize an empty child"),
+                        fs.readdir(&Cx::for_testing(), InodeNumber(1), 0)
+                            .expect_err("readdir must not publish an unreadable child"),
+                    ];
+                    for error in errors {
+                        if fault == "cancelled" {
+                            assert!(matches!(error, FfsError::Cancelled), "{error:?}");
+                        } else if fault == "unreadable" {
+                            assert!(matches!(error, FfsError::Io(_)), "{error:?}");
+                        } else if fault == "not_directory" {
+                            assert!(matches!(error, FfsError::NotDirectory), "{error:?}");
+                        }
+                    }
+                    assert!(
+                        fs.btrfs_nested.lock().slots.is_empty(),
+                        "{device_set}/{fault}: failed child was cached"
+                    );
+                    // A failed attempt must not poison the slot. Restoring the
+                    // backing lets the same mount retry the actual child tree.
+                    *dev.data.lock().unwrap() = healthy.clone();
+                    armed.store(false, Ordering::Relaxed);
+                }
+                let child = fs
+                    .lookup(&cx, InodeNumber(1), OsStr::new("nested"))
+                    .unwrap();
+                assert_eq!(child.kind, FileType::Directory);
+                assert!(fs.btrfs_nested_route(child.ino).unwrap().is_some());
+                let file = fs.lookup(&cx, child.ino, OsStr::new("hello.txt")).unwrap();
+                assert_eq!(
+                    fs.read(&cx, file.ino, 0, 128).unwrap(),
+                    b"hello from btrfs fsops"
+                );
+                assert!(
+                    fs.readdir(&cx, child.ino, 0)
+                        .unwrap()
+                        .iter()
+                        .any(|entry| entry.name == b"hello.txt")
+                );
+            }
+        }
     }
 
     #[test]
