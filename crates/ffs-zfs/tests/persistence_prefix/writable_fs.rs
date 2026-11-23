@@ -2069,6 +2069,355 @@ fn writable_head_keeps_named_snapshots_immutable_and_read_only() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn snapshot_destroy_preserves_live_handles_across_rename_and_cancelled_release() {
+    let cx = Cx::for_testing();
+    for (zpl_version, mirror_width, ashift) in [(4, 1, 9), (5, 2, 12)] {
+        let (engine, devices) = writer_fixture(
+            &cx,
+            &PoolFixtureSpec {
+                zpl_version,
+                mirror_width,
+                ashift,
+                image_bytes: 32 * 1024 * 1024,
+                deadlist_mode: DeadlistMode::NativeDeadlist,
+                ..PoolFixtureSpec::default()
+            },
+        );
+        let fs = ZfsFs::with_writer(&cx, engine, vec![b"data".to_vec()]).unwrap();
+        let mut scope = RequestScope::empty();
+        let head = create(&fs, &cx, ROOT, "retained.bin");
+        let old_bytes = vec![0x41; 65_536];
+        let new_bytes = vec![0x42; 65_536];
+        fs.write(&cx, &mut scope, head.ino, 0, &old_bytes).unwrap();
+        fs.create_snapshot(&cx, b"pinned").unwrap();
+        let control = lookup(&fs, &cx, ROOT, ".zfs");
+        let snapshots = lookup(&fs, &cx, control.ino, "snapshot");
+        let snapshot = lookup(&fs, &cx, snapshots.ino, "pinned");
+        let historical = lookup(&fs, &cx, snapshot.ino, "retained.bin");
+        let (first, _) = fs
+            .open(&cx, &mut scope, historical.ino, libc::O_RDONLY)
+            .unwrap();
+        let (second, _) = fs
+            .open(&cx, &mut scope, historical.ino, libc::O_RDONLY)
+            .unwrap();
+        assert_ne!(first, 0);
+        assert_ne!(first, second);
+
+        // A handle pins its own immutable view, not the entire dataset. A
+        // separately named snapshot remains destroyable, and head COW must
+        // preserve both the live bytes and the pinned historical payload.
+        fs.create_snapshot(&cx, b"unrelated").unwrap();
+        fs.write(&cx, &mut scope, head.ino, 0, &new_bytes).unwrap();
+        fs.destroy_snapshot(&cx, b"unrelated", false).unwrap();
+        assert_eq!(read(&fs, &cx, head.ino), new_bytes);
+        assert_eq!(read(&fs, &cx, historical.ino), old_bytes);
+
+        let assert_pinned = |name: &[u8]| {
+            let before_io = io_counts(&devices);
+            let before_token = fs.last_durable_token().unwrap().unwrap();
+            let before_durable: Vec<_> = devices
+                .iter()
+                .map(|device| blake3::hash(&device.durable_snapshot()))
+                .collect();
+            for defer in [false, true] {
+                assert_eq!(
+                    fs.destroy_snapshot(&cx, name, defer)
+                        .unwrap_err()
+                        .to_errno(),
+                    libc::EBUSY,
+                    "neither normal nor deferred destruction may reclaim an open snapshot"
+                );
+                assert_eq!(io_counts(&devices), before_io);
+                assert_eq!(
+                    fs.last_durable_token().unwrap().unwrap().committed_txg(),
+                    before_token.committed_txg(),
+                    "a refused destruction must not publish a TXG"
+                );
+                for (device, expected) in devices.iter().zip(&before_durable) {
+                    assert_eq!(blake3::hash(&device.durable_snapshot()), *expected);
+                }
+                assert_eq!(read(&fs, &cx, historical.ino), old_bytes);
+            }
+        };
+        assert_pinned(b"pinned");
+        fs.rename_snapshot(&cx, b"pinned", b"renamed").unwrap();
+        let renamed = lookup(&fs, &cx, snapshots.ino, "renamed");
+        assert_eq!(renamed.ino, snapshot.ino);
+        assert_eq!(
+            lookup(&fs, &cx, renamed.ino, "retained.bin").ino,
+            historical.ino
+        );
+        assert_eq!(
+            fs.destroy_snapshot(&cx, b"pinned", false)
+                .unwrap_err()
+                .to_errno(),
+            libc::ENOENT
+        );
+        assert_pinned(b"renamed");
+
+        release(&fs, &cx, historical.ino, first);
+        assert_pinned(b"renamed");
+        // A forged release for a different inode must not drop the remaining
+        // pin, even though its numeric handle exists.
+        assert_eq!(
+            fs.release(
+                &cx,
+                &mut scope,
+                ReleaseRequest {
+                    ino: head.ino,
+                    fh: second,
+                    flags: libc::O_RDONLY,
+                    lock_owner: None,
+                    flush: false,
+                },
+            )
+            .unwrap_err()
+            .to_errno(),
+            libc::EBADF
+        );
+        assert_pinned(b"renamed");
+        fs.fsync(&cx, &mut scope, historical.ino, second, false)
+            .unwrap();
+
+        let cancelled = Cx::for_testing();
+        cancelled.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("snapshot release cancelled"),
+        );
+        let mut release_scope = fs
+            .begin_request_scope(&cancelled, RequestOp::Release)
+            .unwrap();
+        assert!(matches!(
+            fs.release(
+                &cancelled,
+                &mut release_scope,
+                ReleaseRequest {
+                    ino: historical.ino,
+                    fh: second,
+                    flags: libc::O_RDONLY,
+                    lock_owner: None,
+                    flush: false,
+                },
+            ),
+            Err(FfsError::Cancelled)
+        ));
+        fs.end_request_scope(&cancelled, RequestOp::Release, release_scope)
+            .unwrap();
+        let before_free = fs.statfs(&cx, &mut scope, ROOT).unwrap().blocks_free;
+        fs.destroy_snapshot(&cx, b"renamed", false).unwrap();
+        assert!(fs.statfs(&cx, &mut scope, ROOT).unwrap().blocks_free > before_free);
+        assert!(matches!(
+            fs.getattr(&cx, &mut scope, historical.ino),
+            Err(FfsError::NotFound(_))
+        ));
+        assert_eq!(read(&fs, &cx, head.ino), new_bytes);
+
+        fs.create_snapshot(&cx, b"renamed").unwrap();
+        let recreated = lookup(&fs, &cx, snapshots.ino, "renamed");
+        assert_ne!(recreated.ino, snapshot.ino);
+        let current = lookup(&fs, &cx, recreated.ino, "retained.bin");
+        assert_eq!(read(&fs, &cx, current.ino), new_bytes);
+        // LOOKUP alone is not an open lifetime pin, nor may an obsolete handle
+        // from the previous GUID protect the recreated snapshot.
+        fs.destroy_snapshot(&cx, b"renamed", false).unwrap();
+        let token = fs.last_durable_token().unwrap().unwrap();
+        assert_pool_scrub_and_allocation_clean(
+            &cx,
+            &devices,
+            POOL_GUID,
+            Some(token.published_slot()),
+        );
+        let reopened_devices: Vec<_> = devices
+            .iter()
+            .map(FaultableMemberDevice::fresh_from_durable)
+            .collect();
+        let reopened = open_engine_on_devices(
+            &cx,
+            &reopened_devices,
+            default_write_opts(POOL_GUID, token.published_slot()),
+        )
+        .unwrap();
+        let mut objects = reopened.open_read_objects(&cx).unwrap();
+        let dataset = [b"data".to_vec()];
+        assert_eq!(objects.snapshots(&cx, &dataset).unwrap().len(), 1);
+        let mut view = objects.zpl(&cx, &dataset).unwrap();
+        let object = view.resolve(&cx, b"/retained.bin").unwrap();
+        assert_eq!(view.read(&cx, object, 0, 65_536).unwrap(), new_bytes);
+    }
+}
+
+#[test]
+fn read_only_open_pins_snapshot_after_a_durable_rename_with_cancelled_refresh() {
+    let cx = Cx::for_testing();
+    let (mut engine, devices) = writer_fixture(
+        &cx,
+        &PoolFixtureSpec {
+            deadlist_mode: DeadlistMode::NativeDeadlist,
+            ..PoolFixtureSpec::default()
+        },
+    );
+    let dataset = vec![b"data".to_vec()];
+    let immutable = ZfsFs::new(
+        &cx,
+        engine
+            .open_read_objects(&cx)
+            .unwrap()
+            .zpl(&cx, &dataset)
+            .unwrap(),
+        0,
+        0,
+    )
+    .unwrap();
+    let read_only_file = lookup(&immutable, &cx, ROOT, "hello.txt");
+    assert_eq!(
+        immutable
+            .open_read_only(&cx, read_only_file.ino, libc::O_RDONLY)
+            .unwrap(),
+        (0, 0),
+        "an immutable owner retains its stateless open contract"
+    );
+    drop(immutable);
+
+    let rename_cx = Cx::for_testing();
+    let cancel_rename = rename_cx.clone();
+    engine.with_fault_hook(move |event| {
+        if event.operation == "rename_snapshot"
+            && event.stage == ZfsPersistenceStage::BeforeAcknowledge
+        {
+            cancel_rename.cancel_with(
+                asupersync::types::CancelKind::User,
+                Some("snapshot rename committed before cancellation"),
+            );
+        }
+        Ok(())
+    });
+    let fs = ZfsFs::with_writer(&cx, engine, dataset).unwrap();
+    let mut scope = RequestScope::empty();
+    let control = lookup(&fs, &cx, ROOT, ".zfs");
+    let snapshots = lookup(&fs, &cx, control.ino, "snapshot");
+    let snapshot = lookup(&fs, &cx, snapshots.ino, "before");
+    let historical = lookup(&fs, &cx, snapshot.ino, "hello.txt");
+    let (handle, _) = fs
+        .open_read_only(&cx, historical.ino, libc::O_RDONLY)
+        .unwrap();
+    assert_ne!(
+        handle, 0,
+        "read-only opens on a writer must retain lifetime pins"
+    );
+    assert!(matches!(
+        fs.rename_snapshot(&rename_cx, b"before", b"renamed"),
+        Err(FfsError::Cancelled)
+    ));
+    let token = fs.last_durable_token().unwrap().unwrap();
+    assert_eq!(token.committed_txg(), INITIAL_TXG + 1);
+
+    // Do not look up the renamed entry first: the mount's cached directory
+    // still has the old name. Reclamation must resolve committed GUID identity
+    // rather than let that interrupted refresh hide an existing open handle.
+    let before_io = io_counts(&devices);
+    assert_eq!(
+        fs.destroy_snapshot(&cx, b"renamed", false)
+            .unwrap_err()
+            .to_errno(),
+        libc::EBUSY
+    );
+    assert_eq!(io_counts(&devices), before_io);
+    assert_eq!(
+        fs.last_durable_token().unwrap().unwrap().committed_txg(),
+        token.committed_txg()
+    );
+    assert_eq!(read(&fs, &cx, historical.ino), b"SNAPDATA".repeat(512));
+    release(&fs, &cx, historical.ino, handle);
+    fs.destroy_snapshot(&cx, b"renamed", false).unwrap();
+    assert!(matches!(
+        fs.getattr(&cx, &mut scope, historical.ino),
+        Err(FfsError::NotFound(_))
+    ));
+    let token = fs.last_durable_token().unwrap().unwrap();
+    assert_pool_scrub_and_allocation_clean(&cx, &devices, POOL_GUID, Some(token.published_slot()));
+}
+
+#[test]
+fn cancelled_snapshot_destroy_reconciles_catalog_before_reopening_stale_inodes() {
+    let cx = Cx::for_testing();
+    let (mut engine, devices) = writer_fixture(
+        &cx,
+        &PoolFixtureSpec {
+            deadlist_mode: DeadlistMode::NativeDeadlist,
+            ..PoolFixtureSpec::default()
+        },
+    );
+    let destroy_cx = Cx::for_testing();
+    let cancel_destroy = destroy_cx.clone();
+    engine.with_fault_hook(move |event| {
+        if event.operation == "destroy_snapshot"
+            && event.stage == ZfsPersistenceStage::BeforeAcknowledge
+        {
+            cancel_destroy.cancel_with(
+                asupersync::types::CancelKind::User,
+                Some("snapshot destroy committed before cancellation"),
+            );
+        }
+        Ok(())
+    });
+    let fs = ZfsFs::with_writer(&cx, engine, vec![b"data".to_vec()]).unwrap();
+    let mut scope = RequestScope::empty();
+    let control = lookup(&fs, &cx, ROOT, ".zfs");
+    let snapshots = lookup(&fs, &cx, control.ino, "snapshot");
+    let before = lookup(&fs, &cx, snapshots.ino, "before");
+    let historical = lookup(&fs, &cx, before.ino, "hello.txt");
+    // A cached LOOKUP without OPEN does not pin the snapshot. Its stale inode
+    // must become unusable as soon as the committed destroy is observed.
+    assert!(matches!(
+        fs.destroy_snapshot(&destroy_cx, b"before", false),
+        Err(FfsError::Cancelled)
+    ));
+    let destroyed = fs.last_durable_token().unwrap().unwrap();
+    assert_eq!(destroyed.committed_txg(), INITIAL_TXG + 1);
+    let before_io = io_counts(&devices);
+    assert!(matches!(
+        fs.open(&cx, &mut scope, historical.ino, libc::O_RDONLY),
+        Err(FfsError::NotFound(_))
+    ));
+    assert!(matches!(
+        fs.open_read_only(&cx, historical.ino, libc::O_RDONLY),
+        Err(FfsError::NotFound(_))
+    ));
+    assert!(matches!(
+        fs.read(&cx, &mut scope, historical.ino, 0, 8192),
+        Err(FfsError::NotFound(_))
+    ));
+    assert!(matches!(
+        fs.lookup(&cx, &mut scope, snapshots.ino, OsStr::new("before")),
+        Err(FfsError::NotFound(_))
+    ));
+    assert_eq!(io_counts(&devices), before_io);
+    assert_eq!(
+        fs.last_durable_token().unwrap().unwrap().committed_txg(),
+        destroyed.committed_txg()
+    );
+
+    // Reusing the old catalog name publishes a distinct GUID/index. Even
+    // after allocating new head data, the destroyed inode must stay stale.
+    let head = lookup(&fs, &cx, ROOT, "hello.txt");
+    let new_bytes = vec![0x5A; 65_536];
+    fs.write(&cx, &mut scope, head.ino, 0, &new_bytes).unwrap();
+    fs.create_snapshot(&cx, b"before").unwrap();
+    let recreated = lookup(&fs, &cx, snapshots.ino, "before");
+    assert_ne!(recreated.ino, before.ino);
+    let current = lookup(&fs, &cx, recreated.ino, "hello.txt");
+    assert_ne!(current.ino, historical.ino);
+    assert_eq!(read(&fs, &cx, current.ino), new_bytes);
+    assert!(matches!(
+        fs.open(&cx, &mut scope, historical.ino, libc::O_RDONLY),
+        Err(FfsError::NotFound(_))
+    ));
+    let token = fs.last_durable_token().unwrap().unwrap();
+    assert_pool_scrub_and_allocation_clean(&cx, &devices, POOL_GUID, Some(token.published_slot()));
+}
+
+#[test]
 fn writable_mount_admission_refuses_inherited_readonly_and_uncertain_owners() {
     let cx = Cx::for_testing();
     let (engine, devices) = writer_fixture(

@@ -2,7 +2,8 @@
 
 use super::{
     CTL_FLAG, Cx, FfsError, Identity, InodeAttr, InodeNumber, MAX_NODES, Metadata, ROOT, Result,
-    State, SystemTime, Timestamp, UNIX_EPOCH, ViewState, ZfsFs, checkpoint, corrupt, unsupported,
+    State, SystemTime, Timestamp, UNIX_EPOCH, ViewState, ZfsFs, checkpoint, corrupt,
+    decode_snap_idx, unsupported,
 };
 use crate::{ZfsDurableToken, ZfsTransactionEngine, ZfsTxOutcome, ZfsUnlinkedObject};
 use ffs_core::vfs::ReleaseRequest;
@@ -58,6 +59,7 @@ pub(super) struct WriterState {
     pub(super) allow_mode_and_owner_setattr: bool,
     last_token: Option<ZfsDurableToken>,
     refresh_needed: bool,
+    snapshot_refresh_needed: bool,
     handles: BTreeMap<u64, InodeNumber>,
     counts: BTreeMap<InodeNumber, u64>,
     orphans: BTreeMap<InodeNumber, ZfsUnlinkedObject>,
@@ -174,6 +176,7 @@ impl ZfsFs {
                     allow_mode_and_owner_setattr: options.allow_mode_and_owner_setattr,
                     last_token,
                     refresh_needed: false,
+                    snapshot_refresh_needed: false,
                     handles: BTreeMap::new(),
                     counts: BTreeMap::new(),
                     orphans: BTreeMap::new(),
@@ -190,25 +193,30 @@ impl ZfsFs {
     pub fn create_snapshot(&self, cx: &Cx, snap_name: &[u8]) -> Result<u64> {
         let mut state = self.state(cx)?;
         let timestamp = native_timestamp(SystemTime::now())?;
-        let obj = state.mutate(cx, |engine, dataset| {
+        let obj = state.mutate_snapshot(cx, |engine, dataset| {
             engine.create_snapshot(cx, dataset, snap_name, timestamp)
         })?;
         state.publish_committed(|state| {
             state.refresh_head(cx)?;
-            state.invalidate_snapshots_locked(cx)?;
+            state.refresh_snapshots(cx)?;
             Ok(obj)
         })
     }
 
     /// Destroy (or defer-destroy) a snapshot on this mounted dataset and immediately prune `.zfs/snapshot`.
+    ///
+    /// An open file pins its snapshot until its final handle is released. Both
+    /// destruction modes return `EBUSY` before publication while such a pin
+    /// exists; native deferred destruction does not account for mount handles.
     pub fn destroy_snapshot(&self, cx: &Cx, snap_name: &[u8], defer: bool) -> Result<u64> {
         let mut state = self.state(cx)?;
-        let obj = state.mutate(cx, |engine, dataset| {
+        state.reject_pinned_snapshot_reclamation(cx, snap_name)?;
+        let obj = state.mutate_snapshot(cx, |engine, dataset| {
             engine.destroy_snapshot(cx, dataset, snap_name, defer)
         })?;
         state.publish_committed(|state| {
             state.refresh_head(cx)?;
-            state.invalidate_snapshots_locked(cx)?;
+            state.refresh_snapshots(cx)?;
             Ok(obj)
         })
     }
@@ -221,12 +229,12 @@ impl ZfsFs {
         new_snap_name: &[u8],
     ) -> Result<u64> {
         let mut state = self.state(cx)?;
-        let obj = state.mutate(cx, |engine, dataset| {
+        let obj = state.mutate_snapshot(cx, |engine, dataset| {
             engine.rename_snapshot(cx, dataset, old_snap_name, new_snap_name)
         })?;
         state.publish_committed(|state| {
             state.refresh_head(cx)?;
-            state.invalidate_snapshots_locked(cx)?;
+            state.refresh_snapshots(cx)?;
             Ok(obj)
         })
     }
@@ -504,6 +512,30 @@ impl State {
         Ok(())
     }
 
+    pub(super) fn refresh_snapshots(&mut self, cx: &Cx) -> Result<()> {
+        if !self
+            .writer
+            .as_ref()
+            .is_some_and(|writer| writer.snapshot_refresh_needed)
+        {
+            return Ok(());
+        }
+        // Native destruction may have reclaimed blocks even when its caller
+        // was cancelled before refreshing the catalog. Reconcile membership
+        // before another request can open or read any cached snapshot inode.
+        // Rebuilding retains each surviving GUID's ViewState and open pins.
+        if let Err(error) = self.invalidate_snapshots_locked(cx) {
+            if !matches!(error, FfsError::Cancelled) {
+                self.recovery_required = true;
+            }
+            return Err(error);
+        }
+        if let Some(writer) = &mut self.writer {
+            writer.snapshot_refresh_needed = false;
+        }
+        Ok(())
+    }
+
     pub(super) fn writable_metadata(&mut self, cx: &Cx, ino: InodeNumber) -> Result<Metadata> {
         if self.writer.is_none() || ino.0 & CTL_FLAG != 0 {
             return Err(FfsError::ReadOnly);
@@ -641,6 +673,20 @@ impl State {
         }
     }
 
+    fn mutate_snapshot(
+        &mut self,
+        cx: &Cx,
+        operation: impl FnOnce(&mut ZfsTransactionEngine, &[Vec<u8>]) -> ZfsTxOutcome<u64>,
+    ) -> Result<u64> {
+        let value = self.mutate(cx, operation)?;
+        // Record the obligation immediately after durable publication, before
+        // any cancellable read of the new MOS or snapshot catalog can fail.
+        if let Some(writer) = &mut self.writer {
+            writer.snapshot_refresh_needed = true;
+        }
+        Ok(value)
+    }
+
     pub(super) fn reject_pinned_reclamation(&self, ino: InodeNumber) -> Result<()> {
         self.writer.as_ref().ok_or(FfsError::ReadOnly)?;
         // FUSE OPEN and CREATE both hold real backend handles for this writer.
@@ -649,6 +695,36 @@ impl State {
         if self.has_open_handles(ino) {
             return Err(errno(libc::EBUSY));
         }
+        Ok(())
+    }
+
+    fn reject_pinned_snapshot_reclamation(&mut self, cx: &Cx, name: &[u8]) -> Result<()> {
+        self.writer.as_ref().ok_or(FfsError::ReadOnly)?;
+        // Read the committed catalog, not snapshot_dir: a rename can be
+        // durable even if cancellation interrupted its cache refresh. Resolve
+        // its GUID to the stable mount index already used by open handles.
+        let Some(index) = self
+            .head
+            .view
+            .snapshots(cx)?
+            .iter()
+            .find(|snapshot| snapshot.name == name)
+            .and_then(|snapshot| self.snap_idx_by_guid.get(&snapshot.guid))
+            .copied()
+        else {
+            return Ok(());
+        };
+        if self.writer.as_ref().is_some_and(|writer| {
+            writer
+                .counts
+                .keys()
+                .any(|ino| decode_snap_idx(*ino) == Some(index))
+        }) {
+            return Err(errno(libc::EBUSY));
+        }
+        // OPEN, RELEASE, rename and this check/commit hold the same state
+        // mutex, so another caller cannot acquire a pin after this preflight
+        // and before native block reclamation.
         Ok(())
     }
 

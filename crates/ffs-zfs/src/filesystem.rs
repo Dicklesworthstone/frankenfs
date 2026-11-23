@@ -382,6 +382,7 @@ impl ZfsFs {
     }
 
     /// Validate a read-only open request without instantiating writable `O_TRUNC` code.
+    /// A writable owner still retains a lifetime handle, including for snapshots.
     pub fn open_read_only(&self, cx: &Cx, ino: InodeNumber, flags: i32) -> Result<(u64, u32)> {
         checkpoint(cx)?;
         if flags & libc::O_ACCMODE != libc::O_RDONLY || flags & (libc::O_TRUNC | libc::O_CREAT) != 0
@@ -400,6 +401,11 @@ impl ZfsFs {
         }
         if flags & libc::O_DIRECTORY != 0 {
             return Err(FfsError::NotDirectory);
+        }
+        if state.writer.is_some() {
+            let handle = state.next_open_handle()?;
+            state.publish_open_handle(ino, handle);
+            return Ok((handle, 0));
         }
         Ok((0, 0))
     }
@@ -457,6 +463,7 @@ impl ZfsFs {
             return Err(errno(libc::EIO));
         }
         state.refresh_head(cx)?;
+        state.refresh_snapshots(cx)?;
         Ok(state)
     }
 
