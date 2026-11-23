@@ -763,3 +763,159 @@ fn directory_reference_legacy_bonus_and_sa_bonus_encoders_roundtrip_and_preserve
         );
     }
 }
+
+#[test]
+fn trivial_acl_matches_posix_class_precedence_for_all_modes() {
+    // Evaluate the serialized ACE sequence independently of its encoder. An
+    // owner can also belong to the owning group; POSIX still selects only the
+    // owner class, while NFSv4 ACEs match every applicable principal in order.
+    fn grants(raw: &[u8], order: Endian, owner: bool, group: bool, requested: u32) -> bool {
+        let mut remaining = requested;
+        for ace in raw.chunks_exact(8) {
+            let (kind, flags, mask) = match order {
+                Endian::Little => (
+                    u16::from_le_bytes([ace[0], ace[1]]),
+                    u16::from_le_bytes([ace[2], ace[3]]),
+                    u32::from_le_bytes([ace[4], ace[5], ace[6], ace[7]]),
+                ),
+                Endian::Big => (
+                    u16::from_be_bytes([ace[0], ace[1]]),
+                    u16::from_be_bytes([ace[2], ace[3]]),
+                    u32::from_be_bytes([ace[4], ace[5], ace[6], ace[7]]),
+                ),
+            };
+            let applies = match flags {
+                0x1000 => owner,
+                0x2040 => group,
+                0x4000 => true,
+                _ => panic!("unexpected principal flags {flags:#x}"),
+            };
+            assert!(kind <= 1, "only allow and deny ACEs encode a mode");
+            if !applies {
+                continue;
+            }
+            if kind == 1 && remaining & mask != 0 {
+                return false;
+            }
+            if kind == 0 {
+                remaining &= !mask;
+                if remaining == 0 {
+                    return true;
+                }
+            }
+        }
+        remaining == 0
+    }
+
+    for order in [Endian::Little, Endian::Big] {
+        for is_dir in [false, true] {
+            for sticky in [0_u64, 0o1000] {
+                for mode in 0_u64..=0o777 {
+                    let aces = encode_trivial_nfsv4_aces(mode | sticky, is_dir, order);
+                    assert!(aces.len().is_multiple_of(8));
+                    assert!((24..=48).contains(&aces.len()));
+                    for (owner, group) in
+                        [(true, false), (true, true), (false, true), (false, false)]
+                    {
+                        let shift = match (owner, group) {
+                            (true, _) => 6,
+                            (false, true) => 3,
+                            (false, false) => 0,
+                        };
+                        let permissions = (mode >> shift) & 7;
+                        for rwx in 1_u32..=7 {
+                            let mut requested = 0;
+                            if rwx & 4 != 0 {
+                                requested |= 0x01; // READ_DATA / LIST_DIRECTORY
+                            }
+                            if rwx & 2 != 0 {
+                                requested |= 0x06; // WRITE_DATA and APPEND_DATA
+                                if is_dir {
+                                    requested |= 0x40; // DELETE_CHILD
+                                }
+                            }
+                            if rwx & 1 != 0 {
+                                requested |= 0x20; // EXECUTE / SEARCH
+                            }
+                            assert_eq!(
+                                grants(&aces, order, owner, group, requested),
+                                permissions & u64::from(rwx) == u64::from(rwx),
+                                "mode={mode:o}, sticky={sticky:o}, directory={is_dir}, owner={owner}, group={group}, request={rwx:o}, order={order:?}",
+                            );
+                        }
+                        // OpenZFS always allows metadata/ACL reads. Only the
+                        // owner receives metadata/ACL/ownership write rights.
+                        assert!(grants(&aces, order, owner, group, 0x0012_0088));
+                        assert_eq!(grants(&aces, order, owner, group, 0x000c_0110), owner);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn trivial_acl_create_and_chmod_store_actual_ace_counts() {
+    for order in [Endian::Little, Endian::Big] {
+        let parent_attrs = attributes(order, 0o100_644, 0);
+        let mut layouts = vec![layout(2, &parent_attrs)];
+        let mut registrations = Vec::new();
+        let mut registry = SaRegistry::from_zaps(&registrations, &layouts).unwrap();
+        let parent = packed(2, &parent_attrs, &[], order);
+        let mut metadata = registry.decode(&parent, None).unwrap().metadata().unwrap();
+        for (mode, expected_count) in [(0o100_604, 5), (0o100_040, 4), (0o100_640, 3)] {
+            metadata.mode = mode;
+            let (bonus, spill) = registry
+                .encode_updated_with_options(
+                    &mut registrations,
+                    &mut layouts,
+                    &parent,
+                    None,
+                    &metadata,
+                    true,
+                    None,
+                    None,
+                    320,
+                    256,
+                )
+                .unwrap();
+            assert!(spill.is_none());
+            let changed = registry.decode(&bonus, None).unwrap();
+            assert_eq!(changed.integer("ZPL_DACL_COUNT").unwrap(), expected_count);
+            assert_eq!(
+                changed.values[b"ZPL_DACL_ACES".as_slice()].bytes.len() as u64,
+                expected_count * 8,
+            );
+            let fresh = registry
+                .encode_new_from_template(&bonus, &metadata)
+                .unwrap();
+            let created = registry.decode(&fresh, None).unwrap();
+            assert_eq!(created.integer("ZPL_DACL_COUNT").unwrap(), expected_count);
+            assert_eq!(
+                created.values[b"ZPL_DACL_ACES".as_slice()].bytes.len() as u64,
+                expected_count * 8,
+            );
+            let legacy_bonus = metadata
+                .encode_legacy_with_options(None, order, None, true)
+                .unwrap();
+            let size_bytes: [u8; 4] = legacy_bonus[184..188].try_into().unwrap();
+            let count_bytes: [u8; 2] = legacy_bonus[190..192].try_into().unwrap();
+            let (size, count) = match order {
+                Endian::Little => (
+                    u32::from_le_bytes(size_bytes),
+                    u16::from_le_bytes(count_bytes),
+                ),
+                Endian::Big => (
+                    u32::from_be_bytes(size_bytes),
+                    u16::from_be_bytes(count_bytes),
+                ),
+            };
+            assert_eq!(u64::from(count), expected_count);
+            assert_eq!(u64::from(size), expected_count * 8);
+            assert_eq!(
+                &legacy_bonus[192..192 + size as usize],
+                created.values[b"ZPL_DACL_ACES".as_slice()].bytes.as_slice(),
+            );
+        }
+    }
+}

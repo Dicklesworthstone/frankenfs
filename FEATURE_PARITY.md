@@ -3573,6 +3573,35 @@ failures, Clippy diagnostics, and an AArch64-only harness probe build failure;
 those runs therefore do not establish an all-green workspace. These fixtures
 also do not establish native OpenZFS interchange or a real mounted syscall result.
 
+## ZFS mode-preserving trivial ACL encoding (2026-11-23)
+
+Native trivial NFSv4 ACL generation now preserves POSIX owner, owning-group and
+other permission precedence, including owners who also belong to the owning
+group. Ordered owner/group deny entries and an earlier owner allow entry prevent
+asymmetric modes such as 0040 or 0604 from granting a later class's permissions.
+Directory DELETE_CHILD follows the write bit; sticky-directory ownership checks
+remain separate. This corrects generated ACL bytes, not the still-unimplemented
+general native ACL evaluation or inheritance surface.
+
+Both SA encoders now store the actual ACE count. Legacy znode rebuilding stores
+the corresponding byte length and count and copies the variable-length ACL into
+its bounded inline payload. Regression sources independently evaluate all 512
+permission modes, both byte orders, file/directory and sticky cases, all four
+owner/group membership combinations and compound permission requests. A second
+test checks fresh SA, rebuilt SA and legacy count/payload agreement.
+
+Validation used the pinned nightly compiler on the unchanged production helper
+and the identical exhaustive evaluator in a standalone Rust test harness. The
+baseline helper failed (0 passed, 1 failed: mode 0001 overgranted owner execute);
+the corrected helper passed (1 passed, 0 failed, 0 ignored). This is exact-helper
+unit evidence, not full-crate or native OpenZFS qualification. The two complete
+candidate files passed pinned rustfmt; targeted UBS static analysis returned
+exit 0 with no critical findings (reviewed warnings remain). Full owning-crate
+tests, workspace compilation and strict Clippy did not complete: shared storage
+exhaustion, resource-guard termination and repeated executor disconnections
+interrupted the builds. The commit records the repository's emergency gate
+exception; no unavailable check is reported as passed.
+
 ## NTFS logged EA mutation and large-stream truncation
 
 `set_extended_attribute` and `remove_extended_attribute` update exact native
