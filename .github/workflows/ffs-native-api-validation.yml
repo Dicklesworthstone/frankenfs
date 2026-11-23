@@ -1,4 +1,4 @@
-name: Native API validation
+name: NTFS ADS permission planted-red proof
 on:
   push:
     branches: [validation/ffs-native-api-20261123]
@@ -15,260 +15,94 @@ env:
   CARGO_PROFILE_TEST_DEBUG: "0"
   RUSTFLAGS: "-Z threads=1"
   CARGO_HTTP_USER_AGENT: "frankenfs-agent (+https://github.com/Dicklesworthstone/frankenfs)"
-  FFS_SOURCE_PATHS: |
-    README.md
-    crates/ffs-block/src/lib.rs
-    crates/ffs-core/src/lib.rs
-    crates/ffs-ntfs/src/reader/filesystem/writable.rs
-    crates/ffs-ntfs/tests/persistence_prefix/transforms.rs
-    crates/ffs/src/lib.rs
-    crates/ffs/src/native.rs
-    crates/ffs/src/native/tests.rs
-    crates/ffs/src/native/writable.rs
-    crates/ffs/src/native/writable/tests.rs
-  FFS_VALIDATION_WORKFLOW: .github/workflows/ffs-native-api-validation.yml
 jobs:
-  prepare:
+  planted-red:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    permissions:
-      contents: write
-    outputs:
-      tree: ${{ steps.source.outputs.tree }}
-      base: ${{ steps.source.outputs.base }}
-      sources: ${{ steps.source.outputs.sources }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 2
           persist-credentials: false
-      - name: Install pinned formatter
-        run: rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
-      - name: Normalize and publish exact source blobs
-        id: source
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Prepare pinned compiler and runner memory
         run: |
-          set -euo pipefail
-          cargo fmt --all
-          cargo fmt --check
-          git diff --check
-          python3 - <<'PY'
-          import base64, hashlib, json, os, pathlib, subprocess, urllib.request
-          def git(*args):
-              return subprocess.check_output(["git", *args], text=True).strip()
-          paths = os.environ["FFS_SOURCE_PATHS"].split()
-          assert len(paths) == len(set(paths)) == 10
-          allowed = set(paths)
-          workflow = os.environ["FFS_VALIDATION_WORKFLOW"]
-          candidate = git("rev-parse", "HEAD")
-          assert candidate == os.environ["GITHUB_SHA"]
-          base = git("rev-parse", "HEAD^1")
-          changes = set(git("diff", "--name-only", base, "HEAD").splitlines())
-          assert changes <= allowed | {workflow}, sorted(changes - allowed - {workflow})
-          formatted = set(git("diff", "--name-only", "HEAD").splitlines())
-          assert formatted <= allowed, sorted(formatted - allowed)
-          records = []
-          for name in paths:
-              path = pathlib.Path(name)
-              assert path.is_file() and not path.is_symlink(), name
-              raw = path.read_bytes()
-              blob = git("hash-object", name)
-              digest = hashlib.sha256(raw).hexdigest()
-              payload = json.dumps({"encoding": "base64", "content": base64.b64encode(raw).decode("ascii")}).encode()
-              request = urllib.request.Request(
-                  "https://api.github.com/repos/" + os.environ["GITHUB_REPOSITORY"] + "/git/blobs",
-                  data=payload,
-                  headers={
-                      "Authorization": "Bearer " + os.environ["GH_TOKEN"],
-                      "Accept": "application/vnd.github+json",
-                      "X-GitHub-Api-Version": "2022-11-28",
-                      "User-Agent": "frankenfs-agent (+https://github.com/Dicklesworthstone/frankenfs)",
-                      "Content-Type": "application/json",
-                  },
-                  method="POST",
-              )
-              with urllib.request.urlopen(request, timeout=60) as response:
-                  result = json.load(response)
-              assert result["sha"] == blob, (name, result["sha"], blob)
-              records.append({"path": name, "blob": blob, "sha256": digest})
-              print(f"FFS_FORMATTED_BLOB|{name}|{blob}|{digest}", flush=True)
-          subprocess.run(["git", "add", "--", *paths], check=True)
-          tree = git("write-tree")
-          subprocess.run(["git", "diff", "--exit-code"], check=True)
-          print(f"FFS_TESTED_COMMIT|{candidate}")
-          print(f"FFS_TESTED_BASE|{base}")
-          print(f"FFS_TESTED_TREE|{tree}")
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              print("tree=" + tree, file=output)
-              print("base=" + base, file=output)
-              print("sources=" + json.dumps(records, separators=(",", ":")), file=output)
-          PY
-
-  workspace-gates:
-    needs: prepare
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
-    env:
-      FFS_EXPECTED_TREE: ${{ needs.prepare.outputs.tree }}
-      FFS_EXPECTED_SOURCES: ${{ needs.prepare.outputs.sources }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - name: Prepare pinned compiler and runner resources
-        run: |
-          set -euo pipefail
           rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
           sudo apt-get update
-          sudo apt-get install -y pkg-config libfuse3-dev
-          validation_swap=$(sudo mktemp /mnt/ffs-native-gates-XXXXXX.swap)
+          sudo apt-get install -y fuse3 pkg-config
+          validation_swap=$(sudo mktemp /mnt/ffs-ads-red-XXXXXX.swap)
           sudo fallocate -l 12G "$validation_swap"
           sudo chmod 0600 "$validation_swap"
           sudo mkswap "$validation_swap"
           sudo swapon "$validation_swap"
           free -h
+          df -h .
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ntfs-writer-integrity
           cache-on-failure: "true"
           cache-workspace-crates: "true"
-      - name: Verify exact normalized source
+      - name: Verify exact regression candidate without rewriting source
         run: |
-          set -euo pipefail
-          cargo fmt --all
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD^1)" = "e7466d7a85dd818c82922337040c240180270f8b"
           python3 - <<'PY'
-          import hashlib, json, os, pathlib, subprocess
-          records = json.loads(os.environ["FFS_EXPECTED_SOURCES"])
-          paths = os.environ["FFS_SOURCE_PATHS"].split()
-          assert len(records) == len(paths) == 10
-          assert {r["path"] for r in records} == set(paths)
-          for record in records:
-              path = pathlib.Path(record["path"])
-              assert path.is_file() and not path.is_symlink()
-              assert hashlib.sha256(path.read_bytes()).hexdigest() == record["sha256"], str(path)
-              actual = subprocess.check_output(["git", "hash-object", str(path)], text=True).strip()
-              assert actual == record["blob"], str(path)
-          subprocess.run(["git", "add", "--", *paths], check=True)
-          tree = subprocess.check_output(["git", "write-tree"], text=True).strip()
-          assert tree == os.environ["FFS_EXPECTED_TREE"], tree
-          subprocess.run(["git", "diff", "--exit-code"], check=True)
-          print("FFS_SOURCE_VERIFIED|workspace-gates|" + tree)
-          PY
-          cargo fmt --check
-          git diff --check
-      - name: Workspace compiler gate
-        run: cargo check --locked --workspace --all-targets
-      - name: Workspace strict Clippy gate
-        run: cargo clippy --locked --workspace --all-targets -- -D warnings
-      - name: Verify tested source stayed unchanged
-        run: |
-          set -euo pipefail
-          git diff --exit-code
-          test "$(git write-tree)" = "$FFS_EXPECTED_TREE"
-          echo "FFS_GATES_PASS|$FFS_EXPECTED_TREE"
-
-  native-regressions:
-    needs: prepare
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
-    env:
-      FFS_EXPECTED_TREE: ${{ needs.prepare.outputs.tree }}
-      FFS_EXPECTED_SOURCES: ${{ needs.prepare.outputs.sources }}
-      FFS_REQUIRE_ORACLES: "1"
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - name: Prepare pinned compiler and native oracles
-        run: |
-          set -euo pipefail
-          rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
-          sudo apt-get update
-          sudo apt-get install -y e2fsprogs btrfs-progs ntfs-3g dosfstools mtools fuse3 pkg-config libfuse3-dev
-          validation_swap=$(sudo mktemp /mnt/ffs-native-tests-XXXXXX.swap)
-          sudo fallocate -l 12G "$validation_swap"
-          sudo chmod 0600 "$validation_swap"
-          sudo mkswap "$validation_swap"
-          sudo swapon "$validation_swap"
-          command -v mkfs.ext4 e2fsck debugfs mkfs.btrfs btrfs mkfs.ntfs ntfscat
-          free -h
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ntfs-writer-integrity
-          cache-on-failure: "true"
-          cache-workspace-crates: "true"
-      - name: Verify exact normalized source
-        run: |
-          set -euo pipefail
-          cargo fmt --all
-          python3 - <<'PY'
-          import hashlib, json, os, pathlib, subprocess
-          records = json.loads(os.environ["FFS_EXPECTED_SOURCES"])
-          paths = os.environ["FFS_SOURCE_PATHS"].split()
-          assert len(records) == len(paths) == 10
-          assert {r["path"] for r in records} == set(paths)
-          for record in records:
-              path = pathlib.Path(record["path"])
-              assert path.is_file() and not path.is_symlink()
-              assert hashlib.sha256(path.read_bytes()).hexdigest() == record["sha256"], str(path)
-              actual = subprocess.check_output(["git", "hash-object", str(path)], text=True).strip()
-              assert actual == record["blob"], str(path)
-          subprocess.run(["git", "add", "--", *paths], check=True)
-          tree = subprocess.check_output(["git", "write-tree"], text=True).strip()
-          assert tree == os.environ["FFS_EXPECTED_TREE"], tree
-          subprocess.run(["git", "diff", "--exit-code"], check=True)
-          print("FFS_SOURCE_VERIFIED|native-regressions|" + tree)
-          PY
-          cargo fmt --check
-          git diff --check
-      - name: Verify exact ACL test selection
-        run: |
-          set -euo pipefail
-          cargo test --locked -p ffs-ntfs --test persistence_prefix ntfs_mapped_namespace_acl -- --list 2>&1 | tee "$RUNNER_TEMP/ffs-acl-selection.log"
-          python3 - "$RUNNER_TEMP/ffs-acl-selection.log" <<'PY'
-          import pathlib, sys
-          text = pathlib.Path(sys.argv[1]).read_text()
-          selected = {line.removesuffix(": test") for line in text.splitlines() if line.endswith(": test")}
+          import subprocess
           expected = {
-              "transforms::ntfs_mapped_namespace_acl_denials_leave_names_streams_and_storage_unchanged",
-              "transforms::ntfs_mapped_namespace_acl_accepts_object_or_parent_delete_authority",
-              "transforms::ntfs_mapped_namespace_acl_does_not_replace_security_read_errors_with_parent_permission",
+              ".github/workflows/ffs-native-api-validation.yml",
+              "crates/ffs-ntfs/src/reader/filesystem.rs",
+              "crates/ffs-ntfs/tests/persistence_prefix/transforms.rs",
+              "crates/ffs/src/native.rs",
           }
-          assert selected == expected, selected
-          print("FFS_ACL_SELECTION|3")
+          changed = set(subprocess.check_output(
+              ["git", "diff", "--name-only", "HEAD^1", "HEAD"], text=True
+          ).splitlines())
+          assert changed == expected, (changed, expected)
           PY
-      - name: All three namespace ACL regressions
+          cargo fmt --check
+          git diff --check
+          test -z "$(git status --porcelain)"
+          echo "FFS_TESTED_COMMIT|$(git rev-parse HEAD)"
+          echo "FFS_TESTED_TREE|$(git rev-parse HEAD^{tree})"
+      - name: Compile persistence regressions before measuring the failure
+        run: cargo test --locked -p ffs-ntfs --test persistence_prefix --no-run
+      - name: Prove existing ADS creation incorrectly requires parent add permission
+        env:
+          TEST_NAME: transforms::ntfs_mapped_stream_creation_uses_file_authority_without_directory_add_rights
         run: |
-          set -euo pipefail
-          cargo test --locked -p ffs-ntfs --test persistence_prefix ntfs_mapped_namespace_acl -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/ffs-acl-regressions.log"
-          grep -Eq '^test result: ok[.] 3 passed; 0 failed;' "$RUNNER_TEMP/ffs-acl-regressions.log"
-          echo "FFS_ACL_REGRESSIONS_PASS|3"
-      - name: Eleven bounded reader regressions
+          set +e
+          cargo test --locked -p ffs-ntfs --test persistence_prefix "$TEST_NAME" -- --exact --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/ffs-ads-planted-red.log"
+          test_status=${PIPESTATUS[0]}
+          set -e
+          export FFS_RED_TEST_STATUS="$test_status"
+          python3 - <<'PY'
+          import os
+          import pathlib
+          log = (pathlib.Path(os.environ["RUNNER_TEMP"]) / "ffs-ads-planted-red.log").read_text()
+          source_path = pathlib.Path("crates/ffs-ntfs/tests/persistence_prefix/transforms.rs")
+          source = source_path.read_text()
+          test_name = os.environ["TEST_NAME"]
+          definition = source.index("fn " + test_name.split("::")[-1] + "()")
+          first_create = source.index("let direct = fs", definition)
+          first_unwrap = source.index(".unwrap();", first_create)
+          expected_line = source[:first_unwrap].count("\n") + 1
+          assert os.environ["FFS_RED_TEST_STATUS"] == "101", log
+          assert "running 1 test" in log, log
+          assert "test result: FAILED. 0 passed; 1 failed; 0 ignored;" in log, log
+          assert test_name in log, log
+          assert str(source_path) + ":" + str(expected_line) + ":" in log, log
+          assert "called " + chr(96) + "Result::unwrap()" + chr(96) + " on an " + chr(96) + "Err" + chr(96) + " value: PermissionDenied" in log, log
+          print("FFS_PLANTED_RED_CONFIRMED|" + test_name + "|PermissionDenied|first_create")
+          PY
+      - name: Confirm test execution did not change source
+        if: ${{ !cancelled() }}
         run: |
-          set -euo pipefail
-          cargo test --locked -p ffs --lib native::tests::bounded_ -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/ffs-bounded-regressions.log"
-          grep -Eq '^test result: ok[.] 11 passed; 0 failed;' "$RUNNER_TEMP/ffs-bounded-regressions.log"
-          echo "FFS_BOUNDED_READER_PASS|11"
-      - name: Seven writable facade regressions
-        run: |
-          set -euo pipefail
-          cargo test --locked -p ffs --lib native::writable::tests -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/ffs-writer-regressions.log"
-          grep -Eq '^test result: ok[.] 7 passed; 0 failed; 1 ignored;' "$RUNNER_TEMP/ffs-writer-regressions.log"
-          echo "FFS_WRITER_REGRESSIONS_PASS|7"
-      - name: Explicit independent ext4 and btrfs writer validation
-        run: |
-          set -euo pipefail
-          cargo test --locked -p ffs --lib native::writable::tests::native_ext4_and_btrfs_writers_reopen_and_pass_independent_checkers -- --ignored --exact --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/ffs-native-writer-oracles.log"
-          grep -Eq '^test result: ok[.] 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/ffs-native-writer-oracles.log"
-          echo "FFS_NATIVE_ORACLES_PASS|1"
-      - name: Complete public filesystem facade library tests
-        run: cargo test --locked -p ffs --lib -- --test-threads=1
-      - name: Complete NTFS library and integration tests
-        run: cargo test --locked -p ffs-ntfs -- --test-threads=1
-      - name: Verify tested source stayed unchanged
-        run: |
-          set -euo pipefail
-          git diff --exit-code
-          test "$(git write-tree)" = "$FFS_EXPECTED_TREE"
-          echo "FFS_NATIVE_TESTS_PASS|$FFS_EXPECTED_TREE"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git diff --check
+          test -z "$(git status --porcelain)"
+      - name: Retain exact negative regression output
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ntfs-ads-planted-red
+          path: ${{ runner.temp }}/ffs-ads-planted-red.log
+          if-no-files-found: warn
