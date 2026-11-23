@@ -1183,46 +1183,39 @@ fn ntfs_lznt1_compression_partial_write_truncate_dir_inherit_and_incompressible(
     }
 }
 
-#[test]
-fn ntfs_wof_decompression_on_write_materializes_plaintext_and_cleans_reparse() {
-    let cx = Cx::for_testing();
-    let (dev, vol_bytes) = format_to_fault_device(
-        &cx,
-        16,
-        4096,
-        NtfsFormatVersion::V3_1,
-        0xBD84_0003_0000_0001,
-    );
-    let mut engine = open_clean_engine(&cx, &dev, vol_bytes);
-    let root = engine.resolve_path_reference(&cx, "/").unwrap();
+fn wof_write_fixture(
+    cx: &Cx,
+    plaintext: &[u8],
+    backing: &[u8],
+    initialized: usize,
+) -> (Arc<FaultInjectingNtfsDevice>, u64) {
+    assert!(initialized <= plaintext.len());
+    let (dev, vol_bytes) =
+        format_to_fault_device(cx, 16, 4096, NtfsFormatVersion::V3_1, 0xBD84_0003_0000_0001);
+    let mut engine = open_clean_engine(cx, &dev, vol_bytes);
+    let root = engine.resolve_path_reference(cx, "/").unwrap();
 
-    // Build an authentic single-chunk WOF XPRESS4K file (uncompressed single 4096-byte chunk stored
-    // verbatim in `WofCompressedData`, sparse 4096-byte initialized placeholder unnamed `$DATA`, and
-    // WOF reparse tag `0x8000_0017` installed on the base record).
-    let wof_initial = b"WOF-INITIAL-PLAINTEXT-PAYLOAD-01".repeat(128); // exact 4096 bytes
+    // Sparse growth supplies an all-hole placeholder, including a partial
+    // final cluster. The provider's initialized span is set explicitly below.
     let (wof_ref, _) = engine
-        .create_file_at(&cx, root, &utf16("wof.bin"), &wof_initial)
+        .create_file_at(cx, root, &utf16("wof.bin"), &[])
         .into_result()
         .unwrap();
     engine
-        .set_sparse_at(&cx, wof_ref, &[], true, DEFAULT_NTFS_FILETIME)
+        .set_sparse_at(cx, wof_ref, &[], true, DEFAULT_NTFS_FILETIME)
         .into_result()
         .unwrap();
     engine
-        .punch_hole_at(&cx, wof_ref, &[], 0, 4096, DEFAULT_NTFS_FILETIME)
+        .truncate_stream(cx, wof_ref, &[], plaintext.len() as u64)
         .into_result()
         .unwrap();
     engine
-        .create_stream(&cx, wof_ref, &utf16("WofCompressedData"), &wof_initial)
+        .create_stream(cx, wof_ref, &utf16("WofCompressedData"), backing)
         .into_result()
         .unwrap();
 
-    // Install authentic WOF reparse point (version=1, provider=2, file_ver=1, alg=0 XPRESS4K)
-    // by writing a temporary opaque tag first? No — `set_reparse_point_at` intentionally refuses
-    // direct WOF installation; patch `$REPARSE_POINT` cleanly on-disk via a small helper?
-    // Even cleaner: verify `validate_writable_reparse_point` refuses manual WOF installation,
-    // AND patch the test fixture's record with a real WOF reparse point so `NtfsVolume::data_stream`
-    // opens it via `Storage::Wof`!
+    // Direct installation is refused. Construct the XPRESS4K provider in the
+    // image by replacing an equal-sized opaque tag and its secondary index.
     let mut wof_body = Vec::with_capacity(16);
     wof_body.extend_from_slice(&1_u32.to_le_bytes());
     wof_body.extend_from_slice(&2_u32.to_le_bytes());
@@ -1234,26 +1227,20 @@ fn ntfs_wof_decompression_on_write_materializes_plaintext_and_cleans_reparse() {
         data: NtfsReparseData::Opaque(wof_body),
     };
     assert!(matches!(
-        engine.set_reparse_point_at(&cx, wof_ref, &wof_point, true, DEFAULT_NTFS_FILETIME),
+        engine.set_reparse_point_at(cx, wof_ref, &wof_point, true, DEFAULT_NTFS_FILETIME),
         NtfsTxOutcome::NotCommitted(FfsError::UnsupportedFeature(_))
     ));
     // Install a valid opaque placeholder reparse point of exact same 24-byte encoded length
     // (`tag=0x9000_0017`, 16-byte identical payload) so `$REPARSE_POINT` attribute & `$Reparse::$R`
     // exist in the MFT record, then flip the 4-byte tag word in the raw image to `0x8000_0017`
-    // and recalculate USA fixups — producing a 100% genuine WOF-backed MFT record!
+    // and recalculate USA fixups.
     let placeholder_point = NtfsReparsePoint {
         tag: 0x9000_0017,
         guid: None,
         data: wof_point.data.clone(),
     };
     engine
-        .set_reparse_point_at(
-            &cx,
-            wof_ref,
-            &placeholder_point,
-            true,
-            DEFAULT_NTFS_FILETIME,
-        )
+        .set_reparse_point_at(cx, wof_ref, &placeholder_point, true, DEFAULT_NTFS_FILETIME)
         .into_result()
         .unwrap();
     drop(engine);
@@ -1262,13 +1249,29 @@ fn ntfs_wof_decompression_on_write_materializes_plaintext_and_cleans_reparse() {
     // so both the `$REPARSE_POINT` attribute and the `$Reparse` index agree on the WOF tag!
     let mut img = dev.snapshot_durable_only();
     let vol_probe = NtfsVolume::from_device(
-        &cx,
+        cx,
         Box::new(FaultInjectingNtfsDevice::new(img.clone())),
         0,
         vol_bytes,
     )
     .unwrap();
-    let reparse_rec_no = vol_probe.resolve(&cx, "/$Extend/$Reparse").unwrap().number as usize;
+    let reparse_rec_no = vol_probe.resolve(cx, "/$Extend/$Reparse").unwrap().number as usize;
+    // Poison every free cluster so allocating a tail without staging its
+    // plaintext cannot accidentally pass because the formatter zeroed it.
+    let bitmap_record = vol_probe.record(cx, 6, None).unwrap();
+    let bitmap_stream = vol_probe.data_stream(cx, &bitmap_record, &[]).unwrap();
+    let bitmap = vol_probe
+        .read(cx, &bitmap_stream, 0, bitmap_stream.size as usize)
+        .unwrap();
+    let cluster_bytes = vol_probe.geometry.cluster_bytes() as usize;
+    let mut poisoned = 0;
+    for cluster in 0..vol_probe.geometry.cluster_count() as usize {
+        if bitmap[cluster / 8] & (1 << (cluster % 8)) == 0 {
+            img[cluster * cluster_bytes..(cluster + 1) * cluster_bytes].fill(0xD3);
+            poisoned += 1;
+        }
+    }
+    assert!(poisoned >= 4);
     let mft_base =
         (vol_probe.geometry.mft_cluster() * u64::from(vol_probe.geometry.cluster_bytes())) as usize;
     let rec_len = vol_probe.geometry.record_bytes() as usize;
@@ -1308,10 +1311,9 @@ fn ntfs_wof_decompression_on_write_materializes_plaintext_and_cleans_reparse() {
                     assert_eq!(restored[at + 8], 1);
                     assert!(length >= 64);
                     let logical = &restored[at + 48..at + 56];
-                    assert_eq!(logical, &(wof_initial.len() as u64).to_le_bytes());
+                    assert_eq!(logical, &(plaintext.len() as u64).to_le_bytes());
                     assert_eq!(&restored[at + 56..at + 64], &0_u64.to_le_bytes());
-                    restored[at + 56..at + 64]
-                        .copy_from_slice(&(wof_initial.len() as u64).to_le_bytes());
+                    restored[at + 56..at + 64].copy_from_slice(&(initialized as u64).to_le_bytes());
                     initialized_data = true;
                     break;
                 }
@@ -1331,10 +1333,20 @@ fn ntfs_wof_decompression_on_write_materializes_plaintext_and_cleans_reparse() {
         }
         img[mft_rec_off..mft_rec_off + rec_len].copy_from_slice(&restored);
     }
-    let wof_dev = FaultInjectingNtfsDevice::new(img);
+    (FaultInjectingNtfsDevice::new(img), vol_bytes)
+}
+
+#[test]
+fn ntfs_wof_decompression_on_write_materializes_plaintext_and_cleans_reparse() {
+    let cx = Cx::for_testing();
+    // A single raw XPRESS4K chunk requires no offset table.
+    let wof_initial = b"WOF-INITIAL-PLAINTEXT-PAYLOAD-01".repeat(128);
+    let (wof_dev, vol_bytes) =
+        wof_write_fixture(&cx, &wof_initial, &wof_initial, wof_initial.len());
 
     // Confirm reader opens it as genuine WOF and reads exact initial plaintext!
     let mut engine = open_clean_engine(&cx, &wof_dev, vol_bytes);
+    let wof_ref = engine.resolve_path_reference(&cx, "/wof.bin").unwrap();
     assert_eq!(read_file_by_path(&cx, &engine, "/wof.bin"), wof_initial);
 
     // Perform positioned write -> triggers WOF decompression-on-write!
@@ -1354,6 +1366,199 @@ fn ntfs_wof_decompression_on_write_materializes_plaintext_and_cleans_reparse() {
     assert_eq!(streams.len(), 1);
     assert_eq!(streams[0].name, [] as [u16; 0]);
     engine.check_clean_consistency(&cx).unwrap();
+
+    let reopened_device = FaultInjectingNtfsDevice::new(wof_dev.snapshot_durable_only());
+    let reopened = open_clean_engine(&cx, &reopened_device, vol_bytes);
+    assert_eq!(read_file_by_path(&cx, &reopened, "/wof.bin"), expected);
+    reopened.check_clean_consistency(&cx).unwrap();
+}
+
+fn multichunk_wof_payload() -> (Vec<u8>, Vec<u8>) {
+    // A native XPRESS Huffman chunk: literal A, then a distance-one long
+    // match. The other chunks are stored raw, with a partial final chunk.
+    let mut compressed = vec![0_u8; 256];
+    compressed[usize::from(b'A') / 2] = 0x10;
+    compressed[135] = 0x10;
+    compressed.extend_from_slice(&[0, 0x40, 0, 0, 0xFF]);
+    compressed.extend_from_slice(&4092_u16.to_le_bytes());
+    let raw: Vec<_> = (0..4096)
+        .map(|index| u8::try_from(index % 251 + 1).unwrap())
+        .collect();
+    let tail = b"final partial native WOF chunk bytes!";
+    let mut backing = Vec::new();
+    backing.extend_from_slice(&u32::try_from(compressed.len()).unwrap().to_le_bytes());
+    backing.extend_from_slice(
+        &u32::try_from(compressed.len() + raw.len())
+            .unwrap()
+            .to_le_bytes(),
+    );
+    backing.extend_from_slice(&compressed);
+    backing.extend_from_slice(&raw);
+    backing.extend_from_slice(tail);
+    let mut plaintext = vec![b'A'; 4096];
+    plaintext.extend_from_slice(&raw);
+    plaintext.extend_from_slice(tail);
+    (plaintext, backing)
+}
+
+fn assert_materialized_wof(cx: &Cx, engine: &NtfsTransactionEngine, expected: &[u8]) {
+    assert_eq!(read_file_by_path(cx, engine, "/wof.bin"), expected);
+    let volume = engine.volume_view(cx).unwrap();
+    let record = volume.resolve(cx, "/wof.bin").unwrap();
+    assert!(volume.reparse_point(cx, &record).unwrap().is_none());
+    let streams = volume.data_streams(cx, &record).unwrap();
+    assert_eq!(streams.len(), 1);
+    assert!(streams[0].name.is_empty());
+    assert_eq!(
+        streams[0].read_profile.as_ref().unwrap().initialized,
+        expected.len() as u64
+    );
+    engine.check_clean_consistency(cx).unwrap();
+}
+
+#[test]
+fn ntfs_wof_multicluster_writes_preserve_untouched_plaintext_after_reopen() {
+    let cx = Cx::for_testing();
+    let (plaintext, backing) = multichunk_wof_payload();
+    let (seed, vol_bytes) = wof_write_fixture(&cx, &plaintext, &backing, plaintext.len());
+    let pristine = seed.snapshot_durable_only();
+    let patch = b"DECOMPRESSED!";
+    for offset in [
+        4,
+        4092,
+        4096 + 137,
+        plaintext.len() - patch.len(),
+        plaintext.len(),
+        plaintext.len() + 4096 + 17,
+    ] {
+        let dev = FaultInjectingNtfsDevice::new(pristine.clone());
+        let mut engine = open_clean_engine(&cx, &dev, vol_bytes);
+        let reference = engine.resolve_path_reference(&cx, "/wof.bin").unwrap();
+        assert_eq!(read_file_by_path(&cx, &engine, "/wof.bin"), plaintext);
+        let mut expected = plaintext.clone();
+        expected.resize(expected.len().max(offset + patch.len()), 0);
+        expected[offset..offset + patch.len()].copy_from_slice(patch);
+        engine
+            .write_stream_range(&cx, reference, &[], offset as u64, patch)
+            .into_result()
+            .unwrap_or_else(|error| panic!("WOF write at {offset} failed: {error:?}"));
+        assert_materialized_wof(&cx, &engine, &expected);
+        let durable = dev.snapshot_durable_only();
+        drop(engine);
+        let reopened_device = FaultInjectingNtfsDevice::new(durable);
+        let reopened = open_clean_engine(&cx, &reopened_device, vol_bytes);
+        assert_materialized_wof(&cx, &reopened, &expected);
+    }
+}
+
+#[test]
+fn ntfs_wof_empty_writes_materialize_without_extending_file() {
+    let cx = Cx::for_testing();
+    let (plaintext, backing) = multichunk_wof_payload();
+    let (seed, vol_bytes) = wof_write_fixture(&cx, &plaintext, &backing, plaintext.len());
+    let pristine = seed.snapshot_durable_only();
+    for offset in [u64::MAX, plaintext.len() as u64 + 4096, 0] {
+        let dev = FaultInjectingNtfsDevice::new(pristine.clone());
+        let mut engine = open_clean_engine(&cx, &dev, vol_bytes);
+        let reference = engine.resolve_path_reference(&cx, "/wof.bin").unwrap();
+        assert_eq!(read_file_by_path(&cx, &engine, "/wof.bin"), plaintext);
+        engine
+            .write_stream_range(&cx, reference, &[], offset, &[])
+            .into_result()
+            .unwrap_or_else(|error| panic!("empty WOF write at {offset} failed: {error:?}"));
+        assert_materialized_wof(&cx, &engine, &plaintext);
+        let durable = dev.snapshot_durable_only();
+        drop(engine);
+        let reopened_device = FaultInjectingNtfsDevice::new(durable);
+        let reopened = open_clean_engine(&cx, &reopened_device, vol_bytes);
+        assert_materialized_wof(&cx, &reopened, &plaintext);
+    }
+}
+
+#[test]
+fn ntfs_wof_materialization_preserves_zero_tail_beyond_valid_data() {
+    let cx = Cx::for_testing();
+    let (plaintext, backing) = multichunk_wof_payload();
+    let initialized = 4096 + 1037;
+    let (dev, vol_bytes) = wof_write_fixture(&cx, &plaintext, &backing, initialized);
+    let mut engine = open_clean_engine(&cx, &dev, vol_bytes);
+    let reference = engine.resolve_path_reference(&cx, "/wof.bin").unwrap();
+    let mut expected = plaintext;
+    expected[initialized..].fill(0);
+    assert_eq!(read_file_by_path(&cx, &engine, "/wof.bin"), expected);
+    engine
+        .write_stream_range(&cx, reference, &[], 4, b"UPDATED")
+        .into_result()
+        .unwrap();
+    expected[4..11].copy_from_slice(b"UPDATED");
+    assert_materialized_wof(&cx, &engine, &expected);
+    let reopened_device = FaultInjectingNtfsDevice::new(dev.snapshot_durable_only());
+    let reopened = open_clean_engine(&cx, &reopened_device, vol_bytes);
+    assert_materialized_wof(&cx, &reopened, &expected);
+}
+
+#[test]
+fn ntfs_wof_invalid_chunk_table_refuses_write_without_mutation() {
+    let cx = Cx::for_testing();
+    let (plaintext, mut backing) = multichunk_wof_payload();
+    // The first compressed chunk is empty: decoding must fail before native
+    // metadata or allocation can be published.
+    backing[..4].fill(0);
+    let (dev, vol_bytes) = wof_write_fixture(&cx, &plaintext, &backing, plaintext.len());
+    let mut engine = open_clean_engine(&cx, &dev, vol_bytes);
+    let reference = engine.resolve_path_reference(&cx, "/wof.bin").unwrap();
+    let before = dev.snapshot_live();
+    let durable_before = dev.snapshot_durable_only();
+    let writes = dev.write_bytes_total();
+    assert!(matches!(
+        engine.write_stream_range(&cx, reference, &[], 4, b"UPDATED"),
+        NtfsTxOutcome::NotCommitted(FfsError::Corruption { .. })
+    ));
+    assert_eq!(dev.write_bytes_total(), writes);
+    assert_eq!(dev.snapshot_live(), before);
+    assert_eq!(dev.snapshot_durable_only(), durable_before);
+}
+
+#[test]
+fn ntfs_resident_spill_preserves_first_cluster_and_initializes_gap() {
+    let cx = Cx::for_testing();
+    let (dev, vol_bytes) =
+        format_to_fault_device(&cx, 16, 512, NtfsFormatVersion::V3_1, 0xBD84_0003_0000_0002);
+    let mut engine = open_clean_engine(&cx, &dev, vol_bytes);
+    let root = engine.resolve_path_reference(&cx, "/").unwrap();
+    for offset in [512_usize, 1536] {
+        let name = format!("resident-{offset}");
+        let path = format!("/{name}");
+        let mut expected = vec![0xA7; 512];
+        let (reference, _) = engine
+            .create_file_at(&cx, root, &utf16(&name), &expected)
+            .into_result()
+            .unwrap();
+        let volume = engine.volume_view(&cx).unwrap();
+        let record = volume.resolve(&cx, &path).unwrap();
+        assert!(volume.data_stream(&cx, &record, &[]).unwrap().resident());
+        // Exercise the general catalog writer directly, since the path-based
+        // fast path can otherwise hide a resident-to-mapped planner failure.
+        engine
+            .write_stream_at(
+                &cx,
+                reference,
+                &[],
+                offset as u64,
+                b"tail",
+                false,
+                DEFAULT_NTFS_FILETIME,
+            )
+            .into_result()
+            .unwrap();
+        expected.resize(offset, 0);
+        expected.extend_from_slice(b"tail");
+        assert_eq!(read_file_by_path(&cx, &engine, &path), expected);
+        let reopened_device = FaultInjectingNtfsDevice::new(dev.snapshot_durable_only());
+        let reopened = open_clean_engine(&cx, &reopened_device, vol_bytes);
+        assert_eq!(read_file_by_path(&cx, &reopened, &path), expected);
+        reopened.check_clean_consistency(&cx).unwrap();
+    }
 }
 
 #[test]

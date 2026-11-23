@@ -2841,6 +2841,9 @@ impl NtfsTransactionEngine {
         digest: [u8; 32],
     ) -> Result<PreparedTxPlan<u64>> {
         checkpoint(cx)?;
+        // Empty writes may still materialize WOF data, but their offset must
+        // not extend the logical file or select a range past the staged bytes.
+        let offset = if data.is_empty() { 0 } else { offset };
         if data.len() as u64 > MAX_FILE_EDIT_BYTES
             || (!data.is_empty()
                 && offset
@@ -3076,8 +3079,16 @@ impl NtfsTransactionEngine {
                 initialized_bytes: old_init.max(end_offset),
             }
         } else {
-            let cow_start_vcn = offset.min(old_init) / cb;
-            let cow_end_vcn = end_offset.div_ceil(cb).max(1);
+            // Resident data, including decoded WOF plaintext, has no old
+            // physical runs to retain. Initialize its entire new allocation;
+            // copying only the touched clusters would lose the prefix/tail or
+            // expose stale bytes from newly allocated, unwritten clusters.
+            let (cow_start_vcn, cow_end_vcn) =
+                if matches!(cur_stream.storage, EditableStreamStorage::Resident(_)) {
+                    (0, new_size.div_ceil(cb).max(1))
+                } else {
+                    (offset.min(old_init) / cb, end_offset.div_ceil(cb).max(1))
+                };
             let cow_clusters = cow_end_vcn - cow_start_vcn;
             let cow_byte_start = cow_start_vcn * cb;
             let cow_bytes_u64 = cow_clusters

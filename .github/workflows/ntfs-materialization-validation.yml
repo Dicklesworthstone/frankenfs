@@ -1,0 +1,143 @@
+name: NTFS materialization regression validation
+
+on:
+  push:
+    branches: [validation/ntfs-8-materialization-20261123]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ntfs-8-materialization-20261123
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_BUILD_JOBS: "2"
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  RUSTFLAGS: "-Z threads=1"
+  CARGO_HTTP_USER_AGENT: "frankenfs-agent (+https://github.com/Dicklesworthstone/frankenfs)"
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 16
+          persist-credentials: false
+
+      - name: Prepare pinned compiler and isolated runner resources
+        run: |
+          rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
+          sudo apt-get update
+          sudo apt-get install -y e2fsprogs btrfs-progs ntfs-3g dosfstools mtools fuse3 pkg-config
+          validation_swap=$(sudo mktemp /mnt/ffs-ntfs8-XXXXXX.swap)
+          sudo fallocate -l 12G "$validation_swap"
+          sudo chmod 0600 "$validation_swap"
+          sudo mkswap "$validation_swap"
+          sudo swapon "$validation_swap"
+          free -h
+          df -h .
+          mkdir -p "$RUNNER_TEMP/ntfs8-evidence"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ntfs-writer-integrity
+          cache-on-failure: "true"
+          cache-workspace-crates: "true"
+
+      - name: Verify exact committed source and formatting
+        id: prepare
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git rev-parse HEAD | tee "$RUNNER_TEMP/ntfs8-evidence/source.txt"
+          sha256sum crates/ffs-ntfs/src/transaction/mutations.rs crates/ffs-ntfs/tests/persistence_prefix/transforms.rs | tee "$RUNNER_TEMP/ntfs8-evidence/source-sha256.txt"
+          cargo fmt --check
+          git diff --check
+          test -z "$(git status --porcelain)"
+
+      - name: Prove regressions fail on the original implementation
+        id: baseline
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        run: |
+          source_path=crates/ffs-ntfs/src/transaction/mutations.rs
+          cp "$source_path" "$RUNNER_TEMP/ntfs8-evidence/candidate-mutations.rs"
+          trap 'cp "$RUNNER_TEMP/ntfs8-evidence/candidate-mutations.rs" "$source_path"' EXIT
+          git show cbbb36e77a56167375da811e949f13f265695e19:"$source_path" > "$source_path"
+          sha256sum "$source_path" | tee "$RUNNER_TEMP/ntfs8-evidence/baseline-sha256.txt"
+          set +e
+          cargo test --locked -p ffs-ntfs --test persistence_prefix ntfs_wof -- --test-threads=1 > "$RUNNER_TEMP/ntfs8-evidence/baseline-wof.log" 2>&1
+          wof_status=$?
+          cargo test --locked -p ffs-ntfs --test persistence_prefix transforms::ntfs_resident_spill_preserves_first_cluster_and_initializes_gap -- --exact --test-threads=1 > "$RUNNER_TEMP/ntfs8-evidence/baseline-resident.log" 2>&1
+          resident_status=$?
+          set -e
+          cp "$RUNNER_TEMP/ntfs8-evidence/candidate-mutations.rs" "$source_path"
+          trap - EXIT
+          git diff --exit-code -- "$source_path"
+          python3 - "$wof_status" "$resident_status" "$RUNNER_TEMP/ntfs8-evidence" <<'PY'
+          import pathlib
+          import sys
+          assert sys.argv[1:3] == ["101", "101"], sys.argv[1:3]
+          evidence = pathlib.Path(sys.argv[3])
+          wof = (evidence / "baseline-wof.log").read_text()
+          resident = (evidence / "baseline-resident.log").read_text()
+          for name in [
+              "ntfs_wof_multicluster_writes_preserve_untouched_plaintext_after_reopen",
+              "ntfs_wof_materialization_preserves_zero_tail_beyond_valid_data",
+              "ntfs_wof_empty_writes_materialize_without_extending_file",
+          ]:
+              assert f"test transforms::{name} ... FAILED" in wof, name
+          for name in [
+              "ntfs_wof_decompression_on_write_materializes_plaintext_and_cleans_reparse",
+              "ntfs_wof_invalid_chunk_table_refuses_write_without_mutation",
+          ]:
+              assert f"test transforms::{name} ... ok" in wof, name
+          assert "2 passed; 3 failed;" in wof
+          assert "test transforms::ntfs_resident_spill_preserves_first_cluster_and_initializes_gap ... FAILED" in resident
+          assert "0 passed; 1 failed;" in resident
+          for log in [wof, resident]:
+              for line in log.splitlines():
+                  if line.startswith(("test ", "test result:")):
+                      print(line)
+          print("Four causal regressions failed; both baseline controls passed.")
+          PY
+
+      - name: Verify materialization and resident transition fixes
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        run: |
+          git diff --exit-code -- crates/ffs-ntfs/src/transaction/mutations.rs crates/ffs-ntfs/tests/persistence_prefix/transforms.rs
+          cargo test --locked -p ffs-ntfs --test persistence_prefix ntfs_wof -- --test-threads=1 | tee "$RUNNER_TEMP/ntfs8-evidence/fixed-wof.log"
+          cargo test --locked -p ffs-ntfs --test persistence_prefix transforms::ntfs_resident_spill_preserves_first_cluster_and_initializes_gap -- --exact --test-threads=1 | tee "$RUNNER_TEMP/ntfs8-evidence/fixed-resident.log"
+
+      - name: Workspace compiler check
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        run: cargo check --locked --workspace --all-targets
+
+      - name: Workspace strict Clippy
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Complete NTFS tests and persistence cuts
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        run: cargo test --locked -p ffs-ntfs -- --test-threads=1
+
+      - name: NTFS CLI regressions
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        run: cargo test --locked -p ffs-cli --bin ffs-ntfs -- --test-threads=1
+
+      - name: Public filesystem facade regressions
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        run: cargo test --locked -p ffs -- --test-threads=1
+
+      - name: Retain causal and fixed-source evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ntfs8-materialization-evidence
+          path: ${{ runner.temp }}/ntfs8-evidence
+          if-no-files-found: error
