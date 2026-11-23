@@ -1628,7 +1628,7 @@ impl NtfsTransactionEngine {
         for a in &attrs {
             match a.kind {
                 ATTRIBUTE_LIST => {
-                    let valid = match a.value {
+                    let valid = match &a.value {
                         ffs_ondisk::ntfs::NtfsValue::Resident(bytes) => {
                             !bytes.is_empty()
                                 && ffs_ondisk::ntfs::attribute_list::parse_attribute_list(bytes)
@@ -1647,7 +1647,7 @@ impl NtfsTransactionEngine {
                     has_extended_feature = true;
                 }
                 REPARSE_POINT => {
-                    let admitted_reparse = match a.value {
+                    let admitted_reparse = match &a.value {
                         ffs_ondisk::ntfs::NtfsValue::Resident(bytes) => {
                             NtfsReparsePoint::parse(bytes).is_ok_and(|rp| rp.tag != 0)
                         }
@@ -1666,7 +1666,7 @@ impl NtfsTransactionEngine {
                         has_malformed_base_catalog = true;
                     }
                 }
-                DATA => match a.value {
+                DATA => match &a.value {
                     ffs_ondisk::ntfs::NtfsValue::Resident(_) => {
                         if a.flags != 0 || !resident_data_names.insert(a.name.clone()) {
                             has_malformed_base_catalog = true;

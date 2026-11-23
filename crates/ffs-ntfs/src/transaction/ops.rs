@@ -1858,9 +1858,12 @@ impl NtfsTransactionEngine {
                     Ok(None)
                 }
             }
-            // Fall through to the plain path planner on NotFound so POSIX
-            // namespace case mismatches surface as Corruption instead of ENOENT.
-            Err(FfsError::NotFound(_)) => Ok(None),
+            // Fall through to the plain path planner when lookup_reference
+            // cannot resolve or admit the target (e.g. POSIX case mismatch or
+            // inconsistent plain-file flags such as FILE_ATTR_REPARSE_POINT
+            // without a $REPARSE_POINT) so edit_stream_data/edit_named_stream
+            // applies its exact preflight contract.
+            Err(FfsError::NotFound(_) | FfsError::Corruption { .. }) => Ok(None),
             Err(err) => Err(err),
         }
     }
