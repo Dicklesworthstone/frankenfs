@@ -4,6 +4,7 @@
 //! pool: topology, configuration, features and the complete MOS still matter.
 //! Sources: OpenZFS spa.h, vdev_impl.h, uberblock_impl.h, zio_checksum.c.
 
+pub mod crypto;
 pub mod gang;
 pub mod nvlist;
 pub mod raidz;
@@ -261,6 +262,24 @@ impl BlockPointer {
     pub const fn protected(&self) -> bool {
         self.words[6] & (1 << 61) != 0
     }
+    /// Raw 64-bit word (`0..16`) of this block pointer in native logical value form.
+    #[must_use]
+    pub const fn raw_word(&self, index: usize) -> u64 {
+        self.words[index]
+    }
+    /// True when this pointer addresses an encrypted level-0 block (`BP_IS_PROTECTED`
+    /// with `level == 0` and an encrypted `dmu_object_type_t`), where `DVA2` stores
+    /// `(salt, IV1)` and the upper 32 bits of `words[11]` store `IV2`.
+    #[must_use]
+    pub const fn is_encrypted(&self) -> bool {
+        self.protected() && self.level() == 0 && crypto::dmu_ot_is_encrypted(self.object_type())
+    }
+    /// True when this pointer is protected (`BP_IS_PROTECTED`) and authenticated via
+    /// MAC/HMAC rather than encrypted (`level > 0`, `DMU_OT_OBJSET`, or non-encrypted L0).
+    #[must_use]
+    pub const fn is_authenticated(&self) -> bool {
+        self.protected() && !self.is_encrypted()
+    }
     /// Legacy ZFS deduplication bit (`BP_IS_DEDUP`, bit 62 of `blk_prop`).
     #[must_use]
     pub const fn dedup(&self) -> bool {
@@ -296,7 +315,11 @@ impl BlockPointer {
     }
     #[must_use]
     pub const fn fill(&self) -> u64 {
-        self.words[11]
+        if self.is_encrypted() {
+            self.words[11] & 0xffff_ffff
+        } else {
+            self.words[11]
+        }
     }
     #[must_use]
     pub const fn checksum_words(&self) -> [u64; 4] {
@@ -402,6 +425,98 @@ impl BlockPointer {
         words[12..16].copy_from_slice(&cksum);
         Ok(Self { words })
     }
+
+    /// Construct a protected (`BP_IS_PROTECTED`, bit 61) encrypted or authenticated block pointer.
+    pub fn new_protected(spec: &ProtectedBlockSpec<'_>) -> Result<Self, ParseError> {
+        let is_encrypted = spec.level == 0 && crypto::dmu_ot_is_encrypted(spec.object_type);
+        let max_dvas = if is_encrypted { 2 } else { 3 };
+        if spec.dvas.is_empty() || spec.dvas.len() > max_dvas {
+            return Err(invalid(
+                "protected block requires 1..=2 DVAs (encrypted) or 1..=3 DVAs (authenticated)",
+            ));
+        }
+        if !(512..=MAX_BLOCK_BYTES).contains(&spec.logical_bytes)
+            || !spec.logical_bytes.is_multiple_of(512)
+            || spec.physical.len() < 512
+            || spec.physical.len() > spec.logical_bytes
+            || !spec.physical.len().is_multiple_of(512)
+        {
+            return Err(invalid("invalid protected block logical or physical size"));
+        }
+        let lsize_sectors = (spec.logical_bytes / 512) as u64;
+        let psize_sectors = (spec.physical.len() / 512) as u64;
+        if lsize_sectors > 0x1_0000 || psize_sectors > 0x1_0000 {
+            return Err(invalid(
+                "protected block exceeds standard 32 MiB blkptr sector field",
+            ));
+        }
+        if spec.compression == 2 && spec.physical.len() != spec.logical_bytes {
+            return Err(invalid("uncompressed protected block sizes disagree"));
+        }
+        if !matches!(spec.compression, 2 | 3 | 5..=16)
+            || !matches!(spec.checksum_type, 6..=8 | 11)
+            || spec.level > 31
+            || spec.birth == 0
+        {
+            return Err(invalid(
+                "unsupported protected block compression, checksum, level or zero birth",
+            ));
+        }
+        let mut words = [0_u64; 16];
+        for (index, dva) in spec.dvas.iter().enumerate() {
+            if dva.gang
+                || dva.vdev > 0x00ff_ffff
+                || dva.allocated_bytes < spec.physical.len() as u64
+                || !dva.allocated_bytes.is_multiple_of(512)
+                || (dva.allocated_bytes / 512) == 0
+                || (dva.allocated_bytes / 512) > 0x00ff_ffff
+                || !dva.offset.is_multiple_of(512)
+                || (dva.offset / 512) >> 63 != 0
+            {
+                return Err(invalid("invalid protected DVA geometry or alignment"));
+            }
+            words[index * 2] =
+                (u64::from(dva.vdev) << 32) | ((dva.allocated_bytes / 512) & 0x00ff_ffff);
+            words[index * 2 + 1] = (dva.offset / 512) & 0x7fff_ffff_ffff_ffff;
+        }
+        words[6] = (lsize_sectors - 1)
+            | ((psize_sectors - 1) << 16)
+            | ((u64::from(spec.compression) & 0x7f) << 32)
+            | (u64::from(spec.checksum_type) << 40)
+            | (u64::from(spec.object_type) << 48)
+            | ((u64::from(spec.level) & 0x1f) << 56)
+            | (1_u64 << 61)
+            | (u64::from(spec.payload_order == Endian::Little) << 63);
+        words[10] = spec.birth;
+        if is_encrypted {
+            let (Some(salt), Some(iv)) = (spec.salt, spec.iv) else {
+                return Err(invalid("encrypted L0 block requires explicit salt and IV"));
+            };
+            if spec.fill > u64::from(u32::MAX) {
+                return Err(invalid("encrypted L0 block fill overflows 32 bits"));
+            }
+            let (w4, w5, iv2) = crypto::encode_crypt_salt_iv(&salt, &iv, spec.payload_order);
+            words[4] = w4;
+            words[5] = w5;
+            words[11] = (u64::from(iv2) << 32) | spec.fill;
+        } else {
+            if spec.salt.is_some() || spec.iv.is_some() {
+                return Err(invalid(
+                    "authenticated non-encrypted block must not carry salt or IV",
+                ));
+            }
+            words[11] = spec.fill;
+        }
+        let cksum = crypto::compute_protected_checksum_words(
+            spec.physical,
+            spec.checksum_type,
+            spec.payload_order,
+            spec.object_type,
+            spec.mac,
+        )?;
+        words[12..16].copy_from_slice(&cksum);
+        Ok(Self { words })
+    }
     #[must_use]
     pub const fn payload_order(&self) -> Endian {
         if self.words[6] >> 63 == 0 {
@@ -452,16 +567,9 @@ impl BlockPointer {
         decompress(&payload[..packed], self.compression(), self.logical_bytes())
     }
 
-    /// Admission for the ordinary unencrypted single-leaf block pipeline.
-    /// Hole size requires DMU context; embedded/gang blocks use other pipelines.
-    pub fn regular_dvas(&self) -> Result<Vec<Dva>, ParseError> {
-        if self.embedded() || self.protected() || self.hole() {
-            return Err(invalid(
-                "embedded, protected or context-sized hole block is not a regular block",
-            ));
-        }
+    fn parse_dva_slots(&self, max_slots: usize) -> Result<Vec<Dva>, ParseError> {
         if self.words[7] != 0 || self.words[8] != 0 || self.birth() == 0 {
-            return Err(invalid("noncanonical regular block padding or birth"));
+            return Err(invalid("noncanonical block padding or birth"));
         }
         if self.physical_bytes() > self.logical_bytes() {
             return Err(invalid("physical block exceeds logical block size"));
@@ -474,9 +582,9 @@ impl BlockPointer {
         if self.compression() == 2 && self.physical_bytes() != self.logical_bytes() {
             return Err(invalid("uncompressed block sizes disagree"));
         }
-        let mut result = Vec::new();
+        let mut result = Vec::with_capacity(max_slots);
         let mut ended = false;
-        for i in 0..3 {
+        for i in 0..max_slots {
             let first = self.words[i * 2];
             let second = self.words[i * 2 + 1];
             if first == 0 && second == 0 {
@@ -497,15 +605,53 @@ impl BlockPointer {
             });
         }
         if result.is_empty() {
-            return Err(invalid("regular block has no DVA"));
+            return Err(invalid("block pointer has no DVA"));
         }
         Ok(result)
+    }
+
+    /// Admission for the ordinary unencrypted single-leaf block pipeline.
+    /// Hole size requires DMU context; embedded/gang blocks use other pipelines.
+    pub fn regular_dvas(&self) -> Result<Vec<Dva>, ParseError> {
+        if self.embedded() || self.protected() || self.hole() {
+            return Err(invalid(
+                "embedded, protected or context-sized hole block is not a regular block",
+            ));
+        }
+        self.parse_dva_slots(3)
+    }
+
+    /// Admission for protected (`BP_IS_PROTECTED`) encrypted or authenticated blocks.
+    /// Encrypted L0 blocks use at most 2 DVA slots because slot 2 stores `(salt, IV1)`.
+    pub fn protected_dvas(&self) -> Result<Vec<Dva>, ParseError> {
+        if self.embedded() || !self.protected() || self.hole() {
+            return Err(invalid(
+                "expected non-embedded, non-hole protected block pointer",
+            ));
+        }
+        let max_slots = if self.is_encrypted() { 2 } else { 3 };
+        self.parse_dva_slots(max_slots)
+    }
+
+    /// Parse DVA slots for either an unencrypted regular block or a protected block.
+    pub fn data_dvas(&self) -> Result<Vec<Dva>, ParseError> {
+        if self.protected() {
+            self.protected_dvas()
+        } else {
+            self.regular_dvas()
+        }
     }
 
     /// Check physical bytes (including allocation padding inside PSIZE) before
     /// decoding. No partial or unchecked logical bytes escape on failure.
     /// Embedded pointers accept no physical bytes and require a checked parent.
+    /// Protected pointers MUST go through the authenticated crypto pipeline.
     pub fn decode(&self, physical: &[u8]) -> Result<Vec<u8>, ParseError> {
+        if self.protected() {
+            return Err(invalid(
+                "protected block must be decoded via authenticated crypto pipeline",
+            ));
+        }
         if self.embedded() {
             if !physical.is_empty() {
                 return Err(invalid("embedded data must not consume physical bytes"));
@@ -515,6 +661,23 @@ impl BlockPointer {
         self.verify_physical(physical)?;
         decompress(physical, self.compression(), self.logical_bytes())
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct ProtectedBlockSpec<'a> {
+    pub dvas: &'a [Dva],
+    pub logical_bytes: usize,
+    pub physical: &'a [u8],
+    pub compression: u8,
+    pub checksum_type: u8,
+    pub object_type: u8,
+    pub level: u8,
+    pub payload_order: Endian,
+    pub birth: u64,
+    pub fill: u64,
+    pub salt: Option<[u8; crypto::ZIO_DATA_SALT_LEN]>,
+    pub iv: Option<[u8; crypto::ZIO_DATA_IV_LEN]>,
+    pub mac: [u8; crypto::ZIO_DATA_MAC_LEN],
 }
 
 #[derive(Debug, Clone)]

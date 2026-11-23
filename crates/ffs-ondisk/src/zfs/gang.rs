@@ -45,7 +45,7 @@ impl BlockPointer {
     /// Additional header replicas may contain no corresponding member copy.
     /// Supply one native header allocation per declared DVA, in copy order.
     pub fn gang_dvas(&self, header_allocations: &[u64]) -> Result<Vec<Dva>, ParseError> {
-        let dvas = self.regular_dvas()?;
+        let dvas = self.data_dvas()?;
         if !self.gang()
             || dvas.iter().any(|dva| !dva.gang)
             || self.physical_birth() == 0
@@ -78,8 +78,13 @@ impl BlockPointer {
     }
 
     /// Verify a complete physical stream without allocating a logical result
-    /// or decompressing it. Gang-tree interior checks use this same boundary.
+    /// or decompressing it. Gang-tree interior checks and protected physical
+    /// reads use this same boundary.
     pub fn verify_physical(&self, physical: &[u8]) -> Result<(), ParseError> {
+        if self.protected() {
+            self.protected_dvas()?;
+            return super::crypto::verify_protected_physical_checksum(self, physical);
+        }
         self.regular_dvas()?;
         if physical.len() != self.physical_bytes() {
             return Err(invalid("short physical block"));

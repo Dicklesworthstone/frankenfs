@@ -1027,6 +1027,56 @@ impl ObjectSet {
         720 + self.tail_bytes.len()
     }
 
+    /// Stored 32-byte `os_portable_mac` (`objset_phys_t` bytes `720..752`), present
+    /// on 2048-byte and 4096-byte object sets.
+    #[must_use]
+    pub fn portable_mac(&self) -> Option<[u8; 32]> {
+        if self.physical_bytes() < 2048 || self.tail_bytes.len() < 64 {
+            return None;
+        }
+        let mut out = [0_u8; 32];
+        out.copy_from_slice(&self.tail_bytes[0..32]);
+        Some(out)
+    }
+
+    /// Stored 32-byte `os_local_mac` (`objset_phys_t` bytes `752..784`), present
+    /// on 2048-byte and 4096-byte object sets.
+    #[must_use]
+    pub fn local_mac(&self) -> Option<[u8; 32]> {
+        if self.physical_bytes() < 2048 || self.tail_bytes.len() < 64 {
+            return None;
+        }
+        let mut out = [0_u8; 32];
+        out.copy_from_slice(&self.tail_bytes[32..64]);
+        Some(out)
+    }
+
+    /// Write `(os_portable_mac, os_local_mac)` into `objset_phys_t` bytes `720..784`.
+    pub fn set_macs(&mut self, portable: [u8; 32], local: [u8; 32]) -> Result<(), ParseError> {
+        if self.physical_bytes() < 2048 || self.tail_bytes.len() < 64 {
+            return Err(invalid(
+                "encrypted objset_phys_t requires at least 2048 bytes for MAC fields",
+            ));
+        }
+        self.tail_bytes[0..32].copy_from_slice(&portable);
+        self.tail_bytes[32..64].copy_from_slice(&local);
+        Ok(())
+    }
+
+    /// Compute and stamp `(os_portable_mac, os_local_mac)` matching OpenZFS
+    /// `zio_crypt_do_objset_hmacs`.
+    pub fn stamp_encrypted_macs(
+        &mut self,
+        order: Endian,
+        hmac_key: &[u8; 64],
+        version: u64,
+    ) -> Result<(), ParseError> {
+        let raw = self.encode(order)?;
+        let (portable, local) =
+            crate::zfs::crypto::compute_objset_macs(&raw, order, hmac_key, version)?;
+        self.set_macs(portable, local)
+    }
+
     /// Exact OpenZFS `rootbp_write` `blk_fill` for `DMU_OT_OBJSET`: sum of
     /// `BP_GET_FILL(&os_meta_dnode.dn_blkptr[i])` across root pointers.
     #[must_use]
