@@ -19,6 +19,8 @@ use std::process::{Command, Output};
 
 #[path = "cli_e2e/ntfs_ea.rs"]
 mod ntfs_ea;
+#[path = "cli_e2e/ntfs_orphans.rs"]
+mod ntfs_orphans;
 #[path = "cli_e2e/ntfs_sparse.rs"]
 mod ntfs_sparse;
 
