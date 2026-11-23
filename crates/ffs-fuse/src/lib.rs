@@ -7285,7 +7285,7 @@ impl Filesystem for FrankenFuse {
                 // cost is per REPLY rather than per directory entry.
                 let mut census_served: u64 = 0;
                 let mut census_inline: u64 = 0;
-                let entry_ttl = self.entry_ttl_for_parent(&cx, ino);
+                let entry_ttl = entry_ttl.min(self.entry_ttl_for_parent(&cx, ino));
                 let visible = self.inner.dir_handles.visible_len(fh, fs_offset, &entries);
                 for (index, entry) in entries.iter().take(visible).enumerate() {
                     // bd-xfe7z: time the whole loop body so loop_ns - scope_ns -
