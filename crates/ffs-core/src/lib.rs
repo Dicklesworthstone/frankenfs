@@ -146933,6 +146933,10 @@ pub(crate) mod scrub;\n";
             Some((b"nested", NESTED_ID)),
         );
         build_leaf(&mut image, NESTED_ROOT, NESTED_ID, nested_files, None);
+        let device_item = sb_off + 0xC9;
+        image[device_item..device_item + 8].copy_from_slice(&1_u64.to_le_bytes());
+        image[device_item + 8..device_item + 16]
+            .copy_from_slice(&(image_size as u64).to_le_bytes());
         let csum = ffs_types::crc32c(&image[sb_off + 0x20..sb_off + 4096]);
         image[sb_off..sb_off + 4].copy_from_slice(&csum.to_le_bytes());
 
