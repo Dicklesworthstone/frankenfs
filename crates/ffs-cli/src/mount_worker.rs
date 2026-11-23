@@ -140,10 +140,12 @@ impl<T: Send + 'static> MountIoWorker<T> {
         let worker_principal_cx = region.cx().clone();
         let claim_gate = Arc::new(std::sync::atomic::AtomicU8::new(WORKER_QUEUED));
         let worker_gate = Arc::clone(&claim_gate);
+        let parent_cx = cx.clone();
         let (sender, completion) = asupersync::channel::oneshot::channel();
         let task = match region.spawn(move |worker_cx| async move {
             asupersync::runtime::spawn_blocking(move || {
-                if worker_cx.checkpoint().is_err()
+                if parent_cx.checkpoint().is_err()
+                    || worker_cx.checkpoint().is_err()
                     || worker_gate
                         .compare_exchange(
                             WORKER_QUEUED,
