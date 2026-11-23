@@ -1,6 +1,9 @@
 //! FsOps integration using the parent's native-layout/faultable-storage fixtures.
 //! These fixtures exercise the storage model, not native OpenZFS or FUSE mounts.
 
+#[path = "setid.rs"]
+mod setid;
+
 use super::*;
 use ffs_core::vfs::{FileType, ReleaseRequest, RequestOp};
 use ffs_core::{FsOps, InodeAttr, RequestScope, SetAttrRequest};
@@ -2777,126 +2780,317 @@ fn fsync_propagates_member_flush_failures_after_a_known_commit_and_can_retry() {
 }
 
 #[test]
-fn data_mutations_refuse_set_id_files_before_commit_and_do_not_leak_handles() {
+fn data_mutations_clear_set_id_in_the_same_native_commit() {
     let cx = Cx::for_testing();
-    for mode in [0o4755, 0o2755] {
-        let (mut engine, devices) = writer_fixture(&cx, &PoolFixtureSpec::default());
+    for (zpl_version, mode, expected_mode) in
+        [(4, 0o6755, 0o755), (5, 0o4755, 0o755), (5, 0o2644, 0o2644)]
+    {
+        let (mut engine, devices) = writer_fixture(
+            &cx,
+            &PoolFixtureSpec {
+                zpl_version,
+                deadlist_mode: DeadlistMode::NativeDeadlist,
+                image_bytes: 24 * 1024 * 1024,
+                ..PoolFixtureSpec::default()
+            },
+        );
         let dataset = vec![b"data".to_vec()];
         let timestamp = Timestamp {
             seconds: 1_715_000_000,
             nanos: 0,
         };
-        let payload = b"privileged contents must survive refusal";
-        // The explicit image editor can seed privileged native data. The mounted
-        // profile cannot modify it until atomic privilege clearing is implemented.
-        let (object, _) = engine
-            .create_file(
-                &cx,
-                &dataset,
-                2,
-                b"privileged",
-                mode,
-                1234,
-                5678,
-                timestamp,
-                ZfsDataChecksum::Fletcher4,
-            )
-            .into_result()
-            .unwrap();
-        engine
-            .write_file_data(
-                &cx,
-                &dataset,
-                object,
-                0,
-                payload,
-                timestamp,
-                ZfsDataChecksum::Fletcher4,
-            )
-            .into_result()
-            .unwrap();
-        let fs = ZfsFs::with_writer(&cx, engine, dataset).unwrap();
+        let payload = b"0123456789abcdefghijklmnopqrstuvwxyz";
+        let names = [
+            "write",
+            "copy",
+            "truncate",
+            "open-truncate",
+            "punch",
+            "zero",
+            "compound",
+        ];
+        let mut identities = Vec::new();
+        // The explicit native editor retains privileged bits. FsOps has no
+        // caller capability granting retention and must drop them atomically.
+        for name in names {
+            let (object, _) = engine
+                .create_file(
+                    &cx,
+                    &dataset,
+                    2,
+                    name.as_bytes(),
+                    mode,
+                    1234,
+                    5678,
+                    timestamp,
+                    ZfsDataChecksum::Fletcher4,
+                )
+                .into_result()
+                .unwrap();
+            engine
+                .write_file_data(
+                    &cx,
+                    &dataset,
+                    object,
+                    0,
+                    payload,
+                    timestamp,
+                    ZfsDataChecksum::Fletcher4,
+                )
+                .into_result()
+                .unwrap();
+            identities.push((name, object));
+        }
+        let fs = ZfsFs::with_writer_options(
+            &cx,
+            engine,
+            dataset.clone(),
+            ffs_zfs::ZfsMountWriteOptions {
+                allow_mode_and_owner_setattr: true,
+            },
+        )
+        .unwrap();
         let mut scope = RequestScope::empty();
-        let file = lookup(&fs, &cx, ROOT, "privileged");
-        assert_eq!(file.perm, mode);
-        assert_eq!(read(&fs, &cx, file.ino), payload);
         let source = create(&fs, &cx, ROOT, "source");
-        let replacement = b"replacement bytes";
+        let replacement = b"updated";
         fs.write(&cx, &mut scope, source.ino, 0, replacement)
             .unwrap();
-        let ordinary = create(&fs, &cx, ROOT, "ordinary");
-        assert_eq!(
-            fs.copy_file_range(
-                &cx,
-                &mut scope,
-                source.ino,
-                0,
-                ordinary.ino,
-                0,
-                replacement.len() as u64
-            )
-            .unwrap(),
-            replacement.len() as u64
-        );
-        assert_eq!(read(&fs, &cx, ordinary.ino), replacement);
-        let (handle, _) = fs.open(&cx, &mut scope, file.ino, libc::O_RDONLY).unwrap();
-        release(&fs, &cx, file.ino, handle);
-        let token = fs.last_durable_token().unwrap().unwrap();
-        let before = io_counts(&devices);
-        assert_eq!(
-            fs.setattr(
-                &cx,
-                &mut scope,
-                file.ino,
-                &SetAttrRequest {
-                    size: Some(0),
-                    ..SetAttrRequest::default()
+        fs.create_snapshot(&cx, b"privileged-before").unwrap();
+        let control = lookup(&fs, &cx, ROOT, ".zfs");
+        let snapshots = lookup(&fs, &cx, control.ino, "snapshot");
+        let snapshot = lookup(&fs, &cx, snapshots.ino, "privileged-before");
+        let mut expected_files = Vec::new();
+        for (name, object) in identities {
+            let file = lookup(&fs, &cx, ROOT, name);
+            assert_eq!(file.perm, mode);
+            let token = fs.last_durable_token().unwrap().unwrap();
+            let counts = io_counts(&devices);
+            assert_eq!(fs.write(&cx, &mut scope, file.ino, 0, b"").unwrap(), 0);
+            assert_eq!(fs.getattr(&cx, &mut scope, file.ino).unwrap(), file);
+            assert_eq!(fs.last_durable_token().unwrap().unwrap(), token);
+            assert_eq!(io_counts(&devices), counts);
+            let mut expected = payload.to_vec();
+            match name {
+                "write" => {
+                    assert_eq!(
+                        fs.write(&cx, &mut scope, file.ino, 3, replacement).unwrap(),
+                        replacement.len() as u32
+                    );
+                    expected[3..3 + replacement.len()].copy_from_slice(replacement);
                 }
-            )
-            .unwrap_err()
-            .to_errno(),
-            libc::EOPNOTSUPP
-        );
-        assert_eq!(
-            fs.open(&cx, &mut scope, file.ino, libc::O_WRONLY | libc::O_TRUNC)
-                .unwrap_err()
-                .to_errno(),
-            libc::EOPNOTSUPP
-        );
-        assert_eq!(
-            fs.write(&cx, &mut scope, file.ino, 0, replacement)
-                .unwrap_err()
-                .to_errno(),
-            libc::EOPNOTSUPP
-        );
-        assert_eq!(
-            fs.copy_file_range(
-                &cx,
-                &mut scope,
-                source.ino,
-                0,
-                file.ino,
-                0,
-                replacement.len() as u64
-            )
-            .unwrap_err()
-            .to_errno(),
-            libc::EOPNOTSUPP
-        );
-        assert_eq!(io_counts(&devices), before);
-        assert_eq!(fs.last_durable_token().unwrap().unwrap(), token);
-        assert_eq!(read(&fs, &cx, file.ino), payload);
-        let unchanged = fs.getattr(&cx, &mut scope, file.ino).unwrap();
-        assert_eq!(
-            (unchanged.perm, unchanged.size),
-            (mode, payload.len() as u64)
-        );
-        let (next_handle, _) = fs.open(&cx, &mut scope, file.ino, libc::O_RDONLY).unwrap();
-        assert_eq!(next_handle, handle + 1);
-        release(&fs, &cx, file.ino, next_handle);
-        fs.unlink(&cx, &mut scope, ROOT, OsStr::new("privileged"))
+                "copy" => {
+                    assert_eq!(
+                        fs.copy_file_range(
+                            &cx,
+                            &mut scope,
+                            source.ino,
+                            0,
+                            file.ino,
+                            5,
+                            replacement.len() as u64,
+                        )
+                        .unwrap(),
+                        replacement.len() as u64
+                    );
+                    expected[5..5 + replacement.len()].copy_from_slice(replacement);
+                }
+                "truncate" | "compound" => {
+                    fs.setattr(
+                        &cx,
+                        &mut scope,
+                        file.ino,
+                        &SetAttrRequest {
+                            size: Some(9),
+                            // A compound request must not reinstall privilege
+                            // bits after its data change has removed them.
+                            mode: (name == "compound").then_some(0o6755),
+                            ..SetAttrRequest::default()
+                        },
+                    )
+                    .unwrap();
+                    expected.truncate(9);
+                }
+                "open-truncate" => {
+                    let (handle, _) = fs
+                        .open(&cx, &mut scope, file.ino, libc::O_WRONLY | libc::O_TRUNC)
+                        .unwrap();
+                    release(&fs, &cx, file.ino, handle);
+                    expected.clear();
+                }
+                "punch" | "zero" => {
+                    fs.fallocate(
+                        &cx,
+                        &mut scope,
+                        file.ino,
+                        5,
+                        11,
+                        if name == "punch" {
+                            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE
+                        } else {
+                            libc::FALLOC_FL_ZERO_RANGE | libc::FALLOC_FL_KEEP_SIZE
+                        },
+                    )
+                    .unwrap();
+                    expected[5..16].fill(0);
+                }
+                _ => unreachable!(),
+            }
+            let updated = fs.getattr(&cx, &mut scope, file.ino).unwrap();
+            let expected_perm = if name == "compound" {
+                0o755
+            } else {
+                expected_mode
+            };
+            assert_eq!(updated.perm, expected_perm, "{name}, ZPL {zpl_version}");
+            assert_eq!((updated.uid, updated.gid), (1234, 5678));
+            assert_eq!(updated.generation, file.generation);
+            assert_eq!(updated.size, expected.len() as u64);
+            assert_eq!(read(&fs, &cx, file.ino), expected);
+            assert_eq!(
+                fs.last_durable_token().unwrap().unwrap().committed_txg(),
+                token.committed_txg() + 1,
+                "data and mode require one native commit for {name}"
+            );
+            let historical = lookup(&fs, &cx, snapshot.ino, name);
+            assert_eq!(historical.perm, mode & !0o222);
+            assert_eq!(read(&fs, &cx, historical.ino), payload);
+            expected_files.push((object, expected_perm, expected));
+        }
+        let token = fs.last_durable_token().unwrap().unwrap();
+        let fresh: Vec<_> = devices
+            .iter()
+            .map(FaultableMemberDevice::fresh_from_durable)
+            .collect();
+        let recovered = open_engine_on_devices(
+            &cx,
+            &fresh,
+            default_write_opts(POOL_GUID, token.published_slot()),
+        )
+        .unwrap();
+        let mut head = recovered
+            .open_read_objects(&cx)
+            .unwrap()
+            .zpl(&cx, &dataset)
             .unwrap();
+        for (object, expected_perm, expected) in expected_files {
+            assert_eq!(
+                head.stat(&cx, object).unwrap().0.mode & 0o7777,
+                u64::from(expected_perm)
+            );
+            assert_eq!(head.read(&cx, object, 0, 8192).unwrap(), expected);
+        }
+        assert_pool_scrub_and_allocation_clean(&cx, &devices, POOL_GUID, None);
     }
+}
+
+#[test]
+fn cancelled_set_id_data_mutations_preserve_bytes_permissions_and_handle_lifetime() {
+    let cx = Cx::for_testing();
+    let (mut engine, devices) = writer_fixture(&cx, &PoolFixtureSpec::default());
+    let dataset = vec![b"data".to_vec()];
+    let timestamp = Timestamp {
+        seconds: 1_715_000_000,
+        nanos: 0,
+    };
+    let payload = b"privileged contents survive cancelled publication";
+    let (object, _) = engine
+        .create_file(
+            &cx,
+            &dataset,
+            2,
+            b"privileged",
+            0o6755,
+            1234,
+            5678,
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    engine
+        .write_file_data(
+            &cx,
+            &dataset,
+            object,
+            0,
+            payload,
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    let fail_next = Arc::new(AtomicBool::new(false));
+    let inject = Arc::clone(&fail_next);
+    engine.with_fault_hook(move |event| {
+        if matches!(event.stage, ZfsPersistenceStage::ChildBlocksWrite { .. })
+            && inject.swap(false, Ordering::SeqCst)
+        {
+            return Err(FfsError::Cancelled);
+        }
+        Ok(())
+    });
+    // The default writer does not grant chmod authority. Atomic set-ID removal
+    // is nevertheless required for a data operation that it already admits.
+    let fs = ZfsFs::with_writer(&cx, engine, dataset).unwrap();
+    let mut scope = RequestScope::empty();
+    let file = lookup(&fs, &cx, ROOT, "privileged");
+    let (first_handle, _) = fs.open(&cx, &mut scope, file.ino, libc::O_RDONLY).unwrap();
+    release(&fs, &cx, file.ino, first_handle);
+    let token = fs.last_durable_token().unwrap();
+    let counts = io_counts(&devices);
+    for operation in 0..4 {
+        fail_next.store(true, Ordering::SeqCst);
+        let error = match operation {
+            0 => fs
+                .open(&cx, &mut scope, file.ino, libc::O_WRONLY | libc::O_TRUNC)
+                .unwrap_err(),
+            1 => fs
+                .write(&cx, &mut scope, file.ino, 3, b"changed")
+                .unwrap_err(),
+            2 => fs
+                .setattr(
+                    &cx,
+                    &mut scope,
+                    file.ino,
+                    &SetAttrRequest {
+                        size: Some(4),
+                        ..SetAttrRequest::default()
+                    },
+                )
+                .unwrap_err(),
+            _ => fs
+                .fallocate(
+                    &cx,
+                    &mut scope,
+                    file.ino,
+                    3,
+                    8,
+                    libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                )
+                .unwrap_err(),
+        };
+        assert!(matches!(error, FfsError::Cancelled), "{error:?}");
+        assert!(
+            !fail_next.load(Ordering::SeqCst),
+            "reached the native publication boundary"
+        );
+        assert_eq!(io_counts(&devices), counts);
+        assert_eq!(fs.last_durable_token().unwrap(), token);
+        assert_eq!(fs.getattr(&cx, &mut scope, file.ino).unwrap(), file);
+        assert_eq!(read(&fs, &cx, file.ino), payload);
+    }
+    let (next_handle, _) = fs.open(&cx, &mut scope, file.ino, libc::O_RDONLY).unwrap();
+    assert_eq!(
+        next_handle,
+        first_handle + 1,
+        "failed O_TRUNC must not consume a handle"
+    );
+    release(&fs, &cx, file.ino, next_handle);
+    fs.write(&cx, &mut scope, file.ino, 0, b"retry").unwrap();
+    assert_eq!(fs.getattr(&cx, &mut scope, file.ino).unwrap().perm, 0o755);
+    fs.unlink(&cx, &mut scope, ROOT, OsStr::new("privileged"))
+        .unwrap();
+    assert_pool_scrub_and_allocation_clean(&cx, &devices, POOL_GUID, None);
 }
 
 #[test]

@@ -676,6 +676,14 @@ generation and birth time; native immutable/read-only rules are applied before
 publication. Native mode/ownership changes, ACL mutation and evaluation, and the
 remaining dataset/shared-reference lifecycle remain required by this plan.
 
+Writable data operations remove S_ISUID and executable S_ISGID in the same native
+TXG as writes, copies, truncation and supported sparse range edits. An explicit
+mode supplied with truncation cannot restore those bits in the same request.
+Non-executable S_ISGID and immutable snapshot permissions are preserved. Native
+editor APIs expose the clearing policy separately from their existing
+permission-preserving operations. Atomic removal of Linux file-capability xattrs
+remains required; data mutation on such files is refused before publication.
+
 Native symlink creation is exposed through `ZfsTransactionEngine::create_symlink`
 and writable `FsOps::symlink`. Target bytes and the namespace entry publish in
 one TXG, with short inline and longer data-backed legacy znodes on both ZPL v4

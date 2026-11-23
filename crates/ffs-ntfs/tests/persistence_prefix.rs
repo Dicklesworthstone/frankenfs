@@ -7,6 +7,8 @@
 mod catalog_admission;
 #[path = "persistence_prefix/ea.rs"]
 mod ea;
+#[path = "persistence_prefix/orphans.rs"]
+mod orphans;
 #[path = "persistence_prefix/punch.rs"]
 mod punch;
 #[path = "persistence_prefix/sparse_fsops.rs"]

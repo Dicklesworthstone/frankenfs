@@ -1200,7 +1200,12 @@ impl FrankenFuse {
         scope: &mut RequestScope,
         parent: InodeNumber,
     ) -> ffs_error::Result<Duration> {
-        if self.inner.read_only || !self.inner.ops.directory_has_name_aliases(cx, scope, parent)? {
+        if self.inner.read_only
+            || !self
+                .inner
+                .ops
+                .directory_has_name_aliases(cx, scope, parent)?
+        {
             Ok(ATTR_TTL)
         } else {
             Ok(Duration::ZERO)
@@ -3990,9 +3995,9 @@ impl FrankenFuse {
     ) -> Result<(), MutationDispatchError> {
         let cx = self.cx_for_request();
         self.enforce_mutation_guards(&cx, RequestOp::Rename, parent)?;
-        // RENAME_WHITEOUT (overlayfs): rename, then leave a whiteout — a 0:0
-        // character device owned by the caller — under the old name, as
-        // ext4_whiteout_for_rename does. It cannot be combined with EXCHANGE.
+        // RENAME_WHITEOUT must be one backend publication. Native engines
+        // may commit each operation immediately, so composing rename + mknod
+        // here could move the file before discovering whiteouts are unsupported.
         let whiteout = flags & libc::RENAME_WHITEOUT != 0;
         if whiteout && flags & libc::RENAME_EXCHANGE != 0 {
             return Err(MutationDispatchError::Errno(libc::EINVAL));
@@ -4001,31 +4006,16 @@ impl FrankenFuse {
             let _inode_guards =
                 self.acquire_mutation_inode_guards(&[InodeNumber(parent), InodeNumber(newparent)]);
             self.with_request_scope(&cx, RequestOp::Rename, |cx, scope| {
-                if whiteout {
-                    scope.mark_composite();
-                }
-                self.inner.ops.rename2(
+                self.inner.ops.rename2_with_owner(
                     cx,
                     scope,
                     InodeNumber(parent),
                     name,
                     InodeNumber(newparent),
                     newname,
-                    flags & !libc::RENAME_WHITEOUT,
+                    flags,
+                    owner,
                 )?;
-                if whiteout {
-                    #[allow(clippy::cast_possible_truncation)]
-                    self.inner.ops.mknod(
-                        cx,
-                        scope,
-                        InodeNumber(parent),
-                        name,
-                        libc::S_IFCHR as u16,
-                        0,
-                        owner.0,
-                        owner.1,
-                    )?;
-                }
                 self.inner.ops.commit_request_scope(cx, scope)?;
                 Ok(())
             })
@@ -4261,6 +4251,22 @@ impl FrankenFuse {
         len: u64,
         flags: u32,
     ) -> Result<u32, MutationDispatchError> {
+        self.dispatch_copy_file_range_with_caller(
+            ino_in, offset_in, ino_out, offset_out, len, flags, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_copy_file_range_with_caller(
+        &self,
+        ino_in: u64,
+        offset_in: i64,
+        ino_out: u64,
+        offset_out: i64,
+        len: u64,
+        flags: u32,
+        caller: Option<(u32, u32, u32)>,
+    ) -> Result<u32, MutationDispatchError> {
         if flags != 0 {
             return Err(MutationDispatchError::Errno(libc::EINVAL));
         }
@@ -4271,13 +4277,58 @@ impl FrankenFuse {
         if len == 0 {
             return Ok(0);
         }
+        let copy_len = len.min(u64::from(u32::MAX));
+        let source_end = src_offset
+            .checked_add(copy_len)
+            .filter(|&end| i64::try_from(end).is_ok())
+            .ok_or(MutationDispatchError::Errno(libc::EINVAL))?;
+        let destination_end = dst_offset
+            .checked_add(copy_len)
+            .filter(|&end| i64::try_from(end).is_ok())
+            .ok_or(MutationDispatchError::Errno(libc::EINVAL))?;
+        if ino_in == ino_out && src_offset < destination_end && dst_offset < source_end {
+            return Err(MutationDispatchError::Operation {
+                error: FfsError::Io(std::io::Error::from_raw_os_error(libc::EINVAL)),
+                offset: Some(dst_offset),
+            });
+        }
         let cx = self.cx_for_request();
         self.enforce_mutation_guards(&cx, RequestOp::Write, ino_out)?;
-        let copy_len = len.min(u64::from(u32::MAX));
         let copied = {
             let _inode_guards =
                 self.acquire_mutation_inode_guards(&[InodeNumber(ino_in), InodeNumber(ino_out)]);
             self.with_request_scope(&cx, RequestOp::Write, |cx, scope| {
+                let mut copy_len = copy_len;
+                if let Some((uid, gid, pid)) = caller {
+                    let source = self.inner.ops.getattr(cx, scope, InodeNumber(ino_in))?;
+                    let destination = self.inner.ops.getattr(cx, scope, InodeNumber(ino_out))?;
+                    for attr in [&source, &destination] {
+                        if attr.kind == FfsFileType::Directory {
+                            return Err(FfsError::IsDirectory);
+                        }
+                        if attr.kind != FfsFileType::RegularFile {
+                            return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                                libc::EINVAL,
+                            )));
+                        }
+                    }
+                    if src_offset >= source.size {
+                        return Ok(0);
+                    }
+                    copy_len = copy_len.min(source.size - src_offset);
+                    // HANDLE_KILLPRIV_V2 suppresses the kernel's mode update
+                    // before COPY. Keep caller-aware clearing and the copy under
+                    // the same inode guards so chmod cannot restore privileges.
+                    // CAP_FSETID exempts set-ID bits, not security.capability.
+                    self.remove_write_privileges_in_scope(
+                        cx,
+                        scope,
+                        ino_out,
+                        &destination,
+                        (uid, gid, pid),
+                        caller_lacks_fsetid(uid, pid),
+                    )?;
+                }
                 let copied = self.inner.ops.copy_file_range(
                     cx,
                     scope,

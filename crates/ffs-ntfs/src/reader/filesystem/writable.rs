@@ -12,7 +12,8 @@ use super::{
 };
 use crate::security_policy::{NtfsSecurityPatch, NtfsSidPolicy};
 use crate::transaction::{
-    DEFAULT_NTFS_FILETIME, NtfsEaSetMode, NtfsTxOutcome, validate_ntfs_component_utf16,
+    DEFAULT_NTFS_FILETIME, NtfsEaSetMode, NtfsTxOutcome, ORPHAN_STREAM_NAME,
+    validate_ntfs_component_utf16,
 };
 use ffs_ondisk::ntfs::ea::{MAX_EA_NAME_BYTES, NtfsEa};
 use ffs_ondisk::ntfs_security::{
@@ -57,8 +58,10 @@ impl NtfsFs {
     /// Adopt an explicitly admitted native writer for filesystem operations.
     ///
     /// The writer keeps its exclusive backing capability for this object's
-    /// entire lifetime. Ordinary `new`/`new_recovered` constructors remain
-    /// read-only. Native transforms not admitted by the writer stay refused.
+    /// entire lifetime. Before exposing the namespace, it validates and reaps
+    /// native files retained by an earlier FrankenFS mount. Ordinary
+    /// `new`/`new_recovered` constructors remain read-only and preserve those
+    /// survivors. Native transforms not admitted by the writer stay refused.
     pub fn from_engine(cx: &Cx, engine: NtfsTransactionEngine, uid: u32, gid: u32) -> Result<Self> {
         Self::from_engine_with_policy(cx, engine, NtfsSidPolicy::Synthetic { uid, gid })
     }
@@ -68,7 +71,7 @@ impl NtfsFs {
     /// SACL-preserving `chmod`/`chown` when `NtfsSidPolicy::Mapped` is supplied).
     pub fn from_engine_with_policy(
         cx: &Cx,
-        engine: NtfsTransactionEngine,
+        mut engine: NtfsTransactionEngine,
         policy: NtfsSidPolicy,
     ) -> Result<Self> {
         if engine.requires_recovery() {
@@ -76,10 +79,11 @@ impl NtfsFs {
                 "NTFS writer requires recovery before filesystem admission",
             ));
         }
-        engine.check_clean_consistency(cx)?;
+        let last_token = engine.recover_retained_files(cx)?;
         let volume = engine.volume_view(cx)?;
         let mut fs = Self::new_with_policy(cx, volume, policy)?;
         fs.writer = Some(Mutex::new(engine));
+        fs.last_token = Mutex::new(last_token);
         // Construction populated attributes using read-only permissions.
         *fs.cache()? = Cache::default();
         Ok(fs)
@@ -233,7 +237,22 @@ impl NtfsFs {
                 "mutation of literal native colon filenames is not admitted",
             ));
         }
-        parse_ads_component(text)
+        let component = parse_ads_component(text)?;
+        if let Some((_, stream)) = &component {
+            self.enforce_user_stream_mutation(stream)?;
+        }
+        Ok(component)
+    }
+
+    fn enforce_user_stream_mutation(&self, stream: &[u16]) -> Result<()> {
+        let marker: Vec<_> = ORPHAN_STREAM_NAME.encode_utf16().collect();
+        if self.fold_units(stream) == self.fold_units(&marker) {
+            // Only the native retention planner may publish cleanup intent.
+            // FILE_WRITE_DATA must never become authority to delete a file
+            // during the next writable mount.
+            return Err(FfsError::PermissionDenied);
+        }
+        Ok(())
     }
 
     fn directory_reference(&self, cx: &Cx, ino: InodeNumber) -> Result<NtfsReference> {
@@ -299,7 +318,9 @@ impl NtfsFs {
         }
         self.enforce_data_access(cx, ino, FILE_WRITE_DATA)?;
         if is_ads_ino(ino) {
-            self.ads_target(ino)
+            let (target, stream) = self.ads_target(ino)?;
+            self.enforce_user_stream_mutation(&stream)?;
+            Ok((target, stream))
         } else {
             Ok((reference(&self.record(cx, ino)?), Vec::new()))
         }
@@ -1003,10 +1024,9 @@ impl NtfsFs {
         target: NtfsReference,
         ino: InodeNumber,
     ) -> Result<()> {
-        // A native rename keeps the open FILE and its allocation journaled.
-        // Only this live mount's exact retained names are hidden. A crash can
-        // leave an ordinary recoverable native file; never delete a preexisting
-        // name on reopen merely because it resembles this prefix.
+        // The retained native name and its identity-bound ownership stream
+        // publish in one transaction. Only this mount's exact names are hidden;
+        // a new writable mount validates ownership before reaping survivors.
         for _ in 0..16 {
             let sequence = RETAINED_SEQUENCE
                 .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
@@ -1016,7 +1036,14 @@ impl NtfsFs {
                 .collect();
             self.check_retained_file(ino, &retained)?;
             let outcome = self.transact(cx, |engine| {
-                engine.rename_at(cx, parent, name, self.root, &retained, target, true)
+                engine.retain_unlinked_at(
+                    cx,
+                    parent,
+                    name,
+                    target,
+                    &retained,
+                    DEFAULT_NTFS_FILETIME,
+                )
             });
             match outcome {
                 Ok(_) => {

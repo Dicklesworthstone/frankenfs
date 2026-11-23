@@ -1,5 +1,24 @@
 # FEATURE_PARITY
 
+> **ZFS atomic set-ID removal during data mutation (2026-11-23):**
+> Writable FsOps writes, copies, truncation (including open-with-truncate),
+> hole punching and zero-range edits now remove S_ISUID and executable S_ISGID
+> in the native TXG that publishes the data change. Non-executable S_ISGID and
+> existing snapshot permissions are retained. Explicit native editor methods
+> keep their prior permission-preserving policy; new clearing-policy methods
+> share the same staging path. Compound mode/size changes cannot reintroduce
+> the removed bits. Empty writes and range edits wholly beyond EOF with
+> KEEP_SIZE retain their metadata. Authored regressions cover ZPL v4/v5,
+> single-TXG publication, reopen, snapshots, cancellation, handle lifetime and
+> old-or-new data/permission agreement across seven persistence cuts.
+> Workspace formatting and independent source review pass. Compiler and runtime
+> verification remain blocked: the shared host killed dependency compilation
+> even with an isolated disk-backed cache, one compiler job/thread, and debug
+> information and incremental compilation disabled. The focused test build was
+> killed while compiling `libc`, before any project test ran. Atomic removal of
+> capability xattrs, native OpenZFS interchange, mounted qualification and the
+> wider `bd-jdned` roadmap remain open.
+
 > **ZFS atomic directory-entry exchange (2026-11-23):**
 > Writable FsOps `RENAME_EXCHANGE` and `ZfsTransactionEngine::exchange_entries`
 > swap two existing names in one native TXG, including unlike types and nonempty

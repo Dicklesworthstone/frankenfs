@@ -170,7 +170,7 @@ impl ResourceTracker {
 // wrapped counters to another reader, which can admit work past the same cap.
 fn charge_u64(counter: &AtomicU64, amount: u64, limit: Option<u64>, axis: &str) -> Result<u64> {
     counter
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
             current
                 .checked_add(amount)
                 .filter(|next| limit.is_none_or(|cap| *next <= cap))
@@ -181,7 +181,7 @@ fn charge_u64(counter: &AtomicU64, amount: u64, limit: Option<u64>, axis: &str) 
 
 fn charge_u32(counter: &AtomicU32, limit: Option<u32>, axis: &str) -> Result<u32> {
     counter
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
             current
                 .checked_add(1)
                 .filter(|next| limit.is_none_or(|cap| *next <= cap))

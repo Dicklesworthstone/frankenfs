@@ -798,15 +798,19 @@ impl FsOps for ZfsFs {
         }
         let handle = state.next_open_handle()?;
         if flags & libc::O_TRUNC != 0 {
-            state.admit_data_mutation(cx, ino, &metadata)?;
+            state.admit_data_mutation(cx, ino)?;
             let object = state.head.nodes[&ino].object;
             let timestamp = native_timestamp(SystemTime::now())?;
             state.mutate(cx, |engine, dataset| {
-                engine.truncate_file(
+                engine.set_posix_attributes(
                     cx,
                     dataset,
                     object,
-                    0,
+                    &crate::ZfsPosixSetAttr {
+                        size: Some(0),
+                        clear_suid_sgid: true,
+                        ..crate::ZfsPosixSetAttr::default()
+                    },
                     timestamp,
                     crate::ZfsDataChecksum::default(),
                 )
@@ -940,11 +944,11 @@ impl FsOps for ZfsFs {
         if data.is_empty() {
             return Ok(0);
         }
-        state.admit_data_mutation(cx, ino, &metadata)?;
+        state.admit_data_mutation(cx, ino)?;
         let object = state.head.nodes[&ino].object;
         let timestamp = native_timestamp(SystemTime::now())?;
         state.mutate(cx, |engine, dataset| {
-            engine.write_file_data(
+            engine.write_file_data_clearing_setid(
                 cx,
                 dataset,
                 object,
@@ -985,11 +989,11 @@ impl FsOps for ZfsFs {
         if metadata.kind != Kind::Regular {
             return Err(unsupported("ZPL range mutation requires a regular file"));
         }
-        state.admit_data_mutation(cx, ino, &metadata)?;
+        state.admit_data_mutation(cx, ino)?;
         let object = state.head.nodes[&ino].object;
         let timestamp = native_timestamp(SystemTime::now())?;
         state.mutate(cx, |engine, dataset| {
-            engine.edit_file_range(
+            engine.edit_file_range_clearing_setid(
                 cx,
                 dataset,
                 object,
@@ -1042,17 +1046,28 @@ impl FsOps for ZfsFs {
             None => None,
         };
 
-        if !allow_mode_owner
-            && (req_perm.is_some_and(|mode| u64::from(mode) != metadata.mode & 0o7777)
-                || attrs.uid.is_some_and(|uid| u64::from(uid) != metadata.uid)
-                || attrs.gid.is_some_and(|gid| u64::from(gid) != metadata.gid))
+        // FUSE applies its caller/group-aware killpriv policy before WRITE.
+        // Dropping only set-ID bits is permitted even when chmod/chown are not;
+        // a compound request still cannot change any other mode or owner field.
+        let clears_only_setid = metadata.kind == Kind::Regular
+            && req_perm.is_some_and(|mode| {
+                let requested = u64::from(mode);
+                let current = metadata.mode & 0o7777;
+                requested & !current == 0 && (requested ^ current) & !0o6000 == 0
+            });
+        let allow_mode_update = allow_mode_owner || clears_only_setid;
+        if (!allow_mode_update
+            && req_perm.is_some_and(|mode| u64::from(mode) != metadata.mode & 0o7777))
+            || (!allow_mode_owner
+                && (attrs.uid.is_some_and(|uid| u64::from(uid) != metadata.uid)
+                    || attrs.gid.is_some_and(|gid| u64::from(gid) != metadata.gid)))
         {
             return Err(unsupported(
-                "native ZPL mode and ownership changes are not implemented",
+                "native ZPL mode and ownership changes require mount authorization",
             ));
         }
 
-        let mode_update = if allow_mode_owner {
+        let mode_update = if allow_mode_update {
             req_perm.filter(|&m| u64::from(m) != metadata.mode & 0o7777)
         } else {
             None
@@ -1075,7 +1090,9 @@ impl FsOps for ZfsFs {
             mode: mode_update,
             uid: uid_update,
             gid: gid_update,
-            clear_suid_sgid: false,
+            // The permission change belongs to the same native transaction as
+            // the data mutation, including compound size/mode requests.
+            clear_suid_sgid: attrs.size.is_some(),
         };
         if attrs.size.is_some() {
             if metadata.kind == Kind::Directory {
@@ -1084,7 +1101,7 @@ impl FsOps for ZfsFs {
             if metadata.kind != Kind::Regular {
                 return Err(unsupported("ZPL truncate requires a regular file"));
             }
-            state.admit_data_mutation(cx, ino, &metadata)?;
+            state.admit_data_mutation(cx, ino)?;
         }
         if native_attrs.size.is_some()
             || native_attrs.atime.is_some()

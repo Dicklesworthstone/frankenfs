@@ -519,13 +519,20 @@ Directory streams, stream rename, transformed data and extension-record catalogs
 remain outside this writer profile.
 
 Ownership and modes are fixed host projections; native Windows ACLs are not
-enforced. Replacement of a mounted destination held open through a file or ADS
-handle is also refused. An open file
-survives its final unlink through a retained native name hidden from the live
-mounted namespace and reaped on its last release.
-A crash can leave an ordinary recoverable `.ffs-unlinked-*` file visible after
-reopen: durable orphan replay is not implemented. These capabilities do not
-establish native Windows or mounted interoperability qualification.
+enforced. Replacement of a mounted destination held open through an ADS handle
+remains refused. An open file survives its final unlink or ordinary-file
+replacement through a retained native name hidden from the live mounted
+namespace and reclaimed after its final handle and lookup reference are released.
+
+The retained `.ffs-unlinked-*` name and its identity-bound `$FrankenFS.Orphan`
+named DATA stream commit together through native `$LogFile` transactions.
+Writable FrankenFS reopen validates the complete candidate set before reclaiming
+owned survivors; recovery admits at most 4,096 retained files. Malformed or
+foreign ownership markers refuse admission before any cleanup writes. Read-only
+opens and native tools preserve the ordinary surviving files, and legacy or user
+files carrying only the prefix remain untouched. This is FrankenFS cleanup of
+ordinary native files, not Windows `$Deleted` recovery or native Windows/mounted
+interoperability qualification.
 
 ## NTFS: positioned writes into large streams
 
@@ -793,9 +800,13 @@ Changing mode or ownership and creating/deleting datasets or snapshots remain
 outside this mount profile. Existing native project IDs are retained and charged
 to their own quota records through mutation and final reclamation; new children
 default to project 0 while project inheritance remains unsupported.
-Nonempty writes, file-range copies and truncation of files with native set-ID
-bits or Linux file capabilities are refused before data mutation because atomic
-privilege removal is not implemented.
+The writable FsOps adapter handles nonempty writes, file-range copies, truncation
+and supported sparse range edits by clearing native S_ISUID and executable
+S_ISGID bits in the same TXG as the data change. Non-executable S_ISGID is retained,
+empty writes leave metadata unchanged, and snapshots retain their original data
+and permissions. Files with Linux file
+capabilities are still refused before data mutation because atomic capability
+xattr removal is not implemented.
 `fsync`, directory sync and unmount issue real device barriers and report errors.
 An uncertain publication fences the mount until explicit recovery and reopen.
 
@@ -996,7 +1007,7 @@ FrankenFS-specific improvements. FAT directory creation (`mkdir`), offline
 `--partition` slice discovery, and unified six-format read/inspect/check/scrub
 routing in `ffs-cli` are implemented. The remaining high-impact work includes
 FAT Windows naming/mounted power-cut qualification; broader NTFS writable-profile
-coverage and durable orphan recovery; ZFS mounted writes, ZIL writing and pool lifecycle;
+coverage; ZFS mounted writes, ZIL writing and pool lifecycle;
 broader writable profiles through the unified `ffs` API; and executable native-interchange,
 crash/reopen and mounted-operation evidence for each admitted profile.
 

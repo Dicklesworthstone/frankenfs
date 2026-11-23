@@ -1478,6 +1478,37 @@ pub trait FsOps: Send + Sync {
         )))
     }
 
+    /// Rename atomically with the caller's ownership for a whiteout inode.
+    ///
+    /// `owner` is the caller's `(uid, gid)`, used only when creating a
+    /// `RENAME_WHITEOUT` node. Backends that support whiteouts must publish
+    /// the move and the caller-owned node together, or leave both names
+    /// unchanged on failure. A transport must never emulate this operation
+    /// with separate `rename` and `mknod` calls.
+    ///
+    /// The default refuses every whiteout request with `EINVAL`: an older
+    /// `rename2` implementation cannot receive or enforce the caller's
+    /// ownership. All other flags pass unchanged to `rename2`.
+    #[allow(clippy::too_many_arguments)]
+    fn rename2_with_owner(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        parent: InodeNumber,
+        name: &OsStr,
+        new_parent: InodeNumber,
+        new_name: &OsStr,
+        flags: u32,
+        _owner: (u32, u32),
+    ) -> ffs_error::Result<()> {
+        if flags & libc::RENAME_WHITEOUT != 0 {
+            return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                libc::EINVAL,
+            )));
+        }
+        self.rename2(cx, scope, parent, name, new_parent, new_name, flags)
+    }
+
     /// Write data to file `ino` at byte `offset`. Returns bytes written.
     fn write(
         &self,
@@ -1496,6 +1527,13 @@ pub trait FsOps: Send + Sync {
     /// semantics and streams through the existing read/write contract in large
     /// chunks. Format-specific implementations can override this with an
     /// extent-aware clone path.
+    ///
+    /// Without a pending transaction, a later read/write failure or cancellation
+    /// returns the already copied prefix, so callers can advance their offsets
+    /// past successful writes. With a transaction, failures remain errors so the
+    /// caller aborts all staged changes, including any partial failed write.
+    /// Errors before any progress remain errors. Cancellation is checked before
+    /// each read and again before writing the returned bytes.
     #[allow(clippy::too_many_arguments)]
     fn copy_file_range(
         &self,
@@ -1523,12 +1561,22 @@ pub trait FsOps: Send + Sync {
 
         let mut copied = 0_u64;
         while copied < len {
+            if cx.checkpoint().is_err() {
+                if copied == 0 || scope.tx.is_some() {
+                    return Err(FfsError::Cancelled);
+                }
+                break;
+            }
             let remaining = len - copied;
             let request_len =
                 COPY_FILE_RANGE_CHUNK_BYTES.min(u32::try_from(remaining).unwrap_or(u32::MAX));
             let src_offset = offset_in + copied;
             let dst_offset = offset_out + copied;
-            let mut data = self.read(cx, scope, ino_in, src_offset, request_len)?;
+            let mut data = match self.read(cx, scope, ino_in, src_offset, request_len) {
+                Ok(data) => data,
+                Err(error) if copied == 0 || scope.tx.is_some() => return Err(error),
+                Err(_) => break,
+            };
             let request_len = usize::try_from(request_len).unwrap_or(usize::MAX);
             if data.len() > request_len {
                 data.truncate(request_len);
@@ -1537,7 +1585,19 @@ pub trait FsOps: Send + Sync {
                 break;
             }
 
-            let written = self.write(cx, scope, ino_out, dst_offset, &data)?;
+            // A backend read can observe cancellation after it obtained data.
+            // Do not begin a new mutation once that cancellation is visible.
+            if cx.checkpoint().is_err() {
+                if copied == 0 || scope.tx.is_some() {
+                    return Err(FfsError::Cancelled);
+                }
+                break;
+            }
+            let written = match self.write(cx, scope, ino_out, dst_offset, &data) {
+                Ok(written) => written,
+                Err(error) if copied == 0 || scope.tx.is_some() => return Err(error),
+                Err(_) => break,
+            };
             let written = usize::try_from(written)
                 .unwrap_or(usize::MAX)
                 .min(data.len());
@@ -3487,6 +3547,21 @@ impl<T: FsOps + ?Sized> FsOps for Arc<T> {
             .rename2(cx, scope, parent, name, new_parent, new_name, flags)
     }
 
+    fn rename2_with_owner(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        parent: InodeNumber,
+        name: &OsStr,
+        new_parent: InodeNumber,
+        new_name: &OsStr,
+        flags: u32,
+        owner: (u32, u32),
+    ) -> ffs_error::Result<()> {
+        self.as_ref()
+            .rename2_with_owner(cx, scope, parent, name, new_parent, new_name, flags, owner)
+    }
+
     fn write(
         &self,
         cx: &Cx,
@@ -4730,6 +4805,22 @@ macro_rules! delegate_fs_ops {
             ($target).rename2(cx, scope, parent, name, new_parent, new_name, flags)
         }
 
+        fn rename2_with_owner(
+            &$self,
+            cx: &$crate::vfs::__delegate_support::Cx,
+            scope: &mut $crate::vfs::__delegate_support::RequestScope,
+            parent: $crate::vfs::__delegate_support::InodeNumber,
+            name: &$crate::vfs::__delegate_support::OsStr,
+            new_parent: $crate::vfs::__delegate_support::InodeNumber,
+            new_name: &$crate::vfs::__delegate_support::OsStr,
+            flags: u32,
+            owner: (u32, u32),
+        ) -> $crate::vfs::__delegate_support::Result<()> {
+            ($target).rename2_with_owner(
+                cx, scope, parent, name, new_parent, new_name, flags, owner,
+            )
+        }
+
         fn write(
             &$self,
             cx: &$crate::vfs::__delegate_support::Cx,
@@ -5757,6 +5848,9 @@ macro_rules! delegate_fs_ops {
 }
 
 #[cfg(test)]
+mod copy_file_range_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -6712,6 +6806,22 @@ mod fs_ops_wrapper_completeness_pins {
             _flags: u32,
         ) -> ffs_error::Result<()> {
             self.record("rename2");
+            Ok(())
+        }
+        fn rename2_with_owner(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _parent: InodeNumber,
+            _name: &OsStr,
+            _new_parent: InodeNumber,
+            _new_name: &OsStr,
+            flags: u32,
+            owner: (u32, u32),
+        ) -> ffs_error::Result<()> {
+            assert_eq!(flags, libc::RENAME_WHITEOUT | libc::RENAME_NOREPLACE);
+            assert_eq!(owner, (1000, 1001));
+            self.record("rename2_with_owner");
             Ok(())
         }
         fn write(
@@ -7743,6 +7853,16 @@ mod fs_ops_wrapper_completeness_pins {
         let _ = ops.rmdir(&cx, &mut s, ino, name);
         let _ = ops.rename(&cx, &mut s, ino, name, ino, name);
         let _ = ops.rename2(&cx, &mut s, ino, name, ino, name, 0);
+        let _ = ops.rename2_with_owner(
+            &cx,
+            &mut s,
+            ino,
+            name,
+            ino,
+            name,
+            libc::RENAME_WHITEOUT | libc::RENAME_NOREPLACE,
+            (1000, 1001),
+        );
         let _ = ops.write(&cx, &mut s, ino, 0, b"x");
         let _ = ops.copy_file_range(&cx, &mut s, ino, 0, ino, 0, 1);
         let _ = ops.link(&cx, &mut s, ino, ino, name);

@@ -3,9 +3,11 @@
 //! and companion CLI operations.
 
 mod ea;
+mod orphans;
 mod sparse;
 
 pub use ea::NtfsEaSetMode;
+pub(crate) use orphans::ORPHAN_STREAM_NAME;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -4212,6 +4214,12 @@ impl NtfsTransactionEngine {
             hasher.update(&u.to_le_bytes());
         }
         hasher.update(&[u8::from(no_replace)]);
+        if let Some(name) = retain_dst_orphan_name {
+            hasher.update(b"retained:");
+            for unit in name {
+                hasher.update(&unit.to_le_bytes());
+            }
+        }
         let digest = *hasher.finalize().as_bytes();
 
         let plan_res = (|| -> Result<PreparedTxPlan<NtfsExtendedRenameOutcome>> {
@@ -4316,51 +4324,15 @@ impl NtfsTransactionEngine {
                 overwritten_remaining = rem;
                 if rem == 0 {
                     if let Some(orphan_utf16) = retain_dst_orphan_name {
-                        validate_ntfs_component_utf16(orphan_utf16)?;
-                        let root_record = read_mft_record_via_runs(
-                            &self.device,
-                            cx,
-                            &self.geometry,
-                            &ws.mft_runs,
-                            5,
-                        )?;
-                        let root_dir_ref = NtfsReference {
-                            record: 5,
-                            sequence: root_record.sequence,
-                        };
-                        if ws
-                            .lookup_in_dir(self, cx, root_dir_ref, orphan_utf16)?
-                            .is_some()
-                        {
-                            return Err(FfsError::Exists);
-                        }
-                        let orphan_fn = NtfsFileName {
-                            parent: root_dir_ref,
-                            namespace: 1,
-                            name: orphan_utf16.to_vec(),
-                        };
-                        let raw_orphan_fn = {
-                            let dst_cat = ws.catalog_mut(self, cx, dst_ref)?;
-                            dst_cat.file_names.push(EditableFileName {
-                                file_name: orphan_fn.clone(),
-                                ctime: 0,
-                                mtime: 0,
-                                mft_time: 0,
-                                atime: 0,
-                                allocated_size: 0,
-                                data_size: 0,
-                                flags: 0,
-                                reparse: 0,
-                            });
-                            dst_cat.sync_filename_duplicated_fields(self.geometry.cluster_bytes());
-                            dst_cat.file_names.last().expect("orphan").encode()?
-                        };
-                        ws.dir_entries_mut(self, cx, root_dir_ref)?
-                            .push(I30RawEntry {
-                                reference: dst_ref,
-                                file_name: orphan_fn,
-                                raw_fn_bytes: raw_orphan_fn,
-                            });
+                        ws.push_usn_event_explicit(
+                            dst_ref,
+                            dst_parent_ref,
+                            USN_REASON_RENAME_OLD_NAME,
+                            dst_ro.std_flags(),
+                            now_ticks,
+                            dst_match.file_name.name.clone(),
+                        );
+                        self.stage_retained_link(cx, &mut ws, dst_ref, orphan_utf16, now_ticks)?;
                         overwritten_retained = true;
                     } else {
                         ws.push_usn_event_explicit(
