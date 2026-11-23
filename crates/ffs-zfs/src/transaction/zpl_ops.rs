@@ -2402,7 +2402,13 @@ pub(super) fn stage_zpl_mutation(
             if let Some(req_mode) = attrs.mode {
                 new_meta.mode = (new_meta.mode & !0o7777) | u64::from(req_mode & 0o7777);
                 if rebuild_trivial_acl {
-                    new_meta.flags |= ZFS_ACL_TRIVIAL | ZFS_NO_EXECS_DENIED;
+                    // Native zfs_fastaccesschk_execute trusts this flag before
+                    // checking mode or ACL. A regenerated trivial ACL permits
+                    // that shortcut only when every mode class can execute.
+                    new_meta.flags = (new_meta.flags | ZFS_ACL_TRIVIAL) & !ZFS_NO_EXECS_DENIED;
+                    if new_meta.mode & 0o111 == 0o111 {
+                        new_meta.flags |= ZFS_NO_EXECS_DENIED;
+                    }
                 }
             }
             // A compound data/mode request must not restore privilege bits

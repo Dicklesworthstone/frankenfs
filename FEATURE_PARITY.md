@@ -3615,13 +3615,53 @@ The complete candidate passed workspace `cargo fmt --check` and
 `git diff --check`. UBS v5.5.26 scanned the exact seven project source/test
 files with exit 0, no critical findings and no failed modules; warnings were
 reviewed (test assertions/locks/clones and existing production code). This was
-static-only analysis. The full candidate ZPL unit-test build and owning
-all-targets check both ended with rustc SIGKILL before a completed result; no
-candidate codec or ZFS persistence test pass is claimed. Shared storage
-exhaustion and repeated executor loss also prevented the mandatory full
-workspace check and strict Clippy gate. The direct-to-main commit records the
-existing emergency gate exception. Native OpenZFS and mounted qualification,
-and the original broader Bead acceptance, remain open.
+static-only analysis. The ordinary candidate ZPL unit-test build and owning
+all-targets check both ended with rustc SIGKILL before a completed result.
+The ZFS integration-target check was also killed in asupersync before reaching
+the changed ZFS crate. The mandatory full workspace check, workspace strict
+Clippy and ZFS persistence runtime remain incomplete. Direct-to-main commits
+record the existing emergency gate exception; native OpenZFS/mounted
+qualification and the original broader Bead acceptance remain open.
+
+Subsequent focused validation compiled the complete unchanged ZPL module and
+its complete test module in an isolated harness using exact production
+Endian/Entry/error definitions, the real NvList source and the real ffs-types
+dependency. All 20 selected module tests passed (0 failed, 0 ignored, 5 unrelated
+NvList tests filtered). The identical test source against baseline production
+passed 17 and failed 3, reproducing incomplete split-parent child metadata,
+incorrect ACE counts and the mode 0001 owner-execute overgrant. This is module
+unit execution, not full-crate, ZFS transaction or native interchange evidence.
+The exact candidate also passed ordinary production-only
+`cargo check --offline --locked -p ffs-ondisk --lib` and
+`cargo clippy --offline --locked -p ffs-ondisk --lib -- -D warnings`.
+
+## ZFS chmod native execute shortcut (2026-11-23)
+
+Native POSIX mode updates no longer mark every object as having no execute
+denials. OpenZFS trusts ZFS_NO_EXECS_DENIED before checking the mode or ACL in
+its fast execute/search path. When chmod rebuilds a trivial ACL, the writer now
+clears this flag and sets it only if owner, group and other all have execute
+permission (`mode & 0111 == 0111`). This preserves the optimization for
+universally executable modes without bypassing restrictive modes. Existing
+mode-0777 symlink creation and set-ID-only ACL preservation remain unchanged.
+
+A persistence regression exercises regular files/directories, legacy/SA
+metadata, SA spill, restrictive modes and repeated grant/revoke transitions
+through fresh durable reopen. It checks mode and fast-execute flag agreement,
+unrelated flags, file contents and the original snapshot. Its runtime remains
+unexecuted because the ZFS build is blocked by the dependency SIGKILL recorded
+above; the isolated codec suite does not validate transaction execution.
+
+The exact chmod branch also ran in a focused Rust harness using real Metadata
+and unchanged probe assertions. Three probes pass on the candidate; the same
+probes yield 2 passes/1 failure on the baseline (mode 0000 incorrectly sets the
+shortcut). The probes check 512 modes against 5 prior flag states, unrelated-bit
+preservation, absent mode and preserved-ACL paths. This is branch-unit evidence,
+not transaction or native kernel execution.
+
+Workspace formatting passed after the shortcut fix. The exact three-file
+security scope passed UBS static analysis with exit 0 and no critical findings;
+reviewed production warning sites were already present in the baseline.
 
 ## ZFS mode-preserving trivial ACL encoding (2026-11-23)
 

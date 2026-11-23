@@ -6,6 +6,8 @@
 
 #[path = "persistence_prefix/creation_project.rs"]
 mod creation_project;
+#[path = "persistence_prefix/permissions.rs"]
+mod permissions;
 #[path = "persistence_prefix/projects.rs"]
 mod projects;
 #[path = "persistence_prefix/quota_profile.rs"]
