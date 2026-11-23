@@ -17,7 +17,7 @@ use crate::transaction::{
 use ffs_ondisk::ntfs::ea::{MAX_EA_NAME_BYTES, NtfsEa};
 use ffs_ondisk::ntfs_security::{
     FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_DELETE_CHILD, FILE_READ_DATA, FILE_WRITE_DATA,
-    STANDARD_DELETE, STANDARD_WRITE_DAC, STANDARD_WRITE_OWNER,
+    FILE_WRITE_EA, STANDARD_DELETE, STANDARD_WRITE_DAC, STANDARD_WRITE_OWNER,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -256,6 +256,7 @@ impl NtfsFs {
         if attr.perm & 0o222 == 0 {
             return Err(FfsError::PermissionDenied);
         }
+        self.enforce_data_access(cx, ino, FILE_WRITE_DATA)?;
         if is_ads_ino(ino) {
             self.ads_target(ino)
         } else {
@@ -272,15 +273,11 @@ impl NtfsFs {
         if writing {
             self.ensure_writable()?;
             self.data_target(cx, ino)?;
-            if !is_ads_ino(ino) {
-                let rec = self.record(cx, ino)?;
-                self.enforce_dacl(cx, &rec, FILE_WRITE_DATA)?;
-            }
         } else if self.describe(cx, ino)?.kind == FileType::Directory {
             return Err(FfsError::IsDirectory);
-        } else if !is_ads_ino(ino) {
-            let rec = self.record(cx, ino)?;
-            self.enforce_dacl(cx, &rec, FILE_READ_DATA)?;
+        }
+        if access != libc::O_WRONLY {
+            self.enforce_data_access(cx, ino, FILE_READ_DATA)?;
         }
         // Validate the data interpretation before returning a usable handle.
         self.stream(cx, ino)?;
@@ -319,6 +316,7 @@ impl NtfsFs {
         if self.describe(cx, ino)?.kind == FileType::Directory {
             return Err(FfsError::IsDirectory);
         }
+        self.enforce_data_access(cx, ino, FILE_READ_DATA)?;
         self.stream(cx, ino)?;
         Ok((0, 0))
     }
@@ -391,6 +389,17 @@ impl NtfsFs {
         let read_only = Self::check_create_mode(mode, false)?;
         if read_only && access != libc::O_RDONLY {
             return Err(FfsError::PermissionDenied);
+        }
+        self.ensure_writable()?;
+        if access != libc::O_WRONLY
+            && let Some((base, _)) = self.ads_mutation_component(cx, parent, name)?
+        {
+            // A new stream inherits its existing FILE's descriptor. Check all
+            // requested access before creation can durably publish the stream.
+            let base_name = String::from_utf16(&base)
+                .map_err(|_| unsupported("NTFS stream base name is not lossless UTF-8"))?;
+            let base_attr = self.lookup_indexed(cx, parent, OsStr::new(&base_name))?;
+            self.enforce_data_access(cx, base_attr.ino, FILE_READ_DATA)?;
         }
         self.check_open_capacity()?;
         let attr = self.create_locked(cx, parent, name, mode)?;
@@ -543,10 +552,6 @@ impl NtfsFs {
         data: &[u8],
     ) -> Result<u32> {
         self.ensure_writable()?;
-        if !is_ads_ino(ino) {
-            let rec = self.record(cx, ino)?;
-            self.enforce_dacl(cx, &rec, FILE_WRITE_DATA)?;
-        }
         let size = u32::try_from(data.len()).map_err(|_| invalid_argument())?;
         let (target, stream) = self.data_target(cx, ino)?;
         self.transact(cx, |engine| {
@@ -582,10 +587,6 @@ impl NtfsFs {
             return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EFBIG)));
         }
         let (target, stream) = self.data_target(cx, ino)?;
-        if !is_ads_ino(ino) {
-            let rec = self.record(cx, ino)?;
-            self.enforce_dacl(cx, &rec, FILE_WRITE_DATA)?;
-        }
         let now = system_time_to_filetime(SystemTime::now())?;
         self.transact(cx, |engine| {
             engine.punch_hole_at(cx, target, &stream, offset, length, now)
@@ -628,7 +629,7 @@ impl NtfsFs {
             ));
         }
         let record = self.record(cx, ino)?;
-        self.enforce_dacl(cx, &record, FILE_WRITE_DATA)?;
+        self.enforce_dacl(cx, &record, FILE_WRITE_EA)?;
         let flags = self
             .active_volume()?
             .extended_attributes(cx, &record)?
@@ -667,7 +668,7 @@ impl NtfsFs {
             return Ok(false);
         }
         Self::user_ea_name(name)?;
-        self.enforce_dacl(cx, &record, FILE_WRITE_DATA)?;
+        self.enforce_dacl(cx, &record, FILE_WRITE_EA)?;
         if self
             .active_volume()?
             .extended_attributes(cx, &record)?

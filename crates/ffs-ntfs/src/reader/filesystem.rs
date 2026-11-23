@@ -25,7 +25,7 @@ use ffs_core::{
 };
 use ffs_ondisk::ntfs::ea::MAX_EA_NAME_BYTES;
 use ffs_ondisk::ntfs::index::NtfsFileName;
-use ffs_ondisk::ntfs_security::{FILE_READ_DATA, evaluate_dacl_access};
+use ffs_ondisk::ntfs_security::{FILE_READ_DATA, FILE_READ_EA, evaluate_dacl_access};
 use ffs_types::InodeNumber;
 use health::{MountHealth, OperationGuard};
 use lifetime::{NtfsLifetime, is_ads_ino, parse_ads_component};
@@ -631,6 +631,22 @@ impl NtfsFs {
         })
     }
 
+    /// Check native access for unnamed DATA or an alternate stream. Synthetic
+    /// ownership does not read security metadata on the cached data path.
+    fn enforce_data_access(&self, cx: &Cx, ino: InodeNumber, desired_mask: u32) -> Result<()> {
+        if !matches!(&self.sid_policy, NtfsSidPolicy::Mapped { map, .. } if map.enforce_acl) {
+            return Ok(());
+        }
+        // Streams share their base FILE's descriptor and sequence identity.
+        let base = if is_ads_ino(ino) {
+            self.inode(self.ads_target(ino)?.0)?
+        } else {
+            ino
+        };
+        let record = self.record(cx, base)?;
+        self.enforce_dacl(cx, &record, desired_mask)
+    }
+
     pub(super) fn enforce_dacl(
         &self,
         cx: &Cx,
@@ -1003,10 +1019,7 @@ impl FsOps for NtfsFs {
         size: u32,
     ) -> Result<Vec<u8>> {
         let _op = self.operation(cx, false)?;
-        if !is_ads_ino(ino) {
-            let record = self.record(cx, ino)?;
-            self.enforce_dacl(cx, &record, FILE_READ_DATA)?;
-        }
+        self.enforce_data_access(cx, ino, FILE_READ_DATA)?;
         let stream = self.stream(cx, ino)?;
         let volume = self.active_volume()?;
         volume.read(cx, &stream, offset, size as usize)
@@ -1258,6 +1271,7 @@ impl FsOps for NtfsFs {
             return Ok(Vec::new());
         }
         let record = self.record(cx, ino)?;
+        self.enforce_dacl(cx, &record, FILE_READ_EA)?;
         Ok(self.user_eas(cx, &record)?.into_keys().collect())
     }
 
@@ -1284,6 +1298,7 @@ impl FsOps for NtfsFs {
             return Ok(None);
         }
         let record = self.record(cx, ino)?;
+        self.enforce_dacl(cx, &record, FILE_READ_EA)?;
         let result = self.user_eas(cx, &record)?.remove(name);
         checkpoint(cx)?;
         Ok(result)
