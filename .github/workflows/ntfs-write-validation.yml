@@ -1,0 +1,78 @@
+name: NTFS writer integrity validation
+on:
+  push:
+    branches: [validation/ntfs-writer-integrity-20261122]
+permissions:
+  contents: read
+concurrency:
+  group: ntfs-writer-integrity-20261122
+  cancel-in-progress: true
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_BUILD_JOBS: "2"
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  RUSTFLAGS: "-Z threads=1"
+  CARGO_HTTP_USER_AGENT: "frankenfs-agent (+https://github.com/Dicklesworthstone/frankenfs)"
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 70c6cd3452b0c668df4389371621db0958a9c233
+          fetch-depth: 16
+          persist-credentials: false
+      - name: Prepare compiler and isolated runner resources
+        run: |
+          rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
+          sudo apt-get update
+          sudo apt-get install -y e2fsprogs btrfs-progs ntfs-3g dosfstools mtools fuse3 pkg-config
+          validation_swap=$(sudo mktemp /mnt/ffs-ntfs-XXXXXX.swap)
+          sudo fallocate -l 12G "$validation_swap"
+          sudo chmod 0600 "$validation_swap"
+          sudo mkswap "$validation_swap"
+          sudo swapon "$validation_swap"
+          free -h
+          df -h .
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ntfs-writer-integrity
+          cache-on-failure: "true"
+          cache-workspace-crates: "true"
+      - name: Verify committed source and formatting
+        id: prepare
+        run: |
+          test "$(git rev-parse HEAD)" = "70c6cd3452b0c668df4389371621db0958a9c233"
+          cargo fmt --check
+          git diff --check
+          test -z "$(git status --porcelain)"
+      - name: Mapped native access regressions
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        run: cargo test --locked -p ffs-ntfs --test persistence_prefix ntfs_mapped_acl_ -- --nocapture --test-threads=1
+      - name: Atomic compound attribute regressions
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        run: cargo test --locked -p ffs-ntfs --test persistence_prefix compound_setattr -- --nocapture --test-threads=1
+      - name: Sparse hole-punch journal regressions
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        run: cargo test --locked -p ffs-ntfs --test persistence_prefix hole_punch -- --nocapture --test-threads=1
+      - name: Native catalog admission regressions
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        run: cargo test --locked -p ffs-ntfs --test persistence_prefix catalog_ -- --nocapture --test-threads=1
+      - name: Workspace compiler check
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        run: cargo check --locked --workspace --all-targets
+      - name: Workspace strict Clippy
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Complete NTFS tests and persistence cuts
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        run: cargo test --locked -p ffs-ntfs -- --test-threads=1
+      - name: NTFS CLI regressions
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        run: cargo test --locked -p ffs-cli --bin ffs-ntfs -- --test-threads=1
+      - name: Public filesystem facade regressions
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        run: cargo test --locked -p ffs -- --test-threads=1
