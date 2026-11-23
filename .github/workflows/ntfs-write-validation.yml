@@ -41,6 +41,7 @@ jobs:
           cache-on-failure: "true"
           cache-workspace-crates: "true"
       - name: Apply reviewed implementation patches
+        id: prepare
         run: |
           git rev-parse HEAD
           git apply --recount .task-validation/*.patch
@@ -60,22 +61,22 @@ jobs:
       - name: Targeted mapped stream access regressions
         run: cargo test --locked -p ffs-ntfs --test persistence_prefix ntfs_mapped_acl_ -- --nocapture --test-threads=1
       - name: Workspace compiler check
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
         run: cargo check --locked --workspace --all-targets
       - name: Workspace strict Clippy
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Complete NTFS tests and persistence cuts
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
         run: cargo test --locked -p ffs-ntfs -- --test-threads=1
       - name: NTFS CLI regressions
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
         run: cargo test --locked -p ffs-cli --bin ffs-ntfs -- --test-threads=1
       - name: Public filesystem facade regressions
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
         run: cargo test --locked -p ffs -- --test-threads=1
       - name: Changed-file bug scan
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
         run: |
           git -c http.userAgent="frankenfs-agent (+https://github.com/Dicklesworthstone/frankenfs)" clone --depth 1 https://github.com/Dicklesworthstone/ultimate_bug_scanner.git "$RUNNER_TEMP/ubs"
           mapfile -t changed_rust < <(git diff --name-only -- '*.rs')

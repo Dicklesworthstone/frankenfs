@@ -1,10 +1,14 @@
 diff --git a/crates/ffs-ntfs/src/reader/filesystem.rs b/crates/ffs-ntfs/src/reader/filesystem.rs
+index 9b817c6..b01b9b3 100644
 --- a/crates/ffs-ntfs/src/reader/filesystem.rs
 +++ b/crates/ffs-ntfs/src/reader/filesystem.rs
-@@ -634,1 +634,1 @@
--    pub(super) fn enforce_dacl(
-+    /// Resolve the security owner of unnamed DATA or an alternate stream.
-+    /// Streams share the base FILE descriptor and its sequence-bound identity.
+@@ -631,6 +631,18 @@ impl NtfsFs {
+         })
+     }
+ 
++    /// Resolve the security owner of either unnamed DATA or an alternate stream.
++    /// NTFS streams share their base FILE's descriptor; the synthetic ADS inode
++    /// must never bypass native access checks or a stale FILE sequence.
 +    fn data_record(&self, cx: &Cx, ino: InodeNumber) -> Result<NtfsFileRecord> {
 +        let base = if is_ads_ino(ino) {
 +            self.inode(self.ads_target(ino)?.0)?
@@ -14,8 +18,10 @@ diff --git a/crates/ffs-ntfs/src/reader/filesystem.rs b/crates/ffs-ntfs/src/read
 +        self.record(cx, base)
 +    }
 +
-+    pub(super) fn enforce_dacl(
-@@ -1003,9 +1003,7 @@
+     pub(super) fn enforce_dacl(
+         &self,
+         cx: &Cx,
+@@ -1003,10 +1015,8 @@ impl FsOps for NtfsFs {
          size: u32,
      ) -> Result<Vec<u8>> {
          let _op = self.operation(cx, false)?;
@@ -29,9 +35,10 @@ diff --git a/crates/ffs-ntfs/src/reader/filesystem.rs b/crates/ffs-ntfs/src/read
          let volume = self.active_volume()?;
          volume.read(cx, &stream, offset, size as usize)
 diff --git a/crates/ffs-ntfs/src/reader/filesystem/writable.rs b/crates/ffs-ntfs/src/reader/filesystem/writable.rs
+index 6e3b210..014d34b 100644
 --- a/crates/ffs-ntfs/src/reader/filesystem/writable.rs
 +++ b/crates/ffs-ntfs/src/reader/filesystem/writable.rs
-@@ -256,9 +256,11 @@
+@@ -256,10 +256,12 @@ impl NtfsFs {
          if attr.perm & 0o222 == 0 {
              return Err(FfsError::PermissionDenied);
          }
@@ -44,8 +51,8 @@ diff --git a/crates/ffs-ntfs/src/reader/filesystem/writable.rs b/crates/ffs-ntfs
 +            Ok((reference(&record), Vec::new()))
          }
      }
-@@ -271,17 +273,15 @@
-         let writing = access != libc::O_RDONLY || flags & (libc::O_TRUNC | libc::O_CREAT) != 0;
+ 
+@@ -272,14 +274,11 @@ impl NtfsFs {
          if writing {
              self.ensure_writable()?;
              self.data_target(cx, ino)?;
@@ -63,7 +70,7 @@ diff --git a/crates/ffs-ntfs/src/reader/filesystem/writable.rs b/crates/ffs-ntfs
              self.enforce_dacl(cx, &rec, FILE_READ_DATA)?;
          }
          // Validate the data interpretation before returning a usable handle.
-@@ -317,6 +317,8 @@
+@@ -319,6 +318,8 @@ impl NtfsFs {
          if self.describe(cx, ino)?.kind == FileType::Directory {
              return Err(FfsError::IsDirectory);
          }
@@ -72,7 +79,7 @@ diff --git a/crates/ffs-ntfs/src/reader/filesystem/writable.rs b/crates/ffs-ntfs
          self.stream(cx, ino)?;
          Ok((0, 0))
      }
-@@ -542,11 +542,7 @@
+@@ -543,10 +544,6 @@ impl NtfsFs {
          data: &[u8],
      ) -> Result<u32> {
          self.ensure_writable()?;
@@ -82,7 +89,8 @@ diff --git a/crates/ffs-ntfs/src/reader/filesystem/writable.rs b/crates/ffs-ntfs
 -        }
          let size = u32::try_from(data.len()).map_err(|_| invalid_argument())?;
          let (target, stream) = self.data_target(cx, ino)?;
-@@ -581,10 +581,6 @@
+         self.transact(cx, |engine| {
+@@ -582,10 +579,6 @@ impl NtfsFs {
              return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EFBIG)));
          }
          let (target, stream) = self.data_target(cx, ino)?;
@@ -92,11 +100,12 @@ diff --git a/crates/ffs-ntfs/src/reader/filesystem/writable.rs b/crates/ffs-ntfs
 -        }
          let now = system_time_to_filetime(SystemTime::now())?;
          self.transact(cx, |engine| {
+             engine.punch_hole_at(cx, target, &stream, offset, length, now)
 diff --git a/crates/ffs-ntfs/tests/persistence_prefix/transforms.rs b/crates/ffs-ntfs/tests/persistence_prefix/transforms.rs
+index bd7e3c1..86c0df6 100644
 --- a/crates/ffs-ntfs/tests/persistence_prefix/transforms.rs
 +++ b/crates/ffs-ntfs/tests/persistence_prefix/transforms.rs
-@@ -80,7 +80,7 @@
- fn utf16(s: &str) -> Vec<u16> {
+@@ -77,6 +77,285 @@ fn utf16(s: &str) -> Vec<u16> {
      s.encode_utf16().collect()
  }
  
@@ -167,44 +176,91 @@ diff --git a/crates/ffs-ntfs/tests/persistence_prefix/transforms.rs b/crates/ffs
 +fn ntfs_mapped_acl_covers_named_stream_io_and_mutations() {
 +    let cx = Cx::for_testing();
 +    let (dev, vol_bytes) = format_to_fault_device(
-+        &cx, 16, 4096, NtfsFormatVersion::V3_1, 0xAC15_0001_0000_0001,
++        &cx,
++        16,
++        4096,
++        NtfsFormatVersion::V3_1,
++        0xAC15_0001_0000_0001,
 +    );
 +    let mut engine = open_clean_engine(&cx, &dev, vol_bytes);
 +    let root = engine.resolve_path_reference(&cx, "/").unwrap();
 +    let (file, _) = engine
 +        .create_file_at(&cx, root, &utf16("restricted.bin"), b"base-content")
-+        .into_result().unwrap();
-+    engine.create_stream(&cx, file, &utf16("audit"), b"stream-content")
-+        .into_result().unwrap();
-+    engine.set_security_at(
-+        &cx, file, &stream_acl_descriptor(FILE_READ_DATA | FILE_WRITE_DATA),
-+        DEFAULT_NTFS_FILETIME,
-+    ).into_result().unwrap();
++        .into_result()
++        .unwrap();
++    engine
++        .create_stream(&cx, file, &utf16("audit"), b"stream-content")
++        .into_result()
++        .unwrap();
++    engine
++        .set_security_at(
++            &cx,
++            file,
++            &stream_acl_descriptor(FILE_READ_DATA | FILE_WRITE_DATA),
++            DEFAULT_NTFS_FILETIME,
++        )
++        .into_result()
++        .unwrap();
 +    let fs = NtfsFs::from_engine_with_policy(&cx, engine, stream_acl_policy(1002)).unwrap();
 +    let mut scope = RequestScope::empty();
 +    let root_ino = InodeNumber(1);
-+    let base = fs.lookup(&cx, &mut scope, root_ino, OsStr::new("restricted.bin")).unwrap();
-+    let ads = fs.lookup(&cx, &mut scope, root_ino, OsStr::new("restricted.bin:audit")).unwrap();
-+    // The native SID-specific denial is not expressible by mode bits alone.
++    let base = fs
++        .lookup(&cx, &mut scope, root_ino, OsStr::new("restricted.bin"))
++        .unwrap();
++    let ads = fs
++        .lookup(&cx, &mut scope, root_ino, OsStr::new("restricted.bin:audit"))
++        .unwrap();
++    // An explicit deny for this SID cannot be represented by the owner/group/
++    // other projection alone. Native checks must apply to both stream kinds.
 +    assert_ne!(ads.perm & 0o222, 0);
 +    let before = dev.snapshot_live();
 +    let writes = dev.write_bytes_total();
 +    for ino in [base.ino, ads.ino] {
-+        assert!(matches!(fs.read(&cx, &mut scope, ino, 0, 64), Err(FfsError::PermissionDenied)));
-+        for flags in [libc::O_RDONLY, libc::O_WRONLY, libc::O_RDWR] {
-+            assert!(matches!(fs.open(&cx, &mut scope, ino, flags), Err(FfsError::PermissionDenied)));
-+        }
-+        assert!(matches!(fs.open_read_only(&cx, ino, libc::O_RDONLY), Err(FfsError::PermissionDenied)));
-+        assert!(matches!(fs.write(&cx, &mut scope, ino, 0, b"forbidden"), Err(FfsError::PermissionDenied)));
 +        assert!(matches!(
-+            fs.setattr(&cx, &mut scope, ino, &SetAttrRequest {
-+                size: Some(0), ..SetAttrRequest::default()
-+            }), Err(FfsError::PermissionDenied)
++            fs.read(&cx, &mut scope, ino, 0, 64),
++            Err(FfsError::PermissionDenied)
 +        ));
-+        assert!(matches!(fs.fallocate(&cx, &mut scope, ino, 0, 4, 0x03), Err(FfsError::PermissionDenied)));
++        for flags in [libc::O_RDONLY, libc::O_WRONLY, libc::O_RDWR] {
++            assert!(matches!(
++                fs.open(&cx, &mut scope, ino, flags),
++                Err(FfsError::PermissionDenied)
++            ));
++        }
++        assert!(matches!(
++            fs.open_read_only(&cx, ino, libc::O_RDONLY),
++            Err(FfsError::PermissionDenied)
++        ));
++        assert!(matches!(
++            fs.write(&cx, &mut scope, ino, 0, b"forbidden"),
++            Err(FfsError::PermissionDenied)
++        ));
++        assert!(matches!(
++            fs.setattr(
++                &cx,
++                &mut scope,
++                ino,
++                &SetAttrRequest {
++                    size: Some(0),
++                    ..SetAttrRequest::default()
++                },
++            ),
++            Err(FfsError::PermissionDenied)
++        ));
++        assert!(matches!(
++            fs.fallocate(&cx, &mut scope, ino, 0, 4, 0x03),
++            Err(FfsError::PermissionDenied)
++        ));
 +    }
 +    assert!(matches!(
-+        fs.create(&cx, &mut scope, root_ino, OsStr::new("restricted.bin:new"), 0o666, 1002, 2000),
++        fs.create(
++            &cx,
++            &mut scope,
++            root_ino,
++            OsStr::new("restricted.bin:new"),
++            0o666,
++            1002,
++            2000,
++        ),
 +        Err(FfsError::PermissionDenied)
 +    ));
 +    assert!(matches!(
@@ -212,8 +268,14 @@ diff --git a/crates/ffs-ntfs/tests/persistence_prefix/transforms.rs b/crates/ffs
 +        Err(FfsError::PermissionDenied)
 +    ));
 +    assert!(matches!(
-+        fs.rename(&cx, &mut scope, root_ino, OsStr::new("restricted.bin:audit"),
-+            root_ino, OsStr::new("restricted.bin:moved")),
++        fs.rename(
++            &cx,
++            &mut scope,
++            root_ino,
++            OsStr::new("restricted.bin:audit"),
++            root_ino,
++            OsStr::new("restricted.bin:moved"),
++        ),
 +        Err(FfsError::PermissionDenied)
 +    ));
 +    assert_eq!(dev.write_bytes_total(), writes);
@@ -221,22 +283,41 @@ diff --git a/crates/ffs-ntfs/tests/persistence_prefix/transforms.rs b/crates/ffs
 +    assert!(fs.last_durable_token().unwrap().is_none());
 +    drop(fs);
 +
-+    // Another SID retains authorized access to the exact same native streams.
++    // The same native descriptor permits another caller, and changing the ADS
++    // must leave the unnamed stream intact.
 +    let engine = open_clean_engine(&cx, &dev, vol_bytes);
 +    let fs = NtfsFs::from_engine_with_policy(&cx, engine, stream_acl_policy(1001)).unwrap();
-+    let ads = fs.lookup(&cx, &mut scope, root_ino, OsStr::new("restricted.bin:audit")).unwrap();
++    let ads = fs
++        .lookup(&cx, &mut scope, root_ino, OsStr::new("restricted.bin:audit"))
++        .unwrap();
 +    assert_eq!(fs.read(&cx, &mut scope, ads.ino, 0, 64).unwrap(), b"stream-content");
 +    let (fh, _) = fs.open(&cx, &mut scope, ads.ino, libc::O_RDWR).unwrap();
 +    fs.write(&cx, &mut scope, ads.ino, 0, b"allowed").unwrap();
-+    fs.setattr(&cx, &mut scope, ads.ino, &SetAttrRequest {
-+        size: Some(7), ..SetAttrRequest::default()
-+    }).unwrap();
++    fs.setattr(
++        &cx,
++        &mut scope,
++        ads.ino,
++        &SetAttrRequest {
++            size: Some(7),
++            ..SetAttrRequest::default()
++        },
++    )
++    .unwrap();
 +    fs.fallocate(&cx, &mut scope, ads.ino, 1, 3, 0x03).unwrap();
 +    assert_eq!(fs.read(&cx, &mut scope, ads.ino, 0, 64).unwrap(), b"a\0\0\0wed");
 +    assert_eq!(fs.read(&cx, &mut scope, base.ino, 0, 64).unwrap(), b"base-content");
-+    fs.release(&cx, &mut scope, ffs_core::vfs::ReleaseRequest {
-+        ino: ads.ino, fh, flags: libc::O_RDWR, lock_owner: None, flush: false,
-+    }).unwrap();
++    fs.release(
++        &cx,
++        &mut scope,
++        ffs_core::vfs::ReleaseRequest {
++            ino: ads.ino,
++            fh,
++            flags: libc::O_RDWR,
++            lock_owner: None,
++            flush: false,
++        },
++    )
++    .unwrap();
 +    fs.flush_on_destroy(&cx).unwrap();
 +}
 +
@@ -244,39 +325,69 @@ diff --git a/crates/ffs-ntfs/tests/persistence_prefix/transforms.rs b/crates/ffs
 +fn ntfs_mapped_acl_open_checks_read_right_before_truncating_any_stream() {
 +    let cx = Cx::for_testing();
 +    let (dev, vol_bytes) = format_to_fault_device(
-+        &cx, 16, 4096, NtfsFormatVersion::V3_0, 0xAC15_0002_0000_0001,
++        &cx,
++        16,
++        4096,
++        NtfsFormatVersion::V3_0,
++        0xAC15_0002_0000_0001,
 +    );
 +    let mut engine = open_clean_engine(&cx, &dev, vol_bytes);
 +    let root = engine.resolve_path_reference(&cx, "/").unwrap();
-+    let (file, _) = engine.create_file_at(&cx, root, &utf16("write-only.bin"), b"base")
-+        .into_result().unwrap();
-+    engine.create_stream(&cx, file, &utf16("audit"), b"stream").into_result().unwrap();
-+    engine.set_security_at(&cx, file, &stream_acl_descriptor(FILE_READ_DATA), DEFAULT_NTFS_FILETIME)
-+        .into_result().unwrap();
++    let (file, _) = engine
++        .create_file_at(&cx, root, &utf16("write-only.bin"), b"base")
++        .into_result()
++        .unwrap();
++    engine
++        .create_stream(&cx, file, &utf16("audit"), b"stream")
++        .into_result()
++        .unwrap();
++    engine
++        .set_security_at(
++            &cx,
++            file,
++            &stream_acl_descriptor(FILE_READ_DATA),
++            DEFAULT_NTFS_FILETIME,
++        )
++        .into_result()
++        .unwrap();
 +    let fs = NtfsFs::from_engine_with_policy(&cx, engine, stream_acl_policy(1002)).unwrap();
 +    let mut scope = RequestScope::empty();
 +    for name in ["write-only.bin", "write-only.bin:audit"] {
-+        let attr = fs.lookup(&cx, &mut scope, InodeNumber(1), OsStr::new(name)).unwrap();
++        let attr = fs
++            .lookup(&cx, &mut scope, InodeNumber(1), OsStr::new(name))
++            .unwrap();
 +        let before = dev.snapshot_live();
 +        let writes = dev.write_bytes_total();
-+        for flags in [
-+            libc::O_RDONLY, libc::O_RDWR, libc::O_RDONLY | libc::O_TRUNC,
-+            libc::O_RDWR | libc::O_TRUNC,
-+        ] {
++        for flags in [libc::O_RDONLY, libc::O_RDWR, libc::O_RDONLY | libc::O_TRUNC, libc::O_RDWR | libc::O_TRUNC] {
 +            assert!(matches!(
-+                fs.open(&cx, &mut scope, attr.ino, flags), Err(FfsError::PermissionDenied)
++                fs.open(&cx, &mut scope, attr.ino, flags),
++                Err(FfsError::PermissionDenied)
 +            ), "read access must be checked for {name}, flags={flags}");
 +        }
 +        assert_eq!(dev.write_bytes_total(), writes);
 +        assert_eq!(dev.snapshot_live(), before);
 +        let (fh, _) = fs.open(&cx, &mut scope, attr.ino, libc::O_WRONLY).unwrap();
 +        fs.write(&cx, &mut scope, attr.ino, 0, b"ok").unwrap();
-+        assert!(matches!(fs.read(&cx, &mut scope, attr.ino, 0, 2), Err(FfsError::PermissionDenied)));
-+        fs.release(&cx, &mut scope, ffs_core::vfs::ReleaseRequest {
-+            ino: attr.ino, fh, flags: libc::O_WRONLY, lock_owner: None, flush: false,
-+        }).unwrap();
++        assert!(matches!(
++            fs.read(&cx, &mut scope, attr.ino, 0, 2),
++            Err(FfsError::PermissionDenied)
++        ));
++        fs.release(
++            &cx,
++            &mut scope,
++            ffs_core::vfs::ReleaseRequest {
++                ino: attr.ino,
++                fh,
++                flags: libc::O_WRONLY,
++                lock_owner: None,
++                flush: false,
++            },
++        )
++        .unwrap();
 +    }
 +    fs.flush_on_destroy(&cx).unwrap();
 +}
 +
  fn read_file_by_path(cx: &Cx, engine: &NtfsTransactionEngine, path: &str) -> Vec<u8> {
+     let vol = engine.volume_view(cx).unwrap();
+     let rec = vol.resolve(cx, path).unwrap();
