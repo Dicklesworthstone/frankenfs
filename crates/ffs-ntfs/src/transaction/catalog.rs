@@ -24,6 +24,7 @@ use ffs_ondisk::ntfs::{
 };
 
 use super::dir_index::{DirPrePayloadWrite, I30_NAME, encode_resident_attribute};
+use super::mutations::FILE_ATTR_REPARSE_POINT;
 use super::view_index::EditableViewIndex;
 use super::{
     NtfsTransactionEngine, SECTOR_BYTES, checkpoint, corrupt, map_logical_offset, parse_err,
@@ -1582,12 +1583,30 @@ impl NtfsTransactionEngine {
 
         let std_info =
             std_info.ok_or_else(|| corrupt(0, "missing STANDARD_INFORMATION on base record"))?;
+        // A provider's reparse attribute may live in an extension record. Only
+        // the complete catalog can distinguish that case from an orphan marker.
+        if reparse_point.is_none()
+            && std_info.get(32..36).is_some_and(|flags| {
+                u32::from_le_bytes([flags[0], flags[1], flags[2], flags[3]])
+                    & FILE_ATTR_REPARSE_POINT
+                    != 0
+            })
+        {
+            return Err(unsupported(
+                "NTFS reparse FILE attribute has no REPARSE_POINT metadata",
+            ));
+        }
 
         let mut data_streams = Vec::new();
         for (_folded, (orig_name, mut extents)) in data_groups {
             if extents.len() == 1
                 && let NtfsValue::Resident(bytes) = extents[0].value
             {
+                if extents[0].flags == COMPRESSED {
+                    return Err(unsupported(
+                        "resident compressed DATA is outside the writable catalog profile",
+                    ));
+                }
                 if extents[0].flags != 0 {
                     return Err(corrupt(0, "transformed resident DATA attribute"));
                 }
