@@ -50,7 +50,7 @@ pub(super) fn stale_reference(reference: NtfsReference) -> FfsError {
     }
 }
 
-fn check_raw_resident_data_flags(raw_record: &[u8]) -> Result<()> {
+fn check_raw_attribute_flags(raw_record: &[u8]) -> Result<()> {
     let restored = restore_record(raw_record, b"FILE").map_err(|err| parse_err(&err))?;
     let mut at = usize::from(u16::from_le_bytes([restored[20], restored[21]]));
     let used = usize::try_from(u32::from_le_bytes([
@@ -83,6 +83,16 @@ fn check_raw_resident_data_flags(raw_record: &[u8]) -> Result<()> {
         if len < 24 || at + len > used {
             return Err(corrupt(0, "attribute exceeds record bounds"));
         }
+        if kind == ATTR_FILE_NAME
+            && (restored[at + 8] != 0
+                || restored[at + 9] != 0
+                || restored[at + 12..at + 14] != [0, 0]
+                || restored[at + 22..at + 24] != [1, 0])
+        {
+            return Err(unsupported(
+                "NTFS FILE_NAME mutation requires an ordinary indexed resident attribute",
+            ));
+        }
         if kind == DATA
             && restored[at + 8] == 0
             && (restored[at + 22] != 0 || restored[at + 23] != 0)
@@ -113,7 +123,7 @@ fn refuse_unsupported_record_metadata(
             record.number, record.flags
         )));
     }
-    check_raw_resident_data_flags(raw_record)?;
+    check_raw_attribute_flags(raw_record)?;
     for attr in attrs {
         if attr.flags & !(SPARSE | COMPRESSED | ENCRYPTED) != 0 {
             return Err(unsupported(format!(
@@ -1327,6 +1337,7 @@ impl NtfsTransactionEngine {
 
         let mut std_info: Option<Vec<u8>> = None;
         let mut file_names: Vec<EditableFileName> = Vec::new();
+        let mut file_name_identities = BTreeSet::new();
         let mut object_id: Option<Vec<u8>> = None;
         let mut security_descriptor: Option<Vec<u8>> = None;
         let mut data_groups: BTreeMap<Vec<u16>, (Vec<u16>, Vec<NtfsAttribute<'_>>)> =
@@ -1354,7 +1365,22 @@ impl NtfsTransactionEngine {
                     let NtfsValue::Resident(bytes) = attr.value else {
                         return Err(corrupt(0, "nonresident FILE_NAME"));
                     };
-                    file_names.push(EditableFileName::parse_raw(bytes)?);
+                    let file_name = EditableFileName::parse_raw(bytes)?;
+                    let name = &file_name.file_name;
+                    // Identity spans the base and every extension record. Keep
+                    // exact spelling and namespace: POSIX names and DOS/Win32
+                    // aliases may legitimately share a folded spelling.
+                    if !file_name_identities.insert((
+                        name.parent.record,
+                        name.parent.sequence,
+                        name.namespace,
+                        name.name.clone(),
+                    )) {
+                        return Err(unsupported(
+                            "NTFS mutation requires unambiguous native link identities",
+                        ));
+                    }
+                    file_names.push(file_name);
                 }
                 OBJECT_ID if attr.name.is_empty() => {
                     let NtfsValue::Resident(bytes) = attr.value else {
@@ -1542,6 +1568,16 @@ impl NtfsTransactionEngine {
                     });
                 }
             }
+        }
+
+        // The base FILE header counts the complete native catalog, including
+        // extension-record names and DOS aliases. It is not POSIX nlink, and
+        // extension headers do not carry an independent link count. Keep 0/0
+        // catalogs valid for unnamed system records (including synthetic roots).
+        if file_names.len() != usize::from(base_record.hard_links) {
+            return Err(unsupported(
+                "NTFS FILE_NAME catalog does not match the supported native link count",
+            ));
         }
 
         let std_info =

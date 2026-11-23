@@ -17,8 +17,8 @@ mod transforms;
 mod view_index;
 
 pub use mutations::{
-    NtfsEaSetMode, NtfsExtendedRenameOutcome, NtfsRenameOutcome, validate_ntfs_component_utf16,
-    validate_ntfs_stream_name_utf16,
+    NtfsEaSetMode, NtfsExtendedRenameOutcome, NtfsRenameOutcome, NtfsSetAttributes,
+    validate_ntfs_component_utf16, validate_ntfs_stream_name_utf16,
 };
 pub use ops::DEFAULT_NTFS_FILETIME;
 pub use secondary::{NtfsObjectIdData, NtfsUsnSummary};
