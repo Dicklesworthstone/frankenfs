@@ -1180,11 +1180,43 @@ impl FsOps for ZfsFs {
         let mut state = self.state(cx)?;
         let source_parent = state.writable_parent(cx, parent, name.as_bytes())?;
         let target_parent = state.writable_parent(cx, new_parent, new_name.as_bytes())?;
-        if flags & !libc::RENAME_NOREPLACE != 0 {
+        if !matches!(flags, 0 | libc::RENAME_NOREPLACE | libc::RENAME_EXCHANGE) {
             return Err(errno(libc::EINVAL));
         }
         let source = state.child(cx, parent, name.as_bytes())?;
         let object = state.head.nodes[&source].object;
+        if flags == libc::RENAME_EXCHANGE {
+            let target = state.child(cx, new_parent, new_name.as_bytes())?;
+            if target == source {
+                return Ok(());
+            }
+            let source_identity = crate::ZfsObjectIdentity {
+                object,
+                generation: state.head.metadata(cx, source)?.0.generation,
+            };
+            let target_identity = crate::ZfsObjectIdentity {
+                object: state.head.nodes[&target].object,
+                generation: state.head.metadata(cx, target)?.0.generation,
+            };
+            let timestamp = native_timestamp(SystemTime::now())?;
+            state.mutate(cx, |engine, dataset| {
+                engine.exchange_entries(
+                    cx,
+                    dataset,
+                    source_parent,
+                    name.as_bytes(),
+                    target_parent,
+                    new_name.as_bytes(),
+                    source_identity,
+                    target_identity,
+                    timestamp,
+                )
+            })?;
+            // Both objects remain live, including their existing open handles.
+            // The common commit path invalidates directory pages and refreshes
+            // native parent metadata before the next request.
+            return Ok(());
+        }
         let retained = match state.child(cx, new_parent, new_name.as_bytes()) {
             Ok(target) => {
                 if flags & libc::RENAME_NOREPLACE != 0 {

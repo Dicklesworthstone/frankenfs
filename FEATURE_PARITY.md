@@ -1,5 +1,20 @@
 # FEATURE_PARITY
 
+> **ZFS atomic directory-entry exchange (2026-11-23):**
+> Writable FsOps `RENAME_EXCHANGE` and `ZfsTransactionEngine::exchange_entries`
+> swap two existing names in one native TXG, including unlike types and nonempty
+> directories. Object/generation guards bind both endpoints; native parent/link
+> metadata, timestamps, SA spill storage, snapshots and accounting use the shared
+> COW publication path. Open handles retain their original objects. Cycle,
+> immutable/append-only/nounlink and stale-identity checks precede staging;
+> identical objects are no-ops. Five authored regressions cover ZPL v4/v5,
+> mirrors, mixed kinds, handles, aliases, symlinks and every recorded persistence
+> cut including reordered unflushed writes. Scoped formatting and independent
+> source review pass. Cargo tests and full workspace gates remain unexecuted
+> because shared executor disk I/O stalls prevent dependency compilation from
+> reaching project code. Native OpenZFS interchange, mounted qualification and
+> the broader writer roadmap remain open; this does not close `bd-jdned`.
+
 > **ZFS native sparse range edits (2026-11-20):**
 > `ZfsTransactionEngine::edit_file_range`, writable FsOps and the companion
 > `tx-punch-hole` / `tx-zero-range` commands publish sparse edits through the

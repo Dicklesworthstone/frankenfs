@@ -42,8 +42,8 @@ pub use self::dsl_ops::{
     ZfsBookmarkInfo, ZfsHoldInfo, ZfsPropertySetValue, list_bookmarks_in_mos, list_holds_in_mos,
 };
 pub use self::zpl_ops::{
-    ZfsDataChecksum, ZfsFileRangeOperation, ZfsPosixSetAttr, ZfsSetAttr, ZfsUnlinkedObject,
-    ZfsXattrSetMode,
+    ZfsDataChecksum, ZfsFileRangeOperation, ZfsObjectIdentity, ZfsPosixSetAttr, ZfsSetAttr,
+    ZfsUnlinkedObject, ZfsXattrSetMode,
 };
 use self::zpl_ops::{ZplMutation, stage_zpl_mutation};
 pub use self::zvol_ops::{
@@ -1318,6 +1318,40 @@ impl ZfsTransactionEngine {
                 dst_name: dst_name.to_vec(),
                 expected_source_object,
                 retain_replaced: None,
+                timestamp,
+            },
+        )
+    }
+
+    /// Atomically exchange two existing names within one head dataset.
+    ///
+    /// Both entries may be nonempty directories, regular files or symbolic
+    /// links, including different kinds. Native object/generation guards are
+    /// mandatory: retrying an already committed swap with its original guards
+    /// returns `ESTALE` rather than silently exchanging the names back.
+    #[allow(clippy::too_many_arguments)]
+    pub fn exchange_entries(
+        &mut self,
+        cx: &Cx,
+        dataset_components: &[Vec<u8>],
+        src_dir: u64,
+        src_name: &[u8],
+        dst_dir: u64,
+        dst_name: &[u8],
+        source: ZfsObjectIdentity,
+        target: ZfsObjectIdentity,
+        timestamp: Timestamp,
+    ) -> ZfsTxOutcome<u64> {
+        self.execute_zpl_txg(
+            cx,
+            dataset_components,
+            &ZplMutation::ExchangeEntries {
+                src_dir,
+                src_name: src_name.to_vec(),
+                dst_dir,
+                dst_name: dst_name.to_vec(),
+                source,
+                target,
                 timestamp,
             },
         )

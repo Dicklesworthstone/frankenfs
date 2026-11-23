@@ -82,6 +82,194 @@ fn io_counts(devices: &[FaultableMemberDevice]) -> Vec<(usize, usize)> {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn rename_exchange_fsops_keeps_handles_and_moves_nonempty_directories() {
+    let cx = Cx::for_testing();
+    for zpl_version in [4, 5] {
+        let (engine, devices) = writer_fixture(
+            &cx,
+            &PoolFixtureSpec {
+                zpl_version,
+                deadlist_mode: DeadlistMode::NativeDeadlist,
+                ..PoolFixtureSpec::default()
+            },
+        );
+        let fs = ZfsFs::with_writer(&cx, engine, vec![b"data".to_vec()]).unwrap();
+        let mut scope = RequestScope::empty();
+        let first = lookup(&fs, &cx, ROOT, "hello.txt");
+        let second = lookup(&fs, &cx, ROOT, "keep.bin");
+        let first_bytes = read(&fs, &cx, first.ino);
+        let second_bytes = read(&fs, &cx, second.ino);
+        let (first_handle, _) = fs.open(&cx, &mut scope, first.ino, libc::O_RDWR).unwrap();
+        let (second_handle, _) = fs
+            .open(&cx, &mut scope, second.ino, libc::O_RDONLY)
+            .unwrap();
+        fs.rename2(
+            &cx,
+            &mut scope,
+            ROOT,
+            OsStr::new("hello.txt"),
+            ROOT,
+            OsStr::new("keep.bin"),
+            libc::RENAME_EXCHANGE,
+        )
+        .unwrap();
+        assert_eq!(lookup(&fs, &cx, ROOT, "hello.txt").ino, second.ino);
+        assert_eq!(lookup(&fs, &cx, ROOT, "keep.bin").ino, first.ino);
+        assert_eq!(read(&fs, &cx, first.ino), first_bytes);
+        assert_eq!(read(&fs, &cx, second.ino), second_bytes);
+        fs.write(&cx, &mut scope, first.ino, 0, b"open handle")
+            .unwrap();
+        assert!(read(&fs, &cx, lookup(&fs, &cx, ROOT, "keep.bin").ino).starts_with(b"open handle"));
+        fs.fsync(&cx, &mut scope, first.ino, first_handle, false)
+            .unwrap();
+        fs.fsync(&cx, &mut scope, second.ino, second_handle, false)
+            .unwrap();
+        release(&fs, &cx, first.ino, first_handle);
+        release(&fs, &cx, second.ino, second_handle);
+
+        fs.link(&cx, &mut scope, first.ino, ROOT, OsStr::new("alias"))
+            .unwrap();
+        // Exchanging two hard links (or the same name) is a namespace no-op.
+        let alias_io = io_counts(&devices);
+        for destination in ["keep.bin", "alias"] {
+            fs.rename2(
+                &cx,
+                &mut scope,
+                ROOT,
+                OsStr::new("alias"),
+                ROOT,
+                OsStr::new(destination),
+                libc::RENAME_EXCHANGE,
+            )
+            .unwrap();
+            assert_eq!(lookup(&fs, &cx, ROOT, "alias").ino, first.ino);
+            assert_eq!(lookup(&fs, &cx, ROOT, "keep.bin").ino, first.ino);
+            assert_eq!(fs.getattr(&cx, &mut scope, first.ino).unwrap().nlink, 2);
+            assert_eq!(io_counts(&devices), alias_io);
+        }
+        let symlink = fs
+            .symlink(
+                &cx,
+                &mut scope,
+                ROOT,
+                OsStr::new("shortcut"),
+                Path::new("keep.bin"),
+                0,
+                0,
+            )
+            .unwrap();
+        fs.rename2(
+            &cx,
+            &mut scope,
+            ROOT,
+            OsStr::new("alias"),
+            ROOT,
+            OsStr::new("shortcut"),
+            libc::RENAME_EXCHANGE,
+        )
+        .unwrap();
+        assert_eq!(lookup(&fs, &cx, ROOT, "alias").ino, symlink.ino);
+        assert_eq!(lookup(&fs, &cx, ROOT, "shortcut").ino, first.ino);
+        assert_eq!(
+            fs.readlink(&cx, &mut scope, symlink.ino).unwrap(),
+            b"keep.bin"
+        );
+        assert_eq!(fs.getattr(&cx, &mut scope, first.ino).unwrap().nlink, 2);
+
+        let left = fs
+            .mkdir(&cx, &mut scope, ROOT, OsStr::new("left"), 0o755, 0, 0)
+            .unwrap();
+        let right = fs
+            .mkdir(&cx, &mut scope, ROOT, OsStr::new("right"), 0o755, 0, 0)
+            .unwrap();
+        let inner = fs
+            .mkdir(&cx, &mut scope, left.ino, OsStr::new("inner"), 0o755, 0, 0)
+            .unwrap();
+        let left_child = create(&fs, &cx, inner.ino, "left-child");
+        let right_child = create(&fs, &cx, right.ino, "right-child");
+        let root_links = fs.getattr(&cx, &mut scope, ROOT).unwrap().nlink;
+        let left_links = fs.getattr(&cx, &mut scope, left.ino).unwrap().nlink;
+        // A nonempty directory can exchange with a regular file in another parent.
+        fs.rename2(
+            &cx,
+            &mut scope,
+            left.ino,
+            OsStr::new("inner"),
+            right.ino,
+            OsStr::new("right-child"),
+            libc::RENAME_EXCHANGE,
+        )
+        .unwrap();
+        assert_eq!(lookup(&fs, &cx, left.ino, "inner").ino, right_child.ino);
+        assert_eq!(lookup(&fs, &cx, right.ino, "right-child").ino, inner.ino);
+        assert_eq!(
+            lookup(&fs, &cx, inner.ino, "left-child").ino,
+            left_child.ino
+        );
+        assert_eq!(lookup(&fs, &cx, inner.ino, "..").ino, right.ino);
+        assert_eq!(fs.getattr(&cx, &mut scope, ROOT).unwrap().nlink, root_links);
+        assert_eq!(
+            fs.getattr(&cx, &mut scope, left.ino).unwrap().nlink,
+            left_links - 1
+        );
+        assert_eq!(fs.getattr(&cx, &mut scope, right.ino).unwrap().nlink, 3);
+        // Both directories are nonempty. A same-parent exchange preserves nlinks.
+        fs.rename2(
+            &cx,
+            &mut scope,
+            ROOT,
+            OsStr::new("left"),
+            ROOT,
+            OsStr::new("right"),
+            libc::RENAME_EXCHANGE,
+        )
+        .unwrap();
+        assert_eq!(lookup(&fs, &cx, ROOT, "left").ino, right.ino);
+        assert_eq!(lookup(&fs, &cx, ROOT, "right").ino, left.ino);
+        assert_eq!(fs.getattr(&cx, &mut scope, ROOT).unwrap().nlink, root_links);
+
+        let before = io_counts(&devices);
+        for flags in [
+            libc::RENAME_EXCHANGE | libc::RENAME_NOREPLACE,
+            libc::RENAME_EXCHANGE | libc::RENAME_WHITEOUT,
+        ] {
+            assert_eq!(
+                fs.rename2(
+                    &cx,
+                    &mut scope,
+                    ROOT,
+                    OsStr::new("left"),
+                    ROOT,
+                    OsStr::new("right"),
+                    flags
+                )
+                .unwrap_err()
+                .to_errno(),
+                libc::EINVAL
+            );
+        }
+        assert_eq!(
+            fs.rename2(
+                &cx,
+                &mut scope,
+                ROOT,
+                OsStr::new("left"),
+                ROOT,
+                OsStr::new("absent"),
+                libc::RENAME_EXCHANGE
+            )
+            .unwrap_err()
+            .to_errno(),
+            libc::ENOENT
+        );
+        assert_eq!(io_counts(&devices), before);
+        assert_eq!(lookup(&fs, &cx, ROOT, "left").ino, right.ino);
+        assert_eq!(lookup(&fs, &cx, ROOT, "right").ino, left.ino);
+    }
+}
+
+#[test]
 fn native_fsops_lifecycle_persists_metadata_and_reads_its_latest_txg() {
     let cx = Cx::for_testing();
     for (zpl_version, mirror_width, ashift) in [(4, 1, 9), (5, 2, 12)] {

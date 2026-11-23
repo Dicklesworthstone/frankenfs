@@ -50,6 +50,14 @@ pub struct ZfsUnlinkedObject {
     pub generation: u64,
 }
 
+/// A dataset-local object and its native birth generation. Namespace operations
+/// bind both fields so a retry cannot act on a reused object number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ZfsObjectIdentity {
+    pub object: u64,
+    pub generation: u64,
+}
+
 // Native persistent ZPL flags (OpenZFS zfs-2.3.0, sys/zfs_znode.h).
 // Dataset `readonly` is a separate, inherited DSL property.
 #[allow(dead_code)]
@@ -278,6 +286,15 @@ pub(super) enum ZplMutation {
         retain_replaced: Option<ZfsUnlinkedObject>,
         timestamp: Timestamp,
     },
+    ExchangeEntries {
+        src_dir: u64,
+        src_name: Vec<u8>,
+        dst_dir: u64,
+        dst_name: Vec<u8>,
+        source: ZfsObjectIdentity,
+        target: ZfsObjectIdentity,
+        timestamp: Timestamp,
+    },
     UnlinkEntry {
         parent_dir: u64,
         name: Vec<u8>,
@@ -310,6 +327,7 @@ impl ZplMutation {
             Self::RemoveXattr { .. } => "remove_xattr",
             Self::LinkEntry { .. } => "link_entry",
             Self::RenameEntry { .. } => "rename_entry",
+            Self::ExchangeEntries { .. } => "exchange_entries",
             Self::UnlinkEntry { .. } => "unlink_entry",
             Self::ReapUnlinked { .. } => "reap_unlinked",
         }
@@ -2821,6 +2839,262 @@ pub(super) fn stage_zpl_mutation(
                 &m_out.dnode,
             )?;
             source_obj
+        }
+
+        ZplMutation::ExchangeEntries {
+            src_dir,
+            src_name,
+            dst_dir,
+            dst_name,
+            source,
+            target,
+            timestamp,
+        } => {
+            validate_component(src_name, ds_ctx.utf8_only)?;
+            validate_component(dst_name, ds_ctx.utf8_only)?;
+            let mut parents = Vec::with_capacity(2);
+            for &parent in &[*src_dir, *dst_dir] {
+                let loaded = load_zpl_node(
+                    cx,
+                    &mut os_view,
+                    &zpl_meta_base,
+                    zpl_ceiling,
+                    &zpl_dirty_dnodes,
+                    ds_ctx.sa_registry.as_ref(),
+                    parent,
+                    order,
+                )?;
+                if loaded.metadata.kind != Kind::Directory {
+                    return Err(FfsError::NotDirectory);
+                }
+                parents.push(loaded);
+            }
+            let mut entries = vec![read_dir_entries(cx, &mut os_view, *src_dir, &staged_dirs)?];
+            entries.push(if src_dir == dst_dir {
+                entries[0].clone()
+            } else {
+                read_dir_entries(cx, &mut os_view, *dst_dir, &staged_dirs)?
+            });
+            let mut positions = [0; 2];
+            let mut nodes = Vec::with_capacity(2);
+            for (index, (name, identity)) in [(src_name, source), (dst_name, target)]
+                .into_iter()
+                .enumerate()
+            {
+                let position = entries[index]
+                    .iter()
+                    .position(|entry| entry.name == *name)
+                    .ok_or_else(|| {
+                        FfsError::NotFound(String::from_utf8_lossy(name).into_owned())
+                    })?;
+                let reference = entries[index][position]
+                    .scalar()
+                    .map_err(|e| parse_err(&e))?;
+                let (object, kind) = directory_reference(reference).map_err(|e| parse_err(&e))?;
+                if object != identity.object {
+                    return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                        libc::ESTALE,
+                    )));
+                }
+                if object == ds_ctx.root_dir {
+                    return Err(FfsError::PermissionDenied);
+                }
+                let loaded = load_zpl_node(
+                    cx,
+                    &mut os_view,
+                    &zpl_meta_base,
+                    zpl_ceiling,
+                    &zpl_dirty_dnodes,
+                    ds_ctx.sa_registry.as_ref(),
+                    object,
+                    order,
+                )?;
+                if loaded.metadata.generation != identity.generation {
+                    return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                        libc::ESTALE,
+                    )));
+                }
+                if loaded.metadata.links == 0
+                    || kind.is_some_and(|kind| kind != loaded.metadata.kind)
+                    || (loaded.metadata.kind == Kind::Directory
+                        && loaded.metadata.parent != [*src_dir, *dst_dir][index])
+                {
+                    return Err(corrupt(
+                        "ZPL exchange entry disagrees with its native object",
+                    ));
+                }
+                // Both names are removed and replaced. In particular, an
+                // append-only parent cannot accept an exchange as an insertion.
+                admit_directory_remove(&parents[index].metadata, &loaded.metadata)?;
+                admit_directory_add(&parents[1 - index].metadata)?;
+                positions[index] = position;
+                nodes.push(loaded);
+            }
+            if source.object == target.object {
+                return Ok(source.object);
+            }
+
+            // Check BOTH proposed parent edges before staging any COW writes.
+            // Swapping an ancestor and descendant must not turn either side
+            // into a cycle, even when the other entry is a regular file.
+            if src_dir != dst_dir {
+                for (node, new_parent, identity) in
+                    [(&nodes[0], *dst_dir, source), (&nodes[1], *src_dir, target)]
+                {
+                    if node.metadata.kind != Kind::Directory {
+                        continue;
+                    }
+                    let mut current = new_parent;
+                    let mut seen = BTreeSet::new();
+                    loop {
+                        checkpoint(cx)?;
+                        if current == identity.object {
+                            return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                                libc::EINVAL,
+                            )));
+                        }
+                        if !seen.insert(current) || seen.len() > MAX_PATH_DEPTH {
+                            return Err(corrupt("invalid ZPL exchange directory ancestry"));
+                        }
+                        if current == ds_ctx.root_dir {
+                            break;
+                        }
+                        let ancestor = load_zpl_node(
+                            cx,
+                            &mut os_view,
+                            &zpl_meta_base,
+                            zpl_ceiling,
+                            &zpl_dirty_dnodes,
+                            ds_ctx.sa_registry.as_ref(),
+                            current,
+                            order,
+                        )?;
+                        if ancestor.metadata.kind != Kind::Directory {
+                            return Err(corrupt("ZPL exchange ancestor is not a directory"));
+                        }
+                        current = ancestor.metadata.parent;
+                    }
+                }
+            }
+
+            let references = [
+                encode_directory_reference(source.object, nodes[0].metadata.kind)
+                    .map_err(|e| parse_err(&e))?,
+                encode_directory_reference(target.object, nodes[1].metadata.kind)
+                    .map_err(|e| parse_err(&e))?,
+            ];
+            // Preserve each name and its ZAP collision identity. Only its
+            // native object/type value changes; no object is retired or linked.
+            entries[0][positions[0]].values[0] = references[1];
+            if src_dir == dst_dir {
+                entries[0][positions[1]].values[0] = references[0];
+            } else {
+                entries[1][positions[1]].values[0] = references[0];
+            }
+            let parent_count = if src_dir == dst_dir { 1 } else { 2 };
+            for index in 0..parent_count {
+                let mut metadata = parents[index].metadata.clone();
+                if src_dir != dst_dir {
+                    let outgoing = u64::from(nodes[index].metadata.kind == Kind::Directory);
+                    let incoming = u64::from(nodes[1 - index].metadata.kind == Kind::Directory);
+                    metadata.links = metadata
+                        .links
+                        .checked_sub(outgoing)
+                        .and_then(|links| links.checked_add(incoming))
+                        .filter(|&links| links >= 2)
+                        .ok_or_else(|| corrupt("ZPL exchange parent link count is invalid"))?;
+                }
+                metadata.times[1] = *timestamp;
+                metadata.times[2] = *timestamp;
+                let dnode = flush_dir_node(
+                    cx,
+                    &mut os_view,
+                    alloc,
+                    &parents[index],
+                    &metadata,
+                    &entries[index],
+                    ds_ctx.sa_registry.as_ref(),
+                    acct_flags,
+                    order,
+                    new_txg,
+                    staged_writes,
+                    &mut zpl_born,
+                    &mut zpl_retired,
+                    &mut quota_deltas,
+                )?;
+                put_dnode_in_table(
+                    cx,
+                    &mut os_view,
+                    &zpl_meta_base,
+                    zpl_ceiling,
+                    &mut zpl_dirty_dnodes,
+                    [*src_dir, *dst_dir][index],
+                    &dnode,
+                )?;
+            }
+            for (index, loaded) in nodes.iter().enumerate() {
+                let mut metadata = loaded.metadata.clone();
+                metadata.parent = [*dst_dir, *src_dir][index];
+                metadata.times[2] = *timestamp;
+                let (bonus, spill) = encode_updated_zpl_bonus(
+                    loaded,
+                    &metadata,
+                    ds_ctx.sa_registry.as_ref(),
+                    alloc,
+                    order,
+                    new_txg,
+                    staged_writes,
+                )?;
+                let out = cow_update_dnode(
+                    cx,
+                    &mut os_view,
+                    alloc,
+                    DnodeCowSpec {
+                        existing: Some((&loaded.dnode, loaded.ceiling)),
+                        object_type: loaded.dnode.object_type(),
+                        bonus_type: loaded.dnode.bonus_type(),
+                        checksum_type: 7,
+                        compress_type: 2,
+                        user_flags: acct_flags,
+                        indirect_shift: loaded.dnode.indirect_shift(),
+                        data_bytes: loaded.dnode.data_bytes(),
+                        max_block: loaded.dnode.max_block(),
+                        slots: loaded.dnode.slots(),
+                        nblkptr: loaded.dnode.pointers().len(),
+                        bonus,
+                        spill,
+                        order,
+                        new_txg,
+                        leaf_bucket: WriteBucket::ChildBlocks,
+                        indirect_bucket: WriteBucket::ChildBlocks,
+                    },
+                    &BTreeMap::new(),
+                    staged_writes,
+                )?;
+                zpl_born.add_assign(out.born)?;
+                zpl_retired.extend(out.retired_bps);
+                let bytes_delta =
+                    signed_bytes_delta(out.dnode.used_bytes(), loaded.dnode.used_bytes())?;
+                if bytes_delta != 0 {
+                    quota_deltas.push(QuotaDelta {
+                        uid: metadata.uid,
+                        gid: metadata.gid,
+                        projid: Some(loaded.project_id),
+                        bytes_delta,
+                        objs_delta: 0,
+                    });
+                }
+                put_dnode_in_table(
+                    cx,
+                    &mut os_view,
+                    &zpl_meta_base,
+                    zpl_ceiling,
+                    &mut zpl_dirty_dnodes,
+                    [source.object, target.object][index],
+                    &out.dnode,
+                )?;
+            }
+            source.object
         }
 
         ZplMutation::UnlinkEntry {
