@@ -6,11 +6,22 @@ use super::{
     NtfsTxOutcome, NtfsVolume, SECTOR_BYTES, build_clean_ntfs_image, hard_link_index_values,
     large_sparse_stream_fixture, write_options_clean, write_options_recover,
 };
+use ffs_core::{FsOps, RequestScope};
 use ffs_ntfs::NtfsEaSetMode;
+use ffs_ntfs::efs::NtfsEfsKey;
+use ffs_ntfs::formatter::{NtfsFormatOptions, format_image_file};
+use ffs_ntfs::reader::filesystem::NtfsFs;
 use ffs_ondisk::ntfs::ea::{FILE_NEED_EA, NtfsEa};
 use ffs_ondisk::ntfs::index::NtfsFileName;
+use ffs_ondisk::ntfs::reparse::{NtfsReparseData, NtfsReparsePoint};
+use ffs_ondisk::ntfs::usn::{
+    USN_REASON_BASIC_INFO_CHANGE, USN_REASON_CLOSE, USN_REASON_DATA_OVERWRITE,
+    USN_REASON_NAMED_DATA_OVERWRITE, UsnRecordV2, parse_usn_journal_slice,
+};
 use ffs_ondisk::ntfs::{ATTRIBUTE_LIST, DATA, NtfsValue, SPARSE, decode_mapping_pairs};
+use ffs_types::InodeNumber;
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 
 fn fixture(
     clusters: u64,
@@ -723,4 +734,405 @@ fn hole_punch_payload_barrier_failure_preserves_the_previous_allocation() {
     assert_eq!(used_clusters(&device), before);
     assert!(!engine.requires_recovery());
     engine.check_clean_consistency(&cx).unwrap();
+}
+
+fn journal_fixture(
+    payload: &[u8],
+) -> (
+    Arc<FaultInjectingNtfsDevice>,
+    NtfsTransactionEngine,
+    NtfsReference,
+) {
+    let cx = Cx::for_testing();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("journal-punch.img");
+    let mut options = NtfsFormatOptions::new_image(path.clone(), 4);
+    options.cluster_bytes = Some(CLUSTER_BYTES as u32);
+    options.logfile_bytes = Some(256 * 1024);
+    options.serial = Some(0xA01E_0001_1234_5678);
+    let report = format_image_file(&cx, &options, None).unwrap();
+    assert!(report.boot_published && report.check_clean);
+    let image = std::fs::read(path).unwrap();
+    let volume_bytes = image.len() as u64 - SECTOR_BYTES as u64;
+    let device = FaultInjectingNtfsDevice::new(image);
+    let mut engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        volume_bytes,
+        write_options_clean(),
+    )
+    .unwrap();
+    engine
+        .enable_usn_journal(&cx, 65_536, 4096, DEFAULT_FILETIME)
+        .into_result()
+        .unwrap();
+    let (file, _) = engine
+        .create_file(&cx, "/", "punch.bin", payload)
+        .into_result()
+        .unwrap();
+    (device, engine, file)
+}
+
+fn journal_records(volume: &NtfsVolume) -> Vec<UsnRecordV2> {
+    let cx = Cx::for_testing();
+    let summary = volume.usn_summary(&cx).unwrap().expect("active journal");
+    let record = volume.record(&cx, u64::from(summary.record), None).unwrap();
+    let stream = volume
+        .data_stream(&cx, &record, &[u16::from(b'$'), u16::from(b'J')])
+        .unwrap();
+    let bytes = volume
+        .read(
+            &cx,
+            &stream,
+            summary.lowest_valid_usn,
+            usize::try_from(summary.next_usn - summary.lowest_valid_usn).unwrap(),
+        )
+        .unwrap();
+    parse_usn_journal_slice(summary.lowest_valid_usn, &bytes).unwrap()
+}
+
+fn standard_usn(record: &NtfsFileRecord) -> u64 {
+    let attributes = record.attributes().unwrap();
+    let standard = attributes
+        .iter()
+        .find(|attribute| attribute.kind == 0x10)
+        .unwrap();
+    let NtfsValue::Resident(bytes) = standard.value else {
+        panic!("STANDARD_INFORMATION must be resident");
+    };
+    assert_eq!(bytes.len(), 72, "NTFS 3.1 fixture must retain native USN");
+    u64::from_le_bytes(bytes[64..72].try_into().unwrap())
+}
+
+fn assert_punch_record(
+    engine: &NtfsTransactionEngine,
+    file: NtfsReference,
+    before: &[UsnRecordV2],
+    reason: u32,
+    timestamp: u64,
+) -> Vec<UsnRecordV2> {
+    let (volume, record) = view(engine, file);
+    let records = journal_records(&volume);
+    assert_eq!(records.len(), before.len() + 1);
+    assert_eq!(&records[..before.len()], before);
+    let event = records.last().unwrap();
+    assert_eq!(event.file_ref, file);
+    assert_eq!(event.reason, reason);
+    assert_eq!(event.timestamp, timestamp);
+    assert_eq!(event.name, "punch.bin".encode_utf16().collect::<Vec<_>>());
+    assert_eq!(event.file_attributes, standard_flags(&record));
+    assert_eq!(standard_usn(&record), event.usn);
+    records
+}
+
+#[test]
+fn hole_punch_records_unnamed_and_named_changes_without_noop_events() {
+    let cx = Cx::for_testing();
+    let cb = CLUSTER_BYTES as u64;
+    let mut resident = b"original resident bytes".to_vec();
+    let (_device, mut engine, file) = journal_fixture(&resident);
+    let name: Vec<_> = "audit".encode_utf16().collect();
+    let mut named = vec![0xA7; 3 * CLUSTER_BYTES];
+    engine
+        .create_file_stream(&cx, "/punch.bin", &name, &named)
+        .into_result()
+        .unwrap();
+    let before = journal_records(&engine.volume_view(&cx).unwrap());
+    engine
+        .punch_hole_at(&cx, file, &[], 3, 5, DEFAULT_FILETIME + 1)
+        .into_result()
+        .unwrap();
+    resident[3..8].fill(0);
+    assert_stream(
+        &engine,
+        file,
+        &[],
+        &resident,
+        resident.len() as u64,
+        resident.len() as u64,
+    );
+    let after_resident = assert_punch_record(
+        &engine,
+        file,
+        &before,
+        USN_REASON_DATA_OVERWRITE | USN_REASON_CLOSE,
+        DEFAULT_FILETIME + 1,
+    );
+    engine
+        .punch_hole_at(&cx, file, &name, cb, cb, DEFAULT_FILETIME + 2)
+        .into_result()
+        .unwrap();
+    named[CLUSTER_BYTES..2 * CLUSTER_BYTES].fill(0);
+    assert_stream(&engine, file, &name, &named, 2 * cb, 3 * cb);
+    assert_eq!(standard_flags(&view(&engine, file).1) & 0x200, 0);
+    assert_punch_record(
+        &engine,
+        file,
+        &after_resident,
+        USN_REASON_NAMED_DATA_OVERWRITE | USN_REASON_CLOSE,
+        DEFAULT_FILETIME + 2,
+    );
+
+    let mut dense = vec![0xBD; 3 * CLUSTER_BYTES];
+    engine
+        .write_file_data(&cx, "/punch.bin", &dense)
+        .into_result()
+        .unwrap();
+    let before_dense = journal_records(&engine.volume_view(&cx).unwrap());
+    engine
+        .punch_hole_at(&cx, file, &[], cb, cb, DEFAULT_FILETIME + 3)
+        .into_result()
+        .unwrap();
+    dense[CLUSTER_BYTES..2 * CLUSTER_BYTES].fill(0);
+    assert_stream(&engine, file, &[], &dense, 2 * cb, 3 * cb);
+    let after_dense = assert_punch_record(
+        &engine,
+        file,
+        &before_dense,
+        USN_REASON_DATA_OVERWRITE | USN_REASON_BASIC_INFO_CHANGE | USN_REASON_CLOSE,
+        DEFAULT_FILETIME + 3,
+    );
+    engine
+        .punch_hole_at(&cx, file, &[], 0, 5, DEFAULT_FILETIME + 4)
+        .into_result()
+        .unwrap();
+    dense[..5].fill(0);
+    assert_stream(&engine, file, &[], &dense, 2 * cb, 3 * cb);
+    let after = assert_punch_record(
+        &engine,
+        file,
+        &after_dense,
+        USN_REASON_DATA_OVERWRITE | USN_REASON_CLOSE,
+        DEFAULT_FILETIME + 4,
+    );
+
+    let usn_before_noop = standard_usn(&view(&engine, file).1);
+    engine
+        .punch_hole_at(&cx, file, &[], 3 * cb, cb, DEFAULT_FILETIME + 5)
+        .into_result()
+        .unwrap();
+    assert_stream(&engine, file, &[], &dense, 2 * cb, 3 * cb);
+    assert_eq!(standard_usn(&view(&engine, file).1), usn_before_noop);
+    assert_eq!(journal_records(&engine.volume_view(&cx).unwrap()), after);
+    engine.check_clean_consistency(&cx).unwrap();
+}
+
+#[test]
+fn hole_punch_fsops_updates_the_active_native_change_journal() {
+    let cx = Cx::for_testing();
+    let cb = CLUSTER_BYTES as u64;
+    let mut expected = vec![0x79; 2 * CLUSTER_BYTES];
+    let (device, engine, file) = journal_fixture(&expected);
+    let before = journal_records(&engine.volume_view(&cx).unwrap());
+    let fs = NtfsFs::from_engine(&cx, engine, 1000, 1000).unwrap();
+    let mut scope = RequestScope::empty();
+    let attr = fs
+        .lookup(&cx, &mut scope, InodeNumber(1), OsStr::new("punch.bin"))
+        .unwrap();
+    fs.fallocate(
+        &cx,
+        &mut scope,
+        attr.ino,
+        cb,
+        cb,
+        libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+    )
+    .unwrap();
+    let image = device.snapshot_durable_only();
+    let volume = NtfsVolume::from_device(
+        &cx,
+        Box::new(FaultInjectingNtfsDevice::new(image.clone())),
+        0,
+        image.len() as u64 - SECTOR_BYTES as u64,
+    )
+    .unwrap();
+    let record = volume
+        .record(&cx, file.record, Some(file.sequence))
+        .unwrap();
+    let stream = volume.data_stream(&cx, &record, &[]).unwrap();
+    expected[CLUSTER_BYTES..].fill(0);
+    assert_eq!(
+        volume.read(&cx, &stream, 0, expected.len()).unwrap(),
+        expected
+    );
+    let records = journal_records(&volume);
+    assert_eq!(records.len(), before.len() + 1);
+    assert_eq!(&records[..before.len()], before.as_slice());
+    let event = records.last().unwrap();
+    assert_eq!(event.file_ref, file);
+    assert_eq!(
+        event.reason,
+        USN_REASON_DATA_OVERWRITE | USN_REASON_BASIC_INFO_CHANGE | USN_REASON_CLOSE
+    );
+    assert_eq!(standard_usn(&record), event.usn);
+}
+
+#[test]
+fn hole_punch_refuses_transformed_files_before_writes_or_noop_acknowledgment() {
+    let cx = Cx::for_testing();
+    for transform in ["reparse", "encrypted", "compressed"] {
+        let (device, mut engine, file) = journal_fixture(&vec![0x4B; 3 * CLUSTER_BYTES]);
+        match transform {
+            "reparse" => {
+                let point = NtfsReparsePoint {
+                    tag: 0x9000_0017,
+                    guid: None,
+                    data: NtfsReparseData::Opaque(vec![0xAC; 16]),
+                };
+                engine
+                    .set_reparse_point_at(&cx, file, &point, true, DEFAULT_FILETIME)
+                    .into_result()
+                    .unwrap();
+            }
+            "encrypted" => {
+                let key = NtfsEfsKey::from_raw_bytes([0x37; 32]);
+                engine
+                    .encrypt_file_at(&cx, file, &key, DEFAULT_FILETIME)
+                    .into_result()
+                    .unwrap();
+            }
+            "compressed" => {
+                engine
+                    .set_compression_at(&cx, file, true, DEFAULT_FILETIME)
+                    .into_result()
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let before = device.snapshot_durable_only();
+        let written = device.write_bytes_total();
+        let events = engine.persistence_trace().len();
+        let journal = journal_records(&engine.volume_view(&cx).unwrap());
+        for offset in [0, 1 << 30] {
+            let outcome = engine.punch_hole_at(
+                &cx,
+                file,
+                &[],
+                offset,
+                CLUSTER_BYTES as u64,
+                DEFAULT_FILETIME + 1,
+            );
+            assert!(
+                matches!(
+                    outcome,
+                    NtfsTxOutcome::NotCommitted(FfsError::UnsupportedFeature(_))
+                ),
+                "{transform} hole punch was admitted at offset {offset}: {outcome:?}"
+            );
+            assert_eq!(device.write_bytes_total(), written);
+            assert_eq!(device.snapshot_live(), before);
+            assert_eq!(device.snapshot_durable_only(), before);
+            assert_eq!(engine.persistence_trace().len(), events);
+            assert_eq!(journal_records(&engine.volume_view(&cx).unwrap()), journal);
+        }
+    }
+}
+
+#[test]
+fn hole_punch_data_and_usn_recover_together_across_native_publication() {
+    let cx = Cx::for_testing();
+    let original = vec![0x68; 3 * CLUSTER_BYTES];
+    let (device, mut engine, file) = journal_fixture(&original);
+    let before = journal_records(&engine.volume_view(&cx).unwrap());
+    let old_usn = standard_usn(&view(&engine, file).1);
+    let mut expected = original.clone();
+    expected[13..2 * CLUSTER_BYTES + 13].fill(0);
+    type Cut = (NtfsPersistenceStage, bool, Vec<u8>, Vec<u8>);
+    let cuts: Arc<Mutex<Vec<Cut>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&cuts);
+    let source = Arc::clone(&device);
+    let mut committed = false;
+    engine.set_stage_hook(Some(Box::new(move |event| {
+        committed |= event.stage == NtfsPersistenceStage::LogCommitBarrier;
+        if matches!(
+            event.stage,
+            NtfsPersistenceStage::PayloadBarrier
+                | NtfsPersistenceStage::DirtyRestartBarrier
+                | NtfsPersistenceStage::LogCommitBarrier
+                | NtfsPersistenceStage::TargetMetadataBarrier
+                | NtfsPersistenceStage::AckPublished
+        ) {
+            captured.lock().unwrap().push((
+                event.stage,
+                committed,
+                source.snapshot_durable_only(),
+                source.snapshot_reordered_pending(true),
+            ));
+        }
+        Ok(())
+    })));
+    engine
+        .punch_hole_at(
+            &cx,
+            file,
+            &[],
+            13,
+            2 * CLUSTER_BYTES as u64,
+            DEFAULT_FILETIME + 33,
+        )
+        .into_result()
+        .unwrap();
+    engine.set_stage_hook(None);
+    let after = assert_punch_record(
+        &engine,
+        file,
+        &before,
+        USN_REASON_DATA_OVERWRITE | USN_REASON_BASIC_INFO_CHANGE | USN_REASON_CLOSE,
+        DEFAULT_FILETIME + 33,
+    );
+    let captured = cuts.lock().unwrap();
+    for required in [
+        NtfsPersistenceStage::PayloadBarrier,
+        NtfsPersistenceStage::DirtyRestartBarrier,
+        NtfsPersistenceStage::LogCommitBarrier,
+        NtfsPersistenceStage::TargetMetadataBarrier,
+        NtfsPersistenceStage::AckPublished,
+    ] {
+        assert!(
+            captured.iter().any(|(stage, _, _, _)| *stage == required),
+            "missing publication boundary {required:?}"
+        );
+    }
+    for (stage, committed, durable, reordered) in captured.iter() {
+        for (image, may_be_newer) in [(durable, false), (reordered, true)] {
+            let recovered_device = FaultInjectingNtfsDevice::new(image.clone());
+            let recovered = NtfsTransactionEngine::from_device(
+                &cx,
+                Arc::clone(&recovered_device) as Arc<dyn ByteDevice>,
+                0,
+                image.len() as u64 - SECTOR_BYTES as u64,
+                write_options_recover(),
+            )
+            .unwrap_or_else(|error| panic!("journal recovery at {stage:?}: {error}"));
+            recovered.check_clean_consistency(&cx).unwrap();
+            let (volume, record) = view(&recovered, file);
+            let stream = volume.data_stream(&cx, &record, &[]).unwrap();
+            let observed = volume.read(&cx, &stream, 0, original.len()).unwrap();
+            let applied = observed == expected;
+            assert!(applied || observed == original, "mixed data at {stage:?}");
+            if *committed || !may_be_newer {
+                assert_eq!(applied, *committed, "wrong durable prefix at {stage:?}");
+            }
+            let observed_journal = journal_records(&volume);
+            assert_eq!(
+                &observed_journal,
+                if applied { &after } else { &before },
+                "data/journal disagreement at {stage:?}"
+            );
+            assert_eq!(
+                standard_usn(&record),
+                if applied {
+                    after.last().unwrap().usn
+                } else {
+                    old_usn
+                },
+                "target/journal USN disagreement at {stage:?}"
+            );
+            assert_eq!(
+                standard_flags(&record) & 0x200,
+                if applied { 0x200 } else { 0 }
+            );
+        }
+    }
 }

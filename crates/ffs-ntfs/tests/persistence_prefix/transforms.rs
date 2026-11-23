@@ -29,8 +29,8 @@ use ffs_ondisk::ntfs::reparse::{MOUNT_POINT_TAG, NtfsReparseData, NtfsReparsePoi
 use ffs_ondisk::ntfs_security::{
     ACE_FLAG_CONTAINER_INHERIT, ACE_FLAG_INHERIT_ONLY, ACE_FLAG_INHERITED, ACE_FLAG_OBJECT_INHERIT,
     ACE_TYPE_ACCESS_ALLOWED, ACE_TYPE_ACCESS_DENIED, ACE_TYPE_SYSTEM_AUDIT, FILE_ALL_ACCESS,
-    FILE_READ_DATA, FILE_WRITE_DATA, NtfsAccessToken, NtfsAcl, NtfsSecurityDescriptor, NtfsSid,
-    SE_DACL_PRESENT, SE_SACL_PRESENT, SE_SELF_RELATIVE,
+    FILE_READ_DATA, FILE_READ_EA, FILE_WRITE_DATA, FILE_WRITE_EA, NtfsAccessToken, NtfsAcl,
+    NtfsSecurityDescriptor, NtfsSid, SE_DACL_PRESENT, SE_SACL_PRESENT, SE_SELF_RELATIVE,
 };
 use ffs_types::InodeNumber;
 
@@ -75,6 +75,616 @@ fn open_clean_engine(
 
 fn utf16(s: &str) -> Vec<u16> {
     s.encode_utf16().collect()
+}
+
+fn stream_acl_policy(caller_uid: u32) -> NtfsSidPolicy {
+    NtfsSidPolicy::Mapped {
+        caller_uid,
+        caller_gid: 2000,
+        map: NtfsSidMap {
+            enforce_acl: true,
+            posix_nfs_sids: true,
+            ..NtfsSidMap::default()
+        },
+    }
+}
+
+fn stream_acl_descriptor(denied: u32) -> Vec<u8> {
+    NtfsSecurityDescriptor {
+        resource_manager_control: 0,
+        control: SE_SELF_RELATIVE | SE_DACL_PRESENT,
+        owner: Some(NtfsSid {
+            authority: 5,
+            subauthorities: vec![88, 1, 1001],
+        }),
+        group: Some(NtfsSid {
+            authority: 5,
+            subauthorities: vec![88, 2, 2000],
+        }),
+        sacl: NtfsAcl {
+            present: false,
+            offset: 0,
+            revision: None,
+            ace_count: None,
+            size: None,
+            aces: Vec::new(),
+            padding: Vec::new(),
+        },
+        dacl: NtfsAcl {
+            present: true,
+            offset: 0,
+            revision: Some(2),
+            ace_count: Some(2),
+            size: None,
+            aces: vec![
+                build_simple_ace(
+                    ACE_TYPE_ACCESS_DENIED,
+                    0,
+                    denied,
+                    NtfsSid {
+                        authority: 5,
+                        subauthorities: vec![88, 1, 1002],
+                    },
+                ),
+                build_simple_ace(
+                    ACE_TYPE_ACCESS_ALLOWED,
+                    0,
+                    FILE_ALL_ACCESS,
+                    NtfsSid::world_everyone(),
+                ),
+            ],
+            padding: Vec::new(),
+        },
+    }
+    .encode()
+    .unwrap()
+}
+
+#[test]
+fn ntfs_mapped_acl_covers_named_stream_io_and_mutations() {
+    let cx = Cx::for_testing();
+    let (dev, vol_bytes) = format_to_fault_device(
+        &cx,
+        16,
+        4096,
+        NtfsFormatVersion::V3_1,
+        0xAC15_0001_0000_0001,
+    );
+    let mut engine = open_clean_engine(&cx, &dev, vol_bytes);
+    let root = engine.resolve_path_reference(&cx, "/").unwrap();
+    let (file, _) = engine
+        .create_file_at(&cx, root, &utf16("restricted.bin"), b"base-content")
+        .into_result()
+        .unwrap();
+    engine
+        .create_stream(&cx, file, &utf16("audit"), b"stream-content")
+        .into_result()
+        .unwrap();
+    engine
+        .set_security_at(
+            &cx,
+            file,
+            &stream_acl_descriptor(FILE_READ_DATA | FILE_WRITE_DATA),
+            DEFAULT_NTFS_FILETIME,
+        )
+        .into_result()
+        .unwrap();
+    let fs = NtfsFs::from_engine_with_policy(&cx, engine, stream_acl_policy(1002)).unwrap();
+    let mut scope = RequestScope::empty();
+    let root_ino = InodeNumber(1);
+    let base = fs
+        .lookup(&cx, &mut scope, root_ino, OsStr::new("restricted.bin"))
+        .unwrap();
+    let ads = fs
+        .lookup(
+            &cx,
+            &mut scope,
+            root_ino,
+            OsStr::new("restricted.bin:audit"),
+        )
+        .unwrap();
+    // An explicit deny for this SID cannot be represented by the owner/group/
+    // other projection alone. Native checks must apply to both stream kinds.
+    assert_ne!(ads.perm & 0o222, 0);
+    let before = dev.snapshot_live();
+    let writes = dev.write_bytes_total();
+    for ino in [base.ino, ads.ino] {
+        assert!(matches!(
+            fs.read(&cx, &mut scope, ino, 0, 64),
+            Err(FfsError::PermissionDenied)
+        ));
+        for flags in [libc::O_RDONLY, libc::O_WRONLY, libc::O_RDWR] {
+            assert!(matches!(
+                fs.open(&cx, &mut scope, ino, flags),
+                Err(FfsError::PermissionDenied)
+            ));
+        }
+        assert!(matches!(
+            fs.open_read_only(&cx, ino, libc::O_RDONLY),
+            Err(FfsError::PermissionDenied)
+        ));
+        assert!(matches!(
+            fs.write(&cx, &mut scope, ino, 0, b"forbidden"),
+            Err(FfsError::PermissionDenied)
+        ));
+        assert!(matches!(
+            fs.setattr(
+                &cx,
+                &mut scope,
+                ino,
+                &SetAttrRequest {
+                    size: Some(0),
+                    ..SetAttrRequest::default()
+                },
+            ),
+            Err(FfsError::PermissionDenied)
+        ));
+        assert!(matches!(
+            fs.fallocate(&cx, &mut scope, ino, 0, 4, 0x03),
+            Err(FfsError::PermissionDenied)
+        ));
+    }
+    assert!(matches!(
+        fs.create(
+            &cx,
+            &mut scope,
+            root_ino,
+            OsStr::new("restricted.bin:new"),
+            0o666,
+            1002,
+            2000,
+        ),
+        Err(FfsError::PermissionDenied)
+    ));
+    assert!(matches!(
+        fs.unlink(
+            &cx,
+            &mut scope,
+            root_ino,
+            OsStr::new("restricted.bin:audit")
+        ),
+        Err(FfsError::PermissionDenied)
+    ));
+    assert!(matches!(
+        fs.rename(
+            &cx,
+            &mut scope,
+            root_ino,
+            OsStr::new("restricted.bin:audit"),
+            root_ino,
+            OsStr::new("restricted.bin:moved"),
+        ),
+        Err(FfsError::PermissionDenied)
+    ));
+    assert_eq!(dev.write_bytes_total(), writes);
+    assert_eq!(dev.snapshot_live(), before);
+    assert!(fs.last_durable_token().unwrap().is_none());
+    drop(fs);
+
+    // The same native descriptor permits another caller, and changing the ADS
+    // must leave the unnamed stream intact.
+    let engine = open_clean_engine(&cx, &dev, vol_bytes);
+    let fs = NtfsFs::from_engine_with_policy(&cx, engine, stream_acl_policy(1001)).unwrap();
+    let ads = fs
+        .lookup(
+            &cx,
+            &mut scope,
+            root_ino,
+            OsStr::new("restricted.bin:audit"),
+        )
+        .unwrap();
+    assert_eq!(
+        fs.read(&cx, &mut scope, ads.ino, 0, 64).unwrap(),
+        b"stream-content"
+    );
+    let (fh, _) = fs.open(&cx, &mut scope, ads.ino, libc::O_RDWR).unwrap();
+    fs.write(&cx, &mut scope, ads.ino, 0, b"allowed").unwrap();
+    fs.setattr(
+        &cx,
+        &mut scope,
+        ads.ino,
+        &SetAttrRequest {
+            size: Some(7),
+            ..SetAttrRequest::default()
+        },
+    )
+    .unwrap();
+    fs.fallocate(&cx, &mut scope, ads.ino, 1, 3, 0x03).unwrap();
+    assert_eq!(
+        fs.read(&cx, &mut scope, ads.ino, 0, 64).unwrap(),
+        b"a\0\0\0wed"
+    );
+    assert_eq!(
+        fs.read(&cx, &mut scope, base.ino, 0, 64).unwrap(),
+        b"base-content"
+    );
+    fs.release(
+        &cx,
+        &mut scope,
+        ffs_core::vfs::ReleaseRequest {
+            ino: ads.ino,
+            fh,
+            flags: libc::O_RDWR,
+            lock_owner: None,
+            flush: false,
+        },
+    )
+    .unwrap();
+    fs.flush_on_destroy(&cx).unwrap();
+}
+
+#[test]
+fn ntfs_mapped_acl_open_checks_read_right_before_truncating_any_stream() {
+    let cx = Cx::for_testing();
+    let (dev, vol_bytes) = format_to_fault_device(
+        &cx,
+        16,
+        4096,
+        NtfsFormatVersion::V3_0,
+        0xAC15_0002_0000_0001,
+    );
+    let mut engine = open_clean_engine(&cx, &dev, vol_bytes);
+    let root = engine.resolve_path_reference(&cx, "/").unwrap();
+    let (file, _) = engine
+        .create_file_at(&cx, root, &utf16("write-only.bin"), b"base")
+        .into_result()
+        .unwrap();
+    engine
+        .create_stream(&cx, file, &utf16("audit"), b"stream")
+        .into_result()
+        .unwrap();
+    engine
+        .set_security_at(
+            &cx,
+            file,
+            &stream_acl_descriptor(FILE_READ_DATA),
+            DEFAULT_NTFS_FILETIME,
+        )
+        .into_result()
+        .unwrap();
+    let fs = NtfsFs::from_engine_with_policy(&cx, engine, stream_acl_policy(1002)).unwrap();
+    let mut scope = RequestScope::empty();
+    for name in ["write-only.bin", "write-only.bin:audit"] {
+        let attr = fs
+            .lookup(&cx, &mut scope, InodeNumber(1), OsStr::new(name))
+            .unwrap();
+        let before = dev.snapshot_live();
+        let writes = dev.write_bytes_total();
+        for flags in [
+            libc::O_RDONLY,
+            libc::O_RDWR,
+            libc::O_RDONLY | libc::O_TRUNC,
+            libc::O_RDWR | libc::O_TRUNC,
+        ] {
+            assert!(
+                matches!(
+                    fs.open(&cx, &mut scope, attr.ino, flags),
+                    Err(FfsError::PermissionDenied)
+                ),
+                "read access must be checked for {name}, flags={flags}"
+            );
+        }
+        assert_eq!(dev.write_bytes_total(), writes);
+        assert_eq!(dev.snapshot_live(), before);
+        let (fh, _) = fs.open(&cx, &mut scope, attr.ino, libc::O_WRONLY).unwrap();
+        fs.write(&cx, &mut scope, attr.ino, 0, b"ok").unwrap();
+        assert!(matches!(
+            fs.read(&cx, &mut scope, attr.ino, 0, 2),
+            Err(FfsError::PermissionDenied)
+        ));
+        fs.release(
+            &cx,
+            &mut scope,
+            ffs_core::vfs::ReleaseRequest {
+                ino: attr.ino,
+                fh,
+                flags: libc::O_WRONLY,
+                lock_owner: None,
+                flush: false,
+            },
+        )
+        .unwrap();
+    }
+    fs.flush_on_destroy(&cx).unwrap();
+}
+
+#[test]
+fn ntfs_mapped_acl_create_open_checks_read_before_publishing_named_stream() {
+    let cx = Cx::for_testing();
+    let (dev, vol_bytes) = format_to_fault_device(
+        &cx,
+        16,
+        4096,
+        NtfsFormatVersion::V3_1,
+        0xAC15_0003_0000_0001,
+    );
+    let mut engine = open_clean_engine(&cx, &dev, vol_bytes);
+    let root = engine.resolve_path_reference(&cx, "/").unwrap();
+    let (file, _) = engine
+        .create_file_at(&cx, root, &utf16("write-only.bin"), b"base")
+        .into_result()
+        .unwrap();
+    engine
+        .set_security_at(
+            &cx,
+            file,
+            &stream_acl_descriptor(FILE_READ_DATA),
+            DEFAULT_NTFS_FILETIME,
+        )
+        .into_result()
+        .unwrap();
+    let fs = NtfsFs::from_engine_with_policy(&cx, engine, stream_acl_policy(1002)).unwrap();
+    let mut scope = RequestScope::empty();
+    let before = dev.snapshot_live();
+    let durable_before = dev.snapshot_durable_only();
+    let writes = dev.write_bytes_total();
+    for (name, flags) in [
+        ("write-only.bin:read", libc::O_RDONLY),
+        ("write-only.bin:read-write", libc::O_RDWR),
+    ] {
+        assert!(matches!(
+            fs.create_open(
+                &cx,
+                &mut scope,
+                InodeNumber(1),
+                OsStr::new(name),
+                0o666,
+                1002,
+                2000,
+                flags | libc::O_CREAT | libc::O_EXCL,
+            ),
+            Err(FfsError::PermissionDenied)
+        ));
+        assert!(matches!(
+            fs.lookup(&cx, &mut scope, InodeNumber(1), OsStr::new(name)),
+            Err(FfsError::NotFound(_))
+        ));
+    }
+    assert_eq!(dev.write_bytes_total(), writes);
+    assert_eq!(dev.snapshot_live(), before);
+    assert_eq!(dev.snapshot_durable_only(), durable_before);
+    assert!(fs.last_durable_token().unwrap().is_none());
+
+    let (attr, fh, _) = fs
+        .create_open(
+            &cx,
+            &mut scope,
+            InodeNumber(1),
+            OsStr::new("write-only.bin:write"),
+            0o666,
+            1002,
+            2000,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+        )
+        .unwrap();
+    fs.write(&cx, &mut scope, attr.ino, 0, b"permitted")
+        .unwrap();
+    assert!(matches!(
+        fs.read(&cx, &mut scope, attr.ino, 0, 64),
+        Err(FfsError::PermissionDenied)
+    ));
+    fs.release(
+        &cx,
+        &mut scope,
+        ffs_core::vfs::ReleaseRequest {
+            ino: attr.ino,
+            fh,
+            flags: libc::O_WRONLY,
+            lock_owner: None,
+            flush: false,
+        },
+    )
+    .unwrap();
+    fs.flush_on_destroy(&cx).unwrap();
+    drop(fs);
+
+    let engine = open_clean_engine(&cx, &dev, vol_bytes);
+    let fs = NtfsFs::from_engine_with_policy(&cx, engine, stream_acl_policy(1001)).unwrap();
+    let written = fs
+        .lookup(
+            &cx,
+            &mut scope,
+            InodeNumber(1),
+            OsStr::new("write-only.bin:write"),
+        )
+        .unwrap();
+    assert_eq!(
+        fs.read(&cx, &mut scope, written.ino, 0, 64).unwrap(),
+        b"permitted"
+    );
+    let (attr, fh, _) = fs
+        .create_open(
+            &cx,
+            &mut scope,
+            InodeNumber(1),
+            OsStr::new("write-only.bin:read-write"),
+            0o666,
+            1001,
+            2000,
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+        )
+        .unwrap();
+    fs.write(&cx, &mut scope, attr.ino, 0, b"both").unwrap();
+    assert_eq!(fs.read(&cx, &mut scope, attr.ino, 0, 64).unwrap(), b"both");
+    fs.release(
+        &cx,
+        &mut scope,
+        ffs_core::vfs::ReleaseRequest {
+            ino: attr.ino,
+            fh,
+            flags: libc::O_RDWR,
+            lock_owner: None,
+            flush: false,
+        },
+    )
+    .unwrap();
+    fs.flush_on_destroy(&cx).unwrap();
+}
+
+#[test]
+fn ntfs_mapped_acl_extended_attribute_rights_are_independent_of_data_rights() {
+    let cx = Cx::for_testing();
+    let (dev, vol_bytes) = format_to_fault_device(
+        &cx,
+        16,
+        4096,
+        NtfsFormatVersion::V3_1,
+        0xAC15_0004_0000_0001,
+    );
+    // Name, denied native rights, DATA access, EA read access, EA write access.
+    let cases = [
+        (
+            "no-ea.bin",
+            FILE_READ_EA | FILE_WRITE_EA,
+            true,
+            false,
+            false,
+        ),
+        (
+            "no-data.bin",
+            FILE_READ_DATA | FILE_WRITE_DATA,
+            false,
+            true,
+            true,
+        ),
+        ("write-ea.bin", FILE_READ_EA, true, false, true),
+        ("read-ea.bin", FILE_WRITE_EA, true, true, false),
+    ];
+    let mut engine = open_clean_engine(&cx, &dev, vol_bytes);
+    let root = engine.resolve_path_reference(&cx, "/").unwrap();
+    for (name, denied, _, _, _) in cases {
+        let (file, _) = engine
+            .create_file_at(&cx, root, &utf16(name), b"base")
+            .into_result()
+            .unwrap();
+        engine
+            .set_ea_at(
+                &cx,
+                file,
+                b"user.secret",
+                b"initial",
+                0,
+                DEFAULT_NTFS_FILETIME,
+            )
+            .into_result()
+            .unwrap();
+        engine
+            .set_security_at(
+                &cx,
+                file,
+                &stream_acl_descriptor(denied),
+                DEFAULT_NTFS_FILETIME,
+            )
+            .into_result()
+            .unwrap();
+    }
+    let fs = NtfsFs::from_engine_with_policy(&cx, engine, stream_acl_policy(1002)).unwrap();
+    let mut scope = RequestScope::empty();
+    for (name, _, data_allowed, read_ea_allowed, write_ea_allowed) in cases {
+        let attr = fs
+            .lookup(&cx, &mut scope, InodeNumber(1), OsStr::new(name))
+            .unwrap();
+        if data_allowed {
+            assert_eq!(fs.read(&cx, &mut scope, attr.ino, 0, 64).unwrap(), b"base");
+            assert_eq!(fs.write(&cx, &mut scope, attr.ino, 0, b"ok").unwrap(), 2);
+        } else {
+            assert!(matches!(
+                fs.read(&cx, &mut scope, attr.ino, 0, 64),
+                Err(FfsError::PermissionDenied)
+            ));
+            assert!(matches!(
+                fs.write(&cx, &mut scope, attr.ino, 0, b"forbidden"),
+                Err(FfsError::PermissionDenied)
+            ));
+        }
+        let before = dev.snapshot_live();
+        let writes = dev.write_bytes_total();
+        if read_ea_allowed {
+            assert_eq!(
+                fs.listxattr(&cx, attr.ino).unwrap(),
+                vec!["user.secret".to_owned()]
+            );
+            assert_eq!(
+                fs.getxattr(&cx, attr.ino, "user.secret").unwrap(),
+                Some(b"initial".to_vec())
+            );
+            assert_eq!(fs.getxattr(&cx, attr.ino, "user.missing").unwrap(), None);
+        } else {
+            assert!(matches!(
+                fs.listxattr(&cx, attr.ino),
+                Err(FfsError::PermissionDenied)
+            ));
+            for key in ["user.secret", "user.missing"] {
+                assert!(matches!(
+                    fs.getxattr(&cx, attr.ino, key),
+                    Err(FfsError::PermissionDenied)
+                ));
+            }
+        }
+        if write_ea_allowed {
+            fs.setxattr(
+                &cx,
+                &mut scope,
+                attr.ino,
+                "user.created",
+                b"created",
+                XattrSetMode::Create,
+            )
+            .unwrap();
+            fs.setxattr(
+                &cx,
+                &mut scope,
+                attr.ino,
+                "user.secret",
+                b"replaced",
+                XattrSetMode::Replace,
+            )
+            .unwrap();
+            assert!(
+                fs.removexattr(&cx, &mut scope, attr.ino, "user.secret")
+                    .unwrap()
+            );
+        } else {
+            for (key, mode) in [
+                ("user.created", XattrSetMode::Create),
+                ("user.secret", XattrSetMode::Replace),
+            ] {
+                assert!(matches!(
+                    fs.setxattr(&cx, &mut scope, attr.ino, key, b"forbidden", mode),
+                    Err(FfsError::PermissionDenied)
+                ));
+            }
+            for key in ["user.secret", "user.missing"] {
+                assert!(matches!(
+                    fs.removexattr(&cx, &mut scope, attr.ino, key),
+                    Err(FfsError::PermissionDenied)
+                ));
+            }
+            assert_eq!(dev.write_bytes_total(), writes);
+            assert_eq!(dev.snapshot_live(), before);
+        }
+    }
+    fs.flush_on_destroy(&cx).unwrap();
+    drop(fs);
+
+    let engine = open_clean_engine(&cx, &dev, vol_bytes);
+    let volume = engine.volume_view(&cx).unwrap();
+    for (name, _, data_allowed, _, write_ea_allowed) in cases {
+        let path = format!("/{name}");
+        let record = volume.resolve(&cx, &path).unwrap();
+        let eas = volume.extended_attributes(&cx, &record).unwrap();
+        if write_ea_allowed {
+            assert!(eas.find(b"user.secret").is_none());
+            assert_eq!(eas.find(b"user.created").unwrap().value, b"created");
+        } else {
+            assert_eq!(eas.find(b"user.secret").unwrap().value, b"initial");
+            assert!(eas.find(b"user.created").is_none());
+        }
+        assert_eq!(
+            read_file_by_path(&cx, &engine, &path),
+            if data_allowed { b"okse" } else { b"base" }
+        );
+    }
 }
 
 fn read_file_by_path(cx: &Cx, engine: &NtfsTransactionEngine, path: &str) -> Vec<u8> {

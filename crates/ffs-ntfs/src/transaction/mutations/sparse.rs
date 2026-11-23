@@ -1,14 +1,17 @@
 //! Logged hole punching without reading or rewriting untouched DATA extents.
 
 use super::{
-    EditableDataStream, EditableStreamStorage, FILE_ATTR_ENCRYPTED, FILE_ATTR_SPARSE_FILE,
-    MIN_USER_MFT_SLOT, NtfsTransactionEngine, NtfsTxOutcome, PreparedTxPlan, TxWorkspace,
-    checkpoint, corrupt, read_editable_stream_prefix, splice_vcn_interval, stage_runs_writes,
-    unsupported, validate_ntfs_stream_name_utf16,
+    EditableDataStream, EditableStreamStorage, FILE_ATTR_ENCRYPTED, FILE_ATTR_REPARSE_POINT,
+    FILE_ATTR_SPARSE_FILE, MIN_USER_MFT_SLOT, NtfsTransactionEngine, NtfsTxOutcome, PreparedTxPlan,
+    TxWorkspace, checkpoint, corrupt, read_editable_stream_prefix, splice_vcn_interval,
+    stage_runs_writes, unsupported, validate_ntfs_stream_name_utf16,
 };
 use asupersync::Cx;
 use ffs_error::{FfsError, Result};
-use ffs_ondisk::ntfs::usn::{USN_REASON_CLOSE, USN_REASON_DATA_OVERWRITE};
+use ffs_ondisk::ntfs::usn::{
+    USN_REASON_BASIC_INFO_CHANGE, USN_REASON_CLOSE, USN_REASON_DATA_OVERWRITE,
+    USN_REASON_NAMED_DATA_OVERWRITE,
+};
 use ffs_ondisk::ntfs::{NtfsReference, NtfsRun};
 use std::ops::Range;
 
@@ -99,11 +102,17 @@ impl NtfsTransactionEngine {
         if target.record < MIN_USER_MFT_SLOT {
             return Err(FfsError::PermissionDenied);
         }
-        if stream_utf16.is_empty() && (catalog.std_flags() & FILE_ATTR_ENCRYPTED) != 0 {
-            return Err(unsupported("cannot punch hole in an encrypted NTFS file"));
-        }
-        if stream_utf16.is_empty() && catalog.reparse_point.is_some() {
-            return Err(unsupported("cannot punch hole in an NTFS reparse point"));
+        // A provider's unnamed DATA may only be a placeholder, and an EFS
+        // file can carry encryption authority outside its DATA header. Do not
+        // acknowledge raw edits as logical hole punching in either case.
+        if stream_utf16.is_empty() {
+            if catalog.std_flags() & FILE_ATTR_ENCRYPTED != 0 {
+                return Err(unsupported("cannot punch hole in an encrypted NTFS file"));
+            }
+            if catalog.reparse_point.is_some() || catalog.std_flags() & FILE_ATTR_REPARSE_POINT != 0
+            {
+                return Err(unsupported("cannot punch hole in an NTFS reparse point"));
+            }
         }
         let stream_index = catalog
             .data_streams
@@ -111,6 +120,30 @@ impl NtfsTransactionEngine {
             .position(|stream| stream.name == stream_utf16)
             .ok_or_else(|| FfsError::NotFound("NTFS exact DATA stream not found".into()))?;
         let stream = &catalog.data_streams[stream_index];
+        if let EditableStreamStorage::NonResident {
+            compressed,
+            encrypted,
+            compression_unit,
+            sparse,
+            ..
+        } = &stream.storage
+        {
+            if *compressed {
+                return Err(unsupported(
+                    "punch_hole is not supported directly on LZNT1-compressed streams",
+                ));
+            }
+            if *encrypted {
+                return Err(unsupported(
+                    "punch_hole is not supported on encrypted NTFS streams",
+                ));
+            }
+            if *compression_unit != 0 && !(*sparse && *compression_unit == 4) {
+                return Err(unsupported(
+                    "unsupported NTFS sparse compression-unit encoding",
+                ));
+            }
+        }
         range.end = range.end.min(stream.logical_size());
         if range.start >= range.end {
             // Still resolve the sequence and stream before acknowledging a
@@ -140,22 +173,28 @@ impl NtfsTransactionEngine {
             &storage,
             EditableStreamStorage::NonResident { sparse: true, .. }
         );
-        let usn_snap = {
+        let mut reason = if stream_utf16.is_empty() {
+            USN_REASON_DATA_OVERWRITE
+        } else {
+            USN_REASON_NAMED_DATA_OVERWRITE
+        } | USN_REASON_CLOSE;
+        let usn_snapshot = {
             let catalog = ws.catalog_mut(self, cx, target)?;
             catalog.data_streams[stream_index].storage = storage;
             // Native FILE flags describe unnamed DATA, not independent ADS flags.
             // Preserve an existing sparse bit even if a resident value was edited.
             if stream_utf16.is_empty() && sparse {
+                if catalog.std_flags() & FILE_ATTR_SPARSE_FILE == 0 {
+                    reason |= USN_REASON_BASIC_INFO_CHANGE;
+                }
                 catalog.set_std_flags(catalog.std_flags() | FILE_ATTR_SPARSE_FILE);
             }
             catalog.set_std_times(None, Some(now_ticks), Some(now_ticks), None);
             catalog.clone()
         };
-        ws.push_usn_event_for_catalog(
-            &usn_snap,
-            USN_REASON_DATA_OVERWRITE | USN_REASON_CLOSE,
-            now_ticks,
-        );
+        // Finalization publishes the data change, journal record, and target
+        // STANDARD_INFORMATION.usn in the same logged native transaction.
+        ws.push_usn_event_for_catalog(&usn_snapshot, reason, now_ticks);
         ws.sync_target_into_parent_dirs(self, cx, target)?;
         ws.finalize(self, cx, "punch_hole_at", digest, ())
     }
@@ -171,30 +210,14 @@ fn punch_nonresident(
     let EditableStreamStorage::NonResident {
         runs,
         sparse,
-        compressed,
-        encrypted,
         compression_unit,
         data_bytes,
         initialized_bytes,
+        ..
     } = &stream.storage
     else {
         return Err(corrupt(0, "hole-punch source is not nonresident"));
     };
-    if *compressed {
-        return Err(unsupported(
-            "punch_hole is not supported directly on LZNT1-compressed streams",
-        ));
-    }
-    if *encrypted {
-        return Err(unsupported(
-            "punch_hole is not supported on encrypted NTFS streams",
-        ));
-    }
-    if *compression_unit != 0 && !(*sparse && *compression_unit == 4) {
-        return Err(unsupported(
-            "unsupported NTFS sparse compression-unit encoding",
-        ));
-    }
     let cb = u64::from(engine.geometry.cluster_bytes());
     if *data_bytes > i64::MAX as u64
         || runs
