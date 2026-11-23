@@ -36,7 +36,7 @@ use ffs_ondisk::ntfs_security::{
 
 use crate::reader::wof::BACKING_NAME as WOF_BACKING_NAME;
 use crate::reparse_provider::{ReparseCapability, classify_reparse_point};
-use crate::security_policy::NtfsSecurityPatch;
+use crate::security_policy::{NtfsSecurityPatch, apply_security_patch};
 
 use super::btree::I30RawEntry;
 use super::catalog::{
@@ -51,7 +51,7 @@ use super::dir_index::{
     find_attr_offset_in_restored,
 };
 use super::ops::{
-    DEFAULT_NTFS_FILETIME, FILE_ATTR_ARCHIVE, FILE_ATTR_DIRECTORY, FileDataEdit,
+    DEFAULT_NTFS_FILETIME, FILE_ATTR_ARCHIVE, FILE_ATTR_DIRECTORY, FileDataEdit, InheritedSecurity,
     MAX_RESIDENT_DATA_PAYLOAD, PreparedTxPlan, TargetWriteKind, encode_standard_information,
     extract_parent_security, find_contiguous_zero_bits, set_or_clear_bits,
 };
@@ -2294,6 +2294,33 @@ impl NtfsTransactionEngine {
         initial_data: &[u8],
         now_ticks: u64,
     ) -> NtfsTxOutcome<NtfsReference> {
+        self.create_entry_with_security_at(
+            cx,
+            parent_ref,
+            name_utf16,
+            is_dir,
+            read_only,
+            initial_data,
+            now_ticks,
+            None,
+        )
+    }
+
+    /// Publish a new child and its mapped security in the same native transaction.
+    /// Security admission precedes even optional MFT growth, so an unrepresentable
+    /// mode or descriptor cannot leave an accessible child after a failed create.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_entry_with_security_at(
+        &mut self,
+        cx: &Cx,
+        parent_ref: NtfsReference,
+        name_utf16: &[u16],
+        is_dir: bool,
+        read_only: bool,
+        initial_data: &[u8],
+        now_ticks: u64,
+        security_patch: Option<&NtfsSecurityPatch>,
+    ) -> NtfsTxOutcome<NtfsReference> {
         if let Err(err) = checkpoint(cx) {
             return NtfsTxOutcome::NotCommitted(err);
         }
@@ -2313,24 +2340,90 @@ impl NtfsTransactionEngine {
         hasher.update(&[u8::from(is_dir), u8::from(read_only)]);
         hasher.update(&(initial_data.len() as u64).to_le_bytes());
         hasher.update(blake3::hash(initial_data).as_bytes());
-        let digest = *hasher.finalize().as_bytes();
-
-        // Preflight parent existence & collision before touching MFT growth!
-        {
-            let preflight = (|| -> Result<()> {
-                let mut ws = TxWorkspace::load(self, cx)?;
-                if ws
-                    .lookup_in_dir(self, cx, parent_ref, name_utf16)?
-                    .is_some()
-                {
-                    return Err(FfsError::Exists);
+        // Resolve inheritance and the complete requested descriptor before any
+        // storage mutation. In particular, CREATOR_OWNER/GROUP must resolve to
+        // the caller's mapped identities, not the parent's previous identities.
+        let preflight = (|| -> Result<(InheritedSecurity, bool)> {
+            let mut ws = TxWorkspace::load(self, cx)?;
+            if ws
+                .lookup_in_dir(self, cx, parent_ref, name_utf16)?
+                .is_some()
+            {
+                return Err(FfsError::Exists);
+            }
+            let parent_cat = ws.load_catalog(self, cx, parent_ref)?.clone();
+            if parent_cat.reparse_point.is_some() {
+                return Err(unsupported(
+                    "cannot create NTFS child inside a reparse directory",
+                ));
+            }
+            let inherit_compressed = (parent_cat.std_flags() & FILE_ATTR_COMPRESSED) != 0;
+            if inherit_compressed && !is_dir {
+                compression::check_lznt1_geometry(&self.geometry)?;
+            }
+            let parent_security =
+                if let Some(raw) = ws.read_catalog_security_descriptor(self, cx, &parent_cat)? {
+                    InheritedSecurity::Descriptor(raw)
+                } else {
+                    let record = read_mft_record_via_runs(
+                        &self.device,
+                        cx,
+                        &self.geometry,
+                        &ws.mft_runs,
+                        u32::try_from(parent_ref.record).map_err(|_| corrupt(0, "parent u32"))?,
+                    )?;
+                    extract_parent_security(&record)
+                };
+            let security = match parent_security {
+                InheritedSecurity::Descriptor(raw) => {
+                    let parent_sd =
+                        NtfsSecurityDescriptor::parse(&raw).map_err(|err| parse_err(&err))?;
+                    let default_owner = ffs_ondisk::ntfs_security::NtfsSid::administrators();
+                    let default_group = ffs_ondisk::ntfs_security::NtfsSid::local_system();
+                    let child_owner = security_patch
+                        .and_then(|patch| patch.owner.as_ref())
+                        .or(parent_sd.owner.as_ref())
+                        .unwrap_or(&default_owner);
+                    let child_group = security_patch
+                        .and_then(|patch| patch.group.as_ref())
+                        .or(parent_sd.group.as_ref())
+                        .unwrap_or(&default_group);
+                    let child_sd =
+                        inherit_security_descriptor(&parent_sd, is_dir, child_owner, child_group)
+                            .map_err(|err| parse_err(&err))?;
+                    let bytes = if let Some(patch) = security_patch {
+                        apply_security_patch(&child_sd, patch)?
+                    } else {
+                        child_sd.encode().map_err(|err| parse_err(&err))?
+                    };
+                    InheritedSecurity::Descriptor(bytes)
                 }
-                Ok(())
-            })();
-            if let Err(err) = preflight {
-                return NtfsTxOutcome::NotCommitted(err);
+                InheritedSecurity::SharedId(id) => {
+                    if security_patch.is_some() {
+                        return Err(unsupported(
+                            "mapped NTFS create requires a resolved native security descriptor",
+                        ));
+                    }
+                    InheritedSecurity::SharedId(id)
+                }
+            };
+            Ok((security, inherit_compressed))
+        })();
+        let (security, inherit_compressed) = match preflight {
+            Ok(prepared) => prepared,
+            Err(err) => return NtfsTxOutcome::NotCommitted(err),
+        };
+        match &security {
+            InheritedSecurity::SharedId(id) => {
+                hasher.update(&[0]);
+                hasher.update(&id.to_le_bytes());
+            }
+            InheritedSecurity::Descriptor(raw) => {
+                hasher.update(&[1]);
+                hasher.update(blake3::hash(raw).as_bytes());
             }
         }
+        let digest = *hasher.finalize().as_bytes();
 
         let cb = u64::from(self.geometry.cluster_bytes());
         let data_cl = if !is_dir && initial_data.len() > MAX_RESIDENT_DATA_PAYLOAD {
@@ -2351,17 +2444,6 @@ impl NtfsTransactionEngine {
                 return Err(FfsError::Exists);
             }
 
-            let parent_cat = ws.load_catalog(self, cx, parent_ref)?.clone();
-            if parent_cat.reparse_point.is_some() {
-                return Err(unsupported(
-                    "cannot create NTFS child inside a reparse directory",
-                ));
-            }
-            let inherit_compressed = (parent_cat.std_flags() & FILE_ATTR_COMPRESSED) != 0;
-            if inherit_compressed && !is_dir {
-                compression::check_lznt1_geometry(&self.geometry)?;
-            }
-
             let mut base_flags = if is_dir { 0_u32 } else { FILE_ATTR_ARCHIVE };
             if read_only {
                 base_flags |= FILE_ATTR_READONLY;
@@ -2370,47 +2452,23 @@ impl NtfsTransactionEngine {
                 base_flags |= FILE_ATTR_COMPRESSED;
             }
 
-            let (mut std_info, sd_opt) = if let Some(parent_sd_raw) =
-                ws.read_catalog_security_descriptor(self, cx, &parent_cat)?
-                && let Ok(parent_sd) = NtfsSecurityDescriptor::parse(&parent_sd_raw)
-            {
-                let default_owner = ffs_ondisk::ntfs_security::NtfsSid::administrators();
-                let default_group = ffs_ondisk::ntfs_security::NtfsSid::local_system();
-                let child_owner = parent_sd.owner.as_ref().unwrap_or(&default_owner);
-                let child_group = parent_sd.group.as_ref().unwrap_or(&default_group);
-                let inherited_sd =
-                    inherit_security_descriptor(&parent_sd, is_dir, child_owner, child_group)
-                        .map_err(|err| parse_err(&err))?;
-                let inherited_bytes = inherited_sd.encode().map_err(|err| parse_err(&err))?;
-                if self.version == [3, 1] && ws.mft_slot_is_allocated(9) {
-                    let sec_id = ws.intern_security_descriptor(self, cx, &inherited_bytes)?;
-                    let info = encode_standard_information(
-                        is_dir,
-                        &super::ops::InheritedSecurity::SharedId(sec_id),
-                    );
-                    (info, None)
-                } else {
-                    let info = encode_standard_information(
-                        is_dir,
-                        &super::ops::InheritedSecurity::Descriptor(inherited_bytes.clone()),
-                    );
-                    (info, Some(inherited_bytes))
+            let (mut std_info, sd_opt) = match &security {
+                InheritedSecurity::Descriptor(raw)
+                    if self.version == [3, 1] && ws.mft_slot_is_allocated(9) =>
+                {
+                    let id = ws.intern_security_descriptor(self, cx, raw)?;
+                    (
+                        encode_standard_information(is_dir, &InheritedSecurity::SharedId(id)),
+                        None,
+                    )
                 }
-            } else {
-                let parent_raw_rec = read_mft_record_via_runs(
-                    &self.device,
-                    cx,
-                    &self.geometry,
-                    &ws.mft_runs,
-                    u32::try_from(parent_ref.record).map_err(|_| corrupt(0, "parent u32"))?,
-                )?;
-                let security = extract_parent_security(&parent_raw_rec);
-                let info = encode_standard_information(is_dir, &security);
-                let sd = match security {
-                    super::ops::InheritedSecurity::SharedId(_) => None,
-                    super::ops::InheritedSecurity::Descriptor(sd) => Some(sd),
-                };
-                (info, sd)
+                InheritedSecurity::Descriptor(raw) => (
+                    encode_standard_information(is_dir, &security),
+                    Some(raw.clone()),
+                ),
+                InheritedSecurity::SharedId(_) => {
+                    (encode_standard_information(is_dir, &security), None)
+                }
             };
             std_info[32..36].copy_from_slice(&base_flags.to_le_bytes());
             for off in [0_usize, 8, 16, 24] {

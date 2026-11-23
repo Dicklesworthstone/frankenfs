@@ -7,7 +7,7 @@
 
 use std::ffi::OsStr;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use asupersync::Cx;
 use ffs_block::ByteDevice;
@@ -138,6 +138,367 @@ fn stream_acl_descriptor(denied: u32) -> Vec<u8> {
     }
     .encode()
     .unwrap()
+}
+
+#[test]
+fn ntfs_mapped_chmod_preserves_denies_and_refuses_partial_compound_updates() {
+    let cx = Cx::for_testing();
+    let (dev, vol_bytes) = format_to_fault_device(
+        &cx,
+        16,
+        4096,
+        NtfsFormatVersion::V3_1,
+        0xAC15_0002_0000_0001,
+    );
+    let mut engine = open_clean_engine(&cx, &dev, vol_bytes);
+    let root = engine.resolve_path_reference(&cx, "/").unwrap();
+    let (file, _) = engine
+        .create_file_at(&cx, root, &utf16("native-acl.bin"), b"payload")
+        .into_result()
+        .unwrap();
+    engine
+        .link_at(&cx, file, root, &utf16("alias.bin"))
+        .into_result()
+        .unwrap();
+    let descriptor = stream_acl_descriptor(FILE_WRITE_DATA);
+    engine
+        .set_security_at(&cx, file, &descriptor, DEFAULT_NTFS_FILETIME)
+        .into_result()
+        .unwrap();
+    let (restricted, _) = engine
+        .create_file_at(&cx, root, &utf16("owner-denied.bin"), b"retained")
+        .into_result()
+        .unwrap();
+    let mut owner_denied =
+        NtfsSecurityDescriptor::parse(&stream_acl_descriptor(FILE_READ_DATA)).unwrap();
+    owner_denied.dacl.aces[0].sid.clone_from(&owner_denied.owner);
+    engine
+        .set_security_at(
+            &cx,
+            restricted,
+            &owner_denied.encode().unwrap(),
+            DEFAULT_NTFS_FILETIME,
+        )
+        .into_result()
+        .unwrap();
+    let fs = NtfsFs::from_engine_with_policy(&cx, engine, stream_acl_policy(1001)).unwrap();
+    let mut scope = RequestScope::empty();
+    let target = fs
+        .lookup(
+            &cx,
+            &mut scope,
+            InodeNumber(1),
+            OsStr::new("native-acl.bin"),
+        )
+        .unwrap();
+    let changed = fs
+        .setattr(
+            &cx,
+            &mut scope,
+            target.ino,
+            &SetAttrRequest {
+                mode: Some(0o666),
+                ..SetAttrRequest::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(changed.perm, 0o666);
+    let before_ads = dev.snapshot_durable_only();
+    let writes = dev.write_bytes_total();
+    assert!(matches!(
+        fs.create_open(
+            &cx,
+            &mut scope,
+            InodeNumber(1),
+            OsStr::new("native-acl.bin:private"),
+            0o600,
+            1001,
+            2000,
+            libc::O_RDWR,
+        ),
+        Err(FfsError::UnsupportedFeature(_))
+    ));
+    assert_eq!(dev.write_bytes_total(), writes);
+    assert_eq!(dev.snapshot_live(), before_ads);
+    assert_eq!(dev.snapshot_durable_only(), before_ads);
+    let restricted = fs
+        .lookup(
+            &cx,
+            &mut scope,
+            InodeNumber(1),
+            OsStr::new("owner-denied.bin"),
+        )
+        .unwrap();
+    let before = dev.snapshot_durable_only();
+    let writes = dev.write_bytes_total();
+    assert!(matches!(
+        fs.setattr(
+            &cx,
+            &mut scope,
+            restricted.ino,
+            &SetAttrRequest {
+                mode: Some(0o777),
+                size: Some(3),
+                ..SetAttrRequest::default()
+            }
+        ),
+        Err(FfsError::UnsupportedFeature(_))
+    ));
+    assert_eq!(dev.write_bytes_total(), writes);
+    assert_eq!(dev.snapshot_live(), before);
+    assert_eq!(dev.snapshot_durable_only(), before);
+    assert_eq!(
+        fs.getattr(&cx, &mut scope, restricted.ino).unwrap().size,
+        8
+    );
+    fs.flush_on_destroy(&cx).unwrap();
+    drop(fs);
+
+    let engine = open_clean_engine(&cx, &dev, vol_bytes);
+    engine.check_clean_consistency(&cx).unwrap();
+    let volume = engine.volume_view(&cx).unwrap();
+    let file = volume.resolve(&cx, "/native-acl.bin").unwrap();
+    let alias = volume.resolve(&cx, "/alias.bin").unwrap();
+    let security = volume.security_descriptor(&cx, &file).unwrap();
+    assert_eq!(
+        security.descriptor.dacl.aces[0].encode().unwrap(),
+        NtfsSecurityDescriptor::parse(&descriptor).unwrap().dacl.aces[0]
+            .encode()
+            .unwrap()
+    );
+    assert_eq!(
+        volume.security_descriptor(&cx, &alias).unwrap().security_id,
+        security.security_id
+    );
+    drop(volume);
+    let fs = NtfsFs::from_engine_with_policy(&cx, engine, stream_acl_policy(1002)).unwrap();
+    let attr = fs
+        .lookup(&cx, &mut scope, InodeNumber(1), OsStr::new("alias.bin"))
+        .unwrap();
+    assert_eq!(
+        fs.read(&cx, &mut scope, attr.ino, 0, 64).unwrap(),
+        b"payload"
+    );
+    let writes = dev.write_bytes_total();
+    assert!(matches!(
+        fs.write(&cx, &mut scope, attr.ino, 0, b"bad"),
+        Err(FfsError::PermissionDenied)
+    ));
+    assert_eq!(dev.write_bytes_total(), writes);
+}
+
+fn mapped_create_fixture(
+    cx: &Cx,
+    version: NtfsFormatVersion,
+    denied: u32,
+    deny_owner: bool,
+) -> (Arc<FaultInjectingNtfsDevice>, u64, NtfsTransactionEngine) {
+    let (dev, length) = format_to_fault_device(cx, 16, 4096, version, 0xAC15_0003_0000_0001);
+    let mut engine = open_clean_engine(cx, &dev, length);
+    let root = engine.resolve_path_reference(cx, "/").unwrap();
+    let mut sd = NtfsSecurityDescriptor::parse(&stream_acl_descriptor(denied)).unwrap();
+    if deny_owner {
+        sd.dacl.aces[0].sid.clone_from(&sd.owner);
+    }
+    for ace in &mut sd.dacl.aces {
+        ace.flags = ACE_FLAG_OBJECT_INHERIT | ACE_FLAG_CONTAINER_INHERIT;
+    }
+    engine
+        .set_security_at(cx, root, &sd.encode().unwrap(), DEFAULT_NTFS_FILETIME)
+        .into_result()
+        .unwrap();
+    // Keep the fault experiment about child publication, not a separate MFT
+    // capacity-growth transaction.
+    engine.grow_mft(cx, 64).into_result().unwrap();
+    (dev, length, engine)
+}
+
+#[test]
+fn ntfs_mapped_create_refuses_unknown_sids_and_incompatible_inheritance_before_writes() {
+    for unknown_mapping in [true, false] {
+        let cx = Cx::for_testing();
+        let (dev, _, engine) =
+            mapped_create_fixture(&cx, NtfsFormatVersion::V3_1, FILE_READ_DATA, true);
+        let policy = if unknown_mapping {
+            NtfsSidPolicy::Mapped {
+                caller_uid: 1001,
+                caller_gid: 2000,
+                map: NtfsSidMap {
+                    enforce_acl: false,
+                    posix_nfs_sids: false,
+                    ..NtfsSidMap::default()
+                },
+            }
+        } else {
+            stream_acl_policy(1001)
+        };
+        let fs = NtfsFs::from_engine_with_policy(&cx, engine, policy).unwrap();
+        let mut scope = RequestScope::empty();
+        let before = dev.snapshot_durable_only();
+        let writes = dev.write_bytes_total();
+        assert!(matches!(
+            fs.create(
+                &cx,
+                &mut scope,
+                InodeNumber(1),
+                OsStr::new("file"),
+                0o600,
+                1001,
+                2000
+            ),
+            Err(FfsError::UnsupportedFeature(_))
+        ));
+        assert!(matches!(
+            fs.create_open(
+                &cx,
+                &mut scope,
+                InodeNumber(1),
+                OsStr::new("opened"),
+                0o600,
+                1001,
+                2000,
+                libc::O_RDWR
+            ),
+            Err(FfsError::UnsupportedFeature(_))
+        ));
+        assert!(matches!(
+            fs.mkdir(
+                &cx,
+                &mut scope,
+                InodeNumber(1),
+                OsStr::new("directory"),
+                0o700,
+                1001,
+                2000
+            ),
+            Err(FfsError::UnsupportedFeature(_))
+        ));
+        assert_eq!(dev.write_bytes_total(), writes);
+        assert_eq!(dev.snapshot_live(), before);
+        assert_eq!(dev.snapshot_durable_only(), before);
+        assert!(fs.last_durable_token().unwrap().is_none());
+    }
+}
+
+#[test]
+fn ntfs_mapped_creation_publishes_security_in_one_transaction_and_recovers_atomically() {
+    for version in [NtfsFormatVersion::V3_0, NtfsFormatVersion::V3_1] {
+        for directory in [false, true] {
+            let cx = Cx::for_testing();
+            let (dev, length, mut engine) =
+                mapped_create_fixture(&cx, version, FILE_WRITE_DATA, false);
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let event_log = Arc::clone(&events);
+            let cuts = Arc::new(Mutex::new(Vec::<(NtfsPersistenceStage, bool, Vec<u8>)>::new()));
+            let saved = Arc::clone(&cuts);
+            let storage = Arc::clone(&dev);
+            let mut committed = false;
+            engine.set_stage_hook(Some(Box::new(move |event| {
+                event_log
+                    .lock()
+                    .unwrap()
+                    .push((event.stage, event.transaction_id));
+                committed |= event.stage == NtfsPersistenceStage::LogCommitBarrier;
+                let mut cuts = saved.lock().unwrap();
+                if matches!(
+                    event.stage,
+                    NtfsPersistenceStage::DirtyRestartBarrier
+                        | NtfsPersistenceStage::LogCommitBarrier
+                        | NtfsPersistenceStage::TargetMetadataBarrier
+                        | NtfsPersistenceStage::AckPublished
+                ) && !cuts.iter().any(|(stage, _, _)| *stage == event.stage)
+                {
+                    cuts.push((event.stage, committed, storage.snapshot_durable_only()));
+                }
+                Ok(())
+            })));
+            let fs = NtfsFs::from_engine_with_policy(&cx, engine, stream_acl_policy(1001)).unwrap();
+            let mut scope = RequestScope::empty();
+            let mode = if directory { 0o700 } else { 0o600 };
+            let attr = if directory {
+                fs.mkdir(
+                    &cx,
+                    &mut scope,
+                    InodeNumber(1),
+                    OsStr::new("private"),
+                    mode,
+                    1001,
+                    2000,
+                )
+                .unwrap()
+            } else {
+                fs.create_open(
+                    &cx,
+                    &mut scope,
+                    InodeNumber(1),
+                    OsStr::new("private"),
+                    mode,
+                    1001,
+                    2000,
+                    libc::O_RDWR,
+                )
+                .unwrap()
+                .0
+            };
+            assert_eq!((attr.uid, attr.gid, attr.perm), (1001, 2000, mode));
+            let token = fs
+                .last_durable_token()
+                .unwrap()
+                .expect("one completed native create");
+            super::assert_one_compound_transaction(events.lock().unwrap().iter().copied(), &token);
+            let cuts = std::mem::take(&mut *cuts.lock().unwrap());
+            assert_eq!(cuts.len(), 4);
+            assert!(cuts.iter().any(|(_, committed, _)| !committed));
+            drop(fs);
+
+            for (stage, committed, bytes) in cuts {
+                let recovered_device = FaultInjectingNtfsDevice::new(bytes);
+                let recovered = NtfsTransactionEngine::from_device(
+                    &cx,
+                    Arc::clone(&recovered_device) as Arc<dyn ByteDevice>,
+                    0,
+                    length,
+                    write_options_recover(),
+                )
+                .unwrap_or_else(|error| panic!("recover mapped create at {stage:?}: {error}"));
+                recovered.check_clean_consistency(&cx).unwrap();
+                let volume = recovered.volume_view(&cx).unwrap();
+                if !committed {
+                    assert!(
+                        matches!(volume.resolve(&cx, "/private"), Err(FfsError::NotFound(_))),
+                        "{stage:?}"
+                    );
+                    continue;
+                }
+                let record = volume.resolve(&cx, "/private").unwrap();
+                assert_eq!(record.is_directory(), directory);
+                let info = volume.security_descriptor(&cx, &record).unwrap();
+                let map = NtfsSidMap::default();
+                assert_eq!(
+                    info.descriptor.owner,
+                    Some(map.sid_for_uid(1001).unwrap()),
+                    "{stage:?}"
+                );
+                assert_eq!(
+                    info.descriptor.group,
+                    Some(map.sid_for_gid(2000).unwrap()),
+                    "{stage:?}"
+                );
+                assert_eq!(
+                    map.project_posix_mode(&info.descriptor, directory),
+                    mode,
+                    "{stage:?}"
+                );
+                assert!(
+                    info.descriptor.dacl.aces.iter().any(|ace| ace.kind
+                        == ACE_TYPE_ACCESS_DENIED
+                        && ace.flags & ACE_FLAG_INHERITED != 0
+                        && ace.sid == Some(map.sid_for_uid(1002).unwrap())),
+                    "{stage:?}"
+                );
+            }
+        }
+    }
 }
 
 #[test]

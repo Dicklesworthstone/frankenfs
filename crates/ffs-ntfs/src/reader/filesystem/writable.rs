@@ -374,6 +374,30 @@ impl NtfsFs {
         Ok(read_only)
     }
 
+    fn create_mode(&self, mode: u16, directory: bool) -> Result<(bool, Option<u16>)> {
+        if !matches!(self.sid_policy, NtfsSidPolicy::Mapped { .. }) {
+            return Self::check_create_mode(mode, directory).map(|read_only| (read_only, None));
+        }
+        let ftype = u32::from(mode) & libc::S_IFMT;
+        let expected = if directory {
+            libc::S_IFDIR
+        } else {
+            libc::S_IFREG
+        };
+        if ftype != 0 && ftype != expected {
+            return Err(unsupported(
+                "requested file type does not match NTFS create operation",
+            ));
+        }
+        if mode & 0o7000 != 0 {
+            return Err(unsupported(
+                "special POSIX mode bits are not native NTFS permissions",
+            ));
+        }
+        let perm = mode & 0o777;
+        Ok((perm & 0o222 == 0, Some(perm)))
+    }
+
     pub(super) fn create_open_locked(
         &self,
         cx: &Cx,
@@ -386,7 +410,7 @@ impl NtfsFs {
         if ![libc::O_RDONLY, libc::O_WRONLY, libc::O_RDWR].contains(&access) {
             return Err(invalid_argument());
         }
-        let read_only = Self::check_create_mode(mode, false)?;
+        let (read_only, _) = self.create_mode(mode, false)?;
         if read_only && access != libc::O_RDONLY {
             return Err(FfsError::PermissionDenied);
         }
@@ -417,22 +441,7 @@ impl NtfsFs {
         self.ensure_writable()?;
         let parent_rec = self.record(cx, parent)?;
         self.enforce_dacl(cx, &parent_rec, FILE_ADD_FILE)?;
-        let mapped_mode = if matches!(self.sid_policy, NtfsSidPolicy::Mapped { .. }) {
-            let ftype = u32::from(mode) & libc::S_IFMT;
-            if ftype != 0 && ftype != libc::S_IFREG {
-                return Err(unsupported(
-                    "requested file type does not match NTFS create operation",
-                ));
-            }
-            Some(mode & 0o777)
-        } else {
-            None
-        };
-        let read_only = if let Some(perm) = mapped_mode {
-            (perm & 0o222) == 0
-        } else {
-            Self::check_create_mode(mode, false)?
-        };
+        let (read_only, mapped_mode) = self.create_mode(mode, false)?;
         if let Some((base, stream)) = self.ads_mutation_component(cx, parent, name)? {
             if read_only {
                 return Err(unsupported(
@@ -442,6 +451,11 @@ impl NtfsFs {
             let base_name = String::from_utf16(&base)
                 .map_err(|_| unsupported("NTFS stream base name is not lossless UTF-8"))?;
             let base_attr = self.lookup_indexed(cx, parent, OsStr::new(&base_name))?;
+            if mapped_mode.is_some_and(|perm| base_attr.perm & !perm & 0o777 != 0) {
+                return Err(unsupported(
+                    "NTFS alternate streams cannot narrow their base FILE's security descriptor",
+                ));
+            }
             let (target, _) = self.data_target(cx, base_attr.ino)?;
             self.check_ads_registration(target, &stream)?;
             self.transact(cx, |engine| engine.create_stream(cx, target, &stream, &[]))?;
@@ -452,14 +466,7 @@ impl NtfsFs {
         }
         let name = self.component(parent, name)?;
         let parent = self.directory_reference(cx, parent)?;
-        let target = if read_only {
-            self.transact(cx, |engine| {
-                engine.create_entry_at(cx, parent, &name, false, true, &[], DEFAULT_NTFS_FILETIME)
-            })?
-        } else {
-            self.transact(cx, |engine| engine.create_file_at(cx, parent, &name, &[]))?
-        };
-        if let (
+        let target = if let (
             Some(perm),
             NtfsSidPolicy::Mapped {
                 caller_uid,
@@ -478,9 +485,24 @@ impl NtfsFs {
                 dacl_protected: None,
             };
             self.transact(cx, |engine| {
-                engine.patch_security_at(cx, target, &patch, DEFAULT_NTFS_FILETIME)
-            })?;
-        }
+                engine.create_entry_with_security_at(
+                    cx,
+                    parent,
+                    &name,
+                    false,
+                    read_only,
+                    &[],
+                    DEFAULT_NTFS_FILETIME,
+                    Some(&patch),
+                )
+            })?
+        } else if read_only {
+            self.transact(cx, |engine| {
+                engine.create_entry_at(cx, parent, &name, false, true, &[], DEFAULT_NTFS_FILETIME)
+            })?
+        } else {
+            self.transact(cx, |engine| engine.create_file_at(cx, parent, &name, &[]))?
+        };
         cx.masked(|| self.describe(cx, self.inode(target)?))
     }
 
@@ -494,32 +516,10 @@ impl NtfsFs {
         self.ensure_writable()?;
         let parent_rec = self.record(cx, parent)?;
         self.enforce_dacl(cx, &parent_rec, FILE_ADD_SUBDIRECTORY)?;
-        let mapped_mode = if matches!(self.sid_policy, NtfsSidPolicy::Mapped { .. }) {
-            let ftype = u32::from(mode) & libc::S_IFMT;
-            if ftype != 0 && ftype != libc::S_IFDIR {
-                return Err(unsupported(
-                    "requested file type does not match NTFS mkdir operation",
-                ));
-            }
-            Some(mode & 0o777)
-        } else {
-            None
-        };
-        let read_only = if let Some(perm) = mapped_mode {
-            (perm & 0o222) == 0
-        } else {
-            Self::check_create_mode(mode, true)?
-        };
+        let (read_only, mapped_mode) = self.create_mode(mode, true)?;
         let name = self.component(parent, name)?;
         let parent = self.directory_reference(cx, parent)?;
-        let target = if read_only {
-            self.transact(cx, |engine| {
-                engine.create_entry_at(cx, parent, &name, true, true, &[], DEFAULT_NTFS_FILETIME)
-            })?
-        } else {
-            self.transact(cx, |engine| engine.mkdir_at(cx, parent, &name))?
-        };
-        if let (
+        let target = if let (
             Some(perm),
             NtfsSidPolicy::Mapped {
                 caller_uid,
@@ -538,9 +538,24 @@ impl NtfsFs {
                 dacl_protected: None,
             };
             self.transact(cx, |engine| {
-                engine.patch_security_at(cx, target, &patch, DEFAULT_NTFS_FILETIME)
-            })?;
-        }
+                engine.create_entry_with_security_at(
+                    cx,
+                    parent,
+                    &name,
+                    true,
+                    read_only,
+                    &[],
+                    DEFAULT_NTFS_FILETIME,
+                    Some(&patch),
+                )
+            })?
+        } else if read_only {
+            self.transact(cx, |engine| {
+                engine.create_entry_at(cx, parent, &name, true, true, &[], DEFAULT_NTFS_FILETIME)
+            })?
+        } else {
+            self.transact(cx, |engine| engine.mkdir_at(cx, parent, &name))?
+        };
         cx.masked(|| self.describe(cx, self.inode(target)?))
     }
 
