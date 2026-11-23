@@ -2983,6 +2983,9 @@ impl NtfsTransactionEngine {
             return ws.finalize(self, cx, "write_stream_at", digest, old_size);
         }
 
+        // A zero-byte write can still materialize WOF backing, but its
+        // caller-supplied offset must never extend the logical stream.
+        let offset = if data.is_empty() { 0 } else { offset };
         let end_offset = offset
             .checked_add(data.len() as u64)
             .filter(|&end| i64::try_from(end).is_ok())
@@ -3134,8 +3137,15 @@ impl NtfsTransactionEngine {
                 initialized_bytes: old_init.max(end_offset),
             }
         } else {
-            let cow_start_vcn = offset.min(old_init) / cb;
-            let cow_end_vcn = end_offset.div_ceil(cb).max(1);
+            // Resident bytes have no old runs to retain outside the changed
+            // interval. This also covers the complete decoded WOF plaintext:
+            // stage its prefix, suffix, and any new zero gap before publishing.
+            let (cow_start_vcn, cow_end_vcn) =
+                if matches!(&cur_stream.storage, EditableStreamStorage::Resident(_)) {
+                    (0, new_size.div_ceil(cb).max(1))
+                } else {
+                    (offset.min(old_init) / cb, end_offset.div_ceil(cb).max(1))
+                };
             let cow_clusters = cow_end_vcn - cow_start_vcn;
             let cow_byte_start = cow_start_vcn * cb;
             let cow_bytes_u64 = cow_clusters
@@ -3167,24 +3177,17 @@ impl NtfsTransactionEngine {
                 &mut ws.pre_payload_writes,
             )?;
 
-            let (mut working_runs, disp) =
+            let (working_runs, disp) =
                 splice_vcn_interval(&old_runs, cow_start_vcn, cow_end_vcn, &spans, false)?;
             ws.free_clusters_deferred(&disp);
 
             let needed_total_vcns = new_size.div_ceil(cb).max(1);
             let cur_cov_vcns: u64 = working_runs.iter().map(|r| r.clusters).sum();
             if cur_cov_vcns < needed_total_vcns {
-                let extra = ws.alloc_clusters(needed_total_vcns - cur_cov_vcns, 1)?;
-                let mut v = cur_cov_vcns;
-                for &(lcn, cnt) in &extra {
-                    working_runs.push(NtfsRun {
-                        vcn: v,
-                        clusters: cnt,
-                        lcn: Some(lcn),
-                    });
-                    v += cnt;
-                }
-                working_runs = normalize_ntfs_runs(working_runs);
+                return Err(corrupt(
+                    0,
+                    "non-sparse write plan does not cover the logical stream",
+                ));
             }
 
             EditableStreamStorage::NonResident {

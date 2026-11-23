@@ -25,6 +25,7 @@ use ffs_ntfs::transaction::{
     DEFAULT_NTFS_FILETIME, NtfsObjectIdData, NtfsPersistenceStage, NtfsTransactionEngine,
     NtfsTxOutcome,
 };
+use ffs_ondisk::ntfs::NtfsReference;
 use ffs_ondisk::ntfs::reparse::{MOUNT_POINT_TAG, NtfsReparseData, NtfsReparsePoint};
 use ffs_ondisk::ntfs_security::{
     ACE_FLAG_CONTAINER_INHERIT, ACE_FLAG_INHERIT_ONLY, ACE_FLAG_INHERITED, ACE_FLAG_OBJECT_INHERIT,
@@ -172,7 +173,9 @@ fn ntfs_mapped_chmod_preserves_denies_and_refuses_partial_compound_updates() {
         .unwrap();
     let mut owner_denied =
         NtfsSecurityDescriptor::parse(&stream_acl_descriptor(FILE_READ_DATA)).unwrap();
-    owner_denied.dacl.aces[0].sid.clone_from(&owner_denied.owner);
+    owner_denied.dacl.aces[0]
+        .sid
+        .clone_from(&owner_denied.owner);
     engine
         .set_security_at(
             &cx,
@@ -248,10 +251,7 @@ fn ntfs_mapped_chmod_preserves_denies_and_refuses_partial_compound_updates() {
     assert_eq!(dev.write_bytes_total(), writes);
     assert_eq!(dev.snapshot_live(), before);
     assert_eq!(dev.snapshot_durable_only(), before);
-    assert_eq!(
-        fs.getattr(&cx, &mut scope, restricted.ino).unwrap().size,
-        8
-    );
+    assert_eq!(fs.getattr(&cx, &mut scope, restricted.ino).unwrap().size, 8);
     fs.flush_on_destroy(&cx).unwrap();
     drop(fs);
 
@@ -263,7 +263,10 @@ fn ntfs_mapped_chmod_preserves_denies_and_refuses_partial_compound_updates() {
     let security = volume.security_descriptor(&cx, &file).unwrap();
     assert_eq!(
         security.descriptor.dacl.aces[0].encode().unwrap(),
-        NtfsSecurityDescriptor::parse(&descriptor).unwrap().dacl.aces[0]
+        NtfsSecurityDescriptor::parse(&descriptor)
+            .unwrap()
+            .dacl
+            .aces[0]
             .encode()
             .unwrap()
     );
@@ -390,7 +393,9 @@ fn ntfs_mapped_creation_publishes_security_in_one_transaction_and_recovers_atomi
                 mapped_create_fixture(&cx, version, FILE_WRITE_DATA, false);
             let events = Arc::new(Mutex::new(Vec::new()));
             let event_log = Arc::clone(&events);
-            let cuts = Arc::new(Mutex::new(Vec::<(NtfsPersistenceStage, bool, Vec<u8>)>::new()));
+            let cuts = Arc::new(Mutex::new(
+                Vec::<(NtfsPersistenceStage, bool, Vec<u8>)>::new(),
+            ));
             let saved = Arc::clone(&cuts);
             let storage = Arc::clone(&dev);
             let mut committed = false;
@@ -491,10 +496,13 @@ fn ntfs_mapped_creation_publishes_security_in_one_transaction_and_recovers_atomi
                     "{stage:?}"
                 );
                 assert!(
-                    info.descriptor.dacl.aces.iter().any(|ace| ace.kind
-                        == ACE_TYPE_ACCESS_DENIED
-                        && ace.flags & ACE_FLAG_INHERITED != 0
-                        && ace.sid == Some(map.sid_for_uid(1002).unwrap())),
+                    info.descriptor
+                        .dacl
+                        .aces
+                        .iter()
+                        .any(|ace| ace.kind == ACE_TYPE_ACCESS_DENIED
+                            && ace.flags & ACE_FLAG_INHERITED != 0
+                            && ace.sid == Some(map.sid_for_uid(1002).unwrap())),
                     "{stage:?}"
                 );
             }
@@ -575,7 +583,9 @@ fn ntfs_mapped_namespace_acl_denials_leave_names_streams_and_storage_unchanged()
     let victim = fs
         .lookup(&cx, &mut scope, root, OsStr::new("victim.bin"))
         .unwrap();
-    let (victim_handle, _) = fs.open(&cx, &mut scope, victim.ino, libc::O_RDONLY).unwrap();
+    let (victim_handle, _) = fs
+        .open(&cx, &mut scope, victim.ino, libc::O_RDONLY)
+        .unwrap();
     let before = dev.snapshot_live();
     let writes = dev.write_bytes_total();
     for operation in [
@@ -595,14 +605,15 @@ fn ntfs_mapped_namespace_acl_denials_leave_names_streams_and_storage_unchanged()
             "unlink" => fs.unlink(&cx, &mut scope, root, OsStr::new("restricted.bin")),
             "rmdir" => fs.rmdir(&cx, &mut scope, root, OsStr::new("restricted-dir")),
             "link destination" => fs
-                .link(&cx, &mut scope, available.ino, no_files, OsStr::new("linked"))
+                .link(
+                    &cx,
+                    &mut scope,
+                    available.ino,
+                    no_files,
+                    OsStr::new("linked"),
+                )
                 .map(|_| ()),
-            "unlink stream" => fs.unlink(
-                &cx,
-                &mut scope,
-                root,
-                OsStr::new("restricted.bin:audit"),
-            ),
+            "unlink stream" => fs.unlink(&cx, &mut scope, root, OsStr::new("restricted.bin:audit")),
             _ => {
                 let (source, parent, destination) = match operation {
                     "rename source file" => ("restricted.bin", root, "moved-file"),
@@ -663,7 +674,11 @@ fn ntfs_mapped_namespace_acl_denials_leave_names_streams_and_storage_unchanged()
         read_file_by_path(&cx, &engine, "/restricted.bin"),
         b"restricted.bin"
     );
-    assert!(engine.resolve_path_reference(&cx, "/restricted-dir").is_ok());
+    assert!(
+        engine
+            .resolve_path_reference(&cx, "/restricted-dir")
+            .is_ok()
+    );
     assert!(engine.resolve_path_reference(&cx, "/victim-dir").is_ok());
 }
 
@@ -674,13 +689,8 @@ fn ntfs_mapped_namespace_acl_accepts_object_or_parent_delete_authority() {
         (0, NtfsFormatVersion::V3_0, 0, FILE_DELETE_CHILD),
         (1, NtfsFormatVersion::V3_1, STANDARD_DELETE, 0),
     ] {
-        let (dev, vol_bytes) = format_to_fault_device(
-            &cx,
-            16,
-            4096,
-            version,
-            0xAC15_0007_0000_0001 + index,
-        );
+        let (dev, vol_bytes) =
+            format_to_fault_device(&cx, 16, 4096, version, 0xAC15_0007_0000_0001 + index);
         let mut engine = open_clean_engine(&cx, &dev, vol_bytes);
         let root = engine.resolve_path_reference(&cx, "/").unwrap();
         for (name, directory) in [
@@ -766,9 +776,18 @@ fn ntfs_mapped_namespace_acl_accepts_object_or_parent_delete_authority() {
         drop(fs);
         let engine = open_clean_engine(&cx, &dev, vol_bytes);
         engine.check_clean_consistency(&cx).unwrap();
-        assert_eq!(read_file_by_path(&cx, &engine, "/victim.bin"), b"source.bin");
-        assert_eq!(read_file_by_path(&cx, &engine, "/linked.bin"), b"source.bin");
-        assert_eq!(read_file_by_path(&cx, &engine, "/streams.bin"), b"streams.bin");
+        assert_eq!(
+            read_file_by_path(&cx, &engine, "/victim.bin"),
+            b"source.bin"
+        );
+        assert_eq!(
+            read_file_by_path(&cx, &engine, "/linked.bin"),
+            b"source.bin"
+        );
+        assert_eq!(
+            read_file_by_path(&cx, &engine, "/streams.bin"),
+            b"streams.bin"
+        );
         for path in ["/remove.bin", "/remove-dir", "/source.bin"] {
             assert!(matches!(
                 engine.resolve_path_reference(&cx, path),
@@ -1928,37 +1947,43 @@ fn ntfs_lznt1_compression_partial_write_truncate_dir_inherit_and_incompressible(
     }
 }
 
-#[test]
-fn ntfs_wof_decompression_on_write_materializes_plaintext_and_cleans_reparse() {
-    let cx = Cx::for_testing();
-    let (dev, vol_bytes) = format_to_fault_device(
-        &cx,
-        16,
-        4096,
-        NtfsFormatVersion::V3_1,
-        0xBD84_0003_0000_0001,
-    );
-    let mut engine = open_clean_engine(&cx, &dev, vol_bytes);
-    let root = engine.resolve_path_reference(&cx, "/").unwrap();
+fn raw_chunk_wof_device(
+    cx: &Cx,
+    wof_initial: &[u8],
+) -> (Arc<FaultInjectingNtfsDevice>, u64, NtfsReference) {
+    let (dev, vol_bytes) =
+        format_to_fault_device(cx, 16, 4096, NtfsFormatVersion::V3_1, 0xBD84_0003_0000_0001);
+    let mut engine = open_clean_engine(cx, &dev, vol_bytes);
+    let root = engine.resolve_path_reference(cx, "/").unwrap();
 
-    // Build an authentic single-chunk WOF XPRESS4K file (uncompressed single 4096-byte chunk stored
-    // verbatim in `WofCompressedData`, sparse 4096-byte initialized placeholder unnamed `$DATA`, and
-    // WOF reparse tag `0x8000_0017` installed on the base record).
-    let wof_initial = b"WOF-INITIAL-PLAINTEXT-PAYLOAD-01".repeat(128); // exact 4096 bytes
+    // Native XPRESS4K supports raw chunks. Every entry except the last gives
+    // the next chunk's payload-relative offset, followed by the chunk bytes.
+    assert!(!wof_initial.is_empty());
+    let mut backing = Vec::new();
+    for chunk in 1..wof_initial.len().div_ceil(4096) {
+        backing.extend_from_slice(&u32::try_from(chunk * 4096).unwrap().to_le_bytes());
+    }
+    backing.extend_from_slice(wof_initial);
     let (wof_ref, _) = engine
-        .create_file_at(&cx, root, &utf16("wof.bin"), &wof_initial)
+        .create_file_at(cx, root, &utf16("wof.bin"), &[])
         .into_result()
         .unwrap();
     engine
-        .set_sparse_at(&cx, wof_ref, &[], true, DEFAULT_NTFS_FILETIME)
+        .set_sparse_at(cx, wof_ref, &[], true, DEFAULT_NTFS_FILETIME)
         .into_result()
         .unwrap();
     engine
-        .punch_hole_at(&cx, wof_ref, &[], 0, 4096, DEFAULT_NTFS_FILETIME)
+        .truncate_stream_at(
+            cx,
+            wof_ref,
+            &[],
+            wof_initial.len() as u64,
+            DEFAULT_NTFS_FILETIME,
+        )
         .into_result()
         .unwrap();
     engine
-        .create_stream(&cx, wof_ref, &utf16("WofCompressedData"), &wof_initial)
+        .create_stream(cx, wof_ref, &utf16("WofCompressedData"), &backing)
         .into_result()
         .unwrap();
 
@@ -1979,7 +2004,7 @@ fn ntfs_wof_decompression_on_write_materializes_plaintext_and_cleans_reparse() {
         data: NtfsReparseData::Opaque(wof_body),
     };
     assert!(matches!(
-        engine.set_reparse_point_at(&cx, wof_ref, &wof_point, true, DEFAULT_NTFS_FILETIME),
+        engine.set_reparse_point_at(cx, wof_ref, &wof_point, true, DEFAULT_NTFS_FILETIME),
         NtfsTxOutcome::NotCommitted(FfsError::UnsupportedFeature(_))
     ));
     // Install a valid opaque placeholder reparse point of exact same 24-byte encoded length
@@ -1992,13 +2017,7 @@ fn ntfs_wof_decompression_on_write_materializes_plaintext_and_cleans_reparse() {
         data: wof_point.data.clone(),
     };
     engine
-        .set_reparse_point_at(
-            &cx,
-            wof_ref,
-            &placeholder_point,
-            true,
-            DEFAULT_NTFS_FILETIME,
-        )
+        .set_reparse_point_at(cx, wof_ref, &placeholder_point, true, DEFAULT_NTFS_FILETIME)
         .into_result()
         .unwrap();
     drop(engine);
@@ -2007,13 +2026,13 @@ fn ntfs_wof_decompression_on_write_materializes_plaintext_and_cleans_reparse() {
     // so both the `$REPARSE_POINT` attribute and the `$Reparse` index agree on the WOF tag!
     let mut img = dev.snapshot_durable_only();
     let vol_probe = NtfsVolume::from_device(
-        &cx,
+        cx,
         Box::new(FaultInjectingNtfsDevice::new(img.clone())),
         0,
         vol_bytes,
     )
     .unwrap();
-    let reparse_rec_no = vol_probe.resolve(&cx, "/$Extend/$Reparse").unwrap().number as usize;
+    let reparse_rec_no = vol_probe.resolve(cx, "/$Extend/$Reparse").unwrap().number as usize;
     let mft_base =
         (vol_probe.geometry.mft_cluster() * u64::from(vol_probe.geometry.cluster_bytes())) as usize;
     let rec_len = vol_probe.geometry.record_bytes() as usize;
@@ -2077,6 +2096,14 @@ fn ntfs_wof_decompression_on_write_materializes_plaintext_and_cleans_reparse() {
         img[mft_rec_off..mft_rec_off + rec_len].copy_from_slice(&restored);
     }
     let wof_dev = FaultInjectingNtfsDevice::new(img);
+    (wof_dev, vol_bytes, wof_ref)
+}
+
+#[test]
+fn ntfs_wof_decompression_on_write_materializes_plaintext_and_cleans_reparse() {
+    let cx = Cx::for_testing();
+    let wof_initial = b"WOF-INITIAL-PLAINTEXT-PAYLOAD-01".repeat(128);
+    let (wof_dev, vol_bytes, wof_ref) = raw_chunk_wof_device(&cx, &wof_initial);
 
     // Confirm reader opens it as genuine WOF and reads exact initial plaintext!
     let mut engine = open_clean_engine(&cx, &wof_dev, vol_bytes);
@@ -2099,6 +2126,213 @@ fn ntfs_wof_decompression_on_write_materializes_plaintext_and_cleans_reparse() {
     assert_eq!(streams.len(), 1);
     assert_eq!(streams[0].name, [] as [u16; 0]);
     engine.check_clean_consistency(&cx).unwrap();
+}
+
+#[test]
+fn ntfs_resident_promotion_preserves_full_cluster_prefix_and_zero_gap() {
+    let cx = Cx::for_testing();
+    let (device, vol_bytes) =
+        format_to_fault_device(&cx, 16, 512, NtfsFormatVersion::V3_1, 0xBD84_0003_0000_0002);
+    let mut engine = open_clean_engine(&cx, &device, vol_bytes);
+    let root = engine.resolve_path_reference(&cx, "/").unwrap();
+    let initial: Vec<u8> = (0_usize..512).map(|i| (i % 251) as u8).collect();
+    let (reference, _) = engine
+        .create_file_at(&cx, root, &utf16("resident.bin"), &initial)
+        .into_result()
+        .unwrap();
+    let volume = engine.volume_view(&cx).unwrap();
+    let record = volume.resolve(&cx, "/resident.bin").unwrap();
+    assert!(volume.data_stream(&cx, &record, &[]).unwrap().resident());
+    let baseline = device.snapshot_durable_only();
+    drop(engine);
+
+    for offset in [512, 513, 1027] {
+        let device = FaultInjectingNtfsDevice::new(baseline.clone());
+        let mut engine = open_clean_engine(&cx, &device, vol_bytes);
+        let replacement = b"promoted";
+        let mut expected = initial.clone();
+        expected.resize(offset + replacement.len(), 0);
+        expected[offset..offset + replacement.len()].copy_from_slice(replacement);
+        let (size, _) = engine
+            .write_stream_at(
+                &cx,
+                reference,
+                &[],
+                offset as u64,
+                replacement,
+                false,
+                DEFAULT_NTFS_FILETIME,
+            )
+            .into_result()
+            .unwrap();
+        assert_eq!(size, expected.len() as u64);
+        assert_eq!(read_file_by_path(&cx, &engine, "/resident.bin"), expected);
+        let volume = engine.volume_view(&cx).unwrap();
+        let record = volume.resolve(&cx, "/resident.bin").unwrap();
+        assert!(!volume.data_stream(&cx, &record, &[]).unwrap().resident());
+        engine.check_clean_consistency(&cx).unwrap();
+        drop(engine);
+
+        let durable = FaultInjectingNtfsDevice::new(device.snapshot_durable_only());
+        let reopened = open_clean_engine(&cx, &durable, vol_bytes);
+        assert_eq!(read_file_by_path(&cx, &reopened, "/resident.bin"), expected);
+        reopened.check_clean_consistency(&cx).unwrap();
+    }
+}
+
+#[test]
+fn ntfs_wof_multichunk_writes_preserve_untouched_plaintext_and_zero_gaps() {
+    let cx = Cx::for_testing();
+    let initial: Vec<u8> = (0_usize..3 * 4096 + 137).map(|i| (i % 251) as u8).collect();
+    let (device, vol_bytes, reference) = raw_chunk_wof_device(&cx, &initial);
+    let baseline = device.snapshot_durable_only();
+    let replacement = b"materialized-range";
+
+    for offset in [4, 4096 + 17, initial.len() - 5, initial.len() + 4096 + 11] {
+        let device = FaultInjectingNtfsDevice::new(baseline.clone());
+        let mut engine = open_clean_engine(&cx, &device, vol_bytes);
+        assert_eq!(read_file_by_path(&cx, &engine, "/wof.bin"), initial);
+
+        let mut expected = initial.clone();
+        expected.resize(expected.len().max(offset + replacement.len()), 0);
+        expected[offset..offset + replacement.len()].copy_from_slice(replacement);
+        let (written, _) = engine
+            .write_stream_range(&cx, reference, &[], offset as u64, replacement)
+            .into_result()
+            .unwrap();
+        assert_eq!(written, reference);
+        assert_eq!(
+            read_file_by_path(&cx, &engine, "/wof.bin"),
+            expected,
+            "materialization at offset {offset} must preserve every untouched chunk"
+        );
+        engine.check_clean_consistency(&cx).unwrap();
+        drop(engine);
+
+        let durable = FaultInjectingNtfsDevice::new(device.snapshot_durable_only());
+        let reopened = open_clean_engine(&cx, &durable, vol_bytes);
+        assert_eq!(read_file_by_path(&cx, &reopened, "/wof.bin"), expected);
+        let volume = reopened.volume_view(&cx).unwrap();
+        let record = volume.resolve(&cx, "/wof.bin").unwrap();
+        assert!(volume.reparse_point(&cx, &record).unwrap().is_none());
+        let streams = volume.data_streams(&cx, &record).unwrap();
+        assert_eq!(streams.len(), 1);
+        assert!(streams[0].name.is_empty());
+        reopened.check_clean_consistency(&cx).unwrap();
+    }
+}
+
+#[test]
+fn ntfs_wof_zero_length_write_preserves_plaintext_and_eof_at_any_offset() {
+    let cx = Cx::for_testing();
+    let initial: Vec<u8> = (0_usize..3 * 4096 + 137).map(|i| (i % 251) as u8).collect();
+    let (device, vol_bytes, reference) = raw_chunk_wof_device(&cx, &initial);
+    let baseline = device.snapshot_durable_only();
+    for offset in [initial.len() as u64 + 4096, u64::MAX] {
+        let device = FaultInjectingNtfsDevice::new(baseline.clone());
+        let mut engine = open_clean_engine(&cx, &device, vol_bytes);
+        let (size, _) = engine
+            .write_stream_at(
+                &cx,
+                reference,
+                &[],
+                offset,
+                &[],
+                false,
+                DEFAULT_NTFS_FILETIME,
+            )
+            .into_result()
+            .unwrap();
+        assert_eq!(size, initial.len() as u64);
+        assert_eq!(read_file_by_path(&cx, &engine, "/wof.bin"), initial);
+        engine.check_clean_consistency(&cx).unwrap();
+        drop(engine);
+        let durable = FaultInjectingNtfsDevice::new(device.snapshot_durable_only());
+        let reopened = open_clean_engine(&cx, &durable, vol_bytes);
+        assert_eq!(read_file_by_path(&cx, &reopened, "/wof.bin"), initial);
+    }
+}
+
+#[test]
+fn ntfs_wof_materialization_recovers_complete_plaintext_at_commit_barriers() {
+    let cx = Cx::for_testing();
+    let initial: Vec<u8> = (0_usize..3 * 4096 + 137).map(|i| (i % 251) as u8).collect();
+    let (device, vol_bytes, reference) = raw_chunk_wof_device(&cx, &initial);
+    let mut engine = open_clean_engine(&cx, &device, vol_bytes);
+    let before = device.snapshot_durable_only();
+    let writes = device.write_bytes_total();
+    let cancelled = Cx::for_testing();
+    cancelled.set_cancel_requested(true);
+    assert!(matches!(
+        engine.write_stream_range(&cancelled, reference, &[], 4101, b"cancelled"),
+        NtfsTxOutcome::NotCommitted(FfsError::Cancelled)
+    ));
+    assert_eq!(device.write_bytes_total(), writes);
+    assert_eq!(device.snapshot_live(), before);
+
+    let cuts = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = Arc::clone(&cuts);
+    let observed_device = Arc::clone(&device);
+    engine.set_stage_hook(Some(Box::new(move |event| {
+        if matches!(
+            event.stage,
+            NtfsPersistenceStage::PayloadBarrier
+                | NtfsPersistenceStage::LogCommitBarrier
+                | NtfsPersistenceStage::TargetMetadataBarrier
+        ) {
+            captured
+                .lock()
+                .unwrap()
+                .push((event.stage, observed_device.snapshot_durable_only()));
+        }
+        Ok(())
+    })));
+    let replacement = b"complete-after-replay";
+    let offset = 4101;
+    engine
+        .write_stream_range(&cx, reference, &[], offset as u64, replacement)
+        .into_result()
+        .unwrap();
+    engine.set_stage_hook(None);
+    let mut expected = initial.clone();
+    expected[offset..offset + replacement.len()].copy_from_slice(replacement);
+
+    let cuts = std::mem::take(&mut *cuts.lock().unwrap());
+    for expected_stage in [
+        NtfsPersistenceStage::PayloadBarrier,
+        NtfsPersistenceStage::LogCommitBarrier,
+        NtfsPersistenceStage::TargetMetadataBarrier,
+    ] {
+        assert!(
+            cuts.iter().any(|(stage, _)| *stage == expected_stage),
+            "missing persistence snapshot at {expected_stage:?}"
+        );
+    }
+    for (stage, snapshot) in cuts {
+        let recovery_device = FaultInjectingNtfsDevice::new(snapshot);
+        let recovered = NtfsTransactionEngine::from_device(
+            &cx,
+            Arc::clone(&recovery_device) as Arc<dyn ByteDevice>,
+            0,
+            vol_bytes,
+            write_options_recover(),
+        )
+        .unwrap();
+        let committed = stage != NtfsPersistenceStage::PayloadBarrier;
+        assert_eq!(
+            read_file_by_path(&cx, &recovered, "/wof.bin"),
+            if committed { &expected } else { &initial }.clone(),
+            "recovered complete plaintext at {stage:?}"
+        );
+        let volume = recovered.volume_view(&cx).unwrap();
+        let record = volume.resolve(&cx, "/wof.bin").unwrap();
+        assert_eq!(
+            volume.reparse_point(&cx, &record).unwrap().is_none(),
+            committed,
+            "reparse removal and plaintext publication must agree at {stage:?}"
+        );
+        recovered.check_clean_consistency(&cx).unwrap();
+    }
 }
 
 #[test]
