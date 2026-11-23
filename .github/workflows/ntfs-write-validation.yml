@@ -1,0 +1,116 @@
+name: NTFS writer integrity validation
+on:
+  push:
+    branches: [validation/ntfs-writer-integrity-20261122]
+permissions:
+  contents: write
+concurrency:
+  group: ntfs-writer-integrity-20261122
+  cancel-in-progress: false
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_BUILD_JOBS: "2"
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  RUSTFLAGS: "-Z threads=1"
+  CARGO_HTTP_USER_AGENT: "frankenfs-agent (+https://github.com/Dicklesworthstone/frankenfs)"
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Prepare compiler and isolated runner resources
+        run: |
+          rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
+          sudo apt-get update
+          sudo apt-get install -y e2fsprogs btrfs-progs ntfs-3g dosfstools mtools fuse3 pkg-config
+          validation_swap=$(sudo mktemp /mnt/ffs-ntfs-XXXXXX.swap)
+          sudo fallocate -l 12G "$validation_swap"
+          sudo chmod 0600 "$validation_swap"
+          sudo mkswap "$validation_swap"
+          sudo swapon "$validation_swap"
+          free -h
+          df -h .
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ntfs-writer-integrity
+          cache-on-failure: "true"
+          cache-workspace-crates: "true"
+      - name: Apply reviewed implementation patches
+        run: |
+          git rev-parse HEAD
+          git apply --recount .task-validation/*.patch
+          cargo fmt --all
+          cargo fmt --check
+          git diff --check
+          git diff --stat
+          python3 - <<'PY'
+          import json, subprocess
+          paths = subprocess.check_output(["git", "diff", "--name-only"], text=True).splitlines()
+          assert paths and all(p.startswith("crates/ffs-ntfs/") for p in paths), paths
+          snapshot = {p: subprocess.check_output(["git", "hash-object", p], text=True).strip() for p in paths}
+          with open("/tmp/ffs-validated-source.json", "w") as f:
+              json.dump(snapshot, f)
+          print(json.dumps({"source_blobs": snapshot}))
+          PY
+      - name: Targeted mapped stream access regressions
+        run: cargo test --locked -p ffs-ntfs --test persistence_prefix ntfs_mapped_acl_ -- --nocapture --test-threads=1
+      - name: Workspace compiler check
+        if: ${{ !cancelled() }}
+        run: cargo check --locked --workspace --all-targets
+      - name: Workspace strict Clippy
+        if: ${{ !cancelled() }}
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Complete NTFS tests and persistence cuts
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p ffs-ntfs -- --test-threads=1
+      - name: NTFS CLI regressions
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p ffs-cli --bin ffs-ntfs -- --test-threads=1
+      - name: Public filesystem facade regressions
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p ffs -- --test-threads=1
+      - name: Changed-file bug scan
+        if: ${{ !cancelled() }}
+        run: |
+          git -c http.userAgent="frankenfs-agent (+https://github.com/Dicklesworthstone/frankenfs)" clone --depth 1 https://github.com/Dicklesworthstone/ultimate_bug_scanner.git "$RUNNER_TEMP/ubs"
+          mapfile -t changed_rust < <(git diff --name-only -- '*.rs')
+          "$RUNNER_TEMP/ubs/ubs" "${changed_rust[@]}"
+      - name: Upload verified Git blobs without moving any branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          cargo fmt --check
+          git diff --check
+          python3 - <<'PY'
+          import base64, json, os, pathlib, subprocess, urllib.request
+          snapshot = json.load(open("/tmp/ffs-validated-source.json"))
+          current = subprocess.check_output(["git", "diff", "--name-only"], text=True).splitlines()
+          assert sorted(snapshot) == sorted(current), (snapshot, current)
+          for path, expected in snapshot.items():
+              observed = subprocess.check_output(["git", "hash-object", path], text=True).strip()
+              assert observed == expected, (path, expected, observed)
+              payload = json.dumps({
+                  "content": base64.b64encode(pathlib.Path(path).read_bytes()).decode(),
+                  "encoding": "base64",
+              }).encode()
+              req = urllib.request.Request(
+                  "https://api.github.com/repos/" + os.environ["GITHUB_REPOSITORY"] + "/git/blobs",
+                  data=payload, method="POST",
+                  headers={
+                      "Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                      "Accept": "application/vnd.github+json",
+                      "Content-Type": "application/json",
+                      "User-Agent": "frankenfs-agent (+https://github.com/Dicklesworthstone/frankenfs)",
+                  },
+              )
+              with urllib.request.urlopen(req) as response:
+                  result = json.load(response)
+              assert result["sha"] == expected, (path, result)
+              print("VERIFIED_BLOB " + json.dumps({"path": path, "sha": expected}), flush=True)
+          PY
