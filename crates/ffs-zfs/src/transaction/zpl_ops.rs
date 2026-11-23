@@ -606,6 +606,59 @@ fn signed_bytes_delta(new_used: u64, old_used: u64) -> Result<i64> {
         .map_err(|_| corrupt("ZFS quota bytes_delta overflow"))
 }
 
+/// Initialize only allocated portions of an exposed byte range. Whole blocks
+/// become holes; at most two partial boundary blocks require payload reads.
+/// The bounded tree walk skips logical holes, including very large sparse gaps.
+fn zero_allocated_range(
+    cx: &Cx,
+    view: &mut Objects,
+    loaded: &LoadedZplNode,
+    start: u64,
+    end: u64,
+) -> Result<BTreeMap<u64, Option<Vec<u8>>>> {
+    let mut dirty = BTreeMap::new();
+    if start >= end {
+        return Ok(dirty);
+    }
+    let block_bytes = loaded.dnode.data_bytes();
+    let block_size = block_bytes as u64;
+    let blocks = allocated_leaf_blocks_in_range(
+        cx,
+        view,
+        &loaded.dnode,
+        loaded.ceiling,
+        start / block_size,
+        (end - 1) / block_size,
+    )?;
+    let mut edge_bytes = 0_usize;
+    for block in blocks {
+        checkpoint(cx)?;
+        let block_start = block * block_size;
+        let within_start = start.saturating_sub(block_start) as usize;
+        let within_end = (end - block_start).min(block_size) as usize;
+        if within_start == 0 && within_end == block_bytes {
+            dirty.insert(block, None);
+            continue;
+        }
+        edge_bytes = edge_bytes
+            .checked_add(block_bytes)
+            .filter(|&bytes| bytes <= MAX_WRITE_PAYLOAD_BYTES)
+            .ok_or_else(|| unsupported("ZPL range edges exceed 16 MiB of initialized data"))?;
+        let Some((existing, _, _)) =
+            view.object_data_block(cx, &loaded.dnode, loaded.ceiling, block)?
+        else {
+            return Err(corrupt("allocated ZPL range block became a hole"));
+        };
+        let mut bytes = existing.as_ref().clone();
+        bytes[within_start..within_end].fill(0);
+        dirty.insert(
+            block,
+            (!bytes.iter().all(|&byte| byte == 0)).then_some(bytes),
+        );
+    }
+    Ok(dirty)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn load_zpl_node(
     cx: &Cx,
@@ -1948,6 +2001,13 @@ pub(super) fn stage_zpl_mutation(
             new_meta.times[2] = *timestamp;
 
             if data.is_empty() {
+                let dirty_leaves = zero_allocated_range(
+                    cx,
+                    &mut os_view,
+                    &loaded,
+                    loaded.metadata.size,
+                    new_size,
+                )?;
                 let (bonus, spill) = encode_updated_zpl_bonus(
                     &loaded,
                     &new_meta,
@@ -1980,7 +2040,7 @@ pub(super) fn stage_zpl_mutation(
                         leaf_bucket: WriteBucket::ChildBlocks,
                         indirect_bucket: WriteBucket::ChildBlocks,
                     },
-                    &BTreeMap::new(),
+                    &dirty_leaves,
                     staged_writes,
                 )?;
                 zpl_born.add_assign(out.born)?;
@@ -2052,7 +2112,14 @@ pub(super) fn stage_zpl_mutation(
             let last_bid = (end_offset - 1) / (target_bsize as u64);
             let new_max_block = loaded.dnode.max_block().max(last_bid);
 
-            let mut dirty_leaves: BTreeMap<u64, Option<Vec<u8>>> = BTreeMap::new();
+            // Existing allocation beyond EOF is not initialized file data.
+            // Clear the gap using the old geometry; the single-block growth
+            // case below initializes its replacement under the new geometry.
+            let mut dirty_leaves = if old_bsize == target_bsize {
+                zero_allocated_range(cx, &mut os_view, &loaded, loaded.metadata.size, *offset)?
+            } else {
+                BTreeMap::new()
+            };
             // If block 0 existed at smaller `old_bsize < target_bsize` AND `first_bid > 0`,
             // we MUST also rewrite block 0 zero-extended to `target_bsize`!
             if loaded.dnode.max_block() == 0
@@ -2062,7 +2129,10 @@ pub(super) fn stage_zpl_mutation(
                     os_view.object_data_block(cx, &loaded.dnode, loaded.ceiling, 0)?
             {
                 let mut grown = vec![0_u8; target_bsize];
-                let copy_len = old_b0.len().min(target_bsize);
+                let copy_len = old_b0
+                    .len()
+                    .min(target_bsize)
+                    .min(usize::try_from(loaded.metadata.size).unwrap_or(usize::MAX));
                 grown[..copy_len].copy_from_slice(&old_b0[..copy_len]);
                 dirty_leaves.insert(0, Some(grown));
             }
@@ -2084,7 +2154,11 @@ pub(super) fn stage_zpl_mutation(
                     && let Some((existing_bytes, _, _)) =
                         os_view.object_data_block(cx, &loaded.dnode, loaded.ceiling, bid)?
                 {
-                    let copy_len = existing_bytes.len().min(target_bsize);
+                    let visible = loaded.metadata.size.saturating_sub(blk_start);
+                    let copy_len = existing_bytes
+                        .len()
+                        .min(target_bsize)
+                        .min(usize::try_from(visible).unwrap_or(usize::MAX));
                     blk[..copy_len].copy_from_slice(&existing_bytes[..copy_len]);
                 }
                 blk[within..within + count].copy_from_slice(&data[data_off..data_off + count]);
@@ -2203,44 +2277,7 @@ pub(super) fn stage_zpl_mutation(
                     *offset
                 };
                 let block_bytes = loaded.dnode.data_bytes();
-                let block_size = block_bytes as u64;
-                let blocks = allocated_leaf_blocks_in_range(
-                    cx,
-                    &mut os_view,
-                    &loaded.dnode,
-                    loaded.ceiling,
-                    start / block_size,
-                    (end - 1) / block_size,
-                )?;
-                let mut dirty_leaves = BTreeMap::new();
-                let mut edge_bytes = 0_usize;
-                for block in blocks {
-                    checkpoint(cx)?;
-                    let block_start = block * block_size;
-                    let within_start = start.saturating_sub(block_start) as usize;
-                    let within_end = (end - block_start).min(block_size) as usize;
-                    if within_start == 0 && within_end == block_bytes {
-                        dirty_leaves.insert(block, None);
-                        continue;
-                    }
-                    edge_bytes = edge_bytes
-                        .checked_add(block_bytes)
-                        .filter(|&bytes| bytes <= MAX_WRITE_PAYLOAD_BYTES)
-                        .ok_or_else(|| {
-                            unsupported("ZPL range edges exceed 16 MiB of initialized data")
-                        })?;
-                    let Some((existing, _, _)) =
-                        os_view.object_data_block(cx, &loaded.dnode, loaded.ceiling, block)?
-                    else {
-                        return Err(corrupt("allocated ZPL range block became a hole"));
-                    };
-                    let mut bytes = existing.as_ref().clone();
-                    bytes[within_start..within_end].fill(0);
-                    dirty_leaves.insert(
-                        block,
-                        (!bytes.iter().all(|&byte| byte == 0)).then_some(bytes),
-                    );
-                }
+                let dirty_leaves = zero_allocated_range(cx, &mut os_view, &loaded, start, end)?;
                 let mut new_meta = loaded.metadata.clone();
                 if *clear_suid_sgid {
                     new_meta.mode = clear_setid_bits_for_nonroot(new_meta.mode);
@@ -2375,6 +2412,9 @@ pub(super) fn stage_zpl_mutation(
                     dirty_leaves.insert(last_bid, Some(tail));
                 }
                 (prev_block_bytes, new_max)
+            } else if new_size > old_size {
+                dirty_leaves = zero_allocated_range(cx, &mut os_view, &loaded, old_size, new_size)?;
+                (prev_block_bytes, loaded.dnode.max_block())
             } else {
                 (prev_block_bytes, loaded.dnode.max_block())
             };

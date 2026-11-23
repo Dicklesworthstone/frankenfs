@@ -820,6 +820,13 @@ empty writes leave metadata unchanged, and snapshots retain their original data
 and permissions. Files with Linux file
 capabilities are still refused before data mutation because atomic capability
 xattr removal is not implemented.
+
+Write and truncate growth initialize newly visible bytes even when an existing
+checksummed, compressed record contains nonzero bytes beyond the old logical
+EOF. Sparse gaps stay sparse: traversal skips holes, full exposed blocks can
+become holes, and only partial boundary blocks need data reads. Data, EOF,
+timestamps and owner usage changes publish together; snapshots retain the
+original data.
 `fsync`, directory sync and unmount issue real device barriers and report errors.
 An uncertain publication fences the mount until explicit recovery and reopen.
 

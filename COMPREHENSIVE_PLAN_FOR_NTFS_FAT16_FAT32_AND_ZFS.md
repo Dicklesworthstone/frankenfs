@@ -670,8 +670,13 @@ admitted feature profile.
 
 The bounded native writer exposes size and explicit atime/mtime updates through
 `ZfsTransactionEngine::set_attributes` and writable `FsOps::setattr`. A compound
-request publishes the resize and both timestamps in the same TXG. Metadata-only
-updates preserve native data pointers, ACL/xattr values, ownership, object
+request publishes the resize and both timestamps in the same TXG. Write and
+truncate growth initialize existing allocated bytes exposed past the old
+logical EOF, including compressed records and record-size transitions. Bounded
+allocated-tree traversal skips sparse holes; full cleared blocks become holes
+and partial edges retain only initialized predecessor data. Size, data, owner
+usage and retirement publish together while snapshots retain their old blocks.
+Metadata-only updates preserve native data pointers, ACL/xattr values, ownership, object
 generation and birth time; native immutable/read-only rules are applied before
 publication. Native mode/ownership changes, ACL mutation and evaluation, and the
 remaining dataset/shared-reference lifecycle remain required by this plan.

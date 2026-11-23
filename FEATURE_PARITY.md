@@ -3574,6 +3574,35 @@ failures, Clippy diagnostics, and an AArch64-only harness probe build failure;
 those runs therefore do not establish an all-green workspace. These fixtures
 also do not establish native OpenZFS interchange or a real mounted syscall result.
 
+## ZFS initialized file growth across allocated tails (2026-11-23)
+
+Write and truncate growth no longer treat physical allocation past logical EOF
+as initialized file content. A shared bounded range helper visits only allocated
+leaves, turns fully exposed zeroed blocks into holes and reads only partial
+boundary blocks. The existing sparse-range editor uses the same helper.
+Write gaps and truncate growth publish these changes through the existing COW,
+snapshot deadlist and owner-accounting path.
+
+Single-block record expansion copies only bytes below the old EOF. Partially
+overwritten records also retain only previously visible bytes before applying
+the new payload; stale compressed tails cannot enter the enlarged logical file.
+The native engine's existing zero-payload size-extension path uses the same
+initialization. The FsOps empty-write no-op behavior is unchanged.
+
+Four regression sources cover checksum-valid nonzero compressed allocation
+beyond EOF, v4/v5 metadata, single/mirrored storage, record-size transitions,
+zero-length files with existing allocation, a sparse gap over 32 TiB, snapshot
+contents, allocation/scrub checks and every recorded mirrored write/truncate
+publication cut with dropped/reordered volatile writes. These are storage-model
+regressions; they do not establish native OpenZFS or mounted qualification.
+
+The complete candidate passed workspace `cargo fmt --check` and
+`git diff --check`. The exact three growth source/test files also passed a
+targeted UBS static scan (exit 0, 0 critical, reviewed warnings); build/lint phases
+were explicitly not evaluated by that scan. Integration runtime and mandatory
+workspace compilation/strict Clippy remain limited by the recorded shared
+environment failures. No unexecuted persistence regression is counted as a pass.
+
 ## ZFS project inheritance and owner-limit admission (2026-11-23)
 
 The native writer now supports inherited project ownership on regular-file and

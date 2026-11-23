@@ -6,6 +6,8 @@
 
 #[path = "persistence_prefix/creation_project.rs"]
 mod creation_project;
+#[path = "persistence_prefix/growth.rs"]
+mod growth;
 #[path = "persistence_prefix/permissions.rs"]
 mod permissions;
 #[path = "persistence_prefix/projects.rs"]
@@ -115,6 +117,7 @@ struct PoolFixtureSpec {
     additional_read_features: Vec<(&'static [u8], u64)>,
     additional_write_features: Vec<(&'static [u8], u64)>,
     zpl_flags: BTreeMap<u64, u64>,
+    hello_size: Option<u64>,
     hello_mode: u16,
     root_ids: (u64, u64),
     hello_ownership: Option<ffs_ondisk::zfs_zpl::ReclamationOwnership>,
@@ -150,6 +153,7 @@ impl Default for PoolFixtureSpec {
             additional_read_features: Vec::new(),
             additional_write_features: Vec::new(),
             zpl_flags: BTreeMap::new(),
+            hello_size: None,
             hello_mode: 0o644,
             root_ids: (0, 0),
             hello_ownership: None,
@@ -947,7 +951,7 @@ fn build_zpl_objectset(
         let hello_meta = Metadata {
             kind: Kind::Regular,
             mode: (Kind::Regular.to_tag() << 12) | u64::from(spec.hello_mode),
-            size: snap_hello_bytes.len() as u64,
+            size: spec.hello_size.unwrap_or(snap_hello_bytes.len() as u64),
             links: 1,
             parent: 2,
             uid: 1000,
