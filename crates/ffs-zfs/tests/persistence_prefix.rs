@@ -61,6 +61,8 @@ enum DeadlistMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AuxiliaryOwnership {
     XattrDirectory,
+    CapabilityXattr,
+    EmbeddedAcl,
     ExternalAcl,
 }
 
@@ -103,6 +105,7 @@ struct PoolFixtureSpec {
     additional_read_features: Vec<(&'static [u8], u64)>,
     additional_write_features: Vec<(&'static [u8], u64)>,
     zpl_flags: BTreeMap<u64, u64>,
+    hello_mode: u16,
     root_ids: (u64, u64),
     hello_ownership: Option<ffs_ondisk::zfs_zpl::ReclamationOwnership>,
     root_properties: Vec<(&'static [u8], u64)>,
@@ -135,6 +138,7 @@ impl Default for PoolFixtureSpec {
             additional_read_features: Vec::new(),
             additional_write_features: Vec::new(),
             zpl_flags: BTreeMap::new(),
+            hello_mode: 0o644,
             root_ids: (0, 0),
             hello_ownership: None,
             root_properties: Vec::new(),
@@ -902,7 +906,7 @@ fn build_zpl_objectset(
         );
         let hello_meta = Metadata {
             kind: Kind::Regular,
-            mode: (Kind::Regular.to_tag() << 12) | 0o644,
+            mode: (Kind::Regular.to_tag() << 12) | u64::from(spec.hello_mode),
             size: snap_hello_bytes.len() as u64,
             links: 1,
             parent: 2,
@@ -1126,7 +1130,7 @@ fn build_zpl_objectset(
                 .unwrap()
         };
         let (attribute, layout, payload) = match auxiliary {
-            AuxiliaryOwnership::XattrDirectory => {
+            AuxiliaryOwnership::XattrDirectory | AuxiliaryOwnership::CapabilityXattr => {
                 let value = b"private value survives namespace changes";
                 let mut padded = value.to_vec();
                 padded.resize((1_usize << spec.ashift).max(512), 0);
@@ -1152,11 +1156,13 @@ fn build_zpl_objectset(
                     order,
                 );
                 write_dnode_at(&mut table, 14, &value_node).unwrap();
+                let name: &[u8] = if auxiliary == AuxiliaryOwnership::CapabilityXattr {
+                    b"security.capability"
+                } else {
+                    b"user.retained"
+                };
                 let entries = mzap(
-                    &[(
-                        b"user.retained",
-                        encode_directory_reference(14, Kind::Regular).unwrap(),
-                    )],
+                    &[(name, encode_directory_reference(14, Kind::Regular).unwrap())],
                     0xA113,
                     order,
                 );
@@ -1183,6 +1189,25 @@ fn build_zpl_objectset(
                 );
                 write_dnode_at(&mut table, 13, &directory_node).unwrap();
                 (104, 4, order.encode(13).to_vec())
+            }
+            AuxiliaryOwnership::EmbeddedAcl => {
+                let mut acl = vec![0_u8; 88];
+                acl[8..12].copy_from_slice(&24_u32.to_le_bytes());
+                acl[12..14].copy_from_slice(&1_u16.to_le_bytes());
+                acl[14..16].copy_from_slice(&3_u16.to_le_bytes());
+                for (index, (flags, rights)) in [
+                    (0x1000_u16, 1_u32),
+                    (0x2040_u16, 3_u32),
+                    (0x4000_u16, 7_u32),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let start = 16 + index * 8;
+                    acl[start + 2..start + 4].copy_from_slice(&flags.to_le_bytes());
+                    acl[start + 4..start + 8].copy_from_slice(&rights.to_le_bytes());
+                }
+                (176, 5, acl)
             }
             AuxiliaryOwnership::ExternalAcl => {
                 // OpenZFS zfs-2.3.0 zfs_acl_phys_t: external object, byte

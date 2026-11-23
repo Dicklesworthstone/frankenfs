@@ -101,8 +101,8 @@ fn admit_directory_remove(parent: &Metadata, target: &Metadata) -> Result<()> {
 
 fn clear_setid_bits_for_nonroot(mode: u64) -> u64 {
     let mut next = mode & !0o4000;
-    // POSIX / OpenZFS zfs_setattr: clear S_ISGID only when group-exec (0o0010) is set;
-    // mandatory-locking style S_ISGID without group-exec is retained on data write/chown.
+    // Linux/FUSE baseline: group-executable SGID must be dropped. The frontend
+    // additionally removes non-executable SGID for callers outside the file's group.
     if next & 0o0010 != 0 {
         next &= !0o2000;
     }
@@ -2303,9 +2303,21 @@ pub(super) fn stage_zpl_mutation(
             }
             let owner_changed =
                 (loaded.metadata.uid, loaded.metadata.gid) != (new_meta.uid, new_meta.gid);
+            // Set-ID bits do not change NFSv4 access masks. Preserve native ACLs
+            // when FUSE requests only privilege removal before a data mutation.
+            let clears_only_setid = attrs.mode.is_some_and(|mode| {
+                let current = loaded.metadata.mode & 0o7777;
+                let requested = u64::from(mode) & 0o7777;
+                requested != current
+                    && requested & !current == 0
+                    && (requested ^ current) & !0o6000 == 0
+            });
+            let rebuild_trivial_acl = attrs.mode.is_some() && !clears_only_setid;
             if let Some(req_mode) = attrs.mode {
                 new_meta.mode = (new_meta.mode & !0o7777) | u64::from(req_mode & 0o7777);
-                new_meta.flags |= ZFS_ACL_TRIVIAL | ZFS_NO_EXECS_DENIED;
+                if rebuild_trivial_acl {
+                    new_meta.flags |= ZFS_ACL_TRIVIAL | ZFS_NO_EXECS_DENIED;
+                }
             }
             // A compound data/mode request must not restore privilege bits
             // after the caller requested that the data mutation clear them.
@@ -2327,7 +2339,7 @@ pub(super) fn stage_zpl_mutation(
                 &loaded,
                 &new_meta,
                 &mut ds_ctx,
-                attrs.mode.is_some(),
+                rebuild_trivial_acl,
                 None,
                 alloc,
                 order,

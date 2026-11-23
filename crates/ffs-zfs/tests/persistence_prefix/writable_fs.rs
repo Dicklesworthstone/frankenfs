@@ -1,6 +1,9 @@
 //! FsOps integration using the parent's native-layout/faultable-storage fixtures.
 //! These fixtures exercise the storage model, not native OpenZFS or FUSE mounts.
 
+#[path = "setid.rs"]
+mod setid;
+
 use super::*;
 use ffs_core::vfs::{FileType, ReleaseRequest, RequestOp};
 use ffs_core::{FsOps, InodeAttr, RequestScope, SetAttrRequest};

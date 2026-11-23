@@ -73,6 +73,10 @@ impl ZfsFs {
     ///
     /// Native mode bits and numeric owner IDs are exposed; this does not implement
     /// native ACL evaluation. The mount frontend must retain its permission policy.
+    /// Without caller credentials, data mutations conservatively clear SUID and
+    /// group-executable SGID atomically with the data. Non-executable SGID remains;
+    /// frontends may remove it through a clearing-only `setattr` for other callers.
+    /// Files with native capabilities remain outside the data-mutation profile.
     /// Open regular files survive final unlink in the native unlinked set. A
     /// fresh owner drains pending regular-file reclamation before exposing the
     /// mount. Snapshot and control-directory operations remain read-only.

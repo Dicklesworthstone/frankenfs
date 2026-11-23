@@ -1153,6 +1153,150 @@ fn ntfs_mapped_acl_open_checks_read_right_before_truncating_any_stream() {
 }
 
 #[test]
+fn ntfs_mapped_stream_creation_uses_file_authority_without_directory_add_rights() {
+    let cx = Cx::for_testing();
+    for version in [NtfsFormatVersion::V3_0, NtfsFormatVersion::V3_1] {
+        let (dev, vol_bytes) =
+            format_to_fault_device(&cx, 16, 4096, version, 0xAC15_0004_0000_0001);
+        let mut engine = open_clean_engine(&cx, &dev, vol_bytes);
+        let root = engine.resolve_path_reference(&cx, "/").unwrap();
+        let (writable, _) = engine
+            .create_file_at(&cx, root, &utf16("write-only.bin"), b"base")
+            .into_result()
+            .unwrap();
+        let (read_only, _) = engine
+            .create_file_at(&cx, root, &utf16("read-only.bin"), b"protected")
+            .into_result()
+            .unwrap();
+        for (target, denied) in [
+            (root, FILE_ADD_FILE),
+            (writable, FILE_READ_DATA),
+            (read_only, FILE_WRITE_DATA),
+        ] {
+            engine
+                .set_security_at(
+                    &cx,
+                    target,
+                    &stream_acl_descriptor(denied),
+                    DEFAULT_NTFS_FILETIME,
+                )
+                .into_result()
+                .unwrap();
+        }
+        let fs = NtfsFs::from_engine_with_policy(&cx, engine, stream_acl_policy(1002)).unwrap();
+        let mut scope = RequestScope::empty();
+
+        // A stream belongs to the existing FILE. Denying new directory entries
+        // must not prevent a caller with FILE_WRITE_DATA from adding a stream.
+        // The native descriptor projects 0777, so these requests do not claim
+        // a narrower security boundary than the shared FILE actually provides.
+        let direct = fs
+            .create(
+                &cx,
+                &mut scope,
+                InodeNumber(1),
+                OsStr::new("write-only.bin:direct"),
+                0o777,
+                1002,
+                2000,
+            )
+            .unwrap();
+        fs.write(&cx, &mut scope, direct.ino, 0, b"direct").unwrap();
+        let (opened, handle, _) = fs
+            .create_open(
+                &cx,
+                &mut scope,
+                InodeNumber(1),
+                OsStr::new("write-only.bin:opened"),
+                0o777,
+                1002,
+                2000,
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+            )
+            .unwrap();
+        fs.write(&cx, &mut scope, opened.ino, 0, b"opened").unwrap();
+        assert!(matches!(
+            fs.read(&cx, &mut scope, opened.ino, 0, 64),
+            Err(FfsError::PermissionDenied)
+        ));
+        fs.release(
+            &cx,
+            &mut scope,
+            ffs_core::vfs::ReleaseRequest {
+                ino: opened.ino,
+                fh: handle,
+                flags: libc::O_WRONLY,
+                lock_owner: None,
+                flush: false,
+            },
+        )
+        .unwrap();
+
+        // Parent authority still controls ordinary file creation; base-file
+        // authority and requested read access still control stream creation.
+        let before = dev.snapshot_live();
+        let durable = dev.snapshot_durable_only();
+        let writes = dev.write_bytes_total();
+        for (name, flags) in [
+            ("blocked-file.bin", libc::O_WRONLY),
+            ("read-only.bin:blocked", libc::O_WRONLY),
+            ("write-only.bin:read", libc::O_RDONLY),
+            ("write-only.bin:read-write", libc::O_RDWR),
+        ] {
+            assert!(matches!(
+                fs.create_open(
+                    &cx,
+                    &mut scope,
+                    InodeNumber(1),
+                    OsStr::new(name),
+                    0o777,
+                    1002,
+                    2000,
+                    flags | libc::O_CREAT | libc::O_EXCL,
+                ),
+                Err(FfsError::PermissionDenied)
+            ));
+            assert!(matches!(
+                fs.lookup(&cx, &mut scope, InodeNumber(1), OsStr::new(name)),
+                Err(FfsError::NotFound(_))
+            ));
+        }
+        assert!(matches!(
+            fs.create(
+                &cx,
+                &mut scope,
+                InodeNumber(1),
+                OsStr::new("write-only.bin:private"),
+                0o600,
+                1002,
+                2000,
+            ),
+            Err(FfsError::UnsupportedFeature(_))
+        ));
+        assert_eq!(dev.write_bytes_total(), writes);
+        assert_eq!(dev.snapshot_live(), before);
+        assert_eq!(dev.snapshot_durable_only(), durable);
+        fs.flush_on_destroy(&cx).unwrap();
+        drop(fs);
+
+        let engine = open_clean_engine(&cx, &dev, vol_bytes);
+        engine.check_clean_consistency(&cx).unwrap();
+        let fs = NtfsFs::from_engine_with_policy(&cx, engine, stream_acl_policy(1001)).unwrap();
+        for (name, expected) in [
+            ("write-only.bin:direct", b"direct".as_slice()),
+            ("write-only.bin:opened", b"opened".as_slice()),
+            ("write-only.bin", b"base".as_slice()),
+            ("read-only.bin", b"protected".as_slice()),
+        ] {
+            let attr = fs
+                .lookup(&cx, &mut scope, InodeNumber(1), OsStr::new(name))
+                .unwrap();
+            assert_eq!(fs.read(&cx, &mut scope, attr.ino, 0, 64).unwrap(), expected);
+        }
+    }
+}
+
+#[test]
 fn ntfs_mapped_acl_create_open_checks_read_before_publishing_named_stream() {
     let cx = Cx::for_testing();
     let (dev, vol_bytes) = format_to_fault_device(
