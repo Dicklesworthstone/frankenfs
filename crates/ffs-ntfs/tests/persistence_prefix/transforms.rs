@@ -1291,11 +1291,11 @@ fn ntfs_wof_decompression_on_write_materializes_plaintext_and_cleans_reparse() {
             "missing placeholder tag in rec {rec_no}"
         );
         if rec_no == wof_ref.record as usize {
-            // Sparse growth correctly leaves ValidDataLength at zero. WOF's
-            // provider data represents initialized logical bytes, so its
-            // unnamed sparse placeholder must declare that initialized span.
+            // Creating initialized data before punching the whole cluster keeps
+            // WOF's logical span valid while leaving its placeholder unallocated.
+            // Verify those native fields without changing the fixture's DATA.
             let mut at = u16::from_le_bytes(restored[20..22].try_into().unwrap()) as usize;
-            let mut initialized_data = false;
+            let mut checked_placeholder = false;
             while at + 24 <= restored.len() {
                 let kind = u32::from_le_bytes(restored[at..at + 4].try_into().unwrap());
                 if kind == u32::MAX {
@@ -1306,18 +1306,21 @@ fn ntfs_wof_decompression_on_write_materializes_plaintext_and_cleans_reparse() {
                 assert!(length >= 24 && at + length <= restored.len());
                 if kind == ffs_ondisk::ntfs::DATA && restored[at + 9] == 0 {
                     assert_eq!(restored[at + 8], 1);
-                    assert!(length >= 64);
-                    let logical = &restored[at + 48..at + 56];
-                    assert_eq!(logical, &(wof_initial.len() as u64).to_le_bytes());
-                    assert_eq!(&restored[at + 56..at + 64], &0_u64.to_le_bytes());
-                    restored[at + 56..at + 64]
-                        .copy_from_slice(&(wof_initial.len() as u64).to_le_bytes());
-                    initialized_data = true;
+                    assert!(length >= 72);
+                    assert_eq!(
+                        u16::from_le_bytes(restored[at + 12..at + 14].try_into().unwrap()),
+                        ffs_ondisk::ntfs::SPARSE
+                    );
+                    let logical_size = (wof_initial.len() as u64).to_le_bytes();
+                    assert_eq!(&restored[at + 48..at + 56], &logical_size);
+                    assert_eq!(&restored[at + 56..at + 64], &logical_size);
+                    assert_eq!(&restored[at + 64..at + 72], &0_u64.to_le_bytes());
+                    checked_placeholder = true;
                     break;
                 }
                 at += length;
             }
-            assert!(initialized_data, "missing unnamed sparse WOF DATA");
+            assert!(checked_placeholder, "missing unnamed sparse WOF DATA");
         }
         let usa_off = u16::from_le_bytes([restored[4], restored[5]]) as usize;
         let usa_cnt = u16::from_le_bytes([restored[6], restored[7]]) as usize;
@@ -1347,13 +1350,29 @@ fn ntfs_wof_decompression_on_write_materializes_plaintext_and_cleans_reparse() {
     assert_eq!(read_file_by_path(&cx, &engine, "/wof.bin"), expected);
 
     // Verify `WofCompressedData` AND `$REPARSE_POINT` are completely gone!
-    let vol = engine.volume_view(&cx).unwrap();
+    {
+        let vol = engine.volume_view(&cx).unwrap();
+        let rec = vol.resolve(&cx, "/wof.bin").unwrap();
+        assert!(vol.reparse_point(&cx, &rec).unwrap().is_none());
+        let streams = vol.data_streams(&cx, &rec).unwrap();
+        assert_eq!(streams.len(), 1);
+        assert_eq!(streams[0].name, [] as [u16; 0]);
+    }
+    engine.check_clean_consistency(&cx).unwrap();
+    drop(engine);
+
+    // Reopen only durable bytes so cached plaintext cannot hide a lost write
+    // or missing persistent cleanup of the WOF provider metadata.
+    let durable = FaultInjectingNtfsDevice::new(wof_dev.snapshot_durable_only());
+    let reopened = open_clean_engine(&cx, &durable, vol_bytes);
+    assert_eq!(read_file_by_path(&cx, &reopened, "/wof.bin"), expected);
+    let vol = reopened.volume_view(&cx).unwrap();
     let rec = vol.resolve(&cx, "/wof.bin").unwrap();
     assert!(vol.reparse_point(&cx, &rec).unwrap().is_none());
     let streams = vol.data_streams(&cx, &rec).unwrap();
     assert_eq!(streams.len(), 1);
     assert_eq!(streams[0].name, [] as [u16; 0]);
-    engine.check_clean_consistency(&cx).unwrap();
+    reopened.check_clean_consistency(&cx).unwrap();
 }
 
 #[test]
