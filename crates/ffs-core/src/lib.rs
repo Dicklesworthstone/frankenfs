@@ -22164,12 +22164,17 @@ impl OpenFs {
         scope: &RequestScope,
         ino: InodeNumber,
     ) -> Result<Ext4Inode, FfsError> {
-        let inode = self.read_inode_raw_with_scope_using(
-            cx,
-            scope,
-            ino,
-            Ext4Inode::parse_metadata_from_bytes,
-        )?;
+        let inode = self.read_inode_raw_with_scope_using(cx, scope, ino, |bytes| {
+            let inode = Ext4Inode::parse_metadata_from_bytes(bytes)?;
+            // Inline directories need their system.data ibody continuation even
+            // on the lookup/readdir metadata path. Parse it from the same inode
+            // bytes so a fixed request snapshot cannot mix directory versions.
+            if inode.is_dir() && Self::ext4_inode_uses_inline_data(&inode) {
+                Ext4Inode::parse_from_bytes(bytes)
+            } else {
+                Ok(inode)
+            }
+        })?;
         if inode.mode == 0 {
             return Err(FfsError::NotFound(format!("inode {}", ino.0)));
         }
@@ -24751,8 +24756,8 @@ impl OpenFs {
 
     /// Read all directory entries from a directory inode via the device.
     ///
-    /// Iterates over the inode's data blocks via extent mapping, reading
-    /// each block from the device and parsing directory entries.
+    /// Reads inline inode-body entries, or iterates over the inode's mapped
+    /// data blocks and parses their directory entries.
     pub fn read_dir(&self, cx: &Cx, inode: &Ext4Inode) -> Result<Vec<Ext4DirEntry>, FfsError> {
         self.read_dir_with_scope(cx, &RequestScope::empty(), inode)
     }
@@ -24782,7 +24787,9 @@ impl OpenFs {
         // parallel phase and consumed in block order during finalize.
         type DirRunRead = Result<Vec<Vec<u8>>, FfsError>;
 
-        Self::ext4_reject_inline_data_dir(inode)?;
+        if Self::ext4_inode_uses_inline_data(inode) {
+            return self.read_ext4_inline_dir(cx, inode);
+        }
         let bs = u64::from(self.block_size());
         let block_size = self.block_size();
         let num_blocks = dir_logical_block_count(inode.size, bs)?;
@@ -24995,7 +25002,20 @@ impl OpenFs {
         dir_inode: &Ext4Inode,
         name: &[u8],
     ) -> Result<Option<Ext4DirEntry>, FfsError> {
-        Self::ext4_reject_inline_data_dir(dir_inode)?;
+        if Self::ext4_inode_uses_inline_data(dir_inode) {
+            // Validate both independent inline regions before accepting even
+            // an early match. A corrupt continuation must not become ENOENT or
+            // a successful lookup of a partially valid directory.
+            let entries = self.read_ext4_inline_dir(cx, dir_inode)?;
+            let casefold = dir_inode.flags & ffs_types::EXT4_CASEFOLD_FL != 0;
+            let key = casefold.then(|| ffs_ondisk::ext4_casefold_key(name));
+            return Ok(entries.into_iter().find(|entry| {
+                key.as_ref().map_or_else(
+                    || entry.name == name,
+                    |key| ffs_ondisk::ext4_casefold_key(&entry.name) == *key,
+                )
+            }));
+        }
         // Dots live in logical block zero, including an indexed directory's
         // dx root. Neither the current-view name index nor a hashed leaf miss
         // can decide their presence. Keep the mapping and bytes in this scope.
@@ -25828,6 +25848,155 @@ impl Ext4FsOps {
 }
 
 impl OpenFs {
+    /// An inline directory has a parent inode followed by 56 bytes of dirents
+    /// in i_block, plus a second, independently bounded system.data region.
+    /// Neither region has a checksum tail: the inode checksum protects both.
+    /// See Linux's ext4 inline-data format and fs/ext4/inline.c.
+    fn read_ext4_inline_dir(
+        &self,
+        cx: &Cx,
+        inode: &Ext4Inode,
+    ) -> Result<Vec<Ext4DirEntry>, FfsError> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        if !inode.is_dir() {
+            return Err(FfsError::NotDirectory);
+        }
+        let corrupt = |detail: &str| FfsError::Corruption {
+            block: 0,
+            detail: format!("ext4 inline directory {}: {detail}", inode.number),
+        };
+        let sb = self
+            .ext4_superblock()
+            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
+        if !sb.has_incompat(ffs_ondisk::Ext4IncompatFeatures::INLINE_DATA) {
+            return Err(corrupt("inline-data flag without the superblock feature"));
+        }
+        if inode.extent_bytes.len() != 60
+            || inode.flags & (ffs_types::EXT4_EXTENTS_FL | ffs_types::EXT4_INDEX_FL) != 0
+        {
+            return Err(corrupt("invalid i_block size or conflicting layout flags"));
+        }
+        let own_ino = u32::try_from(inode.number)
+            .ok()
+            .filter(|&ino| ino != 0 && ino <= sb.inodes_count)
+            .ok_or_else(|| corrupt("directory inode is outside the filesystem"))?;
+        let parent = u32::from_le_bytes([
+            inode.extent_bytes[0],
+            inode.extent_bytes[1],
+            inode.extent_bytes[2],
+            inode.extent_bytes[3],
+        ]);
+        if parent == 0 || parent > sb.inodes_count {
+            return Err(corrupt("parent inode is outside the filesystem"));
+        }
+
+        // system.data is mandatory even when its value is empty. Do not accept
+        // a missing, duplicated or EA-inode-backed value as an empty directory.
+        let attributes = ffs_ondisk::parse_ibody_xattrs_with_inum(inode)
+            .map_err(|error| corrupt(&format!("invalid inode-body attributes: {error}")))?;
+        let mut continuations = attributes.into_iter().filter(|(attribute, _)| {
+            attribute.name_index == ffs_types::EXT4_XATTR_INDEX_SYSTEM && attribute.name == b"data"
+        });
+        let (continuation, value_inum) = continuations
+            .next()
+            .ok_or_else(|| corrupt("missing system.data inode-body attribute"))?;
+        if value_inum != 0 || continuations.next().is_some() {
+            return Err(corrupt("system.data must be one inode-body value"));
+        }
+        if inode.size != 60 + continuation.value.len() as u64 {
+            return Err(corrupt("size does not match the two inline regions"));
+        }
+
+        let mut entries = vec![
+            Ext4DirEntry {
+                inode: own_ino,
+                rec_len: 12,
+                name_len: 1,
+                file_type: Ext4FileType::Dir,
+                name: b".".to_vec(),
+            },
+            Ext4DirEntry {
+                inode: parent,
+                rec_len: 12,
+                name_len: 2,
+                file_type: Ext4FileType::Dir,
+                name: b"..".to_vec(),
+            },
+        ];
+        let mut names = BTreeSet::from([b".".to_vec(), b"..".to_vec()]);
+        let casefold = inode.flags & ffs_types::EXT4_CASEFOLD_FL != 0;
+        for region in [&inode.extent_bytes[4..], continuation.value.as_slice()] {
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            Self::append_ext4_inline_dir_entries(
+                region,
+                sb.inodes_count,
+                casefold,
+                &mut entries,
+                &mut names,
+            )?;
+        }
+        Ok(entries)
+    }
+
+    fn append_ext4_inline_dir_entries(
+        mut region: &[u8],
+        inodes_count: u32,
+        casefold: bool,
+        entries: &mut Vec<Ext4DirEntry>,
+        names: &mut BTreeSet<Vec<u8>>,
+    ) -> Result<(), FfsError> {
+        let corrupt = |detail: &str| FfsError::Corruption {
+            block: 0,
+            detail: format!("ext4 inline directory: {detail}"),
+        };
+        while !region.is_empty() {
+            if region.len() < 8 {
+                return Err(corrupt("truncated directory entry header"));
+            }
+            let ino = u32::from_le_bytes([region[0], region[1], region[2], region[3]]);
+            // Block-directory rec_len sentinels (0 and 0xffff) do not apply to
+            // either inline region; a record must fit wholly inside this one.
+            let rec_len = u16::from_le_bytes([region[4], region[5]]);
+            let record_size = usize::from(rec_len);
+            let name_len = region[6];
+            let file_type = region[7];
+            let minimum_size = (8 + usize::from(name_len) + 3) & !3;
+            if record_size < 12
+                || !record_size.is_multiple_of(4)
+                || record_size < minimum_size
+                || record_size > region.len()
+            {
+                return Err(corrupt("invalid directory entry length"));
+            }
+            if ino > inodes_count || file_type > 7 {
+                return Err(corrupt("invalid entry inode or file type"));
+            }
+            if ino != 0 {
+                let name = &region[8..8 + usize::from(name_len)];
+                if name.is_empty() || name.contains(&0) || name.contains(&b'/') {
+                    return Err(corrupt("invalid directory entry name"));
+                }
+                let key = if casefold {
+                    ffs_ondisk::ext4_casefold_key(name)
+                } else {
+                    name.to_vec()
+                };
+                if !names.insert(key) {
+                    return Err(corrupt("duplicate directory entry name"));
+                }
+                entries.push(Ext4DirEntry {
+                    inode: ino,
+                    rec_len: u32::from(rec_len),
+                    name_len,
+                    file_type: Ext4FileType::from_raw(file_type),
+                    name: name.to_vec(),
+                });
+            }
+            region = &region[record_size..];
+        }
+        Ok(())
+    }
+
     /// Read inline data from an ext4 inode's i_block area + xattr ibody.
     ///
     /// For inodes with `EXT4_INLINE_DATA_FL`, file content is stored in:
@@ -40233,19 +40402,17 @@ impl OpenFs {
             && inode.flags & ffs_types::EXT4_COMPR_FL == 0
     }
 
-    /// Reject directory operations on an `inline_data` directory.
+    /// Reject block-based mutations of an `inline_data` directory.
     ///
     /// Inline-data directories store their entries inside the inode (i_block +
-    /// the `system.data` ibody xattr), not in extent-mapped blocks. FrankenFS
-    /// has no inline-directory parser, so block-based readdir/lookup/insert
-    /// would silently see an empty directory (and an empty readdir can let
-    /// `rmdir` drop a non-empty dir) or overwrite the inline entries with a
-    /// fresh extent root (data loss). Until full inline-dir support lands
-    /// (bd-4y9ca), fail loudly instead of corrupting.
+    /// the `system.data` ibody xattr), not in extent-mapped blocks. Reads decode
+    /// that layout, but mutation paths still require a block directory. Keep
+    /// them guarded until inline updates and conversion are implemented: an
+    /// empty extent view must never authorize rmdir or overwrite inline data.
     fn ext4_reject_inline_data_dir(inode: &Ext4Inode) -> Result<(), FfsError> {
         if Self::ext4_inode_uses_inline_data(inode) {
             return Err(FfsError::UnsupportedFeature(
-                "ext4 inline_data directories are not yet supported (bd-4y9ca)".to_owned(),
+                "ext4 inline_data directory mutation is not yet supported (bd-4y9ca)".to_owned(),
             ));
         }
         Ok(())
@@ -66402,6 +66569,355 @@ mod tests {
 
     // ── Device-based directory tests ──────────────────────────────────
 
+    fn inline_dir_region(size: usize, entries: &[(u32, &[u8])]) -> Vec<u8> {
+        let mut region = vec![0; size];
+        let mut offset = 0;
+        if entries.is_empty() {
+            region[4..6].copy_from_slice(&u16::try_from(size).unwrap().to_le_bytes());
+        }
+        for (index, &(ino, name)) in entries.iter().enumerate() {
+            let rec_len = if index + 1 == entries.len() {
+                size - offset
+            } else {
+                (8 + name.len() + 3) & !3
+            };
+            assert!(rec_len >= 12 && rec_len >= 8 + name.len());
+            region[offset..offset + 4].copy_from_slice(&ino.to_le_bytes());
+            region[offset + 4..offset + 6]
+                .copy_from_slice(&u16::try_from(rec_len).unwrap().to_le_bytes());
+            region[offset + 6] = u8::try_from(name.len()).unwrap();
+            region[offset + 7] = Ext4FileType::RegFile.to_raw();
+            region[offset + 8..offset + 8 + name.len()].copy_from_slice(name);
+            offset += rec_len;
+        }
+        region
+    }
+
+    /// Deterministic format fixture, independent of mkfs/debugfs availability.
+    /// The 56-byte i_block tail and system.data are separate dirent regions.
+    fn build_ext4_image_with_inline_dir(head: &[u8], continuation: &[u8]) -> Vec<u8> {
+        const ROOT: usize = 4 * 4096 + 256;
+        assert_eq!(head.len(), 56);
+        assert!(continuation.len() <= 68);
+        let mut image = build_ext4_image_with_extents();
+        let incompat = 0x0002_u32 | 0x0040 | 0x8000; // FILETYPE | EXTENTS | INLINE_DATA
+        image[EXT4_SUPERBLOCK_OFFSET + 0x60..EXT4_SUPERBLOCK_OFFSET + 0x64]
+            .copy_from_slice(&incompat.to_le_bytes());
+        let inode = &mut image[ROOT..ROOT + 256];
+        inode.fill(0);
+        inode[..2].copy_from_slice(&0o040_755_u16.to_le_bytes());
+        inode[4..8].copy_from_slice(
+            &u32::try_from(60 + continuation.len())
+                .unwrap()
+                .to_le_bytes(),
+        );
+        inode[0x1A..0x1C].copy_from_slice(&2_u16.to_le_bytes());
+        inode[0x20..0x24].copy_from_slice(&ffs_types::EXT4_INLINE_DATA_FL.to_le_bytes());
+        inode[0x28..0x2C].copy_from_slice(&2_u32.to_le_bytes());
+        inode[0x2C..0x64].copy_from_slice(head);
+        inode[0x80..0x82].copy_from_slice(&32_u16.to_le_bytes());
+        let ibody = &mut inode[160..];
+        ibody[..4].copy_from_slice(&0xEA02_0000_u32.to_le_bytes());
+        ibody[4] = 4;
+        ibody[5] = ffs_types::EXT4_XATTR_INDEX_SYSTEM;
+        // Value offsets are relative to the first entry, after the magic.
+        ibody[6..8].copy_from_slice(&24_u16.to_le_bytes());
+        ibody[12..16].copy_from_slice(&u32::try_from(continuation.len()).unwrap().to_le_bytes());
+        ibody[20..24].copy_from_slice(b"data");
+        // Bytes 24..28 terminate the attribute table, before the value.
+        ibody[28..28 + continuation.len()].copy_from_slice(continuation);
+        image
+    }
+
+    #[test]
+    fn ext4_inline_directory_empty_synthesizes_dot_entries() {
+        let image = build_ext4_image_with_inline_dir(&inline_dir_region(56, &[]), &[]);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(image)),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        let inode = fs.read_inode(&cx, InodeNumber(2)).unwrap();
+        let entries = fs.read_dir(&cx, &inode).unwrap();
+        assert_eq!(entries.len(), 2);
+        for (entry, name) in entries.iter().zip([b".".as_slice(), b"..".as_slice()]) {
+            assert_eq!(entry.name, name);
+            assert_eq!(entry.inode, 2);
+            assert_eq!(entry.file_type, Ext4FileType::Dir);
+            assert_eq!(
+                fs.lookup_name(&cx, &inode, name).unwrap().as_ref(),
+                Some(entry)
+            );
+        }
+        assert!(fs.lookup_name(&cx, &inode, b"absent").unwrap().is_none());
+        let page = fs.readdir(&cx, InodeNumber(1), 0).unwrap();
+        assert_eq!(page.len(), 2);
+        assert!(page.iter().all(|entry| entry.ino == InodeNumber(1)));
+
+        // Read support must not let a block-only mutator treat an inline
+        // directory as an empty extent tree, even when it actually is empty.
+        let dev = fs.block_device_adapter();
+        assert!(matches!(
+            fs.ext4_directory_is_empty_from_device(&cx, &dev, &inode),
+            Err(FfsError::UnsupportedFeature(_))
+        ));
+        assert!(matches!(
+            fs.ext4_dir_extents_from_device(&cx, &dev, &inode),
+            Err(FfsError::UnsupportedFeature(_))
+        ));
+    }
+
+    #[test]
+    fn ext4_inline_directory_lists_and_looks_up_both_regions() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let head = inline_dir_region(56, &[(11, b"hello.txt"), (0, b"deleted"), (11, b"alias")]);
+        let continuation = inline_dir_region(60, &[(12, b"later.txt"), (11, b"\xFFfile")]);
+        let image = build_ext4_image_with_inline_dir(&head, &continuation);
+        let dev = VectoredCountingDevice::new(TestDevice::from_vec(image));
+        let scalar = Arc::clone(&dev.scalar_reads);
+        let vectored = Arc::clone(&dev.vectored_reads);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        let inode = fs.read_inode(&cx, InodeNumber(2)).unwrap();
+        scalar.store(0, AtomicOrdering::SeqCst);
+        vectored.store(0, AtomicOrdering::SeqCst);
+        let entries = fs.read_dir(&cx, &inode).unwrap();
+        let names: Vec<&[u8]> = entries.iter().map(|entry| entry.name.as_slice()).collect();
+        assert_eq!(
+            names,
+            [
+                b".".as_slice(),
+                b"..",
+                b"hello.txt",
+                b"alias",
+                b"later.txt",
+                b"\xFFfile"
+            ]
+        );
+        for entry in &entries {
+            assert_eq!(
+                fs.lookup_name(&cx, &inode, &entry.name).unwrap().as_ref(),
+                Some(entry)
+            );
+        }
+        for absent in [b"deleted".as_slice(), b"missing"] {
+            assert!(fs.lookup_name(&cx, &inode, absent).unwrap().is_none());
+        }
+        assert_eq!(scalar.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(vectored.load(AtomicOrdering::SeqCst), 0);
+
+        // Exercise the metadata-only inode read used by the actual FsOps/FUSE
+        // entry points, both cold and after publishing the hot parent cache.
+        for _ in 0..2 {
+            for (name, ino) in [
+                (b"hello.txt".as_slice(), 11),
+                (b"later.txt", 12),
+                (b"\xFFfile", 11),
+            ] {
+                let attr = FsOps::lookup(
+                    &fs,
+                    &cx,
+                    &mut RequestScope::empty(),
+                    InodeNumber(1),
+                    OsStr::from_bytes(name),
+                )
+                .unwrap();
+                assert_eq!(attr.ino, InodeNumber(ino));
+            }
+        }
+        let page = fs.readdir(&cx, InodeNumber(1), 0).unwrap();
+        assert_eq!(
+            page.iter()
+                .map(|entry| entry.name.as_slice())
+                .collect::<Vec<_>>(),
+            names
+        );
+        for (index, entry) in page.iter().enumerate() {
+            assert_eq!(entry.offset, u64::try_from(index + 1).unwrap());
+            let remaining = fs.readdir(&cx, InodeNumber(1), entry.offset).unwrap();
+            assert_eq!(remaining.as_slice(), &page.as_slice()[index + 1..]);
+        }
+    }
+
+    #[test]
+    fn ext4_inline_directory_casefold_lookup_preserves_stored_names() {
+        let head = inline_dir_region(56, &[(11, "Straße".as_bytes())]);
+        let continuation = inline_dir_region(60, &[(12, b"\xFFNAME")]);
+        let image = build_ext4_image_with_inline_dir(&head, &continuation);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(image)),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        let mut inode = fs.read_inode(&cx, InodeNumber(2)).unwrap();
+        inode.flags |= ffs_types::EXT4_CASEFOLD_FL;
+        assert_eq!(
+            fs.lookup_name(&cx, &inode, b"STRASSE")
+                .unwrap()
+                .unwrap()
+                .name,
+            "Straße".as_bytes()
+        );
+        assert_eq!(
+            fs.lookup_name(&cx, &inode, b"\xFFname")
+                .unwrap()
+                .unwrap()
+                .name,
+            b"\xFFNAME"
+        );
+        // Equivalent names in separate regions would make lookup ambiguous.
+        inode.xattr_ibody[34] = 7;
+        inode.xattr_ibody[36..43].copy_from_slice(b"STRASSE");
+        assert!(matches!(
+            fs.read_dir(&cx, &inode),
+            Err(FfsError::Corruption { .. })
+        ));
+        assert!(matches!(
+            fs.lookup_name(&cx, &inode, b"STRASSE"),
+            Err(FfsError::Corruption { .. })
+        ));
+    }
+
+    #[test]
+    fn ext4_inline_directory_checks_feature_without_misreading_compression_flags() {
+        let mut image = build_ext4_image_with_inline_dir(&inline_dir_region(56, &[]), &[]);
+        image[EXT4_SUPERBLOCK_OFFSET + 0x60..EXT4_SUPERBLOCK_OFFSET + 0x64]
+            .copy_from_slice(&0x0042_u32.to_le_bytes());
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(image)),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        let inode = fs.read_inode(&cx, InodeNumber(2)).unwrap();
+        assert!(matches!(
+            fs.read_dir(&cx, &inode),
+            Err(FfsError::Corruption { .. })
+        ));
+        assert!(matches!(
+            fs.lookup_name(&cx, &inode, b"."),
+            Err(FfsError::Corruption { .. })
+        ));
+
+        // e2compr's method field reuses INLINE_DATA's bit. COMPR_FL remains
+        // authoritative, so this valid block directory must use its extents.
+        let fs = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(build_ext4_image_with_dir())),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        let mut inode = fs.read_inode(&cx, InodeNumber(2)).unwrap();
+        inode.flags |= ffs_types::EXT4_INLINE_DATA_FL | ffs_types::EXT4_COMPR_FL;
+        assert_eq!(fs.read_dir(&cx, &inode).unwrap().len(), 3);
+        assert_eq!(
+            fs.lookup_name(&cx, &inode, b"hello.txt")
+                .unwrap()
+                .unwrap()
+                .inode,
+            11
+        );
+        OpenFs::ext4_reject_inline_data_dir(&inode).unwrap();
+    }
+
+    #[test]
+    fn ext4_inline_directory_rejects_corruption_before_any_lookup_result() {
+        let head = inline_dir_region(56, &[(11, b"hit")]);
+        let continuation = inline_dir_region(60, &[(12, b"later")]);
+        let image = build_ext4_image_with_inline_dir(&head, &continuation);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(image)),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        let inode = fs.read_inode(&cx, InodeNumber(2)).unwrap();
+        let rejects = |label: &str, damaged: &Ext4Inode| {
+            assert!(
+                matches!(fs.read_dir(&cx, damaged), Err(FfsError::Corruption { .. })),
+                "{label}"
+            );
+            for name in [b".".as_slice(), b"hit", b"later", b"absent"] {
+                assert!(
+                    matches!(
+                        fs.lookup_name(&cx, damaged, name),
+                        Err(FfsError::Corruption { .. })
+                    ),
+                    "{label}: {name:?}"
+                );
+            }
+        };
+        for (label, offset, replacement) in [
+            ("zero parent", 0, vec![0, 0, 0, 0]),
+            ("parent outside filesystem", 0, vec![129, 0, 0, 0]),
+            ("entry outside filesystem", 4, vec![129, 0, 0, 0]),
+            ("zero rec_len", 8, vec![0, 0]),
+            ("short rec_len", 8, vec![8, 0]),
+            ("unaligned rec_len", 8, vec![55, 0]),
+            ("entry crosses into xattr", 8, vec![60, 0]),
+            ("block-sized sentinel", 8, vec![0xFC, 0xFF]),
+            ("name crosses record", 10, vec![49]),
+            ("empty live name", 10, vec![0]),
+            ("invalid file type", 11, vec![8]),
+            ("NUL name", 12, vec![0]),
+            ("slash name", 12, vec![b'/']),
+        ] {
+            let mut damaged = inode.clone();
+            damaged.extent_bytes[offset..offset + replacement.len()].copy_from_slice(&replacement);
+            rejects(label, &damaged);
+        }
+        for (label, offset, replacement) in [
+            ("EA-inode continuation", 8, vec![11, 0, 0, 0]),
+            ("value overlaps table", 6, vec![0, 0]),
+            ("late zero rec_len", 32, vec![0, 0]),
+            ("late overrun", 32, vec![64, 0]),
+            ("inline checksum tail", 35, vec![0xDE]),
+        ] {
+            let mut damaged = inode.clone();
+            damaged.xattr_ibody[offset..offset + replacement.len()].copy_from_slice(&replacement);
+            rejects(label, &damaged);
+        }
+        let mut damaged = inode.clone();
+        damaged.xattr_ibody[34] = 3;
+        damaged.xattr_ibody[36..39].copy_from_slice(b"hit");
+        rejects("duplicate across regions", &damaged);
+        damaged.xattr_ibody[34] = 1;
+        damaged.xattr_ibody[36] = b'.';
+        rejects("duplicate synthesized dot", &damaged);
+        let mut damaged = inode.clone();
+        damaged.xattr_ibody.clear();
+        rejects("missing system.data", &damaged);
+        let mut damaged = inode.clone();
+        damaged.extent_bytes.truncate(59);
+        rejects("truncated i_block", &damaged);
+        let mut damaged = inode.clone();
+        damaged.size -= 1;
+        rejects("size disagrees with regions", &damaged);
+        let mut damaged = inode.clone();
+        damaged.flags |= ffs_types::EXT4_EXTENTS_FL;
+        rejects("conflicting extent flag", &damaged);
+        for number in [0, 129, u64::MAX] {
+            let mut damaged = inode.clone();
+            damaged.number = number;
+            rejects("invalid own inode number", &damaged);
+        }
+        let mut damaged = inode;
+        damaged.size = 60;
+        damaged.xattr_ibody[6..8].fill(0);
+        damaged.xattr_ibody[12..16].fill(0);
+        let duplicate = damaged.xattr_ibody[4..24].to_vec();
+        damaged.xattr_ibody[24..].fill(0);
+        damaged.xattr_ibody[24..44].copy_from_slice(&duplicate);
+        rejects("duplicate system.data", &damaged);
+    }
+
     /// Build an ext4 image with a directory inode containing entries.
     ///
     /// Layout (4K blocks, 256K image):
@@ -76692,13 +77208,8 @@ mod tests {
         );
     }
 
-    /// bd-4y9ca regression guard: ext4 inline-data DIRECTORY operations must fail
-    /// loudly (UnsupportedFeature / Err), never silently see an empty/block-mapped
-    /// directory. FrankenFS has no inline-directory parser; a silent empty readdir
-    /// would let rmdir drop a non-empty inline dir, and a silent insert would
-    /// overwrite the inline entries with a fresh extent root — both data loss. This
-    /// pins the comprehensive guard coverage across readdir/lookup/create/unlink/rmdir
-    /// so a future dir-op path cannot regress it.
+    /// A directory falsely marked inline must fail validation, never expose an
+    /// empty listing or authorize mutation of its original block directory.
     #[test]
     fn inline_data_directory_ops_fail_loudly_not_silently_bd_4y9ca() {
         let Some((fs, _tmp)) = open_writable_ext4_mkfs(16) else {
@@ -76715,7 +77226,8 @@ mod tests {
         fs.create(&cx, dir_ino, OsStr::new("child.txt"), 0o644, 0, 0)
             .expect("create child");
 
-        // Mark the directory inline-data, as a kernel-created inline dir would be.
+        // Deliberately inconsistent: mark a block directory inline without
+        // converting its extent root or creating the mandatory system.data.
         {
             let mut inode = fs.read_inode(&cx, dir_ino).expect("read dir inode");
             inode.flags |= ffs_types::EXT4_INLINE_DATA_FL;
@@ -76729,14 +77241,14 @@ mod tests {
         assert!(
             matches!(
                 fs.read_dir(&cx, &inline_inode),
-                Err(FfsError::UnsupportedFeature(_))
+                Err(FfsError::Corruption { .. })
             ),
             "inline-dir readdir must fail loudly, not return an empty listing"
         );
         assert!(
             matches!(
                 fs.lookup_name(&cx, &inline_inode, b"child.txt"),
-                Err(FfsError::UnsupportedFeature(_))
+                Err(FfsError::Corruption { .. })
             ),
             "inline-dir lookup must fail loudly"
         );
@@ -77617,10 +78129,8 @@ mod tests {
 
     #[test]
     fn inline_data_directory_operations_fail_loudly_bd_4y9ca() {
-        // FrankenFS has no inline-directory parser, so directory ops on an
-        // EXT4_INLINE_DATA_FL inode must return a clean UnsupportedFeature error
-        // rather than silently reading an empty dir (which would let rmdir drop a
-        // non-empty dir) or overwriting the inline entries on insert (data loss).
+        // A block directory with an added INLINE_DATA flag is malformed. Reads
+        // must diagnose it, and mutation must never overwrite the old entries.
         let Some((fs, _tmp)) = open_writable_ext4_mkfs(8) else {
             return;
         };
@@ -77630,7 +78140,7 @@ mod tests {
             .mkdir(&cx, root, OsStr::new("inlinedir"), 0o755, 0, 0)
             .expect("mkdir");
 
-        // Flag the directory inode as inline_data (mirrors an inline_data image).
+        // Add the inline flag without converting the block directory layout.
         let mut inode = fs.read_inode(&cx, dir.ino).expect("read inode");
         inode.flags |= ffs_types::EXT4_INLINE_DATA_FL;
         inode.flags &= !ffs_types::EXT4_COMPR_FL;
@@ -77639,16 +78149,13 @@ mod tests {
 
         let reread = fs.read_inode(&cx, dir.ino).expect("reread");
         assert!(
-            matches!(
-                fs.read_dir(&cx, &reread),
-                Err(FfsError::UnsupportedFeature(_))
-            ),
+            matches!(fs.read_dir(&cx, &reread), Err(FfsError::Corruption { .. })),
             "read_dir on an inline_data dir must fail loudly, not return empty"
         );
         assert!(
             matches!(
                 fs.lookup_name(&cx, &reread, b"anything"),
-                Err(FfsError::UnsupportedFeature(_))
+                Err(FfsError::Corruption { .. })
             ),
             "lookup on an inline_data dir must fail loudly"
         );
