@@ -1264,6 +1264,31 @@ impl FileByteDevice {
         Self::from_file(file, true)
     }
 
+    /// Open one offline regular image for mutation and retain an exclusive lock.
+    ///
+    /// Admission, locking and all subsequent I/O use the same descriptor.
+    /// Symlinks and nonregular files are refused; nonblocking open prevents a
+    /// substituted FIFO from hanging before its type can be checked. Advisory
+    /// locking does not establish that a kernel mount or an uncooperative
+    /// writer is absent; the caller must establish exclusive offline ownership.
+    pub fn open_regular_read_write(path: impl AsRef<Path>) -> Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+            .open(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(FfsError::UnsupportedFeature(
+                "writable image opening requires an offline regular file".to_owned(),
+            ));
+        }
+        file.try_lock()
+            .map_err(|error| FfsError::Io(std::io::Error::other(error)))?;
+        Self::from_file(file, true)
+    }
+
     fn from_file(file: File, writable: bool) -> Result<Self> {
         let block_device = file.metadata()?.file_type().is_block_device();
         let len = backing_len(&file)?;

@@ -14529,13 +14529,21 @@ impl OpenFs {
         Ok(flushed)
     }
 
-    /// Enable write operations by loading allocation state for the detected
-    /// filesystem type (ext4 or btrfs).
+    /// Validate the ext4 features this build can maintain during native writes.
     ///
-    /// For ext4: reads all group descriptors from disk to populate the
-    /// in-memory group statistics cache.
-    /// For btrfs: walks the FS tree and extent tree to build an in-memory COW
-    /// tree and extent allocator.
+    /// Writable facades must check this before admission with physical recovery:
+    /// journal replay and orphan cleanup can write before `enable_writes`.
+    /// Geometry, journal, allocator and recovery checks still apply separately.
+    pub fn validate_ext4_write_features(sb: &Ext4Superblock) -> Result<(), FfsError> {
+        if let Some(reason) = Self::ext4_writer_unsupported_features(sb) {
+            return Err(FfsError::UnsupportedFeature(format!(
+                "ext4 image uses features this build cannot maintain across a \
+                 write: {reason}. The filesystem is readable; mount it read-only."
+            )));
+        }
+        Ok(())
+    }
+
     /// Read-only-compatible ext4 features a READER may ignore but a WRITER
     /// must maintain, which this implementation does not (kernel
     /// `ext4_feature_set_ok` refuses a read-write mount for the ones it does
@@ -14653,12 +14661,7 @@ impl OpenFs {
         self.reject_btrfs_unsupported_mutation()?;
         match &self.flavor {
             FsFlavor::Ext4(sb) => {
-                if let Some(reason) = Self::ext4_writer_unsupported_features(sb) {
-                    return Err(FfsError::UnsupportedFeature(format!(
-                        "ext4 image uses features this build cannot maintain across a \
-                         write: {reason}. The filesystem is readable; mount it read-only."
-                    )));
-                }
+                Self::validate_ext4_write_features(sb)?;
                 if let Some(reason) = &self.ext4_orphan_recovery_error {
                     return Err(FfsError::Format(format!(
                         "ext4 orphan recovery failed at mount ({reason}); refusing \

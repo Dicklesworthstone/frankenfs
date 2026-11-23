@@ -1,14 +1,18 @@
 #![forbid(unsafe_code)]
 //! FrankenFS public API facade.
 //!
-//! Core functionality and one read-only native-image entry point for ext4,
-//! btrfs, FAT16, FAT32, NTFS and ZFS. Format-specific engines retain their own
-//! admission and write-authority contracts.
+//! Core functionality and unified native-image readers and explicitly authorized
+//! writers for ext4, btrfs, FAT16, FAT32, NTFS and ZFS. Format-specific engines
+//! retain their own admission, recovery and durability contracts.
 
 pub use ffs_core::*;
 pub use ffs_types::InodeNumber;
 
 mod native;
+pub use native::writable::{
+    ReadWriteBackend, ReadWriteFs, ReadWriteOpenOptions, ZfsWriteSelection, open_read_write,
+    open_read_write_device, open_read_write_devices,
+};
 pub use ffs_ondisk::partition::{
     PartUuid, PartitionEntry, PartitionParseError, PartitionParseOptions, PartitionScheme,
     PartitionSelector, PartitionTable, SyntheticGptPartitionSpec, write_gpt_partition_table,

@@ -1,4 +1,6 @@
-//! Bounded read-only access to the existing native filesystem engines.
+//! Bounded native filesystem access and explicitly authorized writable admission.
+
+pub(crate) mod writable;
 
 use asupersync::Cx;
 use ffs_block::io_engine::{VolumeAccess, VolumeDevice};

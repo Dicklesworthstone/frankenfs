@@ -155,6 +155,54 @@ UTF-16 named-stream selection, including streams stored in extension records.
 Native stream access has executed through the standalone public consumer on
 ntfs-3g-produced images, including streams held in extension records.
 
+### Unified writable image API
+
+The `ffs` library also exposes `open_read_write`, `open_read_write_device`
+and `open_read_write_devices`. They return a `ReadWriteFs` with the detected
+format, selected partition and a common `Box<dyn FsOps>`. The path entry point
+retains an exclusive lock on each admitted regular image, including when the
+filesystem is moved into a mount owner. Both `offline_image` and `allow_write`
+must be explicit; rejected authority is checked before opening paths or reading
+devices. Manual byte bounds and MBR/GPT partition selection remain enforced
+through the native engines.
+
+```rust
+fn edit_image(cx: &asupersync::Cx) -> Result<(), Box<dyn std::error::Error>> {
+    use ffs::{InodeNumber, ReadWriteOpenOptions, RequestScope, open_read_write};
+    use std::ffi::OsStr;
+
+    let options = ReadWriteOpenOptions {
+        offline_image: true,
+        allow_write: true,
+        ..ReadWriteOpenOptions::default()
+    };
+    let image = open_read_write(cx, "offline.img", &options)?;
+    let mut scope = RequestScope::empty();
+    let file = image.filesystem.create(
+        cx, &mut scope, InodeNumber(1), OsStr::new("hello.txt"), 0o644, 1000, 1000,
+    )?;
+    image.filesystem.write(cx, &mut scope, file.ino, 0, b"hello\n")?;
+    image.sync(cx)?;
+    Ok(())
+}
+```
+
+Automatic admission covers supported ext4, single-device btrfs, FAT16/FAT32
+and clean NTFS images. `ReadWriteBackend` selects btrfs roots, FAT OEM naming,
+or explicit NTFS dirty-log recovery and SID/ACL policy. ZFS additionally
+requires `ZfsWriteSelection` with the native pool GUID, label, current root
+slot, dataset and complete mirror members; it does not guess a writable root.
+External ext4 journals, unsupported btrfs topologies and native engine feature
+refusals remain outside this writable profile.
+
+Admission may apply authorized native recovery. Caller-owned devices must
+already have exclusive offline ownership and writable capability. Call
+`ReadWriteFs::sync` or the applicable filesystem `fsync` operation to reach
+the engine's durability boundary: dropping a handle or flushing only its raw
+device does not commit staged ext4/btrfs state. The API does not create an
+application runtime or mount worker. Native crash, mounted-operation and
+cross-platform qualification remain separate from this API surface.
+
 The standalone [`native_reader` example](crates/ffs/examples/native_reader.rs)
 uses that public API for `stat`, NUL-delimited `list`, bounded `read` and an
 explicit `refuse-write` scratch-image check. Its foreground `mount` subcommand
@@ -949,7 +997,7 @@ FrankenFS-specific improvements. FAT directory creation (`mkdir`), offline
 routing in `ffs-cli` are implemented. The remaining high-impact work includes
 FAT Windows naming/mounted power-cut qualification; broader NTFS writable-profile
 coverage and durable orphan recovery; ZFS mounted writes, ZIL writing and pool lifecycle;
-writable six-format `OpenFs` integration; and executable native-interchange,
+broader writable profiles through the unified `ffs` API; and executable native-interchange,
 crash/reopen and mounted-operation evidence for each admitted profile.
 
 The [comprehensive plan](COMPREHENSIVE_PLAN_FOR_NTFS_FAT16_FAT32_AND_ZFS.md),

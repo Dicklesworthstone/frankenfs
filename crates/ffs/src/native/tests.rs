@@ -533,7 +533,7 @@ fn fat_image(cx: &Cx, directory: &Path, kind: &str) -> PathBuf {
     image
 }
 
-fn ext4_image() -> Vec<u8> {
+pub(super) fn ext4_image() -> Vec<u8> {
     // One 4 KiB-block group, dynamic inodes, no metadata checksums or journal.
     // The root metadata is independently specified; validation stays enabled.
     let mut image = vec![0_u8; 256 * 1024];
