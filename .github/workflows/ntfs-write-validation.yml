@@ -1,11 +1,11 @@
-name: NTFS writer integrity validation
+name: NTFS and FUSE release regression validation
 on:
   push:
-    branches: [validation/ntfs-writer-integrity-20261122]
+    branches: [validation/ntfs-fuse-v030-20261123-bb68cc83]
 permissions:
   contents: read
 concurrency:
-  group: ntfs-writer-integrity-20261122
+  group: ntfs-fuse-v030-20261123-bb68cc83
   cancel-in-progress: true
 env:
   CARGO_TERM_COLOR: never
@@ -15,6 +15,7 @@ env:
   CARGO_PROFILE_TEST_DEBUG: "0"
   RUSTFLAGS: "-Z threads=1"
   CARGO_HTTP_USER_AGENT: "frankenfs-agent (+https://github.com/Dicklesworthstone/frankenfs)"
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
 jobs:
   validate:
     runs-on: ubuntu-24.04
@@ -22,15 +23,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 70c6cd3452b0c668df4389371621db0958a9c233
-          fetch-depth: 16
+          ref: 71e0688c65dacfd5c66832d3ba454b5e87746313
+          fetch-depth: 2
           persist-credentials: false
-      - name: Prepare compiler and isolated runner resources
+      - name: Prepare pinned compiler and isolated runner resources
         run: |
           rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
           sudo apt-get update
-          sudo apt-get install -y e2fsprogs btrfs-progs ntfs-3g dosfstools mtools fuse3 pkg-config
-          validation_swap=$(sudo mktemp /mnt/ffs-ntfs-XXXXXX.swap)
+          sudo apt-get install -y e2fsprogs btrfs-progs ntfs-3g dosfstools mtools fuse3 pkg-config ripgrep
+          validation_swap=$(sudo mktemp /mnt/ffs-ntfs-fuse-XXXXXX.swap)
           sudo fallocate -l 12G "$validation_swap"
           sudo chmod 0600 "$validation_swap"
           sudo mkswap "$validation_swap"
@@ -42,37 +43,69 @@ jobs:
           shared-key: ntfs-writer-integrity
           cache-on-failure: "true"
           cache-workspace-crates: "true"
-      - name: Verify committed source and formatting
+      - name: Verify exact candidate source and formatting
         id: prepare
         run: |
-          test "$(git rev-parse HEAD)" = "70c6cd3452b0c668df4389371621db0958a9c233"
+          test "$(git rev-parse HEAD)" = "71e0688c65dacfd5c66832d3ba454b5e87746313"
+          test "$(git rev-parse HEAD^{tree})" = "c39908ef1bd5e266888eacff539d9f48a7bb607a"
           cargo fmt --check
           git diff --check
           test -z "$(git status --porcelain)"
-      - name: Mapped native access regressions
+      - name: Reproduce failures on unmodified merged main
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
-        run: cargo test --locked -p ffs-ntfs --test persistence_prefix ntfs_mapped_acl_ -- --nocapture --test-threads=1
-      - name: Atomic compound attribute regressions
+        id: baseline
+        run: |
+          git fetch --no-tags --depth=1 origin cbbb36e77a56167375da811e949f13f265695e19
+          git worktree add --detach "$RUNNER_TEMP/ffs-baseline" cbbb36e77a56167375da811e949f13f265695e19
+          cd "$RUNNER_TEMP/ffs-baseline"
+          test -z "$(git status --porcelain)"
+          set +e
+          cargo test --locked -p ffs-ntfs --test persistence_prefix -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/ffs-baseline-persistence.log"
+          baseline_status=${PIPESTATUS[0]}
+          set -e
+          test "$baseline_status" -eq 101
+          rg -F "running 131 tests" "$RUNNER_TEMP/ffs-baseline-persistence.log"
+          rg -F "test result: FAILED." "$RUNNER_TEMP/ffs-baseline-persistence.log"
+          rg -F "test transforms::ntfs_wof_decompression_on_write_materializes_plaintext_and_cleans_reparse ... FAILED" "$RUNNER_TEMP/ffs-baseline-persistence.log"
+      - name: Prove new regression detects the old dispatch behavior
+        if: ${{ !cancelled() && steps.baseline.outcome == 'success' }}
+        run: |
+          cp "$GITHUB_WORKSPACE/crates/ffs-ntfs/tests/persistence_prefix/catalog_admission.rs" "$RUNNER_TEMP/ffs-baseline/crates/ffs-ntfs/tests/persistence_prefix/catalog_admission.rs"
+          cd "$RUNNER_TEMP/ffs-baseline"
+          test "$(git diff --name-only)" = "crates/ffs-ntfs/tests/persistence_prefix/catalog_admission.rs"
+          git diff --quiet -- crates/ffs-ntfs/src
+          set +e
+          cargo test --locked -p ffs-ntfs --test persistence_prefix catalog_admission::path_stream_mutations_preserve_strict_failure_for_corrupt_sibling -- --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/ffs-dispatch-before.log"
+          baseline_status=${PIPESTATUS[0]}
+          set -e
+          test "$baseline_status" -eq 101
+          rg -F "test result: FAILED. 0 passed; 1 failed;" "$RUNNER_TEMP/ffs-dispatch-before.log"
+          rg -F "range must retain the strict lookup failure: Committed" "$RUNNER_TEMP/ffs-dispatch-before.log"
+      - name: Complete corrected NTFS tests and persistence cuts
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
-        run: cargo test --locked -p ffs-ntfs --test persistence_prefix compound_setattr -- --nocapture --test-threads=1
-      - name: Sparse hole-punch journal regressions
+        run: cargo test --locked -p ffs-ntfs --no-fail-fast -- --test-threads=1
+      - name: FUSE library and wire regressions
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
-        run: cargo test --locked -p ffs-ntfs --test persistence_prefix hole_punch -- --nocapture --test-threads=1
-      - name: Native catalog admission regressions
-        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
-        run: cargo test --locked -p ffs-ntfs --test persistence_prefix catalog_ -- --nocapture --test-threads=1
+        run: cargo test --locked -p ffs-fuse --lib -- --test-threads=1
       - name: Workspace compiler check
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
         run: cargo check --locked --workspace --all-targets
       - name: Workspace strict Clippy
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
-      - name: Complete NTFS tests and persistence cuts
+      - name: Confirm validated source stayed unchanged
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
-        run: cargo test --locked -p ffs-ntfs -- --test-threads=1
-      - name: NTFS CLI regressions
-        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
-        run: cargo test --locked -p ffs-cli --bin ffs-ntfs -- --test-threads=1
-      - name: Public filesystem facade regressions
-        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
-        run: cargo test --locked -p ffs -- --test-threads=1
+        run: |
+          test "$(git rev-parse HEAD)" = "71e0688c65dacfd5c66832d3ba454b5e87746313"
+          test "$(git rev-parse HEAD^{tree})" = "c39908ef1bd5e266888eacff539d9f48a7bb607a"
+          git diff --check
+          test -z "$(git status --porcelain)"
+      - name: Retain baseline execution logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ntfs-fuse-regression-baselines
+          path: |
+            ${{ runner.temp }}/ffs-baseline-persistence.log
+            ${{ runner.temp }}/ffs-dispatch-before.log
+          if-no-files-found: warn
