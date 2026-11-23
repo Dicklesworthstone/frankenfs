@@ -590,21 +590,11 @@ impl State {
         Ok((inherited_mode, inherited_gid))
     }
 
-    pub(super) fn admit_data_mutation(
-        &mut self,
-        cx: &Cx,
-        ino: InodeNumber,
-        metadata: &Metadata,
-    ) -> Result<()> {
-        // Some transport paths drop privileges after SETATTR, while streaming
-        // copy reaches WRITE directly. This profile cannot atomically clear
-        // set-ID bits or native capabilities, so refuse before any native data
-        // mutation.
-        if metadata.mode & 0o6000 != 0 {
-            return Err(unsupported(
-                "native ZPL data mutation cannot clear set-ID permissions",
-            ));
-        }
+    pub(super) fn admit_data_mutation(&mut self, cx: &Cx, ino: InodeNumber) -> Result<()> {
+        // Set-ID removal is part of each native data transaction, including
+        // streaming copies that reach WRITE without a preceding SETATTR.
+        // Native capabilities still require atomic xattr removal, so refuse
+        // those files before staging any data or permission changes.
         let object = self.head.nodes[&ino].object;
         if self.head.view.has_file_capabilities(cx, object)? {
             return Err(unsupported(

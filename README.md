@@ -793,9 +793,13 @@ Changing mode or ownership and creating/deleting datasets or snapshots remain
 outside this mount profile. Existing native project IDs are retained and charged
 to their own quota records through mutation and final reclamation; new children
 default to project 0 while project inheritance remains unsupported.
-Nonempty writes, file-range copies and truncation of files with native set-ID
-bits or Linux file capabilities are refused before data mutation because atomic
-privilege removal is not implemented.
+The writable FsOps adapter handles nonempty writes, file-range copies, truncation
+and supported sparse range edits by clearing native S_ISUID and executable
+S_ISGID bits in the same TXG as the data change. Non-executable S_ISGID is retained,
+empty writes leave metadata unchanged, and snapshots retain their original data
+and permissions. Files with Linux file
+capabilities are still refused before data mutation because atomic capability
+xattr removal is not implemented.
 `fsync`, directory sync and unmount issue real device barriers and report errors.
 An uncertain publication fences the mount until explicit recovery and reopen.
 

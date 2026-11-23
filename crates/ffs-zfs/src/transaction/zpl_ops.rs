@@ -170,6 +170,8 @@ pub struct ZfsPosixSetAttr {
     pub mode: Option<u16>,
     pub uid: Option<u64>,
     pub gid: Option<u64>,
+    /// Clear set-user-ID and executable set-group-ID after applying `mode`.
+    /// Non-executable set-group-ID and directory permissions are preserved.
     pub clear_suid_sgid: bool,
 }
 
@@ -250,6 +252,7 @@ pub(super) enum ZplMutation {
         offset: u64,
         length: u64,
         operation: ZfsFileRangeOperation,
+        clear_suid_sgid: bool,
         timestamp: Timestamp,
         checksum: ZfsDataChecksum,
     },
@@ -1851,7 +1854,7 @@ pub(super) fn stage_zpl_mutation(
             reject_flags(&loaded.metadata, prohibited)?;
             let new_size = loaded.metadata.size.max(end_offset);
             let mut new_meta = loaded.metadata.clone();
-            if *clear_suid_sgid {
+            if *clear_suid_sgid && !data.is_empty() {
                 new_meta.mode = clear_setid_bits_for_nonroot(new_meta.mode);
             }
             new_meta.size = new_size;
@@ -2072,6 +2075,7 @@ pub(super) fn stage_zpl_mutation(
             offset,
             length,
             operation,
+            clear_suid_sgid,
             timestamp,
             checksum,
         } => {
@@ -2152,6 +2156,9 @@ pub(super) fn stage_zpl_mutation(
                     );
                 }
                 let mut new_meta = loaded.metadata.clone();
+                if *clear_suid_sgid {
+                    new_meta.mode = clear_setid_bits_for_nonroot(new_meta.mode);
+                }
                 new_meta.size = new_size;
                 new_meta.times[1] = *timestamp;
                 new_meta.times[2] = *timestamp;
@@ -2299,7 +2306,12 @@ pub(super) fn stage_zpl_mutation(
             if let Some(req_mode) = attrs.mode {
                 new_meta.mode = (new_meta.mode & !0o7777) | u64::from(req_mode & 0o7777);
                 new_meta.flags |= ZFS_ACL_TRIVIAL | ZFS_NO_EXECS_DENIED;
-            } else if (owner_changed || attrs.clear_suid_sgid) && new_meta.kind != Kind::Directory {
+            }
+            // A compound data/mode request must not restore privilege bits
+            // after the caller requested that the data mutation clear them.
+            if (attrs.clear_suid_sgid || (owner_changed && attrs.mode.is_none()))
+                && new_meta.kind != Kind::Directory
+            {
                 new_meta.mode = clear_setid_bits_for_nonroot(new_meta.mode);
             }
             if let Some(atime) = attrs.atime {

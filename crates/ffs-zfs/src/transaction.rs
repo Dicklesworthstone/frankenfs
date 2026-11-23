@@ -1090,6 +1090,59 @@ impl ZfsTransactionEngine {
         timestamp: Timestamp,
         checksum: ZfsDataChecksum,
     ) -> ZfsTxOutcome<u64> {
+        self.write_file_data_with_setid_policy(
+            cx,
+            dataset_components,
+            file_obj,
+            offset,
+            data,
+            timestamp,
+            checksum,
+            false,
+        )
+    }
+
+    /// Write data and clear set-user-ID and executable set-group-ID permissions
+    /// in the same TXG. A zero-length write does not clear either bit.
+    ///
+    /// This is the data-mutation policy for callers without privilege to retain
+    /// set-ID permissions. File capabilities require separate admission; this
+    /// operation does not remove capability extended attributes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_file_data_clearing_setid(
+        &mut self,
+        cx: &Cx,
+        dataset_components: &[Vec<u8>],
+        file_obj: u64,
+        offset: u64,
+        data: &[u8],
+        timestamp: Timestamp,
+        checksum: ZfsDataChecksum,
+    ) -> ZfsTxOutcome<u64> {
+        self.write_file_data_with_setid_policy(
+            cx,
+            dataset_components,
+            file_obj,
+            offset,
+            data,
+            timestamp,
+            checksum,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_file_data_with_setid_policy(
+        &mut self,
+        cx: &Cx,
+        dataset_components: &[Vec<u8>],
+        file_obj: u64,
+        offset: u64,
+        data: &[u8],
+        timestamp: Timestamp,
+        checksum: ZfsDataChecksum,
+        clear_suid_sgid: bool,
+    ) -> ZfsTxOutcome<u64> {
         self.execute_zpl_txg(
             cx,
             dataset_components,
@@ -1097,7 +1150,7 @@ impl ZfsTransactionEngine {
                 file_obj,
                 offset,
                 data: data.to_vec(),
-                clear_suid_sgid: false,
+                clear_suid_sgid,
                 timestamp,
                 checksum,
             },
@@ -1120,6 +1173,63 @@ impl ZfsTransactionEngine {
         timestamp: Timestamp,
         checksum: ZfsDataChecksum,
     ) -> ZfsTxOutcome<u64> {
+        self.edit_file_range_with_setid_policy(
+            cx,
+            dataset_components,
+            file_obj,
+            offset,
+            length,
+            operation,
+            timestamp,
+            checksum,
+            false,
+        )
+    }
+
+    /// Edit a sparse range and clear set-user-ID and executable set-group-ID
+    /// permissions in the same TXG. A size-preserving range wholly beyond EOF
+    /// does not change the inode's permissions or timestamps.
+    ///
+    /// File capabilities require separate admission; this operation does not
+    /// remove capability extended attributes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn edit_file_range_clearing_setid(
+        &mut self,
+        cx: &Cx,
+        dataset_components: &[Vec<u8>],
+        file_obj: u64,
+        offset: u64,
+        length: u64,
+        operation: ZfsFileRangeOperation,
+        timestamp: Timestamp,
+        checksum: ZfsDataChecksum,
+    ) -> ZfsTxOutcome<u64> {
+        self.edit_file_range_with_setid_policy(
+            cx,
+            dataset_components,
+            file_obj,
+            offset,
+            length,
+            operation,
+            timestamp,
+            checksum,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn edit_file_range_with_setid_policy(
+        &mut self,
+        cx: &Cx,
+        dataset_components: &[Vec<u8>],
+        file_obj: u64,
+        offset: u64,
+        length: u64,
+        operation: ZfsFileRangeOperation,
+        timestamp: Timestamp,
+        checksum: ZfsDataChecksum,
+        clear_suid_sgid: bool,
+    ) -> ZfsTxOutcome<u64> {
         if length == 0
             || offset
                 .checked_add(length)
@@ -1141,6 +1251,7 @@ impl ZfsTransactionEngine {
                 offset,
                 length,
                 operation,
+                clear_suid_sgid,
                 timestamp,
                 checksum,
             },

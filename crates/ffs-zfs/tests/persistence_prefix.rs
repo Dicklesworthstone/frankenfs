@@ -8243,6 +8243,201 @@ fn file_range_head(cx: &Cx, engine: &ZfsTransactionEngine) -> ffs_zfs::Zpl {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn setid_native_data_policy_preserves_legacy_noops_and_nonexecutable_sgid() {
+    use ffs_zfs::{ZfsFileRangeOperation::PunchHole, ZfsPosixSetAttr};
+
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    let timestamp = Timestamp {
+        seconds: 1_730_100_000,
+        nanos: 19,
+    };
+    for zpl_version in [4, 5] {
+        let (mut engine, devices) = file_range_fixture(
+            &cx,
+            &PoolFixtureSpec {
+                zpl_version,
+                deadlist_mode: DeadlistMode::NativeDeadlist,
+                user_accounting: true,
+                ..PoolFixtureSpec::default()
+            },
+        );
+        for (mode, expected_mode) in [(0o6755, 0o755), (0o6644, 0o2644)] {
+            let (file, _) = engine
+                .create_file(
+                    &cx,
+                    &dataset,
+                    2,
+                    format!("setid-{mode:o}").as_bytes(),
+                    mode,
+                    1000,
+                    1000,
+                    timestamp,
+                    ZfsDataChecksum::Fletcher4,
+                )
+                .into_result()
+                .unwrap();
+            let mut expected = b"original-data".to_vec();
+            engine
+                .write_file_data(
+                    &cx,
+                    &dataset,
+                    file,
+                    0,
+                    &expected,
+                    timestamp,
+                    ZfsDataChecksum::Fletcher4,
+                )
+                .into_result()
+                .unwrap();
+            assert_eq!(
+                file_range_head(&cx, &engine)
+                    .stat(&cx, file)
+                    .unwrap()
+                    .0
+                    .mode
+                    & 0o7777,
+                u64::from(mode),
+                "the existing native writer preserves explicitly assigned permissions"
+            );
+            engine
+                .write_file_data_clearing_setid(
+                    &cx,
+                    &dataset,
+                    file,
+                    0,
+                    b"",
+                    timestamp,
+                    ZfsDataChecksum::Fletcher4,
+                )
+                .into_result()
+                .unwrap();
+            engine
+                .edit_file_range_clearing_setid(
+                    &cx,
+                    &dataset,
+                    file,
+                    100,
+                    10,
+                    PunchHole,
+                    timestamp,
+                    ZfsDataChecksum::Fletcher4,
+                )
+                .into_result()
+                .unwrap();
+            let mut head = file_range_head(&cx, &engine);
+            assert_eq!(
+                head.stat(&cx, file).unwrap().0.mode & 0o7777,
+                u64::from(mode)
+            );
+            assert_eq!(head.read(&cx, file, 0, 100).unwrap(), expected);
+
+            let previous_txg = engine.committed_txg();
+            let (_, token) = engine
+                .write_file_data_clearing_setid(
+                    &cx,
+                    &dataset,
+                    file,
+                    0,
+                    b"next",
+                    timestamp,
+                    ZfsDataChecksum::Fletcher4,
+                )
+                .into_result()
+                .unwrap();
+            assert_eq!(token.committed_txg(), previous_txg + 1);
+            expected[..4].copy_from_slice(b"next");
+            let mut head = file_range_head(&cx, &engine);
+            assert_eq!(head.stat(&cx, file).unwrap().0.mode & 0o7777, expected_mode);
+            assert_eq!(head.read(&cx, file, 0, 100).unwrap(), expected);
+
+            engine
+                .set_posix_attributes(
+                    &cx,
+                    &dataset,
+                    file,
+                    &ZfsPosixSetAttr {
+                        mode: Some(mode),
+                        ..ZfsPosixSetAttr::default()
+                    },
+                    timestamp,
+                    ZfsDataChecksum::Fletcher4,
+                )
+                .into_result()
+                .unwrap();
+            engine
+                .edit_file_range(
+                    &cx,
+                    &dataset,
+                    file,
+                    1,
+                    1,
+                    PunchHole,
+                    timestamp,
+                    ZfsDataChecksum::Fletcher4,
+                )
+                .into_result()
+                .unwrap();
+            expected[1] = 0;
+            assert_eq!(
+                file_range_head(&cx, &engine)
+                    .stat(&cx, file)
+                    .unwrap()
+                    .0
+                    .mode
+                    & 0o7777,
+                u64::from(mode),
+                "the existing native range writer preserves permissions"
+            );
+            let previous_txg = engine.committed_txg();
+            let (_, token) = engine
+                .edit_file_range_clearing_setid(
+                    &cx,
+                    &dataset,
+                    file,
+                    3,
+                    2,
+                    PunchHole,
+                    timestamp,
+                    ZfsDataChecksum::Fletcher4,
+                )
+                .into_result()
+                .unwrap();
+            assert_eq!(token.committed_txg(), previous_txg + 1);
+            expected[3..5].fill(0);
+            let mut head = file_range_head(&cx, &engine);
+            assert_eq!(head.stat(&cx, file).unwrap().0.mode & 0o7777, expected_mode);
+            assert_eq!(head.read(&cx, file, 0, 100).unwrap(), expected);
+
+            let previous_txg = engine.committed_txg();
+            let (_, token) = engine
+                .set_posix_attributes(
+                    &cx,
+                    &dataset,
+                    file,
+                    &ZfsPosixSetAttr {
+                        size: Some(5),
+                        mode: Some(mode),
+                        clear_suid_sgid: true,
+                        ..ZfsPosixSetAttr::default()
+                    },
+                    timestamp,
+                    ZfsDataChecksum::Fletcher4,
+                )
+                .into_result()
+                .unwrap();
+            assert_eq!(token.committed_txg(), previous_txg + 1);
+            expected.truncate(5);
+            let mut head = file_range_head(&cx, &engine);
+            assert_eq!(head.stat(&cx, file).unwrap().0.mode & 0o7777, expected_mode);
+            assert_eq!(head.read(&cx, file, 0, 100).unwrap(), expected);
+        }
+        assert_pool_scrub_and_allocation_clean(&cx, &devices, POOL_GUID, None);
+    }
+}
+
+#[test]
 fn file_range_edits_preserve_edges_snapshots_links_and_exact_allocation() {
     use ffs_zfs::ZfsFileRangeOperation::{PunchHole, ZeroRange};
 
@@ -8840,6 +9035,19 @@ fn file_range_persistence_cuts_keep_exact_old_or_new_bytes_and_snapshot_ownershi
     )
     .into_result()
     .unwrap();
+    seed.set_posix_attributes(
+        &cx,
+        &dataset,
+        4,
+        &ffs_zfs::ZfsPosixSetAttr {
+            mode: Some(0o6755),
+            ..ffs_zfs::ZfsPosixSetAttr::default()
+        },
+        timestamp,
+        ZfsDataChecksum::Fletcher4,
+    )
+    .into_result()
+    .unwrap();
     seed.create_snapshot(&cx, &dataset, b"range-cut", timestamp)
         .into_result()
         .unwrap();
@@ -8898,7 +9106,7 @@ fn file_range_persistence_cuts_keep_exact_old_or_new_bytes_and_snapshot_ownershi
                     Ok(())
                 }
             });
-            let outcome = engine.edit_file_range(
+            let outcome = engine.edit_file_range_clearing_setid(
                 &cx,
                 &dataset,
                 4,
@@ -8959,6 +9167,10 @@ fn file_range_persistence_cuts_keep_exact_old_or_new_bytes_and_snapshot_ownershi
             let (metadata, used) = head.stat(&cx, 4).unwrap();
             assert_eq!(metadata.size, bytes.len() as u64);
             assert_eq!(
+                metadata.mode & 0o7777,
+                if published { 0o755 } else { 0o6755 }
+            );
+            assert_eq!(
                 metadata.times[1],
                 if published { edited_time } else { timestamp }
             );
@@ -8966,6 +9178,7 @@ fn file_range_persistence_cuts_keep_exact_old_or_new_bytes_and_snapshot_ownershi
             let mut snapshot = head.open_snapshot(&cx, b"range-cut").unwrap();
             assert_eq!(snapshot.read(&cx, 4, 0, payload.len()).unwrap(), payload);
             assert_eq!(snapshot.stat(&cx, 4).unwrap().1, old_used);
+            assert_eq!(snapshot.stat(&cx, 4).unwrap().0.mode & 0o7777, 0o6755);
             assert_pool_scrub_and_allocation_clean(&cx, &crashed, POOL_GUID, Some(slot));
         }
     }
