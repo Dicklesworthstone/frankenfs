@@ -22,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: e5f68364b77feb34946d48379af574d4bf107306
+          ref: 70c6cd3452b0c668df4389371621db0958a9c233
           fetch-depth: 16
           persist-credentials: false
       - name: Prepare compiler and isolated runner resources
@@ -45,7 +45,7 @@ jobs:
       - name: Verify committed source and formatting
         id: prepare
         run: |
-          test "$(git rev-parse HEAD)" = "e5f68364b77feb34946d48379af574d4bf107306"
+          test "$(git rev-parse HEAD)" = "70c6cd3452b0c668df4389371621db0958a9c233"
           cargo fmt --check
           git diff --check
           test -z "$(git status --porcelain)"
