@@ -50,7 +50,7 @@ pub use stream_name::StreamName;
 pub use transaction::{
     DEFAULT_NTFS_FILETIME, NtfsAdmissionReport, NtfsDurableToken, NtfsEaSetMode,
     NtfsExtendedRenameOutcome, NtfsLogStateSummary, NtfsObjectIdData, NtfsPersistenceEvent,
-    NtfsPersistenceStage, NtfsRecoverySummary, NtfsRenameOutcome, NtfsStorageIdentity,
-    NtfsTransactionEngine, NtfsTxOutcome, NtfsUsnSummary, NtfsWriteOptions,
+    NtfsPersistenceStage, NtfsRecoverySummary, NtfsRenameOutcome, NtfsSetAttributes,
+    NtfsStorageIdentity, NtfsTransactionEngine, NtfsTxOutcome, NtfsUsnSummary, NtfsWriteOptions,
     validate_ntfs_component_utf16, validate_ntfs_stream_name_utf16,
 };

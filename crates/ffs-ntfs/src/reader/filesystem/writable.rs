@@ -817,13 +817,22 @@ impl NtfsFs {
         }
 
         let mtime_ft = match attrs.mtime {
-            Some(mtime) if mtime != current.mtime => Some(system_time_to_filetime(mtime)?),
+            Some(mtime) if attrs.size.is_some() || mtime != current.mtime => {
+                Some(system_time_to_filetime(mtime)?)
+            }
             _ => None,
         };
         let atime_ft = match attrs.atime {
             Some(atime) if atime != current.atime => Some(system_time_to_filetime(atime)?),
             _ => None,
         };
+        if mtime_ft.is_some() || atime_ft.is_some() {
+            self.enforce_dacl(
+                cx,
+                &target_rec,
+                ffs_ondisk::ntfs_security::FILE_WRITE_ATTRIBUTES,
+            )?;
+        }
         if attrs.size.is_some() {
             if current.kind == FileType::Directory {
                 return Err(FfsError::IsDirectory);
@@ -848,28 +857,16 @@ impl NtfsFs {
             return Ok(current);
         }
         let now_ft = mtime_ft.or(atime_ft).unwrap_or(DEFAULT_NTFS_FILETIME);
-        if let Some(patch) = security_patch {
-            self.transact(cx, |engine| {
-                engine.patch_security_at(cx, base_ref, &patch, now_ft)
-            })?;
-        }
-        if attrs.size.is_some() && (current.perm & 0o222 == 0) && new_read_only == Some(false) {
-            self.transact(cx, |engine| {
-                engine.set_metadata_at(cx, base_ref, Some(false), None, None, now_ft)
-            })?;
-            new_read_only = None;
-        }
-        if let Some(size) = attrs.size {
-            let (target, stream) = self.data_target(cx, ino)?;
-            self.transact(cx, |engine| {
-                engine.truncate_stream(cx, target, &stream, size)
-            })?;
-        }
-        if new_read_only.is_some() || mtime_ft.is_some() || atime_ft.is_some() {
-            self.transact(cx, |engine| {
-                engine.set_metadata_at(cx, base_ref, new_read_only, atime_ft, mtime_ft, now_ft)
-            })?;
-        }
+        let native = crate::NtfsSetAttributes {
+            size: attrs.size,
+            read_only: new_read_only,
+            atime_ticks: atime_ft,
+            mtime_ticks: mtime_ft,
+            security: security_patch,
+        };
+        self.transact(cx, |engine| {
+            engine.set_attributes_at(cx, base_ref, &native, now_ft)
+        })?;
         cx.masked(|| self.describe(cx, ino))
     }
 

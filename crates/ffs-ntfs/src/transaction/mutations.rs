@@ -36,6 +36,7 @@ use ffs_ondisk::ntfs_security::{
 
 use crate::reader::wof::BACKING_NAME as WOF_BACKING_NAME;
 use crate::reparse_provider::{ReparseCapability, classify_reparse_point};
+use crate::security_policy::NtfsSecurityPatch;
 
 use super::btree::I30RawEntry;
 use super::catalog::{
@@ -90,6 +91,22 @@ pub struct NtfsExtendedRenameOutcome {
     pub overwritten_remaining_links: u32,
     pub overwritten_retained_as_orphan: bool,
     pub noop_same_inode: bool,
+}
+
+/// Native changes that become visible and recover together in one logged
+/// transaction. Explicit modification time takes precedence over a resize.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NtfsSetAttributes {
+    /// New unnamed DATA length; omitted for metadata-only requests.
+    pub size: Option<u64>,
+    /// Native `FILE_ATTRIBUTE_READONLY` value.
+    pub read_only: Option<bool>,
+    /// Access time in signed-range NTFS FILETIME ticks.
+    pub atime_ticks: Option<u64>,
+    /// Modification time in signed-range NTFS FILETIME ticks.
+    pub mtime_ticks: Option<u64>,
+    /// Descriptor edit preserving unrelated native security information.
+    pub security: Option<NtfsSecurityPatch>,
 }
 
 /// Validate a native filename without normalizing or replacing code units.
@@ -3125,6 +3142,43 @@ impl NtfsTransactionEngine {
         now_ticks: u64,
         digest: [u8; 32],
     ) -> Result<PreparedTxPlan<()>> {
+        let mut ws = TxWorkspace::load(self, cx)?;
+        if !self.stage_stream_truncate(
+            cx,
+            &mut ws,
+            target_ref,
+            stream_utf16,
+            new_size,
+            now_ticks,
+        )? {
+            // An unchanged length retains its WAL token without rewriting the
+            // FILE or allocation, including on full volumes.
+            return Ok(PreparedTxPlan {
+                operation: "truncate_stream_at",
+                operation_digest: digest,
+                result_value: (),
+                pre_payload_writes: Vec::new(),
+                mft_zero_writes: Vec::new(),
+                open_attr_registrations: Vec::new(),
+                mutation_specs: Vec::new(),
+                target_writes: Vec::new(),
+            });
+        }
+        ws.finalize(self, cx, "truncate_stream_at", digest, ())
+    }
+
+    /// Stage a stream resize without publishing a log, target, or allocation
+    /// write. Compound metadata edits use the same workspace and commit point.
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+    fn stage_stream_truncate(
+        &self,
+        cx: &Cx,
+        ws: &mut TxWorkspace,
+        target_ref: NtfsReference,
+        stream_utf16: &[u16],
+        new_size: u64,
+        now_ticks: u64,
+    ) -> Result<bool> {
         checkpoint(cx)?;
         let cb = u64::from(self.geometry.cluster_bytes());
         // Both native byte counts and the cluster-rounded virtual allocation
@@ -3136,7 +3190,6 @@ impl NtfsTransactionEngine {
                 detail: "NTFS stream length or rounded allocation exceeds the signed 64-bit native limit".into(),
             });
         }
-        let mut ws = TxWorkspace::load(self, cx)?;
         let cat_ro = ws.load_catalog(self, cx, target_ref)?.clone();
         if cat_ro.is_directory {
             return Err(FfsError::IsDirectory);
@@ -3150,7 +3203,7 @@ impl NtfsTransactionEngine {
             ));
         }
         let wof_decoded = if stream_utf16.is_empty() {
-            self.prepare_reparse_unnamed_data_write(cx, &mut ws, target_ref, &cat_ro)?
+            self.prepare_reparse_unnamed_data_write(cx, ws, target_ref, &cat_ro)?
         } else {
             None
         };
@@ -3179,18 +3232,7 @@ impl NtfsTransactionEngine {
         // A same-size truncate is a WAL no-op, except when WOF plaintext was
         // just materialized: that workspace change still has to commit.
         if new_size == old_size && !wof_materialized {
-            // Preserve the FILE record and allocation on a size no-op,
-            // including full volumes, while retaining the native WAL token.
-            return Ok(PreparedTxPlan {
-                operation: "truncate_stream_at",
-                operation_digest: digest,
-                result_value: (),
-                pre_payload_writes: Vec::new(),
-                mft_zero_writes: Vec::new(),
-                open_attr_registrations: Vec::new(),
-                mutation_specs: Vec::new(),
-                target_writes: Vec::new(),
-            });
+            return Ok(false);
         }
         let (sparse, compressed, initialized) = match &cur_stream.storage {
             EditableStreamStorage::Resident(bytes) => (false, false, bytes.len() as u64),
@@ -3417,7 +3459,7 @@ impl NtfsTransactionEngine {
         if stream_utf16.is_empty() {
             ws.sync_target_into_parent_dirs(self, cx, target_ref)?;
         }
-        ws.finalize(self, cx, "truncate_stream_at", digest, ())
+        Ok(true)
     }
 
     /// Delete a named Alternate Data Stream (`stream_utf16` must be non-empty) from `target_ref`,
@@ -4278,6 +4320,119 @@ impl NtfsTransactionEngine {
             Ok(plan) => self.execute_logged_tx(cx, plan),
             Err(err) => NtfsTxOutcome::NotCommitted(err),
         }
+    }
+
+    /// Publish a compound unnamed-DATA resize and metadata/security edit with
+    /// one native commit. Planning has no backing writes, including MFT growth:
+    /// insufficient catalog capacity refuses the complete request before WAL
+    /// publication. The caller retains its host authorization policy.
+    pub fn set_attributes_at(
+        &mut self,
+        cx: &Cx,
+        target_ref: NtfsReference,
+        attributes: &NtfsSetAttributes,
+        now_ticks: u64,
+    ) -> NtfsTxOutcome<()> {
+        match self.plan_attributes(cx, target_ref, attributes, now_ticks) {
+            Ok(plan) => self.execute_logged_tx(cx, plan),
+            Err(error) => NtfsTxOutcome::NotCommitted(error),
+        }
+    }
+
+    fn plan_attributes(
+        &self,
+        cx: &Cx,
+        target_ref: NtfsReference,
+        attributes: &NtfsSetAttributes,
+        now_ticks: u64,
+    ) -> Result<PreparedTxPlan<()>> {
+        checkpoint(cx)?;
+        if target_ref.record < 5
+            || (target_ref.record > 5 && target_ref.record < FIRST_NON_RESERVED_SLOT)
+        {
+            return Err(FfsError::PermissionDenied);
+        }
+        if target_ref.record == 5 && attributes.read_only == Some(true) {
+            return Err(unsupported(
+                "setting FILE_ATTR_READONLY on NTFS root directory is refused",
+            ));
+        }
+        if [
+            Some(now_ticks),
+            attributes.atime_ticks,
+            attributes.mtime_ticks,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|ticks| ticks > i64::MAX as u64)
+        {
+            return Err(unsupported("timestamp exceeds signed NTFS FILETIME range"));
+        }
+        let security = attributes
+            .security
+            .as_ref()
+            .map(|patch| self.prepare_security_patch(cx, target_ref, patch))
+            .transpose()?;
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"ntfs.set_attributes_at:");
+        hasher.update(&target_ref.record.to_le_bytes());
+        hasher.update(&target_ref.sequence.to_le_bytes());
+        hasher.update(&now_ticks.to_le_bytes());
+        hasher.update(&[attributes.read_only.map_or(0, |value| 1 + u8::from(value))]);
+        for value in [
+            attributes.size,
+            attributes.atime_ticks,
+            attributes.mtime_ticks,
+        ] {
+            hasher.update(&[u8::from(value.is_some())]);
+            if let Some(value) = value {
+                hasher.update(&value.to_le_bytes());
+            }
+        }
+        if let Some(security) = &security {
+            hasher.update(blake3::hash(security).as_bytes());
+        }
+        let digest = *hasher.finalize().as_bytes();
+        let mut ws = TxWorkspace::load(self, cx)?;
+        let _ = ws.load_catalog(self, cx, target_ref)?;
+        if let Some(security) = &security {
+            self.stage_security_descriptor(cx, &mut ws, target_ref, security, now_ticks)?;
+        }
+        if let Some(size) = attributes.size {
+            self.stage_stream_truncate(cx, &mut ws, target_ref, &[], size, now_ticks)?;
+        }
+        // Apply explicit metadata last: resizing sets automatic mtime, but an
+        // explicit caller-supplied value belongs to the same final transaction.
+        if attributes.read_only.is_some()
+            || attributes.atime_ticks.is_some()
+            || attributes.mtime_ticks.is_some()
+        {
+            let snapshot = {
+                let cat = ws.catalog_mut(self, cx, target_ref)?;
+                if let Some(read_only) = attributes.read_only {
+                    let flags = if read_only {
+                        cat.std_flags() | FILE_ATTR_READONLY
+                    } else {
+                        cat.std_flags() & !FILE_ATTR_READONLY
+                    };
+                    cat.set_std_flags(flags);
+                }
+                cat.set_std_times(
+                    None,
+                    attributes.mtime_ticks,
+                    Some(now_ticks),
+                    attributes.atime_ticks,
+                );
+                cat.clone()
+            };
+            ws.push_usn_event_for_catalog(
+                &snapshot,
+                USN_REASON_BASIC_INFO_CHANGE | USN_REASON_CLOSE,
+                now_ticks,
+            );
+            ws.sync_target_into_parent_dirs(self, cx, target_ref)?;
+        }
+        ws.finalize(self, cx, "set_attributes_at", digest, ())
     }
 
     /// Update file/directory metadata (`FILE_ATTR_READONLY`, `atime`, `mtime`, `mft_time`)

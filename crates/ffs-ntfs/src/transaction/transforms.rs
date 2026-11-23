@@ -748,36 +748,9 @@ impl NtfsTransactionEngine {
         let _ = self.ensure_mft_headroom(cx, 2, 4);
 
         let plan_res = (|| -> Result<PreparedTxPlan<Option<u32>>> {
-            if target_ref.record < 5
-                || (target_ref.record > 5 && target_ref.record < FIRST_NON_RESERVED_SLOT)
-            {
-                return Err(FfsError::PermissionDenied);
-            }
             let mut ws = TxWorkspace::load(self, cx)?;
-            let _ = ws.load_catalog(self, cx, target_ref)?;
-            let assigned_id = if self.version == [3, 1] && ws.mft_slot_is_allocated(9) {
-                let sec_id = ws.intern_security_descriptor(self, cx, &canonical)?;
-                let cat = ws.catalog_mut(self, cx, target_ref)?;
-                cat.set_std_security_id(sec_id);
-                cat.security_descriptor = None;
-                cat.set_std_times(None, None, Some(now_ticks), None);
-                Some(sec_id)
-            } else {
-                let cat = ws.catalog_mut(self, cx, target_ref)?;
-                cat.security_descriptor = Some(canonical);
-                if cat.std_info.len() == 72 {
-                    cat.std_info[52..56].copy_from_slice(&0_u32.to_le_bytes());
-                }
-                cat.set_std_times(None, None, Some(now_ticks), None);
-                None
-            };
-            let snap = ws.load_catalog(self, cx, target_ref)?.clone();
-            ws.push_usn_event_for_catalog(
-                &snap,
-                USN_REASON_SECURITY_CHANGE | USN_REASON_CLOSE,
-                now_ticks,
-            );
-            ws.sync_target_into_parent_dirs(self, cx, target_ref)?;
+            let assigned_id =
+                self.stage_security_descriptor(cx, &mut ws, target_ref, &canonical, now_ticks)?;
             ws.finalize(self, cx, "set_security_at", digest, assigned_id)
         })();
 
@@ -785,6 +758,46 @@ impl NtfsTransactionEngine {
             Ok(plan) => self.execute_logged_tx(cx, plan),
             Err(err) => NtfsTxOutcome::NotCommitted(err),
         }
+    }
+
+    pub(super) fn stage_security_descriptor(
+        &self,
+        cx: &Cx,
+        ws: &mut TxWorkspace,
+        target_ref: NtfsReference,
+        canonical: &[u8],
+        now_ticks: u64,
+    ) -> Result<Option<u32>> {
+        if target_ref.record < 5
+            || (target_ref.record > 5 && target_ref.record < FIRST_NON_RESERVED_SLOT)
+        {
+            return Err(FfsError::PermissionDenied);
+        }
+        let _ = ws.load_catalog(self, cx, target_ref)?;
+        let assigned_id = if self.version == [3, 1] && ws.mft_slot_is_allocated(9) {
+            let sec_id = ws.intern_security_descriptor(self, cx, canonical)?;
+            let cat = ws.catalog_mut(self, cx, target_ref)?;
+            cat.set_std_security_id(sec_id);
+            cat.security_descriptor = None;
+            cat.set_std_times(None, None, Some(now_ticks), None);
+            Some(sec_id)
+        } else {
+            let cat = ws.catalog_mut(self, cx, target_ref)?;
+            cat.security_descriptor = Some(canonical.to_vec());
+            if cat.std_info.len() == 72 {
+                cat.std_info[52..56].copy_from_slice(&0_u32.to_le_bytes());
+            }
+            cat.set_std_times(None, None, Some(now_ticks), None);
+            None
+        };
+        let snap = ws.load_catalog(self, cx, target_ref)?.clone();
+        ws.push_usn_event_for_catalog(
+            &snap,
+            USN_REASON_SECURITY_CHANGE | USN_REASON_CLOSE,
+            now_ticks,
+        );
+        ws.sync_target_into_parent_dirs(self, cx, target_ref)?;
+        Ok(assigned_id)
     }
 
     /// Apply a declarative [`NtfsSecurityPatch`] (owner/group/DACL/POSIX mode) onto
@@ -796,30 +809,35 @@ impl NtfsTransactionEngine {
         patch: &NtfsSecurityPatch,
         now_ticks: u64,
     ) -> NtfsTxOutcome<Option<u32>> {
-        let base_sd = match (|| -> Result<NtfsSecurityDescriptor> {
-            checkpoint(cx)?;
-            let vol = self.volume_view(cx)?;
-            let rec = Self::checked_reference(&vol, cx, target_ref)?;
-            match vol.security_descriptor(cx, &rec) {
-                Ok(info) => Ok(info.descriptor),
-                Err(FfsError::NotFound(_)) => {
-                    // Synthesize a minimal empty self-relative descriptor when none existed.
-                    let empty_raw = [
-                        1_u8, 0, 0x00, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                    ];
-                    NtfsSecurityDescriptor::parse(&empty_raw).map_err(|err| parse_err(&err))
-                }
-                Err(err) => Err(err),
-            }
-        })() {
-            Ok(sd) => sd,
-            Err(err) => return NtfsTxOutcome::NotCommitted(err),
-        };
-        let patched_bytes = match apply_security_patch(&base_sd, patch) {
+        let patched_bytes = match self.prepare_security_patch(cx, target_ref, patch) {
             Ok(bytes) => bytes,
             Err(err) => return NtfsTxOutcome::NotCommitted(err),
         };
         self.set_security_at(cx, target_ref, &patched_bytes, now_ticks)
+    }
+
+    pub(super) fn prepare_security_patch(
+        &self,
+        cx: &Cx,
+        target_ref: NtfsReference,
+        patch: &NtfsSecurityPatch,
+    ) -> Result<Vec<u8>> {
+        checkpoint(cx)?;
+        let vol = self.volume_view(cx)?;
+        let rec = Self::checked_reference(&vol, cx, target_ref)?;
+        let base_sd = match vol.security_descriptor(cx, &rec) {
+            Ok(info) => info.descriptor,
+            Err(FfsError::NotFound(_)) => {
+                // Preserve the absent-descriptor policy, but never turn
+                // corrupt or unreadable security into an empty ACL.
+                let empty_raw = [
+                    1_u8, 0, 0x00, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                ];
+                NtfsSecurityDescriptor::parse(&empty_raw).map_err(|err| parse_err(&err))?
+            }
+            Err(err) => return Err(err),
+        };
+        apply_security_patch(&base_sd, patch)
     }
 
     /// Evaluate MS-DTYP DACL access (`DENY` before `ALLOW`) for `token` against `target_ref`.

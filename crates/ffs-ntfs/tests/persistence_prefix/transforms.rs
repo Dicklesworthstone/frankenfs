@@ -687,6 +687,227 @@ fn ntfs_mapped_acl_extended_attribute_rights_are_independent_of_data_rights() {
     }
 }
 
+#[test]
+fn ntfs_mapped_acl_timestamp_rights_are_independent_of_data_rights_and_atomic() {
+    use ffs_ondisk::ntfs_security::FILE_WRITE_ATTRIBUTES;
+    use std::time::Duration;
+
+    let cx = Cx::for_testing();
+    let (dev, vol_bytes) = format_to_fault_device(
+        &cx,
+        16,
+        4096,
+        NtfsFormatVersion::V3_1,
+        0xAC15_0005_0000_0001,
+    );
+    let mut engine = open_clean_engine(&cx, &dev, vol_bytes);
+    let root = engine.resolve_path_reference(&cx, "/").unwrap();
+    for (name, denied) in [
+        ("no-attributes.bin", FILE_WRITE_ATTRIBUTES),
+        ("no-data.bin", FILE_READ_DATA | FILE_WRITE_DATA),
+    ] {
+        let (file, _) = engine
+            .create_file_at(&cx, root, &utf16(name), b"base-content")
+            .into_result()
+            .unwrap();
+        engine
+            .set_security_at(
+                &cx,
+                file,
+                &stream_acl_descriptor(denied),
+                DEFAULT_NTFS_FILETIME,
+            )
+            .into_result()
+            .unwrap();
+    }
+    let fs = NtfsFs::from_engine_with_policy(&cx, engine, stream_acl_policy(1002)).unwrap();
+    let mut scope = RequestScope::empty();
+    let no_attributes = fs
+        .lookup(
+            &cx,
+            &mut scope,
+            InodeNumber(1),
+            OsStr::new("no-attributes.bin"),
+        )
+        .unwrap();
+    // A DATA write may update timestamps implicitly without WRITE_ATTRIBUTES.
+    assert_eq!(
+        fs.write(&cx, &mut scope, no_attributes.ino, 0, b"DATA")
+            .unwrap(),
+        4
+    );
+    let current = fs.getattr(&cx, &mut scope, no_attributes.ino).unwrap();
+    let mtime = current.mtime + Duration::from_secs(31);
+    let atime = current.atime + Duration::from_secs(17);
+    let before = dev.snapshot_live();
+    let writes = dev.write_bytes_total();
+    for (label, request) in [
+        (
+            "mtime",
+            SetAttrRequest {
+                mtime: Some(mtime),
+                ..SetAttrRequest::default()
+            },
+        ),
+        (
+            "atime",
+            SetAttrRequest {
+                atime: Some(atime),
+                ..SetAttrRequest::default()
+            },
+        ),
+        (
+            "resize and mtime",
+            SetAttrRequest {
+                size: Some(3),
+                mtime: Some(mtime),
+                ..SetAttrRequest::default()
+            },
+        ),
+        (
+            "resize and atime",
+            SetAttrRequest {
+                size: Some(3),
+                atime: Some(atime),
+                ..SetAttrRequest::default()
+            },
+        ),
+        // This stamp equals the current value, but must still override the
+        // resize's automatic mtime and therefore needs WRITE_ATTRIBUTES.
+        (
+            "resize and unchanged mtime",
+            SetAttrRequest {
+                size: Some(3),
+                mtime: Some(current.mtime),
+                ..SetAttrRequest::default()
+            },
+        ),
+    ] {
+        assert!(
+            matches!(
+                fs.setattr(&cx, &mut scope, no_attributes.ino, &request),
+                Err(FfsError::PermissionDenied)
+            ),
+            "{label} must require native WRITE_ATTRIBUTES"
+        );
+        assert_eq!(dev.write_bytes_total(), writes, "{label}");
+        assert_eq!(dev.snapshot_live(), before, "{label}");
+        assert_eq!(dev.snapshot_durable_only(), before, "{label}");
+    }
+    assert_eq!(
+        fs.read(&cx, &mut scope, no_attributes.ino, 0, 64).unwrap(),
+        b"DATA-content"
+    );
+
+    let no_data = fs
+        .lookup(&cx, &mut scope, InodeNumber(1), OsStr::new("no-data.bin"))
+        .unwrap();
+    assert!(matches!(
+        fs.read(&cx, &mut scope, no_data.ino, 0, 64),
+        Err(FfsError::PermissionDenied)
+    ));
+    assert!(matches!(
+        fs.write(&cx, &mut scope, no_data.ino, 0, b"forbidden"),
+        Err(FfsError::PermissionDenied)
+    ));
+    let updated = fs
+        .setattr(
+            &cx,
+            &mut scope,
+            no_data.ino,
+            &SetAttrRequest {
+                atime: Some(atime),
+                mtime: Some(mtime),
+                ..SetAttrRequest::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(updated.atime, atime);
+    assert_eq!(updated.mtime, mtime);
+    assert_eq!(updated.size, no_data.size);
+    let before = dev.snapshot_live();
+    let writes = dev.write_bytes_total();
+    assert!(matches!(
+        fs.setattr(
+            &cx,
+            &mut scope,
+            no_data.ino,
+            &SetAttrRequest {
+                size: Some(3),
+                mtime: Some(mtime + Duration::from_secs(1)),
+                ..SetAttrRequest::default()
+            }
+        ),
+        Err(FfsError::PermissionDenied)
+    ));
+    assert_eq!(dev.write_bytes_total(), writes);
+    assert_eq!(dev.snapshot_live(), before);
+    assert_eq!(dev.snapshot_durable_only(), before);
+    fs.flush_on_destroy(&cx).unwrap();
+    drop(fs);
+
+    let engine = open_clean_engine(&cx, &dev, vol_bytes);
+    engine.check_clean_consistency(&cx).unwrap();
+    assert_eq!(
+        read_file_by_path(&cx, &engine, "/no-attributes.bin"),
+        b"DATA-content"
+    );
+    assert_eq!(
+        read_file_by_path(&cx, &engine, "/no-data.bin"),
+        b"base-content"
+    );
+    let fs = NtfsFs::from_engine_with_policy(&cx, engine, stream_acl_policy(1001)).unwrap();
+    let persisted = fs
+        .lookup(&cx, &mut scope, InodeNumber(1), OsStr::new("no-data.bin"))
+        .unwrap();
+    assert_eq!(persisted.atime, atime);
+    assert_eq!(persisted.mtime, mtime);
+    let allowed = fs
+        .lookup(
+            &cx,
+            &mut scope,
+            InodeNumber(1),
+            OsStr::new("no-attributes.bin"),
+        )
+        .unwrap();
+    assert_eq!(allowed.atime, current.atime);
+    assert_eq!(allowed.mtime, current.mtime);
+    let resized = fs
+        .setattr(
+            &cx,
+            &mut scope,
+            allowed.ino,
+            &SetAttrRequest {
+                size: Some(3),
+                mtime: Some(allowed.mtime),
+                ..SetAttrRequest::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(resized.size, 3);
+    assert_eq!(resized.mtime, allowed.mtime);
+    fs.flush_on_destroy(&cx).unwrap();
+    drop(fs);
+
+    let engine = open_clean_engine(&cx, &dev, vol_bytes);
+    engine.check_clean_consistency(&cx).unwrap();
+    assert_eq!(
+        read_file_by_path(&cx, &engine, "/no-attributes.bin"),
+        b"DAT"
+    );
+    let fs = NtfsFs::from_engine_with_policy(&cx, engine, stream_acl_policy(1001)).unwrap();
+    let persisted = fs
+        .lookup(
+            &cx,
+            &mut scope,
+            InodeNumber(1),
+            OsStr::new("no-attributes.bin"),
+        )
+        .unwrap();
+    assert_eq!(persisted.size, 3);
+    assert_eq!(persisted.mtime, allowed.mtime);
+}
+
 fn read_file_by_path(cx: &Cx, engine: &NtfsTransactionEngine, path: &str) -> Vec<u8> {
     let vol = engine.volume_view(cx).unwrap();
     let rec = vol.resolve(cx, path).unwrap();
@@ -972,7 +1193,7 @@ fn ntfs_wof_decompression_on_write_materializes_plaintext_and_cleans_reparse() {
     let root = engine.resolve_path_reference(&cx, "/").unwrap();
 
     // Build an authentic single-chunk WOF XPRESS4K file (uncompressed single chunk stored
-    // verbatim in `WofCompressedData`, sparse 2048-byte placeholder unnamed `$DATA`, and
+    // verbatim in `WofCompressedData`, a sparse logical-size unnamed `$DATA`, and
     // WOF reparse tag `0x8000_0017` installed on the base record).
     let wof_initial = b"WOF-INITIAL-PLAINTEXT-PAYLOAD-0123456789".repeat(50); // 2000 bytes (< 4096)
     let (wof_ref, _) = engine
@@ -1071,6 +1292,35 @@ fn ntfs_wof_decompression_on_write_materializes_plaintext_and_cleans_reparse() {
             replaced_count >= 1,
             "missing placeholder tag in rec {rec_no}"
         );
+        if rec_no == wof_ref.record as usize {
+            // Sparse growth correctly leaves ValidDataLength at zero. WOF's
+            // provider data represents initialized logical bytes, so its
+            // unnamed sparse placeholder must declare that initialized span.
+            let mut at = u16::from_le_bytes(restored[20..22].try_into().unwrap()) as usize;
+            let mut initialized_data = false;
+            while at + 24 <= restored.len() {
+                let kind = u32::from_le_bytes(restored[at..at + 4].try_into().unwrap());
+                if kind == u32::MAX {
+                    break;
+                }
+                let length =
+                    u32::from_le_bytes(restored[at + 4..at + 8].try_into().unwrap()) as usize;
+                assert!(length >= 24 && at + length <= restored.len());
+                if kind == ffs_ondisk::ntfs::DATA && restored[at + 9] == 0 {
+                    assert_eq!(restored[at + 8], 1);
+                    assert!(length >= 64);
+                    let logical = &restored[at + 48..at + 56];
+                    assert_eq!(logical, &(wof_initial.len() as u64).to_le_bytes());
+                    assert_eq!(&restored[at + 56..at + 64], &0_u64.to_le_bytes());
+                    restored[at + 56..at + 64]
+                        .copy_from_slice(&(wof_initial.len() as u64).to_le_bytes());
+                    initialized_data = true;
+                    break;
+                }
+                at += length;
+            }
+            assert!(initialized_data, "missing unnamed sparse WOF DATA");
+        }
         let usa_off = u16::from_le_bytes([restored[4], restored[5]]) as usize;
         let usa_cnt = u16::from_le_bytes([restored[6], restored[7]]) as usize;
         let token = [0x22_u8, 0x00];
@@ -1286,8 +1536,9 @@ fn ntfs_secure_intern_dedup_multistripe_256k_inheritance_hardlink_dacl_sacl_and_
         .create_file_at(&cx, root, &utf16("stripe_driver.bin"), b"x")
         .into_result()
         .unwrap();
-    // Each descriptor has 60 distinct ACEs (~2.2 KiB); 130 distinct descriptors => > 280 KiB > 256 KiB!
-    for round in 0_u32..130 {
+    // These 60-ACE descriptors encode to 1,988 bytes: 130 total only 258,440
+    // bytes, below 256 KiB. 140 distinct descriptors cross that boundary.
+    for round in 0_u32..140 {
         let mut aces = Vec::with_capacity(60);
         for k in 0_u32..60 {
             aces.push(build_simple_ace(
@@ -1340,7 +1591,7 @@ fn ntfs_secure_intern_dedup_multistripe_256k_inheritance_hardlink_dacl_sacl_and_
             "multi-stripe $Secure check failed: {:?}",
             sec_rep.issues
         );
-        assert!(sec_rep.store.security_ids >= 130);
+        assert!(sec_rep.store.security_ids >= 140);
         assert!(
             sec_rep.store.index_blocks >= 2,
             "expected external $SII/$SDH INDX split"
@@ -1523,7 +1774,9 @@ fn ntfs_reparse_symlink_junction_opaque_objid_usnjrnl_ea_and_refusals() {
     // Ordinary $DATA read & write MUST fail closed while metadata/rename preserve opaque payload!
     {
         let vol = engine.volume_view(&cx).unwrap();
-        let rec = vol.resolve(&cx, "/cloud_placeholder.bin").unwrap();
+        let rec = vol
+            .resolve_no_follow(&cx, "/cloud_placeholder.bin")
+            .unwrap();
         assert!(matches!(
             vol.data_stream(&cx, &rec, &[]),
             Err(FfsError::UnsupportedFeature(_))
@@ -1547,7 +1800,7 @@ fn ntfs_reparse_symlink_junction_opaque_objid_usnjrnl_ea_and_refusals() {
         .unwrap();
     {
         let vol = engine.volume_view(&cx).unwrap();
-        let rec = vol.resolve(&cx, "/cloud_moved.bin").unwrap();
+        let rec = vol.resolve_no_follow(&cx, "/cloud_moved.bin").unwrap();
         let rp = vol.reparse_point(&cx, &rec).unwrap().unwrap();
         assert_eq!(rp, opaque_rp);
     }
