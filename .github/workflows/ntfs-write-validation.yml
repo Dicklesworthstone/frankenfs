@@ -1,11 +1,20 @@
 name: NTFS and FUSE release regression validation
 on:
   push:
-    branches: [validation/ntfs-fuse-v030-20261123-bb68cc83]
+    branches: [main, validation/ntfs-fuse-v030-20261123-bb68cc83]
+    paths:
+      - "crates/ffs-ntfs/**"
+      - "crates/ffs-fuse/**"
+      - ".github/workflows/ntfs-write-validation.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".cargo/config.toml"
+  workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: ntfs-fuse-v030-20261123-bb68cc83
+  group: ntfs-fuse-regressions-${{ github.ref }}
   cancel-in-progress: true
 env:
   CARGO_TERM_COLOR: never
@@ -16,6 +25,7 @@ env:
   RUSTFLAGS: "-Z threads=1"
   CARGO_HTTP_USER_AGENT: "frankenfs-agent (+https://github.com/Dicklesworthstone/frankenfs)"
   CARGO_TARGET_DIR: ${{ github.workspace }}/target
+  CARGO_BUILD_BUILD_DIR: ${{ github.workspace }}/target
 jobs:
   validate:
     runs-on: ubuntu-24.04
@@ -23,7 +33,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 638e6677caf61f3b086fcbbb90e47eaf2023033d
+          ref: ${{ github.sha }}
           fetch-depth: 2
           persist-credentials: false
       - name: Prepare pinned compiler and isolated runner resources
@@ -40,20 +50,25 @@ jobs:
           df -h .
       - uses: Swatinem/rust-cache@v2
         with:
+          prefix-key: ntfs-fuse-registry-v1
           shared-key: ntfs-writer-integrity
           cache-on-failure: "true"
-          cache-workspace-crates: "true"
+          cache-targets: "false"
+          cache-bin: "false"
       - name: Verify exact candidate source and formatting
         id: prepare
         run: |
-          test "$(git rev-parse HEAD)" = "638e6677caf61f3b086fcbbb90e47eaf2023033d"
-          test "$(git rev-parse HEAD^{tree})" = "580c2fc26e1ffb9f13ccb318303339a4d074c053"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/ffs-validated-source.txt"
           cargo fmt --check
           git diff --check
           test -z "$(git status --porcelain)"
       - name: Reproduce failures on unmodified merged main
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
         id: baseline
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/ffs-baseline-target
+          CARGO_BUILD_BUILD_DIR: ${{ runner.temp }}/ffs-baseline-target
         run: |
           git fetch --no-tags --depth=1 origin cbbb36e77a56167375da811e949f13f265695e19
           git worktree add --detach "$RUNNER_TEMP/ffs-baseline" cbbb36e77a56167375da811e949f13f265695e19
@@ -69,6 +84,9 @@ jobs:
           rg -F "test transforms::ntfs_wof_decompression_on_write_materializes_plaintext_and_cleans_reparse ... FAILED" "$RUNNER_TEMP/ffs-baseline-persistence.log"
       - name: Prove new regression detects the old dispatch behavior
         if: ${{ !cancelled() && steps.baseline.outcome == 'success' }}
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/ffs-baseline-target
+          CARGO_BUILD_BUILD_DIR: ${{ runner.temp }}/ffs-baseline-target
         run: |
           cp "$GITHUB_WORKSPACE/crates/ffs-ntfs/tests/persistence_prefix/catalog_admission.rs" "$RUNNER_TEMP/ffs-baseline/crates/ffs-ntfs/tests/persistence_prefix/catalog_admission.rs"
           cd "$RUNNER_TEMP/ffs-baseline"
@@ -81,6 +99,14 @@ jobs:
           test "$baseline_status" -eq 101
           rg -F "test result: FAILED. 0 passed; 1 failed;" "$RUNNER_TEMP/ffs-dispatch-before.log"
           rg -F "range must retain the strict lookup failure: Committed" "$RUNNER_TEMP/ffs-dispatch-before.log"
+      - name: Verify corrected persistence executable inventory
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        run: |
+          cargo test --locked -p ffs-ntfs --test persistence_prefix -- --list > "$RUNNER_TEMP/ffs-candidate-tests.txt"
+          rg -Fx "catalog_admission::path_stream_mutations_preserve_strict_failure_for_corrupt_sibling: test" "$RUNNER_TEMP/ffs-candidate-tests.txt"
+          rg -Fx "transforms::ntfs_wof_multichunk_writes_preserve_untouched_plaintext_and_zero_gaps: test" "$RUNNER_TEMP/ffs-candidate-tests.txt"
+          rg -Fx "transforms::ntfs_wof_materialization_recovers_complete_plaintext_at_commit_barriers: test" "$RUNNER_TEMP/ffs-candidate-tests.txt"
+          rg -Fx "transforms::ntfs_mapped_namespace_acl_denials_leave_names_streams_and_storage_unchanged: test" "$RUNNER_TEMP/ffs-candidate-tests.txt"
       - name: Complete corrected NTFS tests and persistence cuts
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
         run: cargo test --locked -p ffs-ntfs --no-fail-fast -- --test-threads=1
@@ -96,8 +122,7 @@ jobs:
       - name: Confirm validated source stayed unchanged
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
         run: |
-          test "$(git rev-parse HEAD)" = "638e6677caf61f3b086fcbbb90e47eaf2023033d"
-          test "$(git rev-parse HEAD^{tree})" = "580c2fc26e1ffb9f13ccb318303339a4d074c053"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           git diff --check
           test -z "$(git status --porcelain)"
       - name: Retain baseline execution logs
@@ -108,4 +133,6 @@ jobs:
           path: |
             ${{ runner.temp }}/ffs-baseline-persistence.log
             ${{ runner.temp }}/ffs-dispatch-before.log
+            ${{ runner.temp }}/ffs-candidate-tests.txt
+            ${{ runner.temp }}/ffs-validated-source.txt
           if-no-files-found: warn
