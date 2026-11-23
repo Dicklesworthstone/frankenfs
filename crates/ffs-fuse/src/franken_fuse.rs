@@ -1200,7 +1200,12 @@ impl FrankenFuse {
         scope: &mut RequestScope,
         parent: InodeNumber,
     ) -> ffs_error::Result<Duration> {
-        if self.inner.read_only || !self.inner.ops.directory_has_name_aliases(cx, scope, parent)? {
+        if self.inner.read_only
+            || !self
+                .inner
+                .ops
+                .directory_has_name_aliases(cx, scope, parent)?
+        {
             Ok(ATTR_TTL)
         } else {
             Ok(Duration::ZERO)
@@ -3990,9 +3995,9 @@ impl FrankenFuse {
     ) -> Result<(), MutationDispatchError> {
         let cx = self.cx_for_request();
         self.enforce_mutation_guards(&cx, RequestOp::Rename, parent)?;
-        // RENAME_WHITEOUT (overlayfs): rename, then leave a whiteout — a 0:0
-        // character device owned by the caller — under the old name, as
-        // ext4_whiteout_for_rename does. It cannot be combined with EXCHANGE.
+        // RENAME_WHITEOUT must be one backend publication. Native engines
+        // may commit each operation immediately, so composing rename + mknod
+        // here could move the file before discovering whiteouts are unsupported.
         let whiteout = flags & libc::RENAME_WHITEOUT != 0;
         if whiteout && flags & libc::RENAME_EXCHANGE != 0 {
             return Err(MutationDispatchError::Errno(libc::EINVAL));
@@ -4001,31 +4006,16 @@ impl FrankenFuse {
             let _inode_guards =
                 self.acquire_mutation_inode_guards(&[InodeNumber(parent), InodeNumber(newparent)]);
             self.with_request_scope(&cx, RequestOp::Rename, |cx, scope| {
-                if whiteout {
-                    scope.mark_composite();
-                }
-                self.inner.ops.rename2(
+                self.inner.ops.rename2_with_owner(
                     cx,
                     scope,
                     InodeNumber(parent),
                     name,
                     InodeNumber(newparent),
                     newname,
-                    flags & !libc::RENAME_WHITEOUT,
+                    flags,
+                    owner,
                 )?;
-                if whiteout {
-                    #[allow(clippy::cast_possible_truncation)]
-                    self.inner.ops.mknod(
-                        cx,
-                        scope,
-                        InodeNumber(parent),
-                        name,
-                        libc::S_IFCHR as u16,
-                        0,
-                        owner.0,
-                        owner.1,
-                    )?;
-                }
                 self.inner.ops.commit_request_scope(cx, scope)?;
                 Ok(())
             })

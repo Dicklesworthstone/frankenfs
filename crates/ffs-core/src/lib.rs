@@ -146947,10 +146947,10 @@ pub(crate) mod scrub;\n";
             b"atomic-composite-body"
         );
 
-        // Part C: `RENAME_WHITEOUT` via `FsOps::rename2` publishes move + 0:0 char-dev whiteout in
-        // 1 MVCC commit, AND rolls back the move if whiteout inode allocation hits `NoSpace`!
+        // Part C: caller-owned whiteouts publish together with the move, both
+        // with a standalone scope and with a transport-managed request scope.
         let c_before_wo = fs.current_snapshot().high.0;
-        <OpenFs as FsOps>::rename2(
+        <OpenFs as FsOps>::rename2_with_owner(
             &fs,
             &cx,
             &mut RequestScope::empty(),
@@ -146959,6 +146959,7 @@ pub(crate) mod scrub;\n";
             sub_ino,
             OsStr::new("moved_from_whiteout.txt"),
             libc::RENAME_WHITEOUT,
+            (1000, 1001),
         )
         .expect("RENAME_WHITEOUT must succeed");
         assert_eq!(
@@ -146971,6 +146972,61 @@ pub(crate) mod scrub;\n";
             .expect("whiteout char-dev node must exist at old path");
         assert_eq!(wo_attr.kind, FileType::CharDevice);
         assert_eq!(wo_attr.rdev, 0);
+        assert_eq!((wo_attr.uid, wo_attr.gid), (1000, 1001));
+
+        let c_before_scoped_wo = fs.current_snapshot();
+        let mut owned_scope = <OpenFs as FsOps>::begin_request_scope(&fs, &cx, RequestOp::Rename)
+            .expect("begin caller-owned whiteout scope");
+        <OpenFs as FsOps>::rename2_with_owner(
+            &fs,
+            &cx,
+            &mut owned_scope,
+            sub_ino,
+            OsStr::new("moved_from_whiteout.txt"),
+            sub_ino,
+            OsStr::new("scoped_whiteout_target.txt"),
+            libc::RENAME_WHITEOUT | libc::RENAME_NOREPLACE,
+            (2000, 2001),
+        )
+        .expect("stage caller-owned whiteout");
+        assert_eq!(fs.current_snapshot(), c_before_scoped_wo);
+        assert_eq!(
+            fs.lookup(&cx, sub_ino, OsStr::new("moved_from_whiteout.txt"))
+                .expect("source remains visible before publication")
+                .ino,
+            final_ino
+        );
+        assert!(matches!(
+            fs.lookup(&cx, sub_ino, OsStr::new("scoped_whiteout_target.txt")),
+            Err(FfsError::NotFound(_))
+        ));
+        let staged_wo = <OpenFs as FsOps>::lookup(
+            &fs,
+            &cx,
+            &mut owned_scope,
+            sub_ino,
+            OsStr::new("moved_from_whiteout.txt"),
+        )
+        .expect("scoped whiteout");
+        assert_eq!(staged_wo.kind, FileType::CharDevice);
+        assert_eq!(staged_wo.rdev, 0);
+        assert_eq!((staged_wo.uid, staged_wo.gid), (2000, 2001));
+        let owned_seq = <OpenFs as FsOps>::commit_request_scope(&fs, &cx, &mut owned_scope)
+            .expect("publish move and caller-owned whiteout");
+        assert_eq!(owned_seq.0, c_before_scoped_wo.high.0 + 1);
+        <OpenFs as FsOps>::end_request_scope(&fs, &cx, RequestOp::Rename, owned_scope)
+            .expect("end caller-owned whiteout scope");
+        let published_wo = fs
+            .lookup(&cx, sub_ino, OsStr::new("moved_from_whiteout.txt"))
+            .expect("published caller-owned whiteout");
+        assert_eq!(published_wo.ino, staged_wo.ino);
+        assert_eq!((published_wo.uid, published_wo.gid), (2000, 2001));
+        assert_eq!(
+            fs.lookup(&cx, sub_ino, OsStr::new("scoped_whiteout_target.txt"))
+                .expect("published rename destination")
+                .ino,
+            final_ino
+        );
 
         // Force `free_inodes = 0` so the rename leg succeeds privately in `scope.tx` and the
         // whiteout `mknod` leg fails with `NoSpace` — verifying atomic rollback of the rename!
@@ -146989,7 +147045,7 @@ pub(crate) mod scrub;\n";
             &cx,
             &mut RequestScope::empty(),
             sub_ino,
-            OsStr::new("moved_from_whiteout.txt"),
+            OsStr::new("scoped_whiteout_target.txt"),
             sub_ino,
             OsStr::new("never_published.txt"),
             libc::RENAME_WHITEOUT,
@@ -147002,7 +147058,7 @@ pub(crate) mod scrub;\n";
             "failed RENAME_WHITEOUT must roll back the staged rename with 0 commits"
         );
         assert_eq!(
-            fs.lookup(&cx, sub_ino, OsStr::new("moved_from_whiteout.txt"))
+            fs.lookup(&cx, sub_ino, OsStr::new("scoped_whiteout_target.txt"))
                 .expect("original name must remain intact")
                 .ino,
             final_ino

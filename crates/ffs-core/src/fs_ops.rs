@@ -1746,6 +1746,20 @@ impl FsOps for OpenFs {
         new_name: &OsStr,
         flags: u32,
     ) -> ffs_error::Result<()> {
+        self.rename2_with_owner(cx, scope, parent, name, new_parent, new_name, flags, (0, 0))
+    }
+
+    fn rename2_with_owner(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        parent: InodeNumber,
+        name: &OsStr,
+        new_parent: InodeNumber,
+        new_name: &OsStr,
+        flags: u32,
+        owner: (u32, u32),
+    ) -> ffs_error::Result<()> {
         let _mutation = self.mutation_gate_guard_with_pressure(cx);
         let _view = self.btrfs_semantic_view_guard()?;
         // Reject combinations that linux/fs.h forbids before doing any work.
@@ -1806,8 +1820,8 @@ impl FsOps for OpenFs {
                     name.as_encoded_bytes(),
                     whiteout_mode,
                     0,
-                    0,
-                    0,
+                    owner.0,
+                    owner.1,
                 )?;
                 return Ok(());
             }
@@ -1833,8 +1847,8 @@ impl FsOps for OpenFs {
                             name.as_encoded_bytes(),
                             whiteout_mode,
                             0,
-                            0,
-                            0,
+                            owner.0,
+                            owner.1,
                         )
                         .map(|_| ())
                     })

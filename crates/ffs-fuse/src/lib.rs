@@ -23306,6 +23306,14 @@ mod tests {
             new_parent: InodeNumber,
             new_name: String,
         },
+        Rename2 {
+            parent: InodeNumber,
+            name: String,
+            new_parent: InodeNumber,
+            new_name: String,
+            flags: u32,
+            owner: (u32, u32),
+        },
         Symlink {
             parent: InodeNumber,
             name: String,
@@ -23350,6 +23358,7 @@ mod tests {
     struct MutationRecordingFs {
         calls: Arc<Mutex<Vec<MutationCall>>>,
         fsync_errno: Option<i32>,
+        rename_errno: Option<i32>,
         record_scopes: bool,
         getattr_size: u64,
     }
@@ -23359,6 +23368,7 @@ mod tests {
             Self {
                 calls,
                 fsync_errno: None,
+                rename_errno: None,
                 record_scopes: false,
                 getattr_size: 0,
             }
@@ -23368,6 +23378,7 @@ mod tests {
             Self {
                 calls,
                 fsync_errno: None,
+                rename_errno: None,
                 record_scopes: true,
                 getattr_size: 0,
             }
@@ -23380,6 +23391,7 @@ mod tests {
             Self {
                 calls,
                 fsync_errno: None,
+                rename_errno: None,
                 record_scopes: true,
                 getattr_size,
             }
@@ -23389,6 +23401,7 @@ mod tests {
             Self {
                 calls,
                 fsync_errno: Some(errno),
+                rename_errno: None,
                 record_scopes: true,
                 getattr_size: 0,
             }
@@ -23643,6 +23656,37 @@ mod tests {
                     new_parent,
                     new_name: new_name.to_string_lossy().into_owned(),
                 });
+            Ok(())
+        }
+
+        fn rename2_with_owner(
+            &self,
+            cx: &Cx,
+            scope: &mut RequestScope,
+            parent: InodeNumber,
+            name: &OsStr,
+            new_parent: InodeNumber,
+            new_name: &OsStr,
+            flags: u32,
+            owner: (u32, u32),
+        ) -> ffs_error::Result<()> {
+            if flags == 0 {
+                return self.rename(cx, scope, parent, name, new_parent, new_name);
+            }
+            self.calls
+                .lock()
+                .expect("lock mutation calls")
+                .push(MutationCall::Rename2 {
+                    parent,
+                    name: name.to_string_lossy().into_owned(),
+                    new_parent,
+                    new_name: new_name.to_string_lossy().into_owned(),
+                    flags,
+                    owner,
+                });
+            if let Some(errno) = self.rename_errno {
+                return Err(FfsError::Io(std::io::Error::from_raw_os_error(errno)));
+            }
             Ok(())
         }
 
@@ -24823,6 +24867,29 @@ mod tests {
             self.active_renames.fetch_sub(1, Ordering::SeqCst);
             Ok(())
         }
+
+        fn rename2(
+            &self,
+            cx: &Cx,
+            scope: &mut RequestScope,
+            parent: InodeNumber,
+            name: &OsStr,
+            new_parent: InodeNumber,
+            new_name: &OsStr,
+            flags: u32,
+        ) -> ffs_error::Result<()> {
+            // An older backend may support whiteouts while having no way to
+            // receive their caller ownership. It must not be used implicitly.
+            if flags != 0
+                && flags != libc::RENAME_WHITEOUT
+                && flags != (libc::RENAME_WHITEOUT | libc::RENAME_NOREPLACE)
+            {
+                return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                    libc::EINVAL,
+                )));
+            }
+            self.rename(cx, scope, parent, name, new_parent, new_name)
+        }
     }
 
     #[test]
@@ -25491,66 +25558,174 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_rename_whiteout_leaves_a_char_device_owned_by_the_caller() {
-        let calls = Arc::new(Mutex::new(Vec::new()));
+    fn dispatch_rename_whiteout_preserves_flags_and_owner_in_one_backend_call() {
+        for flags in [
+            libc::RENAME_WHITEOUT,
+            libc::RENAME_WHITEOUT | libc::RENAME_NOREPLACE,
+        ] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let options = MountOptions {
+                read_only: false,
+                ..MountOptions::default()
+            };
+            let fuse = FrankenFuse::with_options(
+                Box::new(Arc::new(MutationRecordingFs::with_scope_recording(
+                    Arc::clone(&calls),
+                ))),
+                &options,
+            );
+            fuse.dispatch_rename(
+                8,
+                OsStr::new("old"),
+                9,
+                OsStr::new("new"),
+                flags,
+                (1000, 1001),
+            )
+            .expect("whiteout rename");
+            assert_eq!(
+                calls.lock().expect("lock calls").as_slice(),
+                &[
+                    MutationCall::Begin {
+                        op: RequestOp::Rename,
+                    },
+                    MutationCall::Rename2 {
+                        parent: InodeNumber(8),
+                        name: "old".to_owned(),
+                        new_parent: InodeNumber(9),
+                        new_name: "new".to_owned(),
+                        flags,
+                        owner: (1000, 1001),
+                    },
+                    MutationCall::Commit,
+                    MutationCall::End {
+                        op: RequestOp::Rename,
+                    },
+                ]
+            );
+            assert!(matches!(
+                fuse.dispatch_rename(
+                    8,
+                    OsStr::new("a"),
+                    9,
+                    OsStr::new("b"),
+                    libc::RENAME_WHITEOUT | libc::RENAME_EXCHANGE,
+                    (0, 0),
+                ),
+                Err(MutationDispatchError::Errno(libc::EINVAL))
+            ));
+        }
+    }
+
+    #[test]
+    fn dispatch_rename_whiteout_requires_owner_aware_backend() {
+        let (control, control_mutations) = RenameConcurrencyProbeFs::new(Duration::ZERO);
+        for flags in [
+            libc::RENAME_WHITEOUT,
+            libc::RENAME_WHITEOUT | libc::RENAME_NOREPLACE,
+        ] {
+            control
+                .rename2(
+                    &Cx::for_testing(),
+                    &mut RequestScope::empty(),
+                    InodeNumber(8),
+                    OsStr::new("source"),
+                    InodeNumber(9),
+                    OsStr::new("existing-target"),
+                    flags,
+                )
+                .expect("control: older rename2 accepts whiteouts");
+            assert_eq!(control_mutations.load(Ordering::SeqCst), 1);
+        }
+
+        let (backend, mutations) = RenameConcurrencyProbeFs::new(Duration::ZERO);
         let options = MountOptions {
             read_only: false,
             ..MountOptions::default()
         };
-        let fuse = FrankenFuse::with_options(
-            Box::new(MutationRecordingFs::with_scope_recording(Arc::clone(
-                &calls,
-            ))),
-            &options,
-        );
+        let fuse = FrankenFuse::with_options(Box::new(backend), &options);
+        for flags in [
+            libc::RENAME_WHITEOUT,
+            libc::RENAME_WHITEOUT | libc::RENAME_NOREPLACE,
+        ] {
+            let error = fuse
+                .dispatch_rename(
+                    8,
+                    OsStr::new("source"),
+                    9,
+                    OsStr::new("existing-target"),
+                    flags,
+                    (1000, 1001),
+                )
+                .expect_err("backend has no owner-aware whiteout operation");
+            let errno = match error {
+                MutationDispatchError::Errno(errno) => errno,
+                MutationDispatchError::Operation { error, .. } => error.to_errno(),
+            };
+            assert_eq!(errno, libc::EINVAL);
+            assert_eq!(
+                mutations.load(Ordering::SeqCst),
+                0,
+                "reject before a legacy rename can replace the destination"
+            );
+        }
+
         fuse.dispatch_rename(
             8,
-            OsStr::new("old"),
+            OsStr::new("source"),
             9,
-            OsStr::new("new"),
-            libc::RENAME_WHITEOUT,
+            OsStr::new("existing-target"),
+            0,
             (1000, 1001),
         )
-        .expect("whiteout rename");
-        #[allow(clippy::cast_possible_truncation)]
-        let char_device = libc::S_IFCHR as u16;
+        .expect("ordinary rename remains supported");
+        assert_eq!(mutations.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn dispatch_rename_whiteout_error_does_not_commit_or_fall_back() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut backend = MutationRecordingFs::with_scope_recording(Arc::clone(&calls));
+        backend.rename_errno = Some(libc::ENOSPC);
+        let options = MountOptions {
+            read_only: false,
+            ..MountOptions::default()
+        };
+        let fuse = FrankenFuse::with_options(Box::new(backend), &options);
+        let error = fuse
+            .dispatch_rename(
+                8,
+                OsStr::new("source"),
+                9,
+                OsStr::new("target"),
+                libc::RENAME_WHITEOUT,
+                (1000, 1001),
+            )
+            .expect_err("atomic backend cannot allocate the whiteout");
+        assert!(matches!(
+            error,
+            MutationDispatchError::Operation { error, .. }
+                if error.to_errno() == libc::ENOSPC
+        ));
         assert_eq!(
             calls.lock().expect("lock calls").as_slice(),
             &[
                 MutationCall::Begin {
                     op: RequestOp::Rename,
                 },
-                MutationCall::Rename {
+                MutationCall::Rename2 {
                     parent: InodeNumber(8),
-                    name: "old".to_owned(),
+                    name: "source".to_owned(),
                     new_parent: InodeNumber(9),
-                    new_name: "new".to_owned(),
+                    new_name: "target".to_owned(),
+                    flags: libc::RENAME_WHITEOUT,
+                    owner: (1000, 1001),
                 },
-                MutationCall::Mknod {
-                    parent: InodeNumber(8),
-                    name: "old".to_owned(),
-                    mode: char_device,
-                    rdev: 0,
-                    uid: 1000,
-                    gid: 1001,
-                },
-                MutationCall::Commit,
                 MutationCall::End {
                     op: RequestOp::Rename,
                 },
             ]
         );
-        assert!(matches!(
-            fuse.dispatch_rename(
-                8,
-                OsStr::new("a"),
-                9,
-                OsStr::new("b"),
-                libc::RENAME_WHITEOUT | libc::RENAME_EXCHANGE,
-                (0, 0),
-            ),
-            Err(MutationDispatchError::Errno(libc::EINVAL))
-        ));
     }
 
     #[test]
