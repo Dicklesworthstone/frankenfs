@@ -1,27 +1,31 @@
 diff --git a/crates/ffs-ntfs/src/reader/filesystem.rs b/crates/ffs-ntfs/src/reader/filesystem.rs
-index 9b817c6..b01b9b3 100644
+index 9b817c6..ed9ca08 100644
 --- a/crates/ffs-ntfs/src/reader/filesystem.rs
 +++ b/crates/ffs-ntfs/src/reader/filesystem.rs
-@@ -631,6 +631,18 @@ impl NtfsFs {
+@@ -631,6 +631,22 @@ impl NtfsFs {
          })
      }
  
-+    /// Resolve the security owner of either unnamed DATA or an alternate stream.
-+    /// NTFS streams share their base FILE's descriptor; the synthetic ADS inode
-+    /// must never bypass native access checks or a stale FILE sequence.
-+    fn data_record(&self, cx: &Cx, ino: InodeNumber) -> Result<NtfsFileRecord> {
++    /// Check native access for unnamed DATA or an alternate stream. Synthetic
++    /// ownership does not read security metadata on the cached data path.
++    fn enforce_data_access(&self, cx: &Cx, ino: InodeNumber, desired_mask: u32) -> Result<()> {
++        if !matches!(&self.sid_policy, NtfsSidPolicy::Mapped { map, .. } if map.enforce_acl) {
++            return Ok(());
++        }
++        // Streams share their base FILE's descriptor and sequence identity.
 +        let base = if is_ads_ino(ino) {
 +            self.inode(self.ads_target(ino)?.0)?
 +        } else {
 +            ino
 +        };
-+        self.record(cx, base)
++        let record = self.record(cx, base)?;
++        self.enforce_dacl(cx, &record, desired_mask)
 +    }
 +
      pub(super) fn enforce_dacl(
          &self,
          cx: &Cx,
-@@ -1003,10 +1015,8 @@ impl FsOps for NtfsFs {
+@@ -1003,10 +1019,7 @@ impl FsOps for NtfsFs {
          size: u32,
      ) -> Result<Vec<u8>> {
          let _op = self.operation(cx, false)?;
@@ -29,30 +33,23 @@ index 9b817c6..b01b9b3 100644
 -            let record = self.record(cx, ino)?;
 -            self.enforce_dacl(cx, &record, FILE_READ_DATA)?;
 -        }
-+        let record = self.data_record(cx, ino)?;
-+        self.enforce_dacl(cx, &record, FILE_READ_DATA)?;
++        self.enforce_data_access(cx, ino, FILE_READ_DATA)?;
          let stream = self.stream(cx, ino)?;
          let volume = self.active_volume()?;
          volume.read(cx, &stream, offset, size as usize)
 diff --git a/crates/ffs-ntfs/src/reader/filesystem/writable.rs b/crates/ffs-ntfs/src/reader/filesystem/writable.rs
-index 6e3b210..014d34b 100644
+index 6e3b210..c01eb79 100644
 --- a/crates/ffs-ntfs/src/reader/filesystem/writable.rs
 +++ b/crates/ffs-ntfs/src/reader/filesystem/writable.rs
-@@ -256,10 +256,12 @@ impl NtfsFs {
+@@ -256,6 +256,7 @@ impl NtfsFs {
          if attr.perm & 0o222 == 0 {
              return Err(FfsError::PermissionDenied);
          }
-+        let record = self.data_record(cx, ino)?;
-+        self.enforce_dacl(cx, &record, FILE_WRITE_DATA)?;
++        self.enforce_data_access(cx, ino, FILE_WRITE_DATA)?;
          if is_ads_ino(ino) {
              self.ads_target(ino)
          } else {
--            Ok((reference(&self.record(cx, ino)?), Vec::new()))
-+            Ok((reference(&record), Vec::new()))
-         }
-     }
- 
-@@ -272,14 +274,11 @@ impl NtfsFs {
+@@ -272,15 +273,11 @@ impl NtfsFs {
          if writing {
              self.ensure_writable()?;
              self.data_target(cx, ino)?;
@@ -64,22 +61,22 @@ index 6e3b210..014d34b 100644
              return Err(FfsError::IsDirectory);
 -        } else if !is_ads_ino(ino) {
 -            let rec = self.record(cx, ino)?;
+-            self.enforce_dacl(cx, &rec, FILE_READ_DATA)?;
 +        }
 +        if access != libc::O_WRONLY {
-+            let rec = self.data_record(cx, ino)?;
-             self.enforce_dacl(cx, &rec, FILE_READ_DATA)?;
++            self.enforce_data_access(cx, ino, FILE_READ_DATA)?;
          }
          // Validate the data interpretation before returning a usable handle.
-@@ -319,6 +318,8 @@ impl NtfsFs {
+         self.stream(cx, ino)?;
+@@ -319,6 +316,7 @@ impl NtfsFs {
          if self.describe(cx, ino)?.kind == FileType::Directory {
              return Err(FfsError::IsDirectory);
          }
-+        let record = self.data_record(cx, ino)?;
-+        self.enforce_dacl(cx, &record, FILE_READ_DATA)?;
++        self.enforce_data_access(cx, ino, FILE_READ_DATA)?;
          self.stream(cx, ino)?;
          Ok((0, 0))
      }
-@@ -543,10 +544,6 @@ impl NtfsFs {
+@@ -543,10 +541,6 @@ impl NtfsFs {
          data: &[u8],
      ) -> Result<u32> {
          self.ensure_writable()?;
@@ -90,7 +87,7 @@ index 6e3b210..014d34b 100644
          let size = u32::try_from(data.len()).map_err(|_| invalid_argument())?;
          let (target, stream) = self.data_target(cx, ino)?;
          self.transact(cx, |engine| {
-@@ -582,10 +579,6 @@ impl NtfsFs {
+@@ -582,10 +576,6 @@ impl NtfsFs {
              return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EFBIG)));
          }
          let (target, stream) = self.data_target(cx, ino)?;
