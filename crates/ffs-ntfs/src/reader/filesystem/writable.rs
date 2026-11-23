@@ -243,6 +243,47 @@ impl NtfsFs {
         Ok(reference(&self.record(cx, ino)?))
     }
 
+    fn enforce_namespace_delete(
+        &self,
+        cx: &Cx,
+        parent: NtfsReference,
+        target: NtfsReference,
+    ) -> Result<()> {
+        if !matches!(&self.sid_policy, NtfsSidPolicy::Mapped { map, .. } if map.enforce_acl) {
+            return Ok(());
+        }
+        let target = self.record(cx, self.inode(target)?)?;
+        // MS-FSA 2.1.5.1.2.1 permits DELETE on the object or DELETE_CHILD on
+        // its parent. Only a completed access denial can use that alternative;
+        // unreadable/corrupt security metadata and cancellation remain errors.
+        match self.enforce_dacl(cx, &target, STANDARD_DELETE) {
+            Err(FfsError::PermissionDenied) => {
+                let parent = self.record(cx, self.inode(parent)?)?;
+                self.enforce_dacl(cx, &parent, FILE_DELETE_CHILD)
+            }
+            outcome => outcome,
+        }
+    }
+
+    fn enforce_namespace_add(
+        &self,
+        cx: &Cx,
+        parent: NtfsReference,
+        target: NtfsReference,
+    ) -> Result<()> {
+        if !matches!(&self.sid_policy, NtfsSidPolicy::Mapped { map, .. } if map.enforce_acl) {
+            return Ok(());
+        }
+        let target = self.record(cx, self.inode(target)?)?;
+        let access = if target.is_directory() {
+            FILE_ADD_SUBDIRECTORY
+        } else {
+            FILE_ADD_FILE
+        };
+        let parent = self.record(cx, self.inode(parent)?)?;
+        self.enforce_dacl(cx, &parent, access)
+    }
+
     fn data_target(&self, cx: &Cx, ino: InodeNumber) -> Result<(NtfsReference, Vec<u16>)> {
         let attr = self.describe(cx, ino)?;
         if attr.kind == FileType::Directory {
@@ -921,6 +962,7 @@ impl NtfsFs {
         if let Some((base, stream)) = self.ads_mutation_component(cx, parent, name)? {
             let attr = self.lookup_ads_component(cx, parent, &base, &stream)?;
             let (target, exact_name) = self.data_target(cx, attr.ino)?;
+            self.enforce_namespace_delete(cx, self.directory_reference(cx, parent)?, target)?;
             if self.has_open_handle(attr.ino)? {
                 return Err(FfsError::RequestRejected {
                     errno: libc::EBUSY,
@@ -931,15 +973,11 @@ impl NtfsFs {
             self.retire_ads(attr.ino)?;
             return Ok(());
         }
-        let parent_rec = self.record(cx, parent)?;
         let name = self.component(parent, name)?;
         let parent = self.directory_reference(cx, parent)?;
         let target = self.writer()?.lookup_reference(cx, parent, &name)?;
         let ino = self.inode(target)?;
-        let target_rec = self.record(cx, ino)?;
-        if self.enforce_dacl(cx, &target_rec, STANDARD_DELETE).is_err() {
-            self.enforce_dacl(cx, &parent_rec, FILE_DELETE_CHILD)?;
-        }
+        self.enforce_namespace_delete(cx, parent, target)?;
         let attr = self.describe(cx, ino)?;
         if attr.kind == FileType::Directory {
             return Err(FfsError::IsDirectory);
@@ -1003,6 +1041,7 @@ impl NtfsFs {
         if self.describe(cx, ino)?.kind != FileType::Directory {
             return Err(FfsError::NotDirectory);
         }
+        self.enforce_namespace_delete(cx, parent, target)?;
         self.transact(cx, |engine| engine.unlink_at(cx, parent, &name, target))?;
         Ok(())
     }
@@ -1029,6 +1068,7 @@ impl NtfsFs {
         let name = self.component(parent, name)?;
         let parent = self.directory_reference(cx, parent)?;
         let target = reference(&self.record(cx, ino)?);
+        self.enforce_namespace_add(cx, parent, target)?;
         self.transact(cx, |engine| engine.link_at(cx, target, parent, &name))?;
         cx.masked(|| self.describe(cx, ino))
     }
@@ -1070,6 +1110,7 @@ impl NtfsFs {
             }
             let src_ads_attr = self.lookup_ads_component(cx, parent, &src_base, &src_stream)?;
             let (base_ref, exact_old_stream) = self.data_target(cx, src_ads_attr.ino)?;
+            self.enforce_namespace_delete(cx, self.directory_reference(cx, parent)?, base_ref)?;
             let replaced_ads =
                 match self.lookup_ads_component(cx, new_parent, &dst_base, &dst_stream) {
                     Ok(dst_ads_attr) => {
@@ -1128,6 +1169,8 @@ impl NtfsFs {
             let dst_lookup = engine.lookup_reference(cx, new_parent, &new_name);
             (target, dst_lookup)
         };
+        self.enforce_namespace_delete(cx, parent, target)?;
+        self.enforce_namespace_add(cx, new_parent, target)?;
         let destination_ref = match dst_lookup {
             Ok(destination) if destination != target => Some(destination),
             Ok(_) | Err(FfsError::NotFound(_)) => None,
@@ -1136,6 +1179,9 @@ impl NtfsFs {
         if let Some(destination) = destination_ref {
             let ino = self.inode(destination)?;
             let dst_attr = self.describe(cx, ino)?;
+            if !no_replace {
+                self.enforce_namespace_delete(cx, new_parent, destination)?;
+            }
             if dst_attr.kind == FileType::Directory {
                 let _ = self.transact(cx, |engine| {
                     engine.rename_at(cx, parent, &name, new_parent, &new_name, target, no_replace)

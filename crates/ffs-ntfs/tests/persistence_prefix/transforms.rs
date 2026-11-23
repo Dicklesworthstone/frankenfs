@@ -28,9 +28,10 @@ use ffs_ntfs::transaction::{
 use ffs_ondisk::ntfs::reparse::{MOUNT_POINT_TAG, NtfsReparseData, NtfsReparsePoint};
 use ffs_ondisk::ntfs_security::{
     ACE_FLAG_CONTAINER_INHERIT, ACE_FLAG_INHERIT_ONLY, ACE_FLAG_INHERITED, ACE_FLAG_OBJECT_INHERIT,
-    ACE_TYPE_ACCESS_ALLOWED, ACE_TYPE_ACCESS_DENIED, ACE_TYPE_SYSTEM_AUDIT, FILE_ALL_ACCESS,
-    FILE_READ_DATA, FILE_READ_EA, FILE_WRITE_DATA, FILE_WRITE_EA, NtfsAccessToken, NtfsAcl,
-    NtfsSecurityDescriptor, NtfsSid, SE_DACL_PRESENT, SE_SACL_PRESENT, SE_SELF_RELATIVE,
+    ACE_TYPE_ACCESS_ALLOWED, ACE_TYPE_ACCESS_DENIED, ACE_TYPE_SYSTEM_AUDIT, FILE_ADD_FILE,
+    FILE_ADD_SUBDIRECTORY, FILE_ALL_ACCESS, FILE_DELETE_CHILD, FILE_READ_DATA, FILE_READ_EA,
+    FILE_WRITE_DATA, FILE_WRITE_EA, NtfsAccessToken, NtfsAcl, NtfsSecurityDescriptor, NtfsSid,
+    SE_DACL_PRESENT, SE_SACL_PRESENT, SE_SELF_RELATIVE, STANDARD_DELETE,
 };
 use ffs_types::InodeNumber;
 
@@ -498,6 +499,389 @@ fn ntfs_mapped_creation_publishes_security_in_one_transaction_and_recovers_atomi
                 );
             }
         }
+    }
+}
+
+#[test]
+fn ntfs_mapped_namespace_acl_denials_leave_names_streams_and_storage_unchanged() {
+    let cx = Cx::for_testing();
+    let (dev, vol_bytes) = format_to_fault_device(
+        &cx,
+        16,
+        4096,
+        NtfsFormatVersion::V3_1,
+        0xAC15_0006_0000_0001,
+    );
+    let mut engine = open_clean_engine(&cx, &dev, vol_bytes);
+    let root = engine.resolve_path_reference(&cx, "/").unwrap();
+    for (name, directory, denied) in [
+        ("restricted.bin", false, STANDARD_DELETE),
+        ("available.bin", false, 0),
+        ("restricted-dir", true, STANDARD_DELETE),
+        ("available-dir", true, 0),
+        ("victim.bin", false, STANDARD_DELETE),
+        ("victim-dir", true, STANDARD_DELETE),
+        ("no-files", true, FILE_ADD_FILE),
+        ("no-directories", true, FILE_ADD_SUBDIRECTORY),
+    ] {
+        let (reference, _) = if directory {
+            engine.mkdir_at(&cx, root, &utf16(name))
+        } else {
+            engine.create_file_at(&cx, root, &utf16(name), name.as_bytes())
+        }
+        .into_result()
+        .unwrap();
+        if name == "restricted.bin" {
+            engine
+                .create_stream(&cx, reference, &utf16("audit"), b"retained stream")
+                .into_result()
+                .unwrap();
+        }
+        engine
+            .set_security_at(
+                &cx,
+                reference,
+                &stream_acl_descriptor(denied),
+                DEFAULT_NTFS_FILETIME,
+            )
+            .into_result()
+            .unwrap();
+    }
+    // An explicit user deny is invisible in the broad owner/group/other mode
+    // projection. The adapter itself must enforce the native rights.
+    engine
+        .set_security_at(
+            &cx,
+            root,
+            &stream_acl_descriptor(FILE_DELETE_CHILD),
+            DEFAULT_NTFS_FILETIME,
+        )
+        .into_result()
+        .unwrap();
+    let fs = NtfsFs::from_engine_with_policy(&cx, engine, stream_acl_policy(1002)).unwrap();
+    let mut scope = RequestScope::empty();
+    let root = InodeNumber(1);
+    let no_files = fs
+        .lookup(&cx, &mut scope, root, OsStr::new("no-files"))
+        .unwrap()
+        .ino;
+    let no_directories = fs
+        .lookup(&cx, &mut scope, root, OsStr::new("no-directories"))
+        .unwrap()
+        .ino;
+    let available = fs
+        .lookup(&cx, &mut scope, root, OsStr::new("available.bin"))
+        .unwrap();
+    let victim = fs
+        .lookup(&cx, &mut scope, root, OsStr::new("victim.bin"))
+        .unwrap();
+    let (victim_handle, _) = fs.open(&cx, &mut scope, victim.ino, libc::O_RDONLY).unwrap();
+    let before = dev.snapshot_live();
+    let writes = dev.write_bytes_total();
+    for operation in [
+        "unlink",
+        "rmdir",
+        "rename source file",
+        "rename source directory",
+        "link destination",
+        "rename destination file",
+        "rename destination directory",
+        "replace open file",
+        "replace directory",
+        "unlink stream",
+        "rename stream",
+    ] {
+        let result = match operation {
+            "unlink" => fs.unlink(&cx, &mut scope, root, OsStr::new("restricted.bin")),
+            "rmdir" => fs.rmdir(&cx, &mut scope, root, OsStr::new("restricted-dir")),
+            "link destination" => fs
+                .link(&cx, &mut scope, available.ino, no_files, OsStr::new("linked"))
+                .map(|_| ()),
+            "unlink stream" => fs.unlink(
+                &cx,
+                &mut scope,
+                root,
+                OsStr::new("restricted.bin:audit"),
+            ),
+            _ => {
+                let (source, parent, destination) = match operation {
+                    "rename source file" => ("restricted.bin", root, "moved-file"),
+                    "rename source directory" => ("restricted-dir", root, "moved-dir"),
+                    "rename destination file" => ("available.bin", no_files, "moved-file"),
+                    "rename destination directory" => {
+                        ("available-dir", no_directories, "moved-dir")
+                    }
+                    "replace open file" => ("available.bin", root, "victim.bin"),
+                    "replace directory" => ("available-dir", root, "victim-dir"),
+                    "rename stream" => ("restricted.bin:audit", root, "restricted.bin:new"),
+                    _ => unreachable!(),
+                };
+                fs.rename(
+                    &cx,
+                    &mut scope,
+                    root,
+                    OsStr::new(source),
+                    parent,
+                    OsStr::new(destination),
+                )
+            }
+        };
+        assert!(
+            matches!(result, Err(FfsError::PermissionDenied)),
+            "{operation} must reject the native ACL denial: {result:?}"
+        );
+        assert_eq!(dev.write_bytes_total(), writes, "{operation}");
+    }
+    assert_eq!(dev.snapshot_live(), before);
+    assert_eq!(dev.snapshot_durable_only(), before);
+    assert!(fs.last_durable_token().unwrap().is_none());
+    assert_eq!(
+        fs.read(&cx, &mut scope, victim.ino, 0, 64).unwrap(),
+        b"victim.bin"
+    );
+    fs.release(
+        &cx,
+        &mut scope,
+        ffs_core::vfs::ReleaseRequest {
+            ino: victim.ino,
+            fh: victim_handle,
+            flags: libc::O_RDONLY,
+            lock_owner: None,
+            flush: false,
+        },
+    )
+    .unwrap();
+    fs.flush_on_destroy(&cx).unwrap();
+    drop(fs);
+    let engine = open_clean_engine(&cx, &dev, vol_bytes);
+    engine.check_clean_consistency(&cx).unwrap();
+    assert_eq!(
+        read_file_by_path(&cx, &engine, "/available.bin"),
+        b"available.bin"
+    );
+    assert_eq!(
+        read_file_by_path(&cx, &engine, "/restricted.bin"),
+        b"restricted.bin"
+    );
+    assert!(engine.resolve_path_reference(&cx, "/restricted-dir").is_ok());
+    assert!(engine.resolve_path_reference(&cx, "/victim-dir").is_ok());
+}
+
+#[test]
+fn ntfs_mapped_namespace_acl_accepts_object_or_parent_delete_authority() {
+    let cx = Cx::for_testing();
+    for (index, version, deny_object, deny_parent) in [
+        (0, NtfsFormatVersion::V3_0, 0, FILE_DELETE_CHILD),
+        (1, NtfsFormatVersion::V3_1, STANDARD_DELETE, 0),
+    ] {
+        let (dev, vol_bytes) = format_to_fault_device(
+            &cx,
+            16,
+            4096,
+            version,
+            0xAC15_0007_0000_0001 + index,
+        );
+        let mut engine = open_clean_engine(&cx, &dev, vol_bytes);
+        let root = engine.resolve_path_reference(&cx, "/").unwrap();
+        for (name, directory) in [
+            ("remove.bin", false),
+            ("remove-dir", true),
+            ("source.bin", false),
+            ("victim.bin", false),
+            ("streams.bin", false),
+        ] {
+            let (reference, _) = if directory {
+                engine.mkdir_at(&cx, root, &utf16(name))
+            } else {
+                engine.create_file_at(&cx, root, &utf16(name), name.as_bytes())
+            }
+            .into_result()
+            .unwrap();
+            if name == "streams.bin" {
+                engine
+                    .create_stream(&cx, reference, &utf16("audit"), b"stream payload")
+                    .into_result()
+                    .unwrap();
+            }
+            engine
+                .set_security_at(
+                    &cx,
+                    reference,
+                    &stream_acl_descriptor(deny_object),
+                    DEFAULT_NTFS_FILETIME,
+                )
+                .into_result()
+                .unwrap();
+        }
+        engine
+            .set_security_at(
+                &cx,
+                root,
+                &stream_acl_descriptor(deny_parent),
+                DEFAULT_NTFS_FILETIME,
+            )
+            .into_result()
+            .unwrap();
+        let fs = NtfsFs::from_engine_with_policy(&cx, engine, stream_acl_policy(1002)).unwrap();
+        let mut scope = RequestScope::empty();
+        let root = InodeNumber(1);
+        fs.unlink(&cx, &mut scope, root, OsStr::new("remove.bin"))
+            .unwrap();
+        fs.rmdir(&cx, &mut scope, root, OsStr::new("remove-dir"))
+            .unwrap();
+        let source = fs
+            .lookup(&cx, &mut scope, root, OsStr::new("source.bin"))
+            .unwrap();
+        // Adding a hard link does not need DELETE on the source object.
+        fs.link(&cx, &mut scope, source.ino, root, OsStr::new("linked.bin"))
+            .unwrap();
+        fs.rename(
+            &cx,
+            &mut scope,
+            root,
+            OsStr::new("source.bin"),
+            root,
+            OsStr::new("victim.bin"),
+        )
+        .unwrap();
+        fs.rename(
+            &cx,
+            &mut scope,
+            root,
+            OsStr::new("streams.bin:audit"),
+            root,
+            OsStr::new("streams.bin:renamed"),
+        )
+        .unwrap();
+        let stream = fs
+            .lookup(&cx, &mut scope, root, OsStr::new("streams.bin:renamed"))
+            .unwrap();
+        assert_eq!(
+            fs.read(&cx, &mut scope, stream.ino, 0, 64).unwrap(),
+            b"stream payload"
+        );
+        fs.unlink(&cx, &mut scope, root, OsStr::new("streams.bin:renamed"))
+            .unwrap();
+        fs.flush_on_destroy(&cx).unwrap();
+        drop(fs);
+        let engine = open_clean_engine(&cx, &dev, vol_bytes);
+        engine.check_clean_consistency(&cx).unwrap();
+        assert_eq!(read_file_by_path(&cx, &engine, "/victim.bin"), b"source.bin");
+        assert_eq!(read_file_by_path(&cx, &engine, "/linked.bin"), b"source.bin");
+        assert_eq!(read_file_by_path(&cx, &engine, "/streams.bin"), b"streams.bin");
+        for path in ["/remove.bin", "/remove-dir", "/source.bin"] {
+            assert!(matches!(
+                engine.resolve_path_reference(&cx, path),
+                Err(FfsError::NotFound(_))
+            ));
+        }
+    }
+}
+
+#[test]
+fn ntfs_mapped_namespace_acl_does_not_replace_security_read_errors_with_parent_permission() {
+    use ffs_error::Result;
+    use ffs_types::ByteOffset;
+
+    struct SecurityReadFault {
+        inner: Arc<FaultInjectingNtfsDevice>,
+        descriptor: Vec<u8>,
+        fault: Mutex<Option<FfsError>>,
+    }
+    impl ByteDevice for SecurityReadFault {
+        fn len_bytes(&self) -> u64 {
+            self.inner.len_bytes()
+        }
+        fn read_exact_at(&self, cx: &Cx, offset: ByteOffset, buf: &mut [u8]) -> Result<()> {
+            self.inner.read_exact_at(cx, offset, buf)?;
+            if buf
+                .windows(self.descriptor.len())
+                .any(|bytes| bytes == self.descriptor.as_slice())
+                && let Some(error) = self.fault.lock().unwrap().take()
+            {
+                return Err(error);
+            }
+            Ok(())
+        }
+        fn write_all_at(&self, cx: &Cx, offset: ByteOffset, buf: &[u8]) -> Result<()> {
+            self.inner.write_all_at(cx, offset, buf)
+        }
+        fn sync(&self, cx: &Cx) -> Result<()> {
+            self.inner.sync(cx)
+        }
+    }
+
+    let cx = Cx::for_testing();
+    let (initial, vol_bytes) = format_to_fault_device(
+        &cx,
+        16,
+        4096,
+        NtfsFormatVersion::V3_1,
+        0xAC15_0008_0000_0001,
+    );
+    let descriptor = stream_acl_descriptor(FILE_WRITE_EA);
+    let mut engine = open_clean_engine(&cx, &initial, vol_bytes);
+    let root = engine.resolve_path_reference(&cx, "/").unwrap();
+    let (file, _) = engine
+        .create_file_at(&cx, root, &utf16("protected.bin"), b"keep")
+        .into_result()
+        .unwrap();
+    engine
+        .set_security_at(&cx, file, &descriptor, DEFAULT_NTFS_FILETIME)
+        .into_result()
+        .unwrap();
+    drop(engine);
+    let pristine = initial.snapshot_durable_only();
+    for fault_kind in ["I/O", "corruption", "cancellation"] {
+        let dev = FaultInjectingNtfsDevice::new(pristine.clone());
+        let backing = Arc::new(SecurityReadFault {
+            inner: Arc::clone(&dev),
+            descriptor: descriptor.clone(),
+            fault: Mutex::new(None),
+        });
+        let engine = NtfsTransactionEngine::from_device(
+            &cx,
+            Arc::clone(&backing) as Arc<dyn ByteDevice>,
+            0,
+            vol_bytes,
+            write_options_clean(),
+        )
+        .unwrap();
+        let fs = NtfsFs::from_engine_with_policy(&cx, engine, stream_acl_policy(1002)).unwrap();
+        let mut scope = RequestScope::empty();
+        fs.lookup(&cx, &mut scope, InodeNumber(1), OsStr::new("protected.bin"))
+            .unwrap();
+        *backing.fault.lock().unwrap() = Some(match fault_kind {
+            "I/O" => FfsError::Io(std::io::Error::other("security metadata read failed")),
+            "corruption" => FfsError::Corruption {
+                block: 0,
+                detail: "security metadata is corrupt".into(),
+            },
+            "cancellation" => FfsError::Cancelled,
+            _ => unreachable!(),
+        });
+        let writes = dev.write_bytes_total();
+        let result = fs.unlink(&cx, &mut scope, InodeNumber(1), OsStr::new("protected.bin"));
+        assert!(
+            backing.fault.lock().unwrap().is_none(),
+            "must exercise the descriptor fault"
+        );
+        assert!(
+            matches!(
+                (fault_kind, &result),
+                ("I/O", Err(FfsError::Io(_)))
+                    | ("corruption", Err(FfsError::Corruption { .. }))
+                    | ("cancellation", Err(FfsError::Cancelled))
+            ),
+            "{fault_kind} must propagate instead of granting delete via the parent: {result:?}"
+        );
+        assert_eq!(dev.write_bytes_total(), writes);
+        assert_eq!(dev.snapshot_live(), pristine);
+        assert_eq!(dev.snapshot_durable_only(), pristine);
+        assert!(fs.last_durable_token().unwrap().is_none());
+        drop(fs);
+        let engine = open_clean_engine(&cx, &dev, vol_bytes);
+        assert_eq!(read_file_by_path(&cx, &engine, "/protected.bin"), b"keep");
     }
 }
 
