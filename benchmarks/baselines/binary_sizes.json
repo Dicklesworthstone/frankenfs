@@ -1,21 +1,21 @@
 {
   "schema_version": 1,
   "profile": "release",
-  "opt_level": "z",
+  "opt_level": "3",
   "lto": true,
   "strip": true,
-  "recorded_at_commit": "3edbc6d8903148b42e16412e0220161d193f75a4",
-  "rustc": "rustc 1.100.0-nightly (908501772 2026-08-30)",
+  "recorded_at_commit": "f6e5a8fe94f1a8bf6f2c429c90697f0873298b18",
+  "rustc": "rustc 1.102.0-nightly (bdf712ee8 2026-11-21)",
   "max_growth_percent": 10,
-  "note": "bd-tqrnc: ffs-protected-mount now links native writable NtfsTransactionEngine, ZfsTransactionEngine (single-leaf + mirror), ProtectedStorageSet (FFSRQSM3), and two-stage expected-loss repair gate",
+  "note": "f6e5a8fe9 switched [profile.release] opt-level from \"z\" to 3 and upgraded asupersync 0.7.0, ftui 0.11.0, and zstd 0.14.4; recorded from ubuntu-latest Artifact Gates run 45037511630",
   "binaries": {
     "ffs-cli": {
       "package": "ffs-cli",
-      "size_bytes": 13786112
+      "size_bytes": 22083688
     },
     "ffs-protected-mount": {
       "package": "ffs-cli",
-      "size_bytes": 10879360
+      "size_bytes": 16785328
     }
   }
 }

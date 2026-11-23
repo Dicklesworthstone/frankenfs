@@ -146842,7 +146842,11 @@ pub(crate) mod scrub;\n";
             let dst = root_leaf + off as usize;
             image[dst..dst + 239].copy_from_slice(&ri);
         }
-        stamp_btrfs_test_tree_block_crc32c(&mut image, root_leaf);
+        let stamp_leaf_crc32c = |img: &mut [u8], leaf_off: usize| {
+            let csum = ffs_types::crc32c(&img[leaf_off + 0x20..leaf_off + nodesize]);
+            img[leaf_off..leaf_off + 4].copy_from_slice(&csum.to_le_bytes());
+        };
+        stamp_leaf_crc32c(&mut image, root_leaf);
 
         let build_leaf = |img: &mut [u8],
                           leaf_off: usize,
@@ -146910,7 +146914,7 @@ pub(crate) mod scrub;\n";
                 img[leaf_off + data_cursor..leaf_off + data_cursor + payload.len()]
                     .copy_from_slice(&payload);
             }
-            stamp_btrfs_test_tree_block_crc32c(img, leaf_off);
+            stamp_leaf_crc32c(img, leaf_off);
         };
 
         let parent_files: &[(&[u8], u64, &[u8])] = &[
@@ -146937,8 +146941,7 @@ pub(crate) mod scrub;\n";
         image[device_item..device_item + 8].copy_from_slice(&1_u64.to_le_bytes());
         image[device_item + 8..device_item + 16]
             .copy_from_slice(&(image_size as u64).to_le_bytes());
-        let csum = ffs_types::crc32c(&image[sb_off + 0x20..sb_off + 4096]);
-        image[sb_off..sb_off + 4].copy_from_slice(&csum.to_le_bytes());
+        add_btrfs_dev_info_chunk_tree(&mut image);
 
         let cx = Cx::for_testing();
         let fs = OpenFs::from_device(
