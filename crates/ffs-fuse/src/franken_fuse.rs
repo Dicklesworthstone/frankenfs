@@ -4251,6 +4251,22 @@ impl FrankenFuse {
         len: u64,
         flags: u32,
     ) -> Result<u32, MutationDispatchError> {
+        self.dispatch_copy_file_range_with_caller(
+            ino_in, offset_in, ino_out, offset_out, len, flags, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_copy_file_range_with_caller(
+        &self,
+        ino_in: u64,
+        offset_in: i64,
+        ino_out: u64,
+        offset_out: i64,
+        len: u64,
+        flags: u32,
+        caller: Option<(u32, u32, u32)>,
+    ) -> Result<u32, MutationDispatchError> {
         if flags != 0 {
             return Err(MutationDispatchError::Errno(libc::EINVAL));
         }
@@ -4261,13 +4277,58 @@ impl FrankenFuse {
         if len == 0 {
             return Ok(0);
         }
+        let copy_len = len.min(u64::from(u32::MAX));
+        let source_end = src_offset
+            .checked_add(copy_len)
+            .filter(|&end| i64::try_from(end).is_ok())
+            .ok_or(MutationDispatchError::Errno(libc::EINVAL))?;
+        let destination_end = dst_offset
+            .checked_add(copy_len)
+            .filter(|&end| i64::try_from(end).is_ok())
+            .ok_or(MutationDispatchError::Errno(libc::EINVAL))?;
+        if ino_in == ino_out && src_offset < destination_end && dst_offset < source_end {
+            return Err(MutationDispatchError::Operation {
+                error: FfsError::Io(std::io::Error::from_raw_os_error(libc::EINVAL)),
+                offset: Some(dst_offset),
+            });
+        }
         let cx = self.cx_for_request();
         self.enforce_mutation_guards(&cx, RequestOp::Write, ino_out)?;
-        let copy_len = len.min(u64::from(u32::MAX));
         let copied = {
             let _inode_guards =
                 self.acquire_mutation_inode_guards(&[InodeNumber(ino_in), InodeNumber(ino_out)]);
             self.with_request_scope(&cx, RequestOp::Write, |cx, scope| {
+                let mut copy_len = copy_len;
+                if let Some((uid, gid, pid)) = caller {
+                    let source = self.inner.ops.getattr(cx, scope, InodeNumber(ino_in))?;
+                    let destination = self.inner.ops.getattr(cx, scope, InodeNumber(ino_out))?;
+                    for attr in [&source, &destination] {
+                        if attr.kind == FfsFileType::Directory {
+                            return Err(FfsError::IsDirectory);
+                        }
+                        if attr.kind != FfsFileType::RegularFile {
+                            return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                                libc::EINVAL,
+                            )));
+                        }
+                    }
+                    if src_offset >= source.size {
+                        return Ok(0);
+                    }
+                    copy_len = copy_len.min(source.size - src_offset);
+                    // HANDLE_KILLPRIV_V2 suppresses the kernel's mode update
+                    // before COPY. Keep caller-aware clearing and the copy under
+                    // the same inode guards so chmod cannot restore privileges.
+                    // CAP_FSETID exempts set-ID bits, not security.capability.
+                    self.remove_write_privileges_in_scope(
+                        cx,
+                        scope,
+                        ino_out,
+                        &destination,
+                        (uid, gid, pid),
+                        caller_lacks_fsetid(uid, pid),
+                    )?;
+                }
                 let copied = self.inner.ops.copy_file_range(
                     cx,
                     scope,

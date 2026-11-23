@@ -8033,7 +8033,7 @@ impl Filesystem for FrankenFuse {
 
     fn copy_file_range(
         &mut self,
-        _req: &Request<'_>,
+        req: &Request<'_>,
         ino_in: u64,
         _fh_in: u64,
         offset_in: i64,
@@ -8048,7 +8048,15 @@ impl Filesystem for FrankenFuse {
             ino_in,
             offset_in, ino_out, offset_out, len, flags, "FUSE copy_file_range"
         );
-        match self.dispatch_copy_file_range(ino_in, offset_in, ino_out, offset_out, len, flags) {
+        match self.dispatch_copy_file_range_with_caller(
+            ino_in,
+            offset_in,
+            ino_out,
+            offset_out,
+            len,
+            flags,
+            Some((req.uid(), req.gid(), req.pid())),
+        ) {
             Ok(written) => {
                 reply.written(written);
                 self.notify_inode_invalidation(ino_out);
@@ -8801,6 +8809,27 @@ impl FrankenFuse {
             if attr.kind == FfsFileType::Directory {
                 return Ok(());
             }
+            self.remove_write_privileges_in_scope(cx, scope, ino, &attr, caller, true)?;
+            self.inner.ops.commit_request_scope(cx, scope)?;
+            Ok(())
+        })
+    }
+
+    /// Clear privileges while the caller retains the inode mutation guard and scope.
+    #[allow(clippy::too_many_arguments)]
+    fn remove_write_privileges_in_scope(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: u64,
+        attr: &InodeAttr,
+        caller: (u32, u32, u32),
+        clear_setid: bool,
+    ) -> ffs_error::Result<()> {
+        if attr.kind == FfsFileType::Directory {
+            return Ok(());
+        }
+        if clear_setid {
             let (uid, gid, pid) = caller;
             let perm = killpriv_perm(attr.perm, || caller_in_group(uid, gid, pid, attr.gid));
             if perm != attr.perm {
@@ -8812,17 +8841,15 @@ impl FrankenFuse {
                     .ops
                     .setattr(cx, scope, InodeNumber(ino), &attrs)?;
             }
-            match self
-                .inner
-                .ops
-                .removexattr(cx, scope, InodeNumber(ino), "security.capability")
-            {
-                Err(e) if e.to_errno() != libc::ENODATA => return Err(e),
-                _ => {}
-            }
-            self.inner.ops.commit_request_scope(cx, scope)?;
-            Ok(())
-        })
+        }
+        match self
+            .inner
+            .ops
+            .removexattr(cx, scope, InodeNumber(ino), "security.capability")
+        {
+            Err(error) if error.to_errno() != libc::ENODATA => Err(error),
+            _ => Ok(()),
+        }
     }
 
     /// FUSE_SETXATTR_ACL_KILL_SGID: setting an access ACL by a caller outside
@@ -10108,6 +10135,8 @@ mod section22_corpus;
 
 #[cfg(test)]
 mod tests {
+    mod copy_killpriv;
+
     use super::*;
     use ffs_core::{
         DirEntry as FfsDirEntry, FIEMAP_EXTENT_LAST, FIEMAP_EXTENT_UNWRITTEN, RequestScope,
