@@ -481,7 +481,6 @@ impl NtfsFs {
     ) -> Result<InodeAttr> {
         self.ensure_writable()?;
         let parent_rec = self.record(cx, parent)?;
-        self.enforce_dacl(cx, &parent_rec, FILE_ADD_FILE)?;
         let (read_only, mapped_mode) = self.create_mode(mode, false)?;
         if let Some((base, stream)) = self.ads_mutation_component(cx, parent, name)? {
             if read_only {
@@ -492,12 +491,12 @@ impl NtfsFs {
             let base_name = String::from_utf16(&base)
                 .map_err(|_| unsupported("NTFS stream base name is not lossless UTF-8"))?;
             let base_attr = self.lookup_indexed(cx, parent, OsStr::new(&base_name))?;
+            let (target, _) = self.data_target(cx, base_attr.ino)?;
             if mapped_mode.is_some_and(|perm| base_attr.perm & !perm & 0o777 != 0) {
                 return Err(unsupported(
                     "NTFS alternate streams cannot narrow their base FILE's security descriptor",
                 ));
             }
-            let (target, _) = self.data_target(cx, base_attr.ino)?;
             self.check_ads_registration(target, &stream)?;
             self.transact(cx, |engine| engine.create_stream(cx, target, &stream, &[]))?;
             return cx.masked(|| {
@@ -505,6 +504,9 @@ impl NtfsFs {
                 self.describe(cx, ino)
             });
         }
+        // Creating a new FILE requires directory-add authority. An alternate
+        // stream instead uses the existing FILE's data-write authority above.
+        self.enforce_dacl(cx, &parent_rec, FILE_ADD_FILE)?;
         let name = self.component(parent, name)?;
         let parent = self.directory_reference(cx, parent)?;
         let target = if let (

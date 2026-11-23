@@ -1177,12 +1177,23 @@ fn ntfs_mapped_acl_create_open_checks_read_before_publishing_named_stream() {
         )
         .into_result()
         .unwrap();
+    // The caller can write the existing FILE but cannot add a directory child.
+    engine
+        .set_security_at(
+            &cx,
+            root,
+            &stream_acl_descriptor(FILE_ADD_FILE),
+            DEFAULT_NTFS_FILETIME,
+        )
+        .into_result()
+        .unwrap();
     let fs = NtfsFs::from_engine_with_policy(&cx, engine, stream_acl_policy(1002)).unwrap();
     let mut scope = RequestScope::empty();
     let before = dev.snapshot_live();
     let durable_before = dev.snapshot_durable_only();
     let writes = dev.write_bytes_total();
     for (name, flags) in [
+        ("ordinary.bin", libc::O_WRONLY),
         ("write-only.bin:read", libc::O_RDONLY),
         ("write-only.bin:read-write", libc::O_RDWR),
     ] {
@@ -1192,7 +1203,7 @@ fn ntfs_mapped_acl_create_open_checks_read_before_publishing_named_stream() {
                 &mut scope,
                 InodeNumber(1),
                 OsStr::new(name),
-                0o666,
+                0o777,
                 1002,
                 2000,
                 flags | libc::O_CREAT | libc::O_EXCL,
@@ -1215,7 +1226,7 @@ fn ntfs_mapped_acl_create_open_checks_read_before_publishing_named_stream() {
             &mut scope,
             InodeNumber(1),
             OsStr::new("write-only.bin:write"),
-            0o666,
+            0o777,
             1002,
             2000,
             libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
@@ -1262,7 +1273,7 @@ fn ntfs_mapped_acl_create_open_checks_read_before_publishing_named_stream() {
             &mut scope,
             InodeNumber(1),
             OsStr::new("write-only.bin:read-write"),
-            0o666,
+            0o777,
             1001,
             2000,
             libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
