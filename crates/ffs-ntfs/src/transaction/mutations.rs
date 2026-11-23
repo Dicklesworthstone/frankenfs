@@ -1606,7 +1606,7 @@ impl NtfsTransactionEngine {
         Ok(vol.usn_summary(cx)?.is_some())
     }
 
-    fn record_uses_extended_catalog_or_sparse(
+    pub(super) fn record_uses_extended_catalog_or_sparse(
         &self,
         cx: &Cx,
         reference: NtfsReference,
@@ -1617,33 +1617,111 @@ impl NtfsTransactionEngine {
         let volume = self.volume_view(cx)?;
         let record = Self::checked_reference(&volume, cx, reference)?;
         let attrs = record.attributes().map_err(|err| parse_err(&err))?;
+
+        let mut has_valid_attr_list = false;
+        let mut has_extended_feature = false;
+        let mut has_malformed_base_catalog = false;
+        let mut nonresident_data_names = BTreeSet::new();
+        let mut resident_data_names = BTreeSet::new();
+        let mut file_name_count = 0_usize;
+
         for a in &attrs {
-            if matches!(
-                a.kind,
-                ATTRIBUTE_LIST
-                    | OBJECT_ID
-                    | REPARSE_POINT
-                    | EA_INFORMATION
-                    | EA
-                    | LOGGED_UTILITY_STREAM
-            ) {
-                return Ok(true);
-            }
-            if a.kind == DATA && (a.flags & (SPARSE | COMPRESSED | ENCRYPTED)) != 0 {
-                return Ok(true);
-            }
-            if a.kind == 0x10
-                && a.name.is_empty()
-                && let ffs_ondisk::ntfs::NtfsValue::Resident(std_raw) = a.value
-                && std_raw.len() >= 36
-            {
-                let f = u32::from_le_bytes([std_raw[32], std_raw[33], std_raw[34], std_raw[35]]);
-                if f & (FILE_ATTR_COMPRESSED | FILE_ATTR_REPARSE_POINT | FILE_ATTR_ENCRYPTED) != 0 {
-                    return Ok(true);
+            match a.kind {
+                ATTRIBUTE_LIST => {
+                    let valid = match a.value {
+                        ffs_ondisk::ntfs::NtfsValue::Resident(bytes) => {
+                            !bytes.is_empty()
+                                && ffs_ondisk::ntfs::attribute_list::parse_attribute_list(bytes)
+                                    .is_ok_and(|entries| !entries.is_empty())
+                        }
+                        ffs_ondisk::ntfs::NtfsValue::NonResident(nr) => nr.data_bytes > 0,
+                    };
+                    if valid {
+                        has_valid_attr_list = true;
+                        has_extended_feature = true;
+                    } else {
+                        has_malformed_base_catalog = true;
+                    }
                 }
+                OBJECT_ID | EA_INFORMATION | EA => {
+                    has_extended_feature = true;
+                }
+                REPARSE_POINT => {
+                    let admitted_reparse = match a.value {
+                        ffs_ondisk::ntfs::NtfsValue::Resident(bytes) => {
+                            NtfsReparsePoint::parse(bytes).is_ok_and(|rp| rp.tag != 0)
+                        }
+                        ffs_ondisk::ntfs::NtfsValue::NonResident(_) => false,
+                    };
+                    if admitted_reparse {
+                        has_extended_feature = true;
+                    } else {
+                        has_malformed_base_catalog = true;
+                    }
+                }
+                LOGGED_UTILITY_STREAM => {
+                    if a.name == ffs_ondisk::ntfs::efs::EFS_STREAM_NAME {
+                        has_extended_feature = true;
+                    } else {
+                        has_malformed_base_catalog = true;
+                    }
+                }
+                DATA => match a.value {
+                    ffs_ondisk::ntfs::NtfsValue::Resident(_) => {
+                        if a.flags != 0 || !resident_data_names.insert(a.name.clone()) {
+                            has_malformed_base_catalog = true;
+                        }
+                    }
+                    ffs_ondisk::ntfs::NtfsValue::NonResident(nr) => {
+                        let multi_extent = !nonresident_data_names.insert(a.name.clone());
+                        let sparse_run = ffs_ondisk::ntfs::decode_mapping_pairs(
+                            nr.mapping_pairs,
+                            nr.first_vcn,
+                            nr.last_vcn,
+                            self.geometry.cluster_count(),
+                        )
+                        .is_ok_and(|runs| runs.iter().any(|r| r.lcn.is_none()));
+                        if (a.flags & (SPARSE | COMPRESSED | ENCRYPTED)) != 0
+                            || nr.first_vcn != 0
+                            || nr.compression_unit != 0
+                            || multi_extent
+                            || sparse_run
+                        {
+                            has_extended_feature = true;
+                        }
+                    }
+                },
+                0x30 => {
+                    file_name_count += 1;
+                    if let ffs_ondisk::ntfs::NtfsValue::Resident(bytes) = a.value
+                        && NtfsFileName::parse(bytes).is_ok_and(|n| n.namespace == 2)
+                    {
+                        has_malformed_base_catalog = true;
+                    }
+                }
+                0x10 if a.name.is_empty()
+                    && record.is_directory()
+                    && let ffs_ondisk::ntfs::NtfsValue::Resident(std_raw) = a.value
+                    && std_raw.len() >= 36 =>
+                {
+                    let f =
+                        u32::from_le_bytes([std_raw[32], std_raw[33], std_raw[34], std_raw[35]]);
+                    if f & (FILE_ATTR_COMPRESSED | FILE_ATTR_REPARSE_POINT | FILE_ATTR_ENCRYPTED)
+                        != 0
+                    {
+                        has_extended_feature = true;
+                    }
+                }
+                _ => {}
             }
         }
-        Ok(false)
+        if !has_valid_attr_list
+            && (has_malformed_base_catalog
+                || (file_name_count > 0 && file_name_count != usize::from(record.hard_links)))
+        {
+            return Ok(false);
+        }
+        Ok(has_extended_feature)
     }
 
     fn parent_requires_extended_create(&self, cx: &Cx, parent: NtfsReference) -> Result<bool> {
@@ -1872,10 +1950,8 @@ impl NtfsTransactionEngine {
         if !use_extended && let Ok(path) = self.resolve_reference_path(cx, reference) {
             let outcome =
                 self.edit_stream_data(cx, &path, stream, FileDataEdit::Write { offset, data });
-            if !matches!(
-                outcome,
-                NtfsTxOutcome::NotCommitted(FfsError::UnsupportedFeature(_) | FfsError::NoSpace)
-            ) || self.requires_recovery()
+            if !matches!(outcome, NtfsTxOutcome::NotCommitted(FfsError::NoSpace))
+                || self.requires_recovery()
             {
                 return outcome;
             }
@@ -1923,10 +1999,8 @@ impl NtfsTransactionEngine {
         };
         if !use_extended && let Ok(path) = self.resolve_reference_path(cx, reference) {
             let outcome = self.edit_stream_data(cx, &path, stream, FileDataEdit::Truncate { size });
-            if !matches!(
-                outcome,
-                NtfsTxOutcome::NotCommitted(FfsError::UnsupportedFeature(_) | FfsError::NoSpace)
-            ) || self.requires_recovery()
+            if !matches!(outcome, NtfsTxOutcome::NotCommitted(FfsError::NoSpace))
+                || self.requires_recovery()
             {
                 return outcome;
             }
@@ -1976,10 +2050,8 @@ impl NtfsTransactionEngine {
         };
         if !use_extended && let Ok(path) = self.resolve_reference_path(cx, reference) {
             let outcome = self.edit_named_stream(cx, &path, stream, Some(data));
-            if !matches!(
-                outcome,
-                NtfsTxOutcome::NotCommitted(FfsError::UnsupportedFeature(_) | FfsError::NoSpace)
-            ) || self.requires_recovery()
+            if !matches!(outcome, NtfsTxOutcome::NotCommitted(FfsError::NoSpace))
+                || self.requires_recovery()
             {
                 return outcome;
             }
@@ -2010,10 +2082,8 @@ impl NtfsTransactionEngine {
         };
         if !use_extended && let Ok(path) = self.resolve_reference_path(cx, reference) {
             let outcome = self.edit_named_stream(cx, &path, stream, None);
-            if !matches!(
-                outcome,
-                NtfsTxOutcome::NotCommitted(FfsError::UnsupportedFeature(_) | FfsError::NoSpace)
-            ) || self.requires_recovery()
+            if !matches!(outcome, NtfsTxOutcome::NotCommitted(FfsError::NoSpace))
+                || self.requires_recovery()
             {
                 return outcome;
             }

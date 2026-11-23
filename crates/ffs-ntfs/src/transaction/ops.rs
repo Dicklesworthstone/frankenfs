@@ -1849,6 +1849,22 @@ impl NtfsTransactionEngine {
         self.write_file_stream_range(cx, path, &[], offset, data)
     }
 
+    fn path_extended_stream_target(&self, cx: &Cx, path: &str) -> Result<Option<NtfsReference>> {
+        match self.resolve_path_reference(cx, path) {
+            Ok(reference) => {
+                if self.record_uses_extended_catalog_or_sparse(cx, reference)? {
+                    Ok(Some(reference))
+                } else {
+                    Ok(None)
+                }
+            }
+            // Fall through to the plain path planner on NotFound so POSIX
+            // namespace case mismatches surface as Corruption instead of ENOENT.
+            Err(FfsError::NotFound(_)) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
     /// Write an existing DATA stream selected by path and exact UTF-16 name.
     /// Empty selects unnamed DATA. Sparse mappings and extension records use
     /// the same catalog-aware engine as reference-addressed writes; other
@@ -1864,14 +1880,27 @@ impl NtfsTransactionEngine {
         offset: u64,
         data: &[u8],
     ) -> NtfsTxOutcome<NtfsReference> {
+        if let Err(error) = checkpoint(cx) {
+            return NtfsTxOutcome::NotCommitted(error);
+        }
         if let Err(error) = super::validate_ntfs_stream_name_utf16(stream) {
             return NtfsTxOutcome::NotCommitted(error);
         }
-        let reference = match self.resolve_path_reference(cx, path) {
-            Ok(reference) => reference,
-            Err(error) => return NtfsTxOutcome::NotCommitted(error),
-        };
-        self.write_stream_range(cx, reference, stream, offset, data)
+        match self.path_extended_stream_target(cx, path) {
+            Ok(Some(reference)) => self.write_stream_range(cx, reference, stream, offset, data),
+            Ok(None) => {
+                let outcome =
+                    self.edit_stream_data(cx, path, stream, FileDataEdit::Write { offset, data });
+                if matches!(outcome, NtfsTxOutcome::NotCommitted(FfsError::NoSpace))
+                    && !self.requires_recovery()
+                    && let Ok(reference) = self.resolve_path_reference(cx, path)
+                {
+                    return self.write_stream_range(cx, reference, stream, offset, data);
+                }
+                outcome
+            }
+            Err(error) => NtfsTxOutcome::NotCommitted(error),
+        }
     }
 
     /// Set a regular file's unnamed stream length through a native logged
@@ -1903,14 +1932,27 @@ impl NtfsTransactionEngine {
         stream: &[u16],
         size: u64,
     ) -> NtfsTxOutcome<NtfsReference> {
+        if let Err(error) = checkpoint(cx) {
+            return NtfsTxOutcome::NotCommitted(error);
+        }
         if let Err(error) = super::validate_ntfs_stream_name_utf16(stream) {
             return NtfsTxOutcome::NotCommitted(error);
         }
-        let reference = match self.resolve_path_reference(cx, path) {
-            Ok(reference) => reference,
-            Err(error) => return NtfsTxOutcome::NotCommitted(error),
-        };
-        self.truncate_stream(cx, reference, stream, size)
+        match self.path_extended_stream_target(cx, path) {
+            Ok(Some(reference)) => self.truncate_stream(cx, reference, stream, size),
+            Ok(None) => {
+                let outcome =
+                    self.edit_stream_data(cx, path, stream, FileDataEdit::Truncate { size });
+                if matches!(outcome, NtfsTxOutcome::NotCommitted(FfsError::NoSpace))
+                    && !self.requires_recovery()
+                    && let Ok(reference) = self.resolve_path_reference(cx, path)
+                {
+                    return self.truncate_stream(cx, reference, stream, size);
+                }
+                outcome
+            }
+            Err(error) => NtfsTxOutcome::NotCommitted(error),
+        }
     }
 
     /// Create one named DATA stream, spilling into extension records when
@@ -1924,11 +1966,32 @@ impl NtfsTransactionEngine {
         stream: &[u16],
         data: &[u8],
     ) -> NtfsTxOutcome<NtfsReference> {
-        let reference = match self.resolve_path_reference(cx, path) {
-            Ok(reference) => reference,
-            Err(error) => return NtfsTxOutcome::NotCommitted(error),
-        };
-        self.create_stream(cx, reference, stream, data)
+        if let Err(error) = checkpoint(cx) {
+            return NtfsTxOutcome::NotCommitted(error);
+        }
+        if let Err(error) = super::validate_ntfs_stream_name_utf16(stream) {
+            return NtfsTxOutcome::NotCommitted(error);
+        }
+        if stream.is_empty() {
+            return NtfsTxOutcome::NotCommitted(FfsError::RequestRejected {
+                errno: libc::EINVAL,
+                detail: "creating DATA requires a nonempty stream name".into(),
+            });
+        }
+        match self.path_extended_stream_target(cx, path) {
+            Ok(Some(reference)) => self.create_stream(cx, reference, stream, data),
+            Ok(None) => {
+                let outcome = self.edit_named_stream(cx, path, stream, Some(data));
+                if matches!(outcome, NtfsTxOutcome::NotCommitted(FfsError::NoSpace))
+                    && !self.requires_recovery()
+                    && let Ok(reference) = self.resolve_path_reference(cx, path)
+                {
+                    return self.create_stream(cx, reference, stream, data);
+                }
+                outcome
+            }
+            Err(error) => NtfsTxOutcome::NotCommitted(error),
+        }
     }
 
     /// Remove exactly the named DATA attribute and reclaim its admitted native
@@ -1940,11 +2003,32 @@ impl NtfsTransactionEngine {
         path: &str,
         stream: &[u16],
     ) -> NtfsTxOutcome<NtfsReference> {
-        let reference = match self.resolve_path_reference(cx, path) {
-            Ok(reference) => reference,
-            Err(error) => return NtfsTxOutcome::NotCommitted(error),
-        };
-        self.remove_stream(cx, reference, stream)
+        if let Err(error) = checkpoint(cx) {
+            return NtfsTxOutcome::NotCommitted(error);
+        }
+        if let Err(error) = super::validate_ntfs_stream_name_utf16(stream) {
+            return NtfsTxOutcome::NotCommitted(error);
+        }
+        if stream.is_empty() {
+            return NtfsTxOutcome::NotCommitted(FfsError::RequestRejected {
+                errno: libc::EINVAL,
+                detail: "removing DATA requires a nonempty stream name".into(),
+            });
+        }
+        match self.path_extended_stream_target(cx, path) {
+            Ok(Some(reference)) => self.remove_stream(cx, reference, stream),
+            Ok(None) => {
+                let outcome = self.edit_named_stream(cx, path, stream, None);
+                if matches!(outcome, NtfsTxOutcome::NotCommitted(FfsError::NoSpace))
+                    && !self.requires_recovery()
+                    && let Ok(reference) = self.resolve_path_reference(cx, path)
+                {
+                    return self.remove_stream(cx, reference, stream);
+                }
+                outcome
+            }
+            Err(error) => NtfsTxOutcome::NotCommitted(error),
+        }
     }
 
     pub(super) fn edit_named_stream(
