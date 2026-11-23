@@ -3,6 +3,8 @@
 //! fault-cut / write-reordering / torn-sector / crash-during-recovery tests,
 //! `$Bitmap` & `$LogFile` exhaustion checks, and negative admission controls.
 
+#[path = "persistence_prefix/catalog_admission.rs"]
+mod catalog_admission;
 #[path = "persistence_prefix/ea.rs"]
 mod ea;
 #[path = "persistence_prefix/punch.rs"]
@@ -2329,8 +2331,7 @@ fn rename_uses_native_source_spelling_and_sequence_identity() {
     assert!(!tree.contains_key("/docs/"));
 }
 
-#[test]
-fn rename_and_unlink_refuse_coupled_native_aliases_without_mutating_either_name() {
+fn coupled_native_alias_image() -> (Vec<u8>, NtfsReference) {
     fn raw_attributes(record: &NtfsFileRecord) -> Vec<Vec<u8>> {
         let bytes = record.used_bytes();
         let mut offset = usize::from(u16::from_le_bytes([bytes[20], bytes[21]]));
@@ -2420,7 +2421,14 @@ fn rename_and_unlink_refuse_coupled_native_aliases_without_mutating_either_name(
     aliased_image[file_offset..file_offset + RECORD_BYTES].copy_from_slice(&aliased_record);
     let root_offset = CLUSTER_BYTES + 5 * RECORD_BYTES;
     aliased_image[root_offset..root_offset + RECORD_BYTES].copy_from_slice(&aliased_root);
+    (aliased_image, file_ref)
+}
 
+#[test]
+fn rename_and_unlink_refuse_coupled_native_aliases_without_mutating_either_name() {
+    let cx = Cx::for_testing();
+    let (aliased_image, file_ref) = coupled_native_alias_image();
+    let volume_bytes = aliased_image.len() as u64 - SECTOR_BYTES as u64;
     // Admit the complete two-name image through all unchanged native checkers.
     // The negative control must not rely on malformed input to prevent writes.
     let device = FaultInjectingNtfsDevice::new(aliased_image);
@@ -2447,14 +2455,6 @@ fn rename_and_unlink_refuse_coupled_native_aliases_without_mutating_either_name(
             engine.write_file_data(&cx, source, &vec![0xA7; 3 * CLUSTER_BYTES]),
             NtfsTxOutcome::NotCommitted(FfsError::UnsupportedFeature(_))
         ));
-        assert!(matches!(
-            engine.write_file_range(&cx, source, 3, b"replacement"),
-            NtfsTxOutcome::NotCommitted(FfsError::UnsupportedFeature(_))
-        ));
-        assert!(matches!(
-            engine.truncate_file(&cx, source, 4),
-            NtfsTxOutcome::NotCommitted(FfsError::UnsupportedFeature(_))
-        ));
         assert_eq!(device.write_bytes_total(), 0);
         assert_eq!(device.snapshot_live(), before);
         assert_eq!(device.snapshot_durable_only(), before);
@@ -2466,6 +2466,134 @@ fn rename_and_unlink_refuse_coupled_native_aliases_without_mutating_either_name(
         tree.get("/NativeLongName.txt").map(Vec::as_slice),
         Some(b"one file, two names".as_slice())
     );
+}
+
+fn assert_coupled_alias_data(image: &[u8], file_ref: NtfsReference, expected: &[u8]) {
+    let cx = Cx::for_testing();
+    let tree = read_all_files_from_clean_volume(image);
+    for path in ["/NativeLongName.txt", "/NATIVE~1.TXT"] {
+        assert_eq!(tree[path], expected, "reopened payload through {path}");
+    }
+    let volume = NtfsVolume::from_device(
+        &cx,
+        Box::new(ArcDevice(FaultInjectingNtfsDevice::new(image.to_vec()))),
+        0,
+        image.len() as u64 - SECTOR_BYTES as u64,
+    )
+    .unwrap();
+    let record = volume
+        .record(&cx, file_ref.record, Some(file_ref.sequence))
+        .unwrap();
+    assert_eq!(record.hard_links, 2);
+    let stream = volume.data_stream(&cx, &record, &[]).unwrap();
+    let allocated = if stream.resident() {
+        stream.size.next_multiple_of(8)
+    } else {
+        stream.allocated
+    };
+    let attrs = record.attributes().unwrap();
+    let std_info = attrs.iter().find(|attr| attr.kind == 0x10).unwrap();
+    let ffs_ondisk::ntfs::NtfsValue::Resident(std_info) = std_info.value else {
+        panic!("fixture STANDARD_INFORMATION must remain resident");
+    };
+    let mut native_names = BTreeMap::new();
+    for attr in attrs.iter().filter(|attr| attr.kind == 0x30) {
+        let ffs_ondisk::ntfs::NtfsValue::Resident(value) = attr.value else {
+            panic!("FILE_NAME must remain resident");
+        };
+        let name = NtfsFileName::parse(value).unwrap();
+        assert_eq!(
+            name.parent,
+            NtfsReference {
+                record: 5,
+                sequence: 5
+            }
+        );
+        assert_eq!(&value[8..40], &std_info[..32], "duplicated timestamps");
+        assert_eq!(&value[40..48], &allocated.to_le_bytes(), "allocated size");
+        assert_eq!(
+            &value[48..56],
+            &(expected.len() as u64).to_le_bytes(),
+            "data size"
+        );
+        assert_eq!(&value[56..60], &std_info[32..36], "duplicated flags");
+        assert!(
+            native_names
+                .insert((name.namespace, name.name), value.to_vec())
+                .is_none()
+        );
+    }
+    assert_eq!(native_names.len(), 2);
+    assert!(native_names.contains_key(&(1, "NativeLongName.txt".encode_utf16().collect())));
+    assert!(native_names.contains_key(&(2, "NATIVE~1.TXT".encode_utf16().collect())));
+
+    let root = volume.record(&cx, 5, Some(5)).unwrap();
+    let root_attrs = root.attributes().unwrap();
+    let root_index = root_attrs.iter().find(|attr| attr.kind == 0x90).unwrap();
+    let ffs_ondisk::ntfs::NtfsValue::Resident(index) = root_index.value else {
+        panic!("two-name fixture must retain a resident root index");
+    };
+    let mut at = 16 + u32::from_le_bytes(index[16..20].try_into().unwrap()) as usize;
+    let mut indexed_names = BTreeMap::new();
+    while u16::from_le_bytes(index[at + 12..at + 14].try_into().unwrap()) & 2 == 0 {
+        let reference =
+            NtfsReference::decode(u64::from_le_bytes(index[at..at + 8].try_into().unwrap()));
+        let length = usize::from(u16::from_le_bytes(
+            index[at + 8..at + 10].try_into().unwrap(),
+        ));
+        let key_length = usize::from(u16::from_le_bytes(
+            index[at + 10..at + 12].try_into().unwrap(),
+        ));
+        if reference == file_ref {
+            let value = &index[at + 16..at + 16 + key_length];
+            let name = NtfsFileName::parse(value).unwrap();
+            assert!(
+                indexed_names
+                    .insert((name.namespace, name.name), value.to_vec())
+                    .is_none()
+            );
+        }
+        assert!(length >= 16);
+        at += length;
+    }
+    assert_eq!(
+        indexed_names, native_names,
+        "every alias index key must match its complete FILE_NAME metadata"
+    );
+}
+
+#[test]
+fn ranged_writes_and_truncates_preserve_coupled_native_alias_metadata() {
+    let cx = Cx::for_testing();
+    let (image, file_ref) = coupled_native_alias_image();
+    let volume_bytes = image.len() as u64 - SECTOR_BYTES as u64;
+    let device = FaultInjectingNtfsDevice::new(image);
+    let mut engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        volume_bytes,
+        write_options_clean(),
+    )
+    .unwrap();
+    let mut expected = b"one file, two names".to_vec();
+    for source in ["/NativeLongName.txt", "/NATIVE~1.TXT"] {
+        let offset = CLUSTER_BYTES + 3;
+        let payload = b"range through alias";
+        let (written, _) = engine
+            .write_file_range(&cx, source, offset as u64, payload)
+            .into_result()
+            .unwrap();
+        assert_eq!(written, file_ref);
+        expected.resize(offset + payload.len(), 0);
+        expected[offset..].copy_from_slice(payload);
+        assert_coupled_alias_data(&device.snapshot_durable_only(), file_ref, &expected);
+
+        let (truncated, _) = engine.truncate_file(&cx, source, 4).into_result().unwrap();
+        assert_eq!(truncated, file_ref);
+        expected.truncate(4);
+        assert_coupled_alias_data(&device.snapshot_durable_only(), file_ref, &expected);
+    }
 }
 
 #[test]
@@ -4574,26 +4702,69 @@ fn plain_data_writes_refuse_unsupported_target_metadata_without_mutation() {
         let writes = device.write_bytes_total();
         let events = engine.persistence_trace().len();
 
-        for outcome in [
-            engine.write_file_data(&cx, "/plain.bin", b"replacement"),
-            engine.write_file_range(&cx, "/plain.bin", 2, b"range"),
-            engine.truncate_file(&cx, "/plain.bin", 4),
-            engine.write_file_range(&cx, "/plain.bin", u64::MAX, b""),
-            engine.truncate_file(&cx, "/plain.bin", b"original bytes".len() as u64),
-            engine.write_file_stream_range(&cx, "/plain.bin", &[120], 0, b"named"),
-            engine.truncate_file_stream(&cx, "/plain.bin", &[120], 0),
-            engine.unlink_file(&cx, "/plain.bin"),
+        for operation in [
+            "replace",
+            "range",
+            "truncate",
+            "empty range",
+            "same size",
+            "named range",
+            "named truncate",
+            "unlink",
         ] {
-            assert!(
-                matches!(
-                    outcome,
-                    NtfsTxOutcome::NotCommitted(FfsError::UnsupportedFeature(_))
-                ),
-                "unsupported target {shape:?} must refuse before mutation: {outcome:?}"
+            let outcome = match operation {
+                "replace" => engine.write_file_data(&cx, "/plain.bin", b"replacement"),
+                "range" => engine.write_file_range(&cx, "/plain.bin", 2, b"range"),
+                "truncate" => engine.truncate_file(&cx, "/plain.bin", 4),
+                "empty range" => engine.write_file_range(&cx, "/plain.bin", u64::MAX, b""),
+                "same size" => {
+                    engine.truncate_file(&cx, "/plain.bin", b"original bytes".len() as u64)
+                }
+                "named range" => {
+                    engine.write_file_stream_range(&cx, "/plain.bin", &[120], 0, b"named")
+                }
+                "named truncate" => engine.truncate_file_stream(&cx, "/plain.bin", &[120], 0),
+                "unlink" => engine.unlink_file(&cx, "/plain.bin"),
+                _ => unreachable!(),
+            };
+            let transformed_resident = matches!(
+                shape,
+                Shape::DataFlags(
+                    ffs_ondisk::ntfs::COMPRESSED
+                        | ffs_ondisk::ntfs::ENCRYPTED
+                        | ffs_ondisk::ntfs::SPARSE
+                ) | Shape::TransformedNamedStream
             );
-            assert_eq!(device.write_bytes_total(), writes, "{shape:?}");
-            assert_eq!(device.snapshot_live(), before, "{shape:?}");
-            assert_eq!(engine.persistence_trace().len(), events, "{shape:?}");
+            if transformed_resident && !matches!(operation, "replace" | "unlink") {
+                assert!(
+                    matches!(
+                        &outcome,
+                        NtfsTxOutcome::NotCommitted(FfsError::Corruption { detail, .. })
+                            if detail == "transformed resident DATA attribute"
+                    ),
+                    "{operation} must reject structurally invalid resident DATA for {shape:?}: {outcome:?}"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        outcome,
+                        NtfsTxOutcome::NotCommitted(FfsError::UnsupportedFeature(_))
+                    ),
+                    "{operation} must refuse unsupported target {shape:?} before mutation: {outcome:?}"
+                );
+            }
+            assert_eq!(device.write_bytes_total(), writes, "{shape:?}: {operation}");
+            assert_eq!(device.snapshot_live(), before, "{shape:?}: {operation}");
+            assert_eq!(
+                device.snapshot_durable_only(),
+                before,
+                "{shape:?}: {operation}"
+            );
+            assert_eq!(
+                engine.persistence_trace().len(),
+                events,
+                "{shape:?}: {operation}"
+            );
         }
     }
 }
@@ -4853,22 +5024,37 @@ fn plain_data_writes_require_exact_posix_namespace_spelling() {
     let before = device.snapshot_live();
     let writes = device.write_bytes_total();
     let trace_len = engine.persistence_trace().len();
-    for outcome in [
-        engine.write_file_data(&cx, "/mixedcase.bin", b"wrong name"),
-        engine.write_file_range(&cx, "/mixedcase.bin", 0, b"wrong name"),
-        engine.truncate_file(&cx, "/mixedcase.bin", 0),
-        engine.write_file_range(&cx, "/mixedcase.bin", 0, b""),
-        engine.truncate_file(&cx, "/mixedcase.bin", initial.len() as u64),
-    ] {
-        assert!(
-            matches!(
-                outcome,
-                NtfsTxOutcome::NotCommitted(FfsError::Corruption { .. })
-            ),
-            "case-folded lookup must not select a POSIX native name: {outcome:?}"
-        );
+    for operation in ["replace", "range", "truncate", "empty range", "same size"] {
+        let outcome = match operation {
+            "replace" => engine.write_file_data(&cx, "/mixedcase.bin", b"wrong name"),
+            "range" => engine.write_file_range(&cx, "/mixedcase.bin", 0, b"wrong name"),
+            "truncate" => engine.truncate_file(&cx, "/mixedcase.bin", 0),
+            "empty range" => engine.write_file_range(&cx, "/mixedcase.bin", 0, b""),
+            "same size" => engine.truncate_file(&cx, "/mixedcase.bin", initial.len() as u64),
+            _ => unreachable!(),
+        };
+        if operation == "replace" {
+            assert!(
+                matches!(
+                    &outcome,
+                    NtfsTxOutcome::NotCommitted(FfsError::Corruption { detail, .. })
+                        if detail == "NTFS FILE_NAME disagrees with its parent index"
+                ),
+                "legacy replacement must reject a mismatched POSIX name: {outcome:?}"
+            );
+        } else {
+            assert!(
+                matches!(
+                    &outcome,
+                    NtfsTxOutcome::NotCommitted(FfsError::NotFound(detail))
+                        if detail == "NTFS directory entry"
+                ),
+                "{operation} must not resolve a case-folded POSIX name: {outcome:?}"
+            );
+        }
         assert_eq!(device.write_bytes_total(), writes);
         assert_eq!(device.snapshot_live(), before);
+        assert_eq!(device.snapshot_durable_only(), before);
         assert_eq!(engine.persistence_trace().len(), trace_len);
     }
     engine
