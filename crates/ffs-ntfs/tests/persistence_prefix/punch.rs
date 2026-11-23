@@ -875,10 +875,15 @@ fn hole_punch_records_unnamed_and_named_changes_without_noop_events() {
     );
 
     let mut dense = vec![0xBD; 3 * CLUSTER_BYTES];
+    // The ADS is now sparse, so replacing unnamed DATA needs the complete
+    // catalog path even though the unnamed stream itself is still resident.
     engine
-        .write_file_data(&cx, "/punch.bin", &dense)
+        .write_file_data_extended(&cx, "/punch.bin", &dense)
         .into_result()
         .unwrap();
+    assert_stream(&engine, file, &[], &dense, 3 * cb, 3 * cb);
+    assert_stream(&engine, file, &name, &named, 2 * cb, 3 * cb);
+    assert_eq!(standard_flags(&view(&engine, file).1) & 0x200, 0);
     let before_dense = journal_records(&engine.volume_view(&cx).unwrap());
     engine
         .punch_hole_at(&cx, file, &[], cb, cb, DEFAULT_FILETIME + 3)
@@ -915,6 +920,7 @@ fn hole_punch_records_unnamed_and_named_changes_without_noop_events() {
     assert_stream(&engine, file, &[], &dense, 2 * cb, 3 * cb);
     assert_eq!(standard_usn(&view(&engine, file).1), usn_before_noop);
     assert_eq!(journal_records(&engine.volume_view(&cx).unwrap()), after);
+    assert_stream(&engine, file, &name, &named, 2 * cb, 3 * cb);
     engine.check_clean_consistency(&cx).unwrap();
 }
 

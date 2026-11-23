@@ -308,6 +308,29 @@ fn compound_setattr_request(size: u64) -> ffs_ntfs::NtfsSetAttributes {
     }
 }
 
+fn assert_one_compound_transaction(
+    events: impl IntoIterator<Item = (NtfsPersistenceStage, u32)>,
+    token: &ffs_ntfs::transaction::NtfsDurableToken,
+) {
+    assert_ne!(token.transaction_id(), 0);
+    let mut commit_barriers = 0;
+    for (stage, transaction_id) in events {
+        if stage == NtfsPersistenceStage::LogCommitBarrier {
+            commit_barriers += 1;
+            assert_eq!(
+                transaction_id,
+                token.transaction_id(),
+                "one public request must commit only its final native transaction"
+            );
+        }
+    }
+    // Commit and Forget may occupy separate log pages and need two barriers.
+    assert!(
+        commit_barriers > 0,
+        "the native commit must cross a durable barrier"
+    );
+}
+
 #[test]
 fn compound_setattr_commits_size_times_flags_and_both_security_stores_once() {
     for shared_security in [false, true] {
@@ -327,27 +350,21 @@ fn compound_setattr_commits_size_times_flags_and_both_security_stores_once() {
         let stages = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&stages);
         engine.set_stage_hook(Some(Box::new(move |event| {
-            captured.lock().unwrap().push(event.stage);
+            captured
+                .lock()
+                .unwrap()
+                .push((event.stage, event.transaction_id));
             Ok(())
         })));
         let size = (3 * CLUSTER_BYTES + 19) as u64;
         let request = compound_setattr_request(size);
-        let (_, token) = engine
+        let ((), token) = engine
             .set_attributes_at(&cx, file, &request, DEFAULT_FILETIME + 333)
             .into_result()
             .unwrap();
         engine.set_stage_hook(None);
         assert!(token.matches_engine(&engine));
-        assert_eq!(
-            stages
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|stage| **stage == NtfsPersistenceStage::LogCommitBarrier)
-                .count(),
-            1,
-            "one public request must have one native commit"
-        );
+        assert_one_compound_transaction(stages.lock().unwrap().iter().copied(), &token);
         let after = compound_attribute_state(&cx, &engine);
         let mut expected = original.payload;
         expected.resize(size as usize, 0);
@@ -438,7 +455,10 @@ fn compound_setattr_fsops_finishes_every_field_after_durable_cancellation() {
         let stages = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&stages);
         engine.set_stage_hook(Some(Box::new(move |event| {
-            captured.lock().unwrap().push(event.stage);
+            captured
+                .lock()
+                .unwrap()
+                .push((event.stage, event.transaction_id));
             if event.stage == stage {
                 cancellation.set_cancel_requested(true);
             }
@@ -470,15 +490,11 @@ fn compound_setattr_fsops_finishes_every_field_after_durable_cancellation() {
         assert_eq!(after.perm, 0o644);
         assert_eq!(after.atime, atime);
         assert_eq!(after.mtime, mtime);
-        assert_eq!(
-            stages
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|seen| **seen == NtfsPersistenceStage::LogCommitBarrier)
-                .count(),
-            1
-        );
+        let token = fs
+            .last_durable_token()
+            .unwrap()
+            .expect("committed setattr token");
+        assert_one_compound_transaction(stages.lock().unwrap().iter().copied(), &token);
         let next = Cx::for_testing();
         let visible = fs.getattr(&next, &mut scope, file.ino).unwrap();
         assert_eq!(visible.size, after.size);
@@ -494,6 +510,7 @@ fn compound_setattr_fsops_finishes_every_field_after_durable_cancellation() {
 fn compound_setattr_all_persistence_cuts_recover_one_complete_request() {
     struct Cut {
         stage: NtfsPersistenceStage,
+        transaction_id: u32,
         committed: bool,
         durable: Vec<u8>,
         live: Vec<u8>,
@@ -511,6 +528,7 @@ fn compound_setattr_all_persistence_cuts_recover_one_complete_request() {
         committed |= event.stage == NtfsPersistenceStage::LogCommitBarrier;
         captured.lock().unwrap().push(Cut {
             stage: event.stage,
+            transaction_id: event.transaction_id,
             committed,
             durable: storage.snapshot_durable_only(),
             live: storage.snapshot_live(),
@@ -518,7 +536,7 @@ fn compound_setattr_all_persistence_cuts_recover_one_complete_request() {
         });
         Ok(())
     })));
-    engine
+    let ((), token) = engine
         .set_attributes_at(
             &cx,
             file,
@@ -536,11 +554,9 @@ fn compound_setattr_all_persistence_cuts_recover_one_complete_request() {
     assert_ne!(after.security, before.security);
     let cuts = std::mem::take(&mut *cuts.lock().unwrap());
     assert!(cuts.iter().any(|cut| !cut.committed));
-    assert_eq!(
-        cuts.iter()
-            .filter(|cut| cut.stage == NtfsPersistenceStage::LogCommitBarrier)
-            .count(),
-        1
+    assert_one_compound_transaction(
+        cuts.iter().map(|cut| (cut.stage, cut.transaction_id)),
+        &token,
     );
     for cut in cuts {
         let durable = recover_compound_attribute_state(cut.durable);
@@ -4629,15 +4645,6 @@ fn plain_data_writes_refuse_unsupported_target_metadata_without_mutation() {
         Shape::TransformedNamedStream,
         Shape::DosOnlyName,
     ] {
-        let device = FaultInjectingNtfsDevice::new(clean.clone());
-        let mut engine = NtfsTransactionEngine::from_device(
-            &cx,
-            Arc::clone(&device) as Arc<dyn ByteDevice>,
-            0,
-            volume_bytes,
-            write_options_clean(),
-        )
-        .unwrap();
         let mut attributes = base_attributes.clone();
         let mut links = 1;
         let attr_kind = |attr: &&mut Vec<u8>| u32::from_le_bytes(attr[0..4].try_into().unwrap());
@@ -4690,18 +4697,8 @@ fn plain_data_writes_refuse_unsupported_target_metadata_without_mutation() {
                 name[value + 65] = 2;
             }
         }
-        // Change the targeted FILE after clean admission to exercise the
-        // per-operation guard, independently of the volume admission checks.
         let changed =
             build_file_record(file.record as u32, file.sequence, links, false, &attributes);
-        device
-            .write_all_at(&cx, ByteOffset(offset as u64), &changed)
-            .unwrap();
-        device.sync(&cx).unwrap();
-        let before = device.snapshot_live();
-        let writes = device.write_bytes_total();
-        let events = engine.persistence_trace().len();
-
         for operation in [
             "replace",
             "range",
@@ -4712,6 +4709,26 @@ fn plain_data_writes_refuse_unsupported_target_metadata_without_mutation() {
             "named truncate",
             "unlink",
         ] {
+            // Each operation gets an independent image, including the positive
+            // controls for supported resident streams with file-level markers.
+            let device = FaultInjectingNtfsDevice::new(clean.clone());
+            let mut engine = NtfsTransactionEngine::from_device(
+                &cx,
+                Arc::clone(&device) as Arc<dyn ByteDevice>,
+                0,
+                volume_bytes,
+                write_options_clean(),
+            )
+            .unwrap();
+            // Change the targeted FILE after clean admission to exercise the
+            // per-operation guard, independently of volume admission checks.
+            device
+                .write_all_at(&cx, ByteOffset(offset as u64), &changed)
+                .unwrap();
+            device.sync(&cx).unwrap();
+            let before = device.snapshot_live();
+            let writes = device.write_bytes_total();
+            let events = engine.persistence_trace().len();
             let outcome = match operation {
                 "replace" => engine.write_file_data(&cx, "/plain.bin", b"replacement"),
                 "range" => engine.write_file_range(&cx, "/plain.bin", 2, b"range"),
@@ -4727,22 +4744,102 @@ fn plain_data_writes_refuse_unsupported_target_metadata_without_mutation() {
                 "unlink" => engine.unlink_file(&cx, "/plain.bin"),
                 _ => unreachable!(),
             };
-            let transformed_resident = matches!(
-                shape,
-                Shape::DataFlags(
-                    ffs_ondisk::ntfs::COMPRESSED
-                        | ffs_ondisk::ntfs::ENCRYPTED
-                        | ffs_ondisk::ntfs::SPARSE
-                ) | Shape::TransformedNamedStream
-            );
-            if transformed_resident && !matches!(operation, "replace" | "unlink") {
+            // File-level sparse/compression markers describe policy or history;
+            // they do not make a plain resident DATA payload transformed. Keep
+            // these bounded operations resident and verify every retained bit.
+            if let Shape::StandardFlags(flags @ (0x0200 | 0x0800)) = shape
+                && matches!(
+                    operation,
+                    "range" | "truncate" | "empty range" | "same size"
+                )
+            {
+                let (identity, token) = outcome.into_result().unwrap_or_else(|error| {
+                    panic!(
+                        "{operation} must preserve supported resident marker {flags:#x}: {error}"
+                    )
+                });
+                assert_eq!(identity, file);
+                assert!(token.matches_engine(&engine));
+                let mut expected = b"original bytes".to_vec();
+                match operation {
+                    "range" => expected[2..7].copy_from_slice(b"range"),
+                    "truncate" => expected.truncate(4),
+                    "empty range" | "same size" => {}
+                    _ => unreachable!(),
+                }
+                let volume = engine.volume_view(&cx).unwrap();
+                let record = volume
+                    .record(&cx, file.record, Some(file.sequence))
+                    .unwrap();
+                assert_eq!(record.hard_links, 1);
+                let stream = volume.data_stream(&cx, &record, &[]).unwrap();
+                assert!(stream.resident());
+                assert_eq!(stream.size, expected.len() as u64);
+                assert_eq!(stream.initialized, expected.len() as u64);
+                assert_eq!(
+                    volume.read(&cx, &stream, 0, expected.len()).unwrap(),
+                    expected
+                );
+                let attrs = record.attributes().unwrap();
+                let info = attrs
+                    .iter()
+                    .find(|attribute| attribute.kind == 0x10)
+                    .unwrap();
+                let ffs_ondisk::ntfs::NtfsValue::Resident(info) = &info.value else {
+                    panic!("STANDARD_INFORMATION must remain resident");
+                };
+                assert_eq!(u32::from_le_bytes(info[32..36].try_into().unwrap()), flags);
+                let security = base_attributes
+                    .iter()
+                    .find(|attribute| {
+                        u32::from_le_bytes(attribute[0..4].try_into().unwrap()) == 0x50
+                    })
+                    .unwrap();
+                let after = device.snapshot_live();
+                assert!(
+                    copied_test_record_attributes(&after[offset..offset + RECORD_BYTES])
+                        .contains(security)
+                );
+                assert_eq!(device.snapshot_durable_only(), after);
+                engine.check_clean_consistency(&cx).unwrap();
+                continue;
+            }
+            let corruption_detail = if matches!(operation, "replace" | "unlink") {
+                None
+            } else {
+                match shape {
+                    Shape::DataFlags(ffs_ondisk::ntfs::ENCRYPTED | ffs_ondisk::ntfs::SPARSE)
+                    | Shape::TransformedNamedStream => Some("transformed resident DATA attribute"),
+                    Shape::DuplicateData => Some("mixed resident/nonresident DATA extents"),
+                    Shape::UnsupportedAttribute(ffs_ondisk::ntfs::ATTRIBUTE_LIST) => {
+                        Some("invalid field: ntfs.attribute_list (invalid type or entry boundary)")
+                    }
+                    Shape::UnsupportedAttribute(ffs_ondisk::ntfs::REPARSE_POINT) => {
+                        Some("invalid field: ntfs.reparse (reserved reparse tag)")
+                    }
+                    Shape::DosOnlyName => Some("directory index does not match target FILE_NAME"),
+                    _ => None,
+                }
+            };
+            if let Some(expected_detail) = corruption_detail {
                 assert!(
                     matches!(
                         &outcome,
                         NtfsTxOutcome::NotCommitted(FfsError::Corruption { detail, .. })
-                            if detail == "transformed resident DATA attribute"
+                            if detail == expected_detail
                     ),
-                    "{operation} must reject structurally invalid resident DATA for {shape:?}: {outcome:?}"
+                    "{operation} must reject malformed native metadata for {shape:?}: {outcome:?}"
+                );
+            } else if matches!(shape, Shape::StandardFlags(0x0200 | 0x0800 | 0x4000))
+                && matches!(operation, "named range" | "named truncate")
+            {
+                assert!(
+                    matches!(
+                        &outcome,
+                        NtfsTxOutcome::NotCommitted(FfsError::NotFound(detail))
+                            if detail == "NTFS data stream not found"
+                    ),
+                    "{operation} must not create a missing stream for {shape:?}: {outcome:?}"
                 );
             } else {
                 assert!(

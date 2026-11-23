@@ -1,9 +1,15 @@
 //! Mutation admission must validate native FILE_NAME metadata before staging
 //! either payload or journal writes, including names in extension records.
 
-use super::*;
+use super::{
+    Arc, ByteDevice, ByteOffset, CLUSTER_BYTES, Cx, DEFAULT_FILETIME, FaultInjectingNtfsDevice,
+    FfsError, NtfsFileRecord, NtfsReference, NtfsTransactionEngine, NtfsTxOutcome, RECORD_BYTES,
+    SECTOR_BYTES, assert_native_hard_links, build_clean_ntfs_image, build_file_record,
+    build_nonresident_attr, build_resident_attr, copied_test_record_attributes,
+    write_options_clean,
+};
 use ffs_ondisk::ntfs::attribute_list::{NtfsAttributeListEntry, encode_attribute_list};
-use ffs_ondisk::ntfs::{ATTRIBUTE_LIST, SPARSE};
+use ffs_ondisk::ntfs::{ATTRIBUTE_LIST, REPARSE_POINT, SPARSE};
 
 fn attribute_list_entry(attribute: &[u8], reference: NtfsReference) -> NtfsAttributeListEntry {
     let name_at = usize::from(u16::from_le_bytes(attribute[10..12].try_into().unwrap()));
@@ -229,6 +235,203 @@ fn catalog_rejects_malformed_file_names_in_base_and_extension_before_any_write()
                 assert_eq!(engine.persistence_trace().len(), events);
             }
         }
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn catalog_rejects_orphan_reparse_marker_before_any_direct_mutation() {
+    use ffs_ondisk::ntfs::reparse::{NtfsReparseData, NtfsReparsePoint};
+
+    fn assert_refused<T: std::fmt::Debug>(operation: &str, outcome: &NtfsTxOutcome<T>) {
+        assert!(
+            matches!(
+                outcome,
+                NtfsTxOutcome::NotCommitted(FfsError::UnsupportedFeature(detail))
+                    if detail == "NTFS reparse FILE attribute has no REPARSE_POINT metadata"
+            ),
+            "{operation} must refuse the orphan reparse marker before publication: {outcome:?}"
+        );
+    }
+
+    let cx = Cx::for_testing();
+    let image = build_clean_ntfs_image(256, 64, 0xCA7A_1000_0000_0004);
+    let length = image.len() as u64 - SECTOR_BYTES as u64;
+    let seed = FaultInjectingNtfsDevice::new(image);
+    let mut engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&seed) as Arc<dyn ByteDevice>,
+        0,
+        length,
+        write_options_clean(),
+    )
+    .unwrap();
+    let payload = vec![0x51; 2 * CLUSTER_BYTES + 17];
+    let (reference, _) = engine
+        .create_file(&cx, "/", "provider", &payload)
+        .into_result()
+        .unwrap();
+    let point = NtfsReparsePoint {
+        tag: 0x9000_101A,
+        guid: None,
+        data: NtfsReparseData::Opaque(vec![0xFE, 0xCA, 0x01, 0x02]),
+    };
+    engine
+        .set_reparse_point_at(&cx, reference, &point, true, DEFAULT_FILETIME)
+        .into_result()
+        .unwrap();
+    let kept: Vec<_> = "kept".encode_utf16().collect();
+    // A present opaque provider remains admissible for named-stream creation
+    // and ordinary metadata updates; this guard must not reject all reparses.
+    engine
+        .create_stream_at(&cx, reference, &kept, b"kept ADS", DEFAULT_FILETIME)
+        .into_result()
+        .unwrap();
+    engine
+        .set_attributes_at(
+            &cx,
+            reference,
+            &ffs_ntfs::NtfsSetAttributes {
+                mtime_ticks: Some(DEFAULT_FILETIME + 9),
+                ..ffs_ntfs::NtfsSetAttributes::default()
+            },
+            DEFAULT_FILETIME + 10,
+        )
+        .into_result()
+        .unwrap();
+    engine.check_clean_consistency(&cx).unwrap();
+
+    let clean = seed.snapshot_durable_only();
+    let device = FaultInjectingNtfsDevice::new(clean.clone());
+    let mut engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        length,
+        write_options_clean(),
+    )
+    .unwrap();
+    let offset = CLUSTER_BYTES + usize::try_from(reference.record).unwrap() * RECORD_BYTES;
+    let mut attributes = copied_test_record_attributes(&clean[offset..offset + RECORD_BYTES]);
+    let position = attributes
+        .iter()
+        .position(|attribute| attribute[..4] == REPARSE_POINT.to_le_bytes())
+        .unwrap();
+    let reparse = attributes.remove(position);
+    let value_at = usize::from(u16::from_le_bytes(reparse[20..22].try_into().unwrap()));
+    let value_len = u32::from_le_bytes(reparse[16..20].try_into().unwrap()) as usize;
+    assert_eq!(
+        reparse[value_at..value_at + value_len],
+        point.encode().unwrap()
+    );
+    // Remove only the provider metadata after clean admission. The FILE's
+    // reparse marker and every native name/index identity remain unchanged.
+    let changed = build_file_record(
+        reference.record as u32,
+        reference.sequence,
+        1,
+        false,
+        &attributes,
+    );
+    device
+        .write_all_at(&cx, ByteOffset(offset as u64), &changed)
+        .unwrap();
+    device.sync(&cx).unwrap();
+    let before = device.snapshot_durable_only();
+    let writes = device.write_bytes_total();
+    let events = engine.persistence_trace().len();
+    let new_stream: Vec<_> = "blocked".encode_utf16().collect();
+    for operation in [
+        "write",
+        "empty-write",
+        "truncate",
+        "same-size-truncate",
+        "named-write",
+        "named-truncate",
+        "create-ads",
+        "punch-hole",
+        "named-punch-hole",
+        "compound-setattr",
+    ] {
+        match operation {
+            "write" => assert_refused(
+                operation,
+                &engine.write_stream_at(&cx, reference, &[], 1, b"new", false, DEFAULT_FILETIME),
+            ),
+            "empty-write" => assert_refused(
+                operation,
+                &engine.write_stream_at(
+                    &cx,
+                    reference,
+                    &[],
+                    u64::MAX,
+                    b"",
+                    false,
+                    DEFAULT_FILETIME,
+                ),
+            ),
+            "truncate" => assert_refused(
+                operation,
+                &engine.truncate_stream_at(&cx, reference, &[], 4, DEFAULT_FILETIME),
+            ),
+            "same-size-truncate" => assert_refused(
+                operation,
+                &engine.truncate_stream_at(
+                    &cx,
+                    reference,
+                    &[],
+                    payload.len() as u64,
+                    DEFAULT_FILETIME,
+                ),
+            ),
+            "named-write" => assert_refused(
+                operation,
+                &engine.write_stream_at(&cx, reference, &kept, 0, b"new", false, DEFAULT_FILETIME),
+            ),
+            "named-truncate" => assert_refused(
+                operation,
+                &engine.truncate_stream_at(&cx, reference, &kept, 1, DEFAULT_FILETIME),
+            ),
+            "create-ads" => assert_refused(
+                operation,
+                &engine.create_stream_at(&cx, reference, &new_stream, b"new ADS", DEFAULT_FILETIME),
+            ),
+            "punch-hole" => assert_refused(
+                operation,
+                &engine.punch_hole_at(
+                    &cx,
+                    reference,
+                    &[],
+                    1,
+                    CLUSTER_BYTES as u64,
+                    DEFAULT_FILETIME,
+                ),
+            ),
+            "named-punch-hole" => assert_refused(
+                operation,
+                &engine.punch_hole_at(&cx, reference, &kept, 1, 2, DEFAULT_FILETIME),
+            ),
+            "compound-setattr" => assert_refused(
+                operation,
+                &engine.set_attributes_at(
+                    &cx,
+                    reference,
+                    &ffs_ntfs::NtfsSetAttributes {
+                        size: Some(1),
+                        read_only: Some(true),
+                        mtime_ticks: Some(DEFAULT_FILETIME + 17),
+                        ..ffs_ntfs::NtfsSetAttributes::default()
+                    },
+                    DEFAULT_FILETIME + 18,
+                ),
+            ),
+            _ => unreachable!(),
+        }
+        assert_eq!(device.write_bytes_total(), writes, "{operation}");
+        assert_eq!(device.snapshot_live(), before, "{operation}");
+        assert_eq!(device.snapshot_durable_only(), before, "{operation}");
+        assert_eq!(engine.persistence_trace().len(), events, "{operation}");
+        assert!(!engine.requires_recovery(), "{operation}");
     }
 }
 
