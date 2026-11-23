@@ -7,6 +7,496 @@ use ffs_types::InodeNumber;
 use std::ffi::OsStr;
 use std::fs;
 
+#[test]
+fn bounded_tracker_refuses_counter_overflow_without_wrapping() {
+    let tracker = Arc::new(ResourceTracker::new(ResourceBudget::default()));
+    tracker.operations.store(u64::MAX, Ordering::SeqCst);
+    assert!(tracker.charge_operation().is_err());
+    assert_eq!(tracker.snapshot().operations, u64::MAX);
+    tracker.operations.store(0, Ordering::SeqCst);
+
+    tracker.charge_physical_io(u64::MAX).unwrap();
+    assert!(tracker.charge_physical_io(1).is_err());
+    assert_eq!(tracker.snapshot().physical_io_bytes, u64::MAX);
+    tracker.charge_decoded_bytes(u64::MAX).unwrap();
+    assert!(tracker.charge_decoded_bytes(1).is_err());
+    assert_eq!(tracker.snapshot().decoded_bytes, u64::MAX);
+
+    let retained = tracker.acquire_retained_bytes(u64::MAX).unwrap();
+    assert!(tracker.acquire_retained_bytes(1).is_err());
+    assert_eq!(tracker.snapshot().retained_bytes, u64::MAX);
+    drop(retained);
+    assert_eq!(tracker.snapshot().retained_bytes, 0);
+
+    tracker
+        .current_reference_depth
+        .store(u32::MAX, Ordering::SeqCst);
+    assert!(tracker.enter_reference_depth().is_err());
+    assert_eq!(tracker.snapshot().current_reference_depth, u32::MAX);
+    tracker.retry_attempts.store(u32::MAX, Ordering::SeqCst);
+    assert!(tracker.charge_retry_attempt().is_err());
+    assert_eq!(tracker.snapshot().retry_attempts, u32::MAX);
+}
+
+#[test]
+fn bounded_tracker_shared_admission_never_exceeds_the_cap() {
+    let tracker = Arc::new(ResourceTracker::new(ResourceBudget {
+        max_decoded_bytes: Some(1024),
+        max_retained_bytes: Some(32),
+        ..ResourceBudget::default()
+    }));
+    let successes = AtomicU64::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            scope.spawn(|| {
+                for _ in 0..512 {
+                    if tracker.charge_decoded_bytes(1).is_ok() {
+                        successes.fetch_add(1, Ordering::SeqCst);
+                    }
+                    if let Ok(guard) = tracker.acquire_retained_bytes(8) {
+                        assert!(tracker.snapshot().retained_bytes <= 32);
+                        std::thread::yield_now();
+                        drop(guard);
+                    }
+                }
+            });
+        }
+    });
+    assert_eq!(successes.load(Ordering::SeqCst), 1024);
+    let usage = tracker.snapshot();
+    assert_eq!(usage.decoded_bytes, 1024);
+    assert_eq!(usage.retained_bytes, 0);
+    assert!(usage.peak_retained_bytes <= 32);
+}
+
+#[derive(Clone, Copy)]
+enum BoundedLayout {
+    File {
+        size: u64,
+        fail_at: Option<u64>,
+        oversize: bool,
+    },
+    PagedDirectory(u64),
+    DeepDirectory(u64),
+    AncestorCycle,
+    CookieCycle,
+    NonmonotoneCookies,
+    Symlink(u64),
+}
+
+#[derive(Default)]
+struct BoundedCalls {
+    reads: AtomicU64,
+    attributes: AtomicU64,
+    directories: AtomicU64,
+    symlinks: AtomicU64,
+}
+
+/// Adversarial VFS responses exercise facade limits independently of any native
+/// parser. Native-image coverage below remains a separate evidence level.
+struct BoundedTestFs {
+    layout: BoundedLayout,
+    calls: Arc<BoundedCalls>,
+}
+
+impl FsOps for BoundedTestFs {
+    fn getattr(
+        &self,
+        _cx: &Cx,
+        _scope: &mut RequestScope,
+        ino: InodeNumber,
+    ) -> Result<ffs_core::InodeAttr> {
+        self.calls.attributes.fetch_add(1, Ordering::SeqCst);
+        let (kind, size) = match self.layout {
+            BoundedLayout::DeepDirectory(_) | BoundedLayout::AncestorCycle => {
+                (FileType::Directory, 0)
+            }
+            BoundedLayout::Symlink(size) => (FileType::Symlink, size),
+            BoundedLayout::File { size, .. } => (FileType::RegularFile, size),
+            _ => (FileType::RegularFile, 0),
+        };
+        Ok(ffs_core::InodeAttr {
+            ino,
+            size,
+            blocks: 0,
+            atime: std::time::UNIX_EPOCH,
+            mtime: std::time::UNIX_EPOCH,
+            ctime: std::time::UNIX_EPOCH,
+            crtime: std::time::UNIX_EPOCH,
+            kind,
+            perm: 0o755,
+            nlink: 1,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            blksize: 4096,
+            generation: 1,
+        })
+    }
+
+    fn lookup(
+        &self,
+        _cx: &Cx,
+        _scope: &mut RequestScope,
+        _parent: InodeNumber,
+        name: &OsStr,
+    ) -> Result<ffs_core::InodeAttr> {
+        Err(FfsError::NotFound(name.to_string_lossy().into_owned()))
+    }
+
+    fn readdir(
+        &self,
+        _cx: &Cx,
+        _scope: &mut RequestScope,
+        ino: InodeNumber,
+        offset: u64,
+    ) -> Result<ffs_core::ReaddirPage> {
+        self.calls.directories.fetch_add(1, Ordering::SeqCst);
+        let child = match self.layout {
+            BoundedLayout::PagedDirectory(pages) if offset < pages => {
+                assert_eq!(
+                    self.calls.attributes.load(Ordering::SeqCst),
+                    offset,
+                    "process a page before retaining the next directory page"
+                );
+                Some((offset + 2, offset + 1))
+            }
+            BoundedLayout::DeepDirectory(depth) if offset == 0 && ino.0 < depth => {
+                Some((ino.0 + 1, 1))
+            }
+            BoundedLayout::AncestorCycle if offset == 0 => {
+                Some((if ino.0 == 1 { 2 } else { 1 }, 1))
+            }
+            BoundedLayout::CookieCycle => Some((2, if offset == 4 { 9 } else { 4 })),
+            BoundedLayout::NonmonotoneCookies => match offset {
+                0 => Some((2, 9)),
+                9 => Some((3, 4)),
+                4 => Some((4, 17)),
+                _ => None,
+            },
+            BoundedLayout::File { .. } | BoundedLayout::Symlink(_) if offset == 0 => Some((2, 1)),
+            _ => None,
+        };
+        let entries = child
+            .map(|(child, cookie)| ffs_core::DirEntry {
+                ino: InodeNumber(child),
+                offset: cookie,
+                kind: FileType::RegularFile,
+                name: b"child".to_vec(),
+            })
+            .into_iter()
+            .collect();
+        Ok(ffs_core::ReaddirPage::new(entries))
+    }
+
+    fn read(
+        &self,
+        _cx: &Cx,
+        _scope: &mut RequestScope,
+        _ino: InodeNumber,
+        offset: u64,
+        requested: u32,
+    ) -> Result<Vec<u8>> {
+        self.calls.reads.fetch_add(1, Ordering::SeqCst);
+        let BoundedLayout::File {
+            size,
+            fail_at,
+            oversize,
+        } = self.layout
+        else {
+            return Ok(Vec::new());
+        };
+        if fail_at.is_some_and(|limit| offset >= limit) {
+            return Err(FfsError::Corruption {
+                block: offset / 4096,
+                detail: "planted late read failure".to_owned(),
+            });
+        }
+        let count = if oversize {
+            u64::from(requested) + 1
+        } else {
+            size.saturating_sub(offset).min(u64::from(requested))
+        };
+        Ok((0..count)
+            .map(|index| u8::try_from((offset + index) % 251).unwrap())
+            .collect())
+    }
+
+    fn readlink(
+        &self,
+        _cx: &Cx,
+        _scope: &mut RequestScope,
+        _ino: InodeNumber,
+    ) -> Result<Vec<u8>> {
+        self.calls.symlinks.fetch_add(1, Ordering::SeqCst);
+        let BoundedLayout::Symlink(size) = self.layout else {
+            return Err(FfsError::Format("not a symlink".to_owned()));
+        };
+        Ok(vec![b'x'; usize::try_from(size).unwrap()])
+    }
+}
+
+fn bounded_fixture(
+    layout: BoundedLayout,
+    budget: ResourceBudget,
+) -> (ReadOnlyFs, Arc<BoundedCalls>) {
+    let calls = Arc::new(BoundedCalls::default());
+    (
+        ReadOnlyFs {
+            format: FsFormatKind::Ext4,
+            partition: None,
+            filesystem: Box::new(BoundedTestFs {
+                layout,
+                calls: Arc::clone(&calls),
+            }),
+            ntfs: None,
+            tracker: Arc::new(ResourceTracker::new(budget)),
+        },
+        calls,
+    )
+}
+
+#[test]
+fn bounded_read_admits_decode_and_working_memory_before_calling_backend() {
+    let cx = Cx::for_testing();
+    for budget in [
+        ResourceBudget {
+            max_decoded_bytes: Some(3),
+            ..ResourceBudget::default()
+        },
+        ResourceBudget {
+            max_retained_bytes: Some(3),
+            ..ResourceBudget::default()
+        },
+    ] {
+        let (fs, calls) = bounded_fixture(
+            BoundedLayout::File {
+                size: 8,
+                fail_at: None,
+                oversize: false,
+            },
+            budget,
+        );
+        assert!(fs.read_bounded(&cx, InodeNumber(2), 0, 8, 8).is_err());
+        assert_eq!(calls.reads.load(Ordering::SeqCst), 0);
+        assert_eq!(fs.resource_usage().retained_bytes, 0);
+        assert_eq!(fs.resource_usage().decoded_bytes, 0);
+    }
+}
+
+#[test]
+fn bounded_read_accounts_for_output_and_decode_buffers_together() {
+    let cx = Cx::for_testing();
+    for (cap, succeeds) in [(12, false), (16, true)] {
+        let (fs, _) = bounded_fixture(
+            BoundedLayout::File {
+                size: 8,
+                fail_at: None,
+                oversize: false,
+            },
+            ResourceBudget {
+                max_retained_bytes: Some(cap),
+                ..ResourceBudget::default()
+            },
+        );
+        let result = fs.read_bounded(&cx, InodeNumber(2), 0, 8, 8);
+        assert_eq!(result.is_ok(), succeeds);
+        if let Ok(bytes) = result {
+            assert_eq!(bytes, (0_u8..8).collect::<Vec<_>>());
+        }
+        assert_eq!(fs.resource_usage().retained_bytes, 0);
+        assert!(fs.resource_usage().peak_retained_bytes <= cap);
+    }
+}
+
+#[test]
+fn bounded_read_rejects_oversized_and_late_failure_without_partial_success() {
+    let cx = Cx::for_testing();
+    for (fail_at, oversize, expected_decoded) in [(None, true, 0), (Some(8), false, 8)] {
+        let (fs, _) = bounded_fixture(
+            BoundedLayout::File {
+                size: 12,
+                fail_at,
+                oversize,
+            },
+            ResourceBudget::default(),
+        );
+        assert!(matches!(
+            fs.read_bounded(&cx, InodeNumber(2), 0, 12, 4),
+            Err(FfsError::Corruption { .. })
+        ));
+        assert_eq!(fs.resource_usage().retained_bytes, 0);
+        assert_eq!(fs.resource_usage().decoded_bytes, expected_decoded);
+    }
+}
+
+#[test]
+fn bounded_read_releases_unused_eof_reservation_and_obeys_cancellation() {
+    let cx = Cx::for_testing();
+    let (fs, calls) = bounded_fixture(
+        BoundedLayout::File {
+            size: 3,
+            fail_at: None,
+            oversize: false,
+        },
+        ResourceBudget::default(),
+    );
+    assert_eq!(
+        fs.read_bounded(&cx, InodeNumber(2), 0, 8, 8).unwrap(),
+        [0, 1, 2]
+    );
+    assert_eq!(fs.resource_usage().decoded_bytes, 3);
+    assert_eq!(fs.resource_usage().retained_bytes, 0);
+    let reads = calls.reads.load(Ordering::SeqCst);
+    cx.set_cancel_requested(true);
+    assert!(matches!(
+        fs.read_bounded(&cx, InodeNumber(2), 0, 8, 8),
+        Err(FfsError::Cancelled)
+    ));
+    assert_eq!(calls.reads.load(Ordering::SeqCst), reads);
+}
+
+#[test]
+fn bounded_walk_streams_large_files_and_directory_pages() {
+    let cx = Cx::for_testing();
+    let (fs, calls) = bounded_fixture(
+        BoundedLayout::File {
+            size: 4 * 1024 * 1024,
+            fail_at: None,
+            oversize: false,
+        },
+        ResourceBudget {
+            max_retained_bytes: Some(128 * 1024),
+            ..ResourceBudget::default()
+        },
+    );
+    let walk = fs.walk_bounded(&cx, true).unwrap();
+    assert_eq!(walk.files_visited, 1);
+    assert_eq!(walk.decoded_file_bytes, 4 * 1024 * 1024);
+    assert_eq!(calls.reads.load(Ordering::SeqCst), 64);
+    assert!(walk.usage.peak_retained_bytes <= 128 * 1024);
+    assert_eq!(walk.usage.retained_bytes, 0);
+
+    let (fs, _) = bounded_fixture(
+        BoundedLayout::PagedDirectory(10_000),
+        ResourceBudget {
+            max_retained_bytes: Some(1024),
+            ..ResourceBudget::default()
+        },
+    );
+    let walk = fs.walk_bounded(&cx, false).unwrap();
+    assert_eq!(walk.files_visited, 10_000);
+    assert!(walk.usage.peak_retained_bytes <= 1024);
+    assert_eq!(walk.usage.retained_bytes, 0);
+}
+
+#[test]
+fn bounded_walk_deep_namespace_uses_heap_instead_of_call_stack() {
+    std::thread::Builder::new()
+        .stack_size(128 * 1024)
+        .spawn(|| {
+            let (fs, _) = bounded_fixture(
+                BoundedLayout::DeepDirectory(2048),
+                ResourceBudget {
+                    max_retained_bytes: Some(1024 * 1024),
+                    ..ResourceBudget::default()
+                },
+            );
+            let walk = fs.walk_bounded(&Cx::for_testing(), false).unwrap();
+            assert_eq!(walk.directories_visited, 2048);
+            assert_eq!(walk.usage.peak_reference_depth, 2048);
+            assert_eq!(walk.usage.current_reference_depth, 0);
+            assert_eq!(walk.usage.retained_bytes, 0);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn bounded_walk_refuses_cycles_and_releases_depth_and_memory() {
+    for (layout, expected) in [
+        (BoundedLayout::AncestorCycle, "cyclic directory reference"),
+        (BoundedLayout::CookieCycle, "cyclic directory continuation"),
+    ] {
+        let (fs, calls) = bounded_fixture(
+            layout,
+            ResourceBudget {
+                max_operations: Some(100),
+                ..ResourceBudget::default()
+            },
+        );
+        let error = fs.walk_bounded(&Cx::for_testing(), false).unwrap_err();
+        assert!(error.to_string().contains(expected), "{error}");
+        assert!(calls.directories.load(Ordering::SeqCst) <= 3);
+        assert_eq!(fs.resource_usage().current_reference_depth, 0);
+        assert_eq!(fs.resource_usage().retained_bytes, 0);
+    }
+    let (fs, _) =
+        bounded_fixture(BoundedLayout::NonmonotoneCookies, ResourceBudget::default());
+    assert_eq!(
+        fs.walk_bounded(&Cx::for_testing(), false)
+            .unwrap()
+            .files_visited,
+        3,
+        "opaque cookies need not be numerically increasing"
+    );
+}
+
+#[test]
+fn bounded_walk_checks_depth_and_symlink_decode_before_following() {
+    let (fs, _) = bounded_fixture(
+        BoundedLayout::DeepDirectory(3),
+        ResourceBudget {
+            max_reference_depth: Some(2),
+            ..ResourceBudget::default()
+        },
+    );
+    let error = fs.walk_bounded(&Cx::for_testing(), false).unwrap_err();
+    assert!(error.to_string().contains("reference_depth"));
+    assert_eq!(fs.resource_usage().current_reference_depth, 0);
+    assert_eq!(fs.resource_usage().retained_bytes, 0);
+
+    let (fs, calls) = bounded_fixture(
+        BoundedLayout::Symlink(64),
+        ResourceBudget {
+            max_decoded_bytes: Some(32),
+            ..ResourceBudget::default()
+        },
+    );
+    let error = fs.walk_bounded(&Cx::for_testing(), false).unwrap_err();
+    assert!(error.to_string().contains("decoded_bytes"));
+    assert_eq!(calls.symlinks.load(Ordering::SeqCst), 0);
+    assert_eq!(fs.resource_usage().current_reference_depth, 0);
+    assert_eq!(fs.resource_usage().retained_bytes, 0);
+}
+
+#[test]
+fn bounded_native_fat_walk_reads_real_payload_under_a_small_memory_cap() {
+    let cx = Cx::for_testing();
+    let directory = tempfile::tempdir().unwrap();
+    let path = fat_image(&cx, directory.path(), "fat16");
+    let opened = open_read_only(
+        &cx,
+        &path,
+        &ReadOnlyOpenOptions {
+            budget: ResourceBudget {
+                max_retained_bytes: Some(128 * 1024),
+                max_decoded_bytes: Some(1024),
+                ..ResourceBudget::default()
+            },
+            ..ReadOnlyOpenOptions::default()
+        },
+    )
+    .unwrap();
+    let walk = opened.walk_bounded(&cx, true).unwrap();
+    assert_eq!(walk.directories_visited, 1);
+    assert_eq!(walk.files_visited, 1);
+    assert_eq!(walk.decoded_file_bytes, b"native facade payload\0".len() as u64);
+    assert_eq!(walk.usage.retained_bytes, 0);
+    assert_eq!(walk.usage.current_reference_depth, 0);
+}
+
 fn fat_image(cx: &Cx, directory: &Path, kind: &str) -> PathBuf {
     let image = directory.join(format!("{kind}.img"));
     let cli = ffs_fat::Cli::try_parse_from([
