@@ -24204,12 +24204,12 @@ fn ext4_casefold_htree_unicode_12_1_matches_kernel_dx_hash_and_e2fsck_bd_vsuni_3
         let mut idx = 0_usize;
         while idx + 2 < tokens.len() {
             if let Some(rest) = tokens[idx].strip_prefix("0x")
-                && let Some((major_hex, minor_hex)) = rest.split_once("-0x")
+                && let Some((major_hex, minor_raw)) = rest.split_once('-')
                 && tokens[idx + 1].starts_with('(')
                 && tokens[idx + 1].ends_with(')')
                 && let (Ok(major), Ok(minor)) = (
                     u32::from_str_radix(major_hex, 16),
-                    u32::from_str_radix(minor_hex, 16),
+                    u32::from_str_radix(minor_raw.strip_prefix("0x").unwrap_or(minor_raw), 16),
                 )
             {
                 let name = tokens[idx + 2];
