@@ -1668,6 +1668,23 @@ fn read_u64(data: &[u8], off: usize, field: &'static str) -> Result<u64, ParseEr
 /// - offset 247: `uuid` (16 bytes) — zero if absent/stale, rejected if partial and valid
 /// - offset 263: `parent_uuid` (16 bytes) — zero if absent/stale, rejected if partial and valid
 pub fn parse_root_item(data: &[u8]) -> Result<BtrfsRootItem, ParseError> {
+    parse_root_item_inner(data, false)
+}
+
+/// Parse an uncommitted in-memory staged `ROOT_ITEM` payload where `bytenr == 0`
+/// is permitted while still enforcing every other structural, extension, and
+/// tree-level invariant.
+///
+/// On-disk / committed root items must continue to use [`parse_root_item`],
+/// which strictly rejects `bytenr == 0`.
+pub fn parse_staged_root_item(data: &[u8]) -> Result<BtrfsRootItem, ParseError> {
+    parse_root_item_inner(data, true)
+}
+
+fn parse_root_item_inner(
+    data: &[u8],
+    allow_zero_bytenr: bool,
+) -> Result<BtrfsRootItem, ParseError> {
     if data.len() < BTRFS_ROOT_ITEM_LEGACY_SIZE {
         return Err(ParseError::InsufficientData {
             needed: BTRFS_ROOT_ITEM_LEGACY_SIZE,
@@ -1751,7 +1768,7 @@ pub fn parse_root_item(data: &[u8]) -> Result<BtrfsRootItem, ParseError> {
         [0u8; 16]
     };
 
-    if bytenr == 0 {
+    if bytenr == 0 && !allow_zero_bytenr {
         return Err(ParseError::InvalidField {
             field: "root_item.bytenr",
             reason: "must be non-zero",
@@ -18820,11 +18837,25 @@ mod tests {
             "root_item.bytenr",
             "must be non-zero",
         );
+        let staged_zero = parse_staged_root_item(&zero_bytenr)
+            .expect("staged root item parser permits zero bytenr");
+        assert_eq!(staged_zero.bytenr, 0);
+        assert_insufficient_data(parse_staged_root_item(&[0_u8; 238]), 239, 0, 238);
+        assert_invalid_field(
+            parse_staged_root_item(&partial_uuid),
+            "root_item.uuid",
+            "partial extension field",
+        );
 
         let mut bad_level = make_root_item_payload(239, 0x1234_0000);
         bad_level[238] = BTRFS_MAX_TREE_LEVEL + 1;
         assert_invalid_field(
             parse_root_item(&bad_level),
+            "root_item.level",
+            "exceeds maximum btrfs tree level",
+        );
+        assert_invalid_field(
+            parse_staged_root_item(&bad_level),
             "root_item.level",
             "exceeds maximum btrfs tree level",
         );

@@ -17346,7 +17346,8 @@ impl OpenFs {
             return Ok(false);
         };
         drop(alloc);
-        let root_item = parse_root_item(&data).map_err(|error| parse_to_ffs_error(&error))?;
+        let root_item =
+            ffs_btrfs::parse_staged_root_item(&data).map_err(|error| parse_to_ffs_error(&error))?;
         Ok(root_item.bytenr == 0)
     }
 
@@ -123754,7 +123755,11 @@ pub(crate) mod scrub;\n";
                 .unwrap()
                 .unwrap()
         };
-        assert_eq!(parse_root_item(&data).unwrap().bytenr, 0);
+        assert!(
+            parse_root_item(&data).is_err(),
+            "on-disk root_item parser must still reject zero bytenr"
+        );
+        assert_eq!(ffs_btrfs::parse_staged_root_item(&data).unwrap().bytenr, 0);
         let link = fs.lookup(&cx, parent, OsStr::new("pending")).unwrap();
         assert_eq!(link.kind, FileType::Directory);
         assert!(fs.btrfs_nested_route(link.ino).unwrap().is_none());
