@@ -21,6 +21,7 @@ use ffs_ondisk::zfs::send_stream::{
     DRR_FLAG_SPILL_BLOCK, DRR_OBJECT_SPILL, DRR_RAW_BYTESWAP, DrrBegin, DrrEnd, DrrFree,
     DrrFreeObjects, DrrObject, DrrObjectRange, DrrRecord, DrrSpill, DrrWrite, DrrWriteEmbedded,
     Fletcher4Stream, ReceiveResumeToken, SendFeatureFlags, StreamCryptoKeydata, StreamHeaderType,
+    StreamMetaDnode,
 };
 use ffs_ondisk::zfs::{BlockPointer, Endian};
 use ffs_ondisk::zfs_dmu::{DMU_OT_DNODE, DNODE_BLOCK_BYTES, DNODE_BYTES, Dnode, dnode_at};
@@ -1409,7 +1410,15 @@ pub fn send_stream(
             let info = crypto_info
                 .as_ref()
                 .ok_or_else(|| corrupt("missing crypto info for raw encrypted send"))?;
-            let key_len = info.record.suite.key_len().map_err(|e| parse_err(&e))?;
+            let to_ivset_guid = to_ivset_guid.filter(|&guid| guid != 0).ok_or_else(|| {
+                unsupported("raw encrypted send requires a nonzero source snapshot IV-set GUID")
+            })?;
+            let from_ivset_guid = match sub_base {
+                Some(base) => Some(base.ivset_guid.filter(|&guid| guid != 0).ok_or_else(|| {
+                    unsupported("raw incremental send requires a nonzero base IV-set GUID")
+                })?),
+                None => None,
+            };
             let keydata = StreamCryptoKeydata {
                 suite: info.record.suite,
                 version: info.record.version,
@@ -1419,11 +1428,12 @@ pub fn send_stream(
                 pbkdf2_iters: info.record.pbkdf2_iters,
                 iv: info.record.iv,
                 mac: info.record.mac,
-                wrapped_master_key: info.record.encrypted_master_key[..key_len].to_vec(),
+                wrapped_master_key: info.record.encrypted_master_key,
                 wrapped_hmac_key: info.record.encrypted_hmac_key,
+                meta_dnode: StreamMetaDnode::from_dnode(&os.meta).map_err(|e| parse_err(&e))?,
                 portable_mac,
-                to_ivset_guid: to_ivset_guid.unwrap_or(0),
-                from_ivset_guid: sub_base.as_ref().and_then(|b| b.ivset_guid),
+                to_ivset_guid,
+                from_ivset_guid,
             };
             keydata
                 .to_nvlist()

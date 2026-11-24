@@ -8,10 +8,10 @@
 use super::dmu_cow::{
     DatasetCompression, DatasetFeatureUsage, DnodeCowSpec, MosFeatureState, PoolSpaceAllocator,
     SpaceDelta, StagedBlockWrite, StagedLeafUpdate, WriteBucket, allocate_object_id,
-    collect_non_hole_bps_from, cow_update_dnode_with_staged_leaves, dmu_ot_is_byte_array,
-    enqueue_into_dataset_deadlist, ensure_dnode_table_block_loaded, put_dnode_in_table,
-    read_staged_or_committed_dnode, remove_dnode_from_table, write_dataset_objset_block,
-    write_dataset_objset_block_raw_protected, zap_optional_u64,
+    allocated_leaf_blocks_in_range, collect_non_hole_bps_from, cow_update_dnode_with_staged_leaves,
+    dmu_ot_is_byte_array, enqueue_into_dataset_deadlist, ensure_dnode_table_block_loaded,
+    put_dnode_in_table, read_staged_or_committed_dnode, remove_dnode_from_table,
+    write_dataset_objset_block, write_dataset_objset_block_raw_protected, zap_optional_u64,
 };
 use super::dsl_ops::{
     DMU_OT_DSL_DATASET, DMU_OT_DSL_DIR_CHILD_MAP, DMU_OT_DSL_DS_SNAP_MAP, DMU_OT_DSL_PROPS,
@@ -52,7 +52,7 @@ use ffs_ondisk::zfs::send_stream::{
     DMU_REPLAY_RECORD_BYTES, DRR_FLAG_CI_DATA, DRR_OBJECT_SPILL, DRR_RAW_BYTESWAP, DrrBegin,
     DrrFree, DrrFreeObjects, DrrObject, DrrObjectRange, DrrRecord, DrrSpill, DrrType, DrrWrite,
     DrrWriteEmbedded, Fletcher4Stream, ReceiveResumeToken, StreamCryptoKeydata, StreamHeaderType,
-    detect_stream_endian, validate_toname_snapshot,
+    StreamMetaDnode, detect_stream_endian, validate_toname_snapshot,
 };
 use ffs_ondisk::zfs::{
     BlockPointer, Endian, MAX_BLOCK_BYTES, ProtectedBlockSpec, RegularBlockSpec, decompress,
@@ -284,6 +284,7 @@ struct StagedSubstreamMeta {
     prev_snap_obj: u64,
     prev_snap_txg: u64,
     is_raw_encrypted: bool,
+    raw_meta_dnode: Option<StreamMetaDnode>,
     crypto_version: u64,
     portable_mac: [u8; 32],
     to_ivset_guid: Option<u64>,
@@ -436,6 +437,67 @@ fn validate_received_base_ivset(
         ));
     }
     Ok(())
+}
+
+fn admit_received_meta_dnode(meta: &StreamMetaDnode) -> Result<()> {
+    // The native envelope admits larger profiles; local dnode-table indexing
+    // and the COW writer currently support 16 KiB tables and seven levels.
+    if meta.data_bytes != DNODE_BLOCK_BYTES as u64 || !(1..=7).contains(&meta.levels) {
+        return Err(unsupported(
+            "raw receive requires a 16 KiB meta-dnode with at most seven levels",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_received_raw_object(meta: Option<&StreamMetaDnode>, object: u64) -> Result<()> {
+    if meta.is_some_and(|meta| object / 32 > meta.max_block) {
+        return Err(FfsError::Format(
+            "raw receive object exceeds the source meta-dnode maximum block".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_received_meta_geometry(meta: &StreamMetaDnode, existing: &Dnode) -> Result<()> {
+    // OpenZFS raw receive treats these four properties as immutable once the
+    // object set exists. Selectors and maxblkid are supplied by the new stream.
+    if meta.levels != existing.levels()
+        || meta.data_bytes != existing.data_bytes() as u64
+        || meta.indirect_shift != existing.indirect_shift()
+        || usize::from(meta.nblkptr) != existing.pointers().len()
+    {
+        return Err(FfsError::Format(
+            "raw receive meta-dnode geometry disagrees with its existing object set".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn read_received_objectset(
+    cx: &Cx,
+    mos: &mut Objects,
+    head: &Dnode,
+    ceiling: u64,
+) -> Result<ObjectSet> {
+    let root = head
+        .bonus()
+        .get(128..256)
+        .ok_or_else(|| corrupt("truncated receive dataset root block pointer"))?;
+    let bp = BlockPointer::parse(root, head.order()).map_err(|e| parse_err(&e))?;
+    let (raw, order, _) = mos.read_dataset_objset_block_raw(cx, &bp, ceiling, None, true)?;
+    ObjectSet::parse(&raw, order).map_err(|e| parse_err(&e))
+}
+
+fn received_raw_order(flags: u8, stream_order: Endian) -> Endian {
+    if flags & DRR_RAW_BYTESWAP == 0 {
+        stream_order
+    } else {
+        match stream_order {
+            Endian::Little => Endian::Big,
+            Endian::Big => Endian::Little,
+        }
+    }
 }
 
 // ── ZAP Helpers for Resume State ────────────────────────────────────────────
@@ -1032,6 +1094,11 @@ impl ZfsTransactionEngine {
                 "raw encrypted receive requires DRR_BEGIN crypt_keydata".into(),
             ));
         }
+        if let Some(kd) = &keydata
+            && let Err(error) = admit_received_meta_dnode(&kd.meta_dnode)
+        {
+            return ZfsTxOutcome::NotCommitted(error);
+        }
 
         if keydata.is_some()
             && (!self
@@ -1184,6 +1251,19 @@ impl ZfsTransactionEngine {
                             ),
                         );
                     }
+                    if received_raw_order(r.flags, stream_order) != self.order {
+                        return cleanup_on_abort(
+                            self,
+                            unsupported(
+                                "raw receive cannot reconstruct foreign-order dnode tables",
+                            ),
+                        );
+                    }
+                    if let Err(error) =
+                        validate_received_raw_object(stage_meta.raw_meta_dnode.as_ref(), r.firstobj)
+                    {
+                        return cleanup_on_abort(self, error);
+                    }
                     if r.toguid != 0 && r.toguid != begin.toguid {
                         return cleanup_on_abort(
                             self,
@@ -1215,6 +1295,11 @@ impl ZfsTransactionEngine {
                     pending_ops.push(RecvOp::ObjectRange(r));
                 }
                 DrrRecord::Object(o) => {
+                    if let Err(error) =
+                        validate_received_raw_object(stage_meta.raw_meta_dnode.as_ref(), o.object)
+                    {
+                        return cleanup_on_abort(self, error);
+                    }
                     if o.toguid != 0 && o.toguid != begin.toguid {
                         return cleanup_on_abort(
                             self,
@@ -1350,6 +1435,11 @@ impl ZfsTransactionEngine {
                     pending_ops.push(RecvOp::FreeObjects(f));
                 }
                 DrrRecord::Write(w) => {
+                    if let Err(error) =
+                        validate_received_raw_object(stage_meta.raw_meta_dnode.as_ref(), w.object)
+                    {
+                        return cleanup_on_abort(self, error);
+                    }
                     if w.toguid != 0 && w.toguid != begin.toguid {
                         return cleanup_on_abort(
                             self,
@@ -1486,6 +1576,11 @@ impl ZfsTransactionEngine {
                     pending_ops.push(RecvOp::WriteEmbedded { rec: e, payload });
                 }
                 DrrRecord::Free(f) => {
+                    if let Err(error) =
+                        validate_received_raw_object(stage_meta.raw_meta_dnode.as_ref(), f.object)
+                    {
+                        return cleanup_on_abort(self, error);
+                    }
                     if f.toguid != 0 && f.toguid != begin.toguid {
                         return cleanup_on_abort(
                             self,
@@ -1506,6 +1601,11 @@ impl ZfsTransactionEngine {
                     pending_ops.push(RecvOp::Free(f));
                 }
                 DrrRecord::Spill(s) => {
+                    if let Err(error) =
+                        validate_received_raw_object(stage_meta.raw_meta_dnode.as_ref(), s.object)
+                    {
+                        return cleanup_on_abort(self, error);
+                    }
                     if let Err(error) =
                         admit_received_compression(s.compressiontype, &self.mos_features)
                     {
@@ -1556,7 +1656,9 @@ impl ZfsTransactionEngine {
                 }
             }
 
-            if !pending_ops.is_empty() && (pending_bytes >= checkpoint_limit || saw_end) {
+            if (!pending_ops.is_empty() && pending_bytes >= checkpoint_limit)
+                || (saw_end && (!pending_ops.is_empty() || is_raw))
+            {
                 let next_prog = ChunkProgress {
                     object: last_obj,
                     offset: last_offset,
@@ -1569,6 +1671,7 @@ impl ZfsTransactionEngine {
                     &pending_ops,
                     &substream_object_ranges,
                     &next_prog,
+                    saw_end,
                 ) {
                     ZfsTxOutcome::Committed { .. } => {
                         committed_progress = next_prog;
@@ -1663,7 +1766,7 @@ impl ZfsTransactionEngine {
                 "resuming stream objset type disagrees with persisted staging dataset".into(),
             ));
         }
-        let (staging_head, _) = mos.object_with_ceiling(cx, staging.head_object)?;
+        let (staging_head, staging_ceiling) = mos.object_with_ceiling(cx, staging.head_object)?;
         let staging_entries = dataset_feature_entries(
             cx,
             &mut mos,
@@ -1690,6 +1793,8 @@ impl ZfsTransactionEngine {
                 .as_ref()
                 .ok_or_else(|| corrupt("raw receive staging dataset lacks crypto identity"))?;
             validate_received_crypto_identity(kd, &crypto.record)?;
+            let staging_os = read_received_objectset(cx, &mut mos, &staging_head, staging_ceiling)?;
+            validate_received_meta_geometry(&kd.meta_dnode, &staging_os.meta)?;
             if state.ivsetguid.unwrap_or(0) != kd.to_ivset_guid {
                 return Err(FfsError::Format(
                     "resuming raw stream ivset_guid disagrees with persisted receive state".into(),
@@ -1736,6 +1841,7 @@ impl ZfsTransactionEngine {
                 prev_snap_obj: staging.prev_snap_obj,
                 prev_snap_txg: staging.prev_snap_txg,
                 is_raw_encrypted,
+                raw_meta_dnode: keydata.map(|kd| kd.meta_dnode),
                 crypto_version,
                 portable_mac,
                 to_ivset_guid,
@@ -1964,17 +2070,18 @@ impl ZfsTransactionEngine {
                     }
 
                     // Build initial empty ObjectSet (`kind = 2` ZPL or `3` ZVOL).
+                    let raw_meta = kd_cloned.as_ref().map(|kd| kd.meta_dnode);
                     let empty_meta = Dnode::from_spec(DnodeSpec {
                         object_type: DMU_OT_DNODE,
                         bonus_type: 0,
-                        checksum_type: 0,
-                        compress_type: 0,
+                        checksum_type: raw_meta.map_or(0, |mdn| mdn.checksum),
+                        compress_type: raw_meta.map_or(0, |mdn| mdn.compression),
                         flags: DNODE_FLAG_USED_BYTES,
                         order,
-                        levels: 1,
-                        indirect_shift: 17,
+                        levels: raw_meta.map_or(1, |mdn| mdn.levels),
+                        indirect_shift: raw_meta.map_or(17, |mdn| mdn.indirect_shift),
                         data_bytes: DNODE_BLOCK_BYTES,
-                        max_block: 0,
+                        max_block: raw_meta.map_or(0, |mdn| mdn.max_block),
                         used_bytes: 0,
                         slots: 1,
                         pointers: vec![BlockPointer::hole_pointer(); 3],
@@ -2154,6 +2261,7 @@ impl ZfsTransactionEngine {
                         prev_snap_obj: origin_snap_obj,
                         prev_snap_txg: u64::from(origin_snap_obj != 0),
                         is_raw_encrypted: kd_cloned.is_some(),
+                        raw_meta_dnode: kd_cloned.as_ref().map(|kd| kd.meta_dnode),
                         crypto_version: kd_cloned.as_ref().map_or(1, |k| k.version),
                         portable_mac: kd_cloned.as_ref().map_or([0_u8; 32], |k| k.portable_mac),
                         to_ivset_guid: kd_cloned.as_ref().map(|k| k.to_ivset_guid),
@@ -2193,7 +2301,7 @@ impl ZfsTransactionEngine {
                             "incremental receive target has no base snapshot".into(),
                         ));
                     }
-                    let (prev_snap_dn, _) = read_staged_or_committed_dnode(
+                    let (prev_snap_dn, prev_snap_ceiling) = read_staged_or_committed_dnode(
                         cx,
                         mos,
                         &mos_meta,
@@ -2238,6 +2346,8 @@ impl ZfsTransactionEngine {
                         };
                         validate_received_crypto_identity(kd, &tc.record)?;
                         validate_received_base_ivset(cx, mos, kd, prev_snap_obj)?;
+                        let base_os = read_received_objectset(cx, mos, &prev_snap_dn, prev_snap_ceiling)?;
+                        validate_received_meta_geometry(&kd.meta_dnode, &base_os.meta)?;
                     } else if target_crypto.is_some() {
                         return Err(unsupported(
                             "non-raw incremental receive into an encrypted dataset requires re-encryption",
@@ -2452,6 +2562,7 @@ impl ZfsTransactionEngine {
                         prev_snap_obj,
                         prev_snap_txg,
                         is_raw_encrypted: kd_cloned.is_some(),
+                        raw_meta_dnode: kd_cloned.as_ref().map(|kd| kd.meta_dnode),
                         crypto_version: kd_cloned.as_ref().map_or(1, |k| k.version),
                         portable_mac: kd_cloned.as_ref().map_or([0_u8; 32], |k| k.portable_mac),
                         to_ivset_guid: kd_cloned.as_ref().map(|k| k.to_ivset_guid),
@@ -2463,7 +2574,7 @@ impl ZfsTransactionEngine {
         )
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn commit_recv_chunk_txg(
         &mut self,
         cx: &Cx,
@@ -2472,6 +2583,7 @@ impl ZfsTransactionEngine {
         ops: &[RecvOp],
         known_object_ranges: &BTreeMap<u64, ObjectRangeMeta>,
         progress: &ChunkProgress,
+        final_chunk: bool,
     ) -> ZfsTxOutcome<()> {
         let stage_cloned = stage.clone();
         let ops_owned = ops.to_vec();
@@ -2501,13 +2613,13 @@ impl ZfsTransactionEngine {
                     .map_err(|e| parse_err(&e))?;
                 let (os_raw, os_order, _) =
                     mos.read_dataset_objset_block_raw(cx, &old_os_bp, head_ceil, None, true)?;
-                let mut preserved_local_mac = [0_u8; 32];
-                if os_raw.len() >= 784 {
-                    preserved_local_mac.copy_from_slice(&os_raw[752..784]);
-                }
                 let mut os = ObjectSet::parse(&os_raw, os_order).map_err(|e| parse_err(&e))?;
                 let old_meta = os.meta.clone();
                 let old_meta_ceil = old_os_bp.birth();
+                let raw_meta = stage_cloned.raw_meta_dnode;
+                if let Some(meta) = raw_meta {
+                    validate_received_meta_geometry(&meta, &old_meta)?;
+                }
 
                 let stage_crypto =
                     resolve_staging_crypto_info(cx, mos, stage_cloned.stage_dd_obj)?;
@@ -3020,6 +3132,7 @@ impl ZfsTransactionEngine {
 
                 // Flush all modified object dnodes into `meta_dirty_blocks`.
                 for (obj_id, draft) in drafts {
+                    validate_received_raw_object(raw_meta.as_ref(), obj_id)?;
                     let cow_out = cow_update_dnode_with_staged_leaves(
                         cx,
                         &mut os_view,
@@ -3083,24 +3196,67 @@ impl ZfsTransactionEngine {
                     }
                 }
 
-                // Flush `meta_dirty_blocks` into `os.meta`!
-                if !meta_dirty_blocks.is_empty() {
+                // Raw metadata selectors and maximum block come from BEGIN,
+                // including streams with no OBJECT or WRITE records. Preserve
+                // the old upper range until END so later FREEOBJECTS records
+                // can still retire objects when the source table shrank.
+                let target_meta_max = raw_meta.map_or(max_meta_block, |meta| {
+                    if final_chunk {
+                        meta.max_block
+                    } else {
+                        meta.max_block.max(old_meta.max_block())
+                    }
+                });
+                if raw_meta.is_some() && target_meta_max < old_meta.max_block() {
+                    // A hostile header cannot discard allocated objects merely
+                    // by lowering mdn_maxblkid. Their FREEOBJECTS records must
+                    // have retired every child before the table is truncated.
+                    for bid in allocated_leaf_blocks_in_range(
+                        cx, &mut os_view, &old_meta, old_meta_ceil,
+                        target_meta_max + 1, old_meta.max_block(),
+                    )? {
+                        checkpoint(cx)?;
+                        let allocated = if let Some(bytes) = meta_dirty_blocks.get(&bid) {
+                            count_allocated_dnodes(bytes, order).map_err(|e| parse_err(&e))?
+                        } else if let Some((bytes, block_order, _)) = os_view.object_data_block(
+                            cx, &old_meta, old_meta_ceil, bid,
+                        )? {
+                            count_allocated_dnodes(&bytes, block_order).map_err(|e| parse_err(&e))?
+                        } else {
+                            0
+                        };
+                        if allocated != 0 {
+                            return Err(FfsError::Format(
+                                "raw meta-dnode truncation would discard allocated objects".into(),
+                            ));
+                        }
+                    }
+                }
+                if !meta_dirty_blocks.is_empty() || raw_meta.is_some() {
                     let mut meta_leaves: BTreeMap<u64, StagedLeafUpdate> = BTreeMap::new();
                     for (bid, blk_bytes) in meta_dirty_blocks {
-                        let upd = if stage_cloned.is_raw_encrypted {
+                        if bid > target_meta_max {
+                            // Final truncation retires this old table block in
+                            // COW; never allocate an unreachable replacement.
+                            continue;
+                        }
+                        let upd = if stage_cloned.is_raw_encrypted && blk_bytes.iter().all(|&byte| byte == 0) {
+                            // A native hole has no ciphertext or range MAC. In
+                            // particular, FREEOBJECTS may clear an entire old
+                            // table block without a source OBJECT_RANGE record.
+                            StagedLeafUpdate::Hole
+                        } else if stage_cloned.is_raw_encrypted {
                             let rng = object_ranges.get(&bid).ok_or_else(|| {
                                 corrupt(format!(
                                     "raw encrypted receive missing DRR_OBJECT_RANGE for dnode block {bid}"
                                 ))
                             })?;
-                            let blk_order = if rng.flags & DRR_RAW_BYTESWAP != 0 {
-                                match stream_order {
-                                    Endian::Little => Endian::Big,
-                                    Endian::Big => Endian::Little,
-                                }
-                            } else {
-                                order
-                            };
+                            let blk_order = received_raw_order(rng.flags, stream_order);
+                            if blk_order != order {
+                                return Err(unsupported(
+                                    "raw receive cannot reconstruct foreign-order dnode tables",
+                                ));
+                            }
                             let fill = count_allocated_dnodes(&blk_bytes, blk_order)
                                 .map_err(|e| parse_err(&e))?;
                             let dva = alloc.allocate(blk_bytes.len())?;
@@ -3139,12 +3295,12 @@ impl ZfsTransactionEngine {
                             existing: Some((&old_meta, old_meta_ceil)),
                             object_type: DMU_OT_DNODE,
                             bonus_type: 0,
-                            checksum_type: old_meta.checksum_type(),
-                            compress_type: old_meta.compress_type(),
+                            checksum_type: raw_meta.map_or(old_meta.checksum_type(), |meta| meta.checksum),
+                            compress_type: raw_meta.map_or(old_meta.compress_type(), |meta| meta.compression),
                             user_flags: 0,
                             indirect_shift: old_meta.indirect_shift(),
                             data_bytes: DNODE_BLOCK_BYTES,
-                            max_block: max_meta_block,
+                            max_block: target_meta_max,
                             slots: 1,
                             nblkptr: 3,
                             bonus: Vec::new(),
@@ -3158,7 +3314,7 @@ impl ZfsTransactionEngine {
                         0,
                         stage_cloned.compression,
                         None,
-                        raw_enc_ver.map(|v| (v, old_meta.levels())),
+                        raw_enc_ver.map(|v| (v, raw_meta.map_or(old_meta.levels(), |meta| meta.levels))),
                         staged_writes,
                     )?;
                     born_space.add_assign(meta_out.born)?;
@@ -3170,6 +3326,9 @@ impl ZfsTransactionEngine {
                 // Write updated `DMU_OT_OBJSET` root block.
                 retired_bps.push(old_os_bp);
                 let new_os_bp = if stage_cloned.is_raw_encrypted {
+                    // Native raw receive defers local accounting until mount.
+                    // Its MAC is not portable and must never survive a clone.
+                    os.flags &= !1;
                     write_dataset_objset_block_raw_protected(
                         &mut os,
                         alloc,
@@ -3177,7 +3336,7 @@ impl ZfsTransactionEngine {
                         order,
                         new_txg,
                         stage_cloned.portable_mac,
-                        preserved_local_mac,
+                        [0_u8; 32],
                         staged_writes,
                     )?
                 } else {

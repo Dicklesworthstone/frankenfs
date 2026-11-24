@@ -10,7 +10,8 @@
 //! host paths, devices, pools, key files, or import authority.
 
 use super::crypto::{
-    ZIO_DATA_IV_LEN, ZIO_DATA_MAC_LEN, ZIO_DATA_SALT_LEN, ZfsKeyFormat, ZioEncrypt,
+    DSL_CRYPTO_KEY_VERSION_V1, ZFS_MAX_MASTER_KEY_LEN, ZIO_DATA_IV_LEN, ZIO_DATA_MAC_LEN,
+    ZIO_DATA_SALT_LEN, ZfsKeyFormat, ZioEncrypt,
 };
 use super::nvlist::{NvList, Value};
 use super::{EMBEDDED_PAYLOAD_BYTES, Endian, MAX_BLOCK_BYTES, ParseError, invalid};
@@ -1003,8 +1004,95 @@ pub fn validate_toname_snapshot(toname: &[u8]) -> Result<Vec<u8>, ParseError> {
 
 // ── Raw Encrypted `crypt_keydata` XDR Payload ───────────────────────────────
 
-/// Wrapped encryption key & IV-set payload carried inside raw encrypted (`-w`)
-/// `DRR_BEGIN` XDR nvlists (`crypt_keydata`, `to_ivset_guid`, `from_ivset_guid`).
+/// Source meta-dnode geometry authenticated by the raw stream's portable MAC.
+/// Native `dsl_crypto_recv_raw_objset_check` requires every `mdn_*` field;
+/// recreating an arbitrary empty meta-dnode loses the source's authenticated
+/// structure even when every received leaf is otherwise correct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamMetaDnode {
+    pub checksum: u8,
+    pub compression: u8,
+    pub levels: u8,
+    pub data_bytes: u64,
+    pub indirect_shift: u8,
+    pub nblkptr: u8,
+    pub max_block: u64,
+}
+
+impl StreamMetaDnode {
+    pub fn from_dnode(dnode: &crate::zfs_dmu::Dnode) -> Result<Self, ParseError> {
+        if dnode.object_type() != crate::zfs_dmu::DMU_OT_DNODE {
+            return Err(invalid("raw stream meta-dnode has the wrong object type"));
+        }
+        let meta = Self {
+            checksum: dnode.checksum_type(),
+            compression: dnode.compress_type(),
+            levels: dnode.levels(),
+            data_bytes: dnode.data_bytes() as u64,
+            indirect_shift: dnode.indirect_shift(),
+            nblkptr: u8::try_from(dnode.pointers().len())
+                .map_err(|_| invalid("raw stream meta-dnode pointer count overflows u8"))?,
+            max_block: dnode.max_block(),
+        };
+        meta.validate()?;
+        Ok(meta)
+    }
+
+    fn validate(self) -> Result<(), ParseError> {
+        // These are the legacy selector ceilings used by OpenZFS 2.3.0 raw
+        // receive, not the larger set of algorithms supported in data BPs.
+        if self.checksum >= 9 || self.compression >= 15 {
+            return Err(invalid("raw stream meta-dnode has a non-legacy selector"));
+        }
+        if !(1..=12).contains(&self.levels)
+            || !(12..=17).contains(&self.indirect_shift)
+            || self.nblkptr != 3
+            || !(512..=MAX_BLOCK_BYTES as u64).contains(&self.data_bytes)
+            || !self.data_bytes.is_multiple_of(512)
+        {
+            return Err(invalid("raw stream meta-dnode geometry is invalid"));
+        }
+        let fanout = 1_u128 << (self.indirect_shift - 7);
+        let capacity = u128::from(self.nblkptr) * fanout.pow(u32::from(self.levels - 1));
+        if u128::from(self.max_block) >= capacity {
+            return Err(invalid(
+                "raw stream meta-dnode max block exceeds tree capacity",
+            ));
+        }
+        Ok(())
+    }
+
+    fn encode_into(self, fields: &mut BTreeMap<String, Value>) {
+        for (name, value) in [
+            ("mdn_checksum", u64::from(self.checksum)),
+            ("mdn_compress", u64::from(self.compression)),
+            ("mdn_nlevels", u64::from(self.levels)),
+            ("mdn_blksz", self.data_bytes),
+            ("mdn_indblkshift", u64::from(self.indirect_shift)),
+            ("mdn_nblkptr", u64::from(self.nblkptr)),
+            ("mdn_maxblkid", self.max_block),
+        ] {
+            fields.insert(name.to_owned(), Value::Unsigned(value));
+        }
+    }
+
+    fn decode_from(kd: &NvList) -> Result<Self, ParseError> {
+        let meta = Self {
+            checksum: nv_u8(kd, "mdn_checksum")?,
+            compression: nv_u8(kd, "mdn_compress")?,
+            levels: nv_u8(kd, "mdn_nlevels")?,
+            data_bytes: nv_u64(kd, "mdn_blksz")?,
+            indirect_shift: nv_u8(kd, "mdn_indblkshift")?,
+            nblkptr: nv_u8(kd, "mdn_nblkptr")?,
+            max_block: nv_u64(kd, "mdn_maxblkid")?,
+        };
+        meta.validate()?;
+        Ok(meta)
+    }
+}
+
+/// Wrapped encryption key, source meta-dnode, MAC, and IV-set identities carried
+/// together inside the raw encrypted (`-w`) `DRR_BEGIN.crypt_keydata` nvlist.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamCryptoKeydata {
     pub suite: ZioEncrypt,
@@ -1015,20 +1103,42 @@ pub struct StreamCryptoKeydata {
     pub pbkdf2_iters: u64,
     pub iv: [u8; ZIO_DATA_IV_LEN],
     pub mac: [u8; ZIO_DATA_MAC_LEN],
-    pub wrapped_master_key: Vec<u8>,
+    /// The native envelope always carries 32 bytes, including for AES-128/192.
+    /// Only the cipher's active prefix participates in key unwrapping.
+    pub wrapped_master_key: [u8; ZFS_MAX_MASTER_KEY_LEN],
     pub wrapped_hmac_key: [u8; 64],
+    pub meta_dnode: StreamMetaDnode,
     pub portable_mac: [u8; 32],
     pub to_ivset_guid: u64,
     pub from_ivset_guid: Option<u64>,
 }
 
 impl StreamCryptoKeydata {
-    /// Encode into an OpenZFS-compatible `NvList` containing `crypt_keydata`,
-    /// `to_ivset_guid`, optional `from_ivset_guid`, and `portable_mac`.
-    pub fn to_nvlist(&self) -> Result<NvList, ParseError> {
-        if self.wrapped_master_key.len() != self.suite.key_len()? {
-            return Err(invalid("wrapped master key length mismatches cipher suite"));
+    fn validate(&self) -> Result<(), ParseError> {
+        if !self.suite.is_active() || self.version != DSL_CRYPTO_KEY_VERSION_V1 {
+            return Err(invalid(
+                "raw stream requires an active version-1 crypto key",
+            ));
         }
+        if self.keyformat == ZfsKeyFormat::None {
+            return Err(invalid("raw stream keyformat must describe a wrapping key"));
+        }
+        let passphrase = self.keyformat == ZfsKeyFormat::Passphrase;
+        if passphrase == (self.pbkdf2_salt == 0) || passphrase == (self.pbkdf2_iters == 0) {
+            return Err(invalid(
+                "raw stream PBKDF2 properties disagree with keyformat",
+            ));
+        }
+        if self.to_ivset_guid == 0 || self.from_ivset_guid == Some(0) {
+            return Err(invalid("raw stream has a zero IV-set identity"));
+        }
+        self.meta_dnode.validate()
+    }
+
+    /// Encode the native `crypt_keydata` envelope, including its required source
+    /// meta-dnode fields and nested IV-set identities.
+    pub fn to_nvlist(&self) -> Result<NvList, ParseError> {
+        self.validate()?;
         let mut kd = BTreeMap::new();
         kd.insert(
             "DSL_CRYPTO_SUITE".to_owned(),
@@ -1045,19 +1155,34 @@ impl StreamCryptoKeydata {
         );
         kd.insert("pbkdf2salt".to_owned(), Value::Unsigned(self.pbkdf2_salt));
         kd.insert("pbkdf2iters".to_owned(), Value::Unsigned(self.pbkdf2_iters));
-        kd.insert("DSL_CRYPTO_IV".to_owned(), Value::Bytes(self.iv.to_vec()));
-        kd.insert("DSL_CRYPTO_MAC".to_owned(), Value::Bytes(self.mac.to_vec()));
+        kd.insert(
+            "DSL_CRYPTO_IV".to_owned(),
+            Value::UnsignedBytes(self.iv.to_vec()),
+        );
+        kd.insert(
+            "DSL_CRYPTO_MAC".to_owned(),
+            Value::UnsignedBytes(self.mac.to_vec()),
+        );
         kd.insert(
             "DSL_CRYPTO_MASTER_KEY_1".to_owned(),
-            Value::Bytes(self.wrapped_master_key.clone()),
+            Value::UnsignedBytes(self.wrapped_master_key.to_vec()),
         );
         kd.insert(
             "DSL_CRYPTO_HMAC_KEY_1".to_owned(),
-            Value::Bytes(self.wrapped_hmac_key.to_vec()),
+            Value::UnsignedBytes(self.wrapped_hmac_key.to_vec()),
         );
         kd.insert(
             "portable_mac".to_owned(),
-            Value::Bytes(self.portable_mac.to_vec()),
+            Value::UnsignedBytes(self.portable_mac.to_vec()),
+        );
+        self.meta_dnode.encode_into(&mut kd);
+        kd.insert(
+            "to_ivset_guid".to_owned(),
+            Value::Unsigned(self.to_ivset_guid),
+        );
+        kd.insert(
+            "from_ivset_guid".to_owned(),
+            Value::Unsigned(self.from_ivset_guid.unwrap_or(0)),
         );
 
         let mut root = BTreeMap::new();
@@ -1065,13 +1190,6 @@ impl StreamCryptoKeydata {
             "crypt_keydata".to_owned(),
             Value::List(NvList { fields: kd }),
         );
-        root.insert(
-            "to_ivset_guid".to_owned(),
-            Value::Unsigned(self.to_ivset_guid),
-        );
-        if let Some(from_ivset) = self.from_ivset_guid {
-            root.insert("from_ivset_guid".to_owned(), Value::Unsigned(from_ivset));
-        }
         Ok(NvList { fields: root })
     }
 
@@ -1087,7 +1205,7 @@ impl StreamCryptoKeydata {
         if !suite.is_active() {
             return Err(invalid("crypt_keydata suite is not an active cipher"));
         }
-        let version = kd.unsigned("DSL_CRYPTO_VERSION").unwrap_or(1);
+        let version = nv_u64(kd, "DSL_CRYPTO_VERSION")?;
         let guid = kd
             .unsigned("DSL_CRYPTO_GUID")
             .ok_or_else(|| invalid("crypt_keydata missing DSL_CRYPTO_GUID"))?;
@@ -1095,8 +1213,8 @@ impl StreamCryptoKeydata {
             .unsigned("keyformat")
             .ok_or_else(|| invalid("crypt_keydata missing keyformat"))?;
         let keyformat = ZfsKeyFormat::from_raw(keyformat_raw)?;
-        let pbkdf2_salt = kd.unsigned("pbkdf2salt").unwrap_or(0);
-        let pbkdf2_iters = kd.unsigned("pbkdf2iters").unwrap_or(0);
+        let pbkdf2_salt = nv_u64(kd, "pbkdf2salt")?;
+        let pbkdf2_iters = nv_u64(kd, "pbkdf2iters")?;
         let iv_bytes = nv_bytes(kd, "DSL_CRYPTO_IV")?;
         let iv: [u8; ZIO_DATA_IV_LEN] = iv_bytes
             .try_into()
@@ -1105,31 +1223,19 @@ impl StreamCryptoKeydata {
         let mac: [u8; ZIO_DATA_MAC_LEN] = mac_bytes
             .try_into()
             .map_err(|_| invalid("crypt_keydata DSL_CRYPTO_MAC must be 16 bytes"))?;
-        let wrapped_master_key = nv_bytes(kd, "DSL_CRYPTO_MASTER_KEY_1")?.to_vec();
-        if wrapped_master_key.len() != suite.key_len()? {
-            return Err(invalid(
-                "crypt_keydata wrapped master key length mismatches cipher suite",
-            ));
-        }
+        let wrapped_master_key = nv_bytes(kd, "DSL_CRYPTO_MASTER_KEY_1")?
+            .try_into()
+            .map_err(|_| invalid("crypt_keydata DSL_CRYPTO_MASTER_KEY_1 must be 32 bytes"))?;
         let hmac_bytes = nv_bytes(kd, "DSL_CRYPTO_HMAC_KEY_1")?;
         let wrapped_hmac_key: [u8; 64] = hmac_bytes
             .try_into()
             .map_err(|_| invalid("crypt_keydata DSL_CRYPTO_HMAC_KEY_1 must be 64 bytes"))?;
-        let portable_mac: [u8; 32] =
-            match nv_bytes_opt(kd, "portable_mac").or_else(|| nv_bytes_opt(root, "portable_mac")) {
-                Some(bytes) => bytes
-                    .try_into()
-                    .map_err(|_| invalid("crypt_keydata portable_mac must be 32 bytes"))?,
-                None => [0_u8; 32],
-            };
-        let to_ivset_guid = root
-            .unsigned("to_ivset_guid")
-            .or_else(|| kd.unsigned("to_ivset_guid"))
-            .unwrap_or(0);
-        let from_ivset_guid = root
-            .unsigned("from_ivset_guid")
-            .or_else(|| kd.unsigned("from_ivset_guid"));
-        Ok(Self {
+        let portable_mac = nv_bytes(kd, "portable_mac")?
+            .try_into()
+            .map_err(|_| invalid("crypt_keydata portable_mac must be 32 bytes"))?;
+        let to_ivset_guid = nv_u64(kd, "to_ivset_guid")?;
+        let from_ivset_guid = kd.unsigned("from_ivset_guid").filter(|&guid| guid != 0);
+        let keydata = Self {
             suite,
             version,
             guid,
@@ -1140,10 +1246,13 @@ impl StreamCryptoKeydata {
             mac,
             wrapped_master_key,
             wrapped_hmac_key,
+            meta_dnode: StreamMetaDnode::decode_from(kd)?,
             portable_mac,
             to_ivset_guid,
             from_ivset_guid,
-        })
+        };
+        keydata.validate()?;
+        Ok(keydata)
     }
 }
 
@@ -1346,15 +1455,20 @@ fn read_cksum4(bytes: &[u8], offset: usize, order: Endian) -> Result<[u64; 4], P
     ])
 }
 
-fn nv_bytes_opt<'a>(nvl: &'a NvList, key: &str) -> Option<&'a [u8]> {
-    match nvl.fields.get(key) {
-        Some(Value::Bytes(b)) => Some(b.as_slice()),
-        _ => None,
-    }
+fn nv_u64(nvl: &NvList, key: &str) -> Result<u64, ParseError> {
+    nvl.unsigned(key)
+        .ok_or_else(|| invalid("missing required uint64 field in nvlist"))
+}
+
+fn nv_u8(nvl: &NvList, key: &str) -> Result<u8, ParseError> {
+    u8::try_from(nv_u64(nvl, key)?).map_err(|_| invalid("nvlist integer exceeds u8 field"))
 }
 
 fn nv_bytes<'a>(nvl: &'a NvList, key: &str) -> Result<&'a [u8], ParseError> {
-    nv_bytes_opt(nvl, key).ok_or_else(|| invalid("missing required byte-array field in nvlist"))
+    match nvl.fields.get(key) {
+        Some(Value::UnsignedBytes(bytes)) => Ok(bytes),
+        _ => Err(invalid("missing required uint8-array field in nvlist")),
+    }
 }
 
 fn nv_bool(nvl: &NvList, key: &str) -> bool {
@@ -1716,8 +1830,17 @@ mod tests {
             pbkdf2_iters: 0,
             iv: [0x12; 12],
             mac: [0x34; 16],
-            wrapped_master_key: vec![0x56; 32],
+            wrapped_master_key: [0x56; 32],
             wrapped_hmac_key: [0x78; 64],
+            meta_dnode: StreamMetaDnode {
+                checksum: 7,
+                compression: 0,
+                levels: 2,
+                data_bytes: 16 * 1024,
+                indirect_shift: 17,
+                nblkptr: 3,
+                max_block: 8,
+            },
             portable_mac: [0x9A; 32],
             to_ivset_guid: 0x0102_0304_0506_0708,
             from_ivset_guid: Some(0x090A_0B0C_0D0E_0F10),
@@ -1756,5 +1879,184 @@ mod tests {
         assert!(validate_toname_snapshot(b"tank/ds@../../etc/passwd").is_err());
         assert!(validate_toname_snapshot(b"tank/ds@..").is_err());
         assert!(validate_toname_snapshot(b"tank/ds").is_err());
+    }
+
+    fn native_raw_begin_fixture() -> NvList {
+        // Construct the native contract directly, independently of to_nvlist.
+        // Byte fields are UINT8_ARRAY, all identities and geometry are nested,
+        // and even AES-128 carries a full 32-byte wrapped-master-key envelope.
+        let fields = BTreeMap::from([
+            (
+                "DSL_CRYPTO_SUITE".into(),
+                Value::Unsigned(ZioEncrypt::Aes128Gcm as u64),
+            ),
+            ("DSL_CRYPTO_VERSION".into(), Value::Unsigned(1)),
+            ("DSL_CRYPTO_GUID".into(), Value::Unsigned(73)),
+            (
+                "keyformat".into(),
+                Value::Unsigned(ZfsKeyFormat::Raw as u64),
+            ),
+            ("pbkdf2salt".into(), Value::Unsigned(0)),
+            ("pbkdf2iters".into(), Value::Unsigned(0)),
+            ("DSL_CRYPTO_IV".into(), Value::UnsignedBytes(vec![0x91; 12])),
+            (
+                "DSL_CRYPTO_MAC".into(),
+                Value::UnsignedBytes(vec![0xa2; 16]),
+            ),
+            (
+                "DSL_CRYPTO_MASTER_KEY_1".into(),
+                Value::UnsignedBytes(vec![0xb3; 32]),
+            ),
+            (
+                "DSL_CRYPTO_HMAC_KEY_1".into(),
+                Value::UnsignedBytes(vec![0xc4; 64]),
+            ),
+            ("portable_mac".into(), Value::UnsignedBytes(vec![0xd5; 32])),
+            ("mdn_checksum".into(), Value::Unsigned(7)),
+            ("mdn_compress".into(), Value::Unsigned(0)),
+            ("mdn_nlevels".into(), Value::Unsigned(2)),
+            ("mdn_blksz".into(), Value::Unsigned(16 * 1024)),
+            ("mdn_indblkshift".into(), Value::Unsigned(17)),
+            ("mdn_nblkptr".into(), Value::Unsigned(3)),
+            ("mdn_maxblkid".into(), Value::Unsigned(8)),
+            ("to_ivset_guid".into(), Value::Unsigned(79)),
+            ("from_ivset_guid".into(), Value::Unsigned(0)),
+        ]);
+        NvList {
+            fields: BTreeMap::from([("crypt_keydata".into(), Value::List(NvList { fields }))]),
+        }
+    }
+
+    fn native_crypto_fields(root: &mut NvList) -> &mut BTreeMap<String, Value> {
+        let Value::List(kd) = root.fields.get_mut("crypt_keydata").unwrap() else {
+            panic!("fixture must contain crypt_keydata");
+        };
+        &mut kd.fields
+    }
+
+    #[test]
+    fn native_raw_begin_preserves_all_cipher_envelopes_and_source_geometry() {
+        for suite in [
+            ZioEncrypt::Aes128Ccm,
+            ZioEncrypt::Aes192Ccm,
+            ZioEncrypt::Aes256Ccm,
+            ZioEncrypt::Aes128Gcm,
+            ZioEncrypt::Aes192Gcm,
+            ZioEncrypt::Aes256Gcm,
+        ] {
+            let mut native = native_raw_begin_fixture();
+            native_crypto_fields(&mut native)
+                .insert("DSL_CRYPTO_SUITE".into(), Value::Unsigned(suite as u64));
+            let decoded = StreamCryptoKeydata::from_nvlist(&native).unwrap();
+            assert_eq!(decoded.suite, suite);
+            assert_eq!(decoded.wrapped_master_key, [0xb3; 32]);
+            assert_eq!(decoded.meta_dnode.levels, 2);
+            assert_eq!(decoded.meta_dnode.max_block, 8);
+            assert_eq!(decoded.meta_dnode.data_bytes, 16 * 1024);
+            assert_eq!(decoded.to_ivset_guid, 79);
+            assert_eq!(decoded.from_ivset_guid, None);
+            assert_eq!(decoded.to_nvlist().unwrap(), native);
+            let encoded = decoded.to_nvlist().unwrap().encode_xdr().unwrap();
+            assert_eq!(
+                StreamCryptoKeydata::from_nvlist(&NvList::parse_exact(&encoded).unwrap()).unwrap(),
+                decoded
+            );
+        }
+    }
+
+    #[test]
+    fn native_raw_begin_requires_nested_typed_crypto_and_meta_fields() {
+        for name in [
+            "DSL_CRYPTO_SUITE",
+            "DSL_CRYPTO_VERSION",
+            "DSL_CRYPTO_GUID",
+            "keyformat",
+            "pbkdf2salt",
+            "pbkdf2iters",
+            "DSL_CRYPTO_IV",
+            "DSL_CRYPTO_MAC",
+            "DSL_CRYPTO_MASTER_KEY_1",
+            "DSL_CRYPTO_HMAC_KEY_1",
+            "portable_mac",
+            "mdn_checksum",
+            "mdn_compress",
+            "mdn_nlevels",
+            "mdn_blksz",
+            "mdn_indblkshift",
+            "mdn_nblkptr",
+            "mdn_maxblkid",
+            "to_ivset_guid",
+        ] {
+            let mut missing = native_raw_begin_fixture();
+            let value = native_crypto_fields(&mut missing).remove(name).unwrap();
+            // A same-named outer field cannot substitute for crypt_keydata.
+            missing.fields.insert(name.to_owned(), value);
+            assert!(
+                StreamCryptoKeydata::from_nvlist(&missing).is_err(),
+                "{name}"
+            );
+        }
+        for (name, length) in [
+            ("DSL_CRYPTO_IV", 12),
+            ("DSL_CRYPTO_MAC", 16),
+            ("DSL_CRYPTO_MASTER_KEY_1", 32),
+            ("DSL_CRYPTO_HMAC_KEY_1", 64),
+            ("portable_mac", 32),
+        ] {
+            let mut wrong_type = native_raw_begin_fixture();
+            native_crypto_fields(&mut wrong_type)
+                .insert(name.into(), Value::Bytes(vec![0; length]));
+            assert!(
+                StreamCryptoKeydata::from_nvlist(&wrong_type).is_err(),
+                "{name}"
+            );
+            let mut truncated = native_raw_begin_fixture();
+            native_crypto_fields(&mut truncated)
+                .insert(name.into(), Value::UnsignedBytes(vec![0; length - 1]));
+            assert!(
+                StreamCryptoKeydata::from_nvlist(&truncated).is_err(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_raw_begin_rejects_invalid_geometry_key_formats_and_versions() {
+        for (name, value) in [
+            ("DSL_CRYPTO_VERSION", 0),
+            ("DSL_CRYPTO_VERSION", 2),
+            ("keyformat", 0),
+            ("keyformat", 3),
+            ("pbkdf2salt", 1),
+            ("pbkdf2iters", 1),
+            ("to_ivset_guid", 0),
+            ("mdn_checksum", 9),
+            ("mdn_compress", 15),
+            ("mdn_nlevels", 0),
+            ("mdn_nlevels", 13),
+            ("mdn_nlevels", 256),
+            ("mdn_blksz", 511),
+            ("mdn_blksz", MAX_BLOCK_BYTES as u64 + 512),
+            ("mdn_indblkshift", 11),
+            ("mdn_indblkshift", 18),
+            ("mdn_nblkptr", 2),
+            ("mdn_maxblkid", 3072),
+        ] {
+            let mut malformed = native_raw_begin_fixture();
+            native_crypto_fields(&mut malformed).insert(name.into(), Value::Unsigned(value));
+            assert!(
+                StreamCryptoKeydata::from_nvlist(&malformed).is_err(),
+                "{name}={value}"
+            );
+        }
+        let mut passphrase = native_raw_begin_fixture();
+        let fields = native_crypto_fields(&mut passphrase);
+        fields.insert("keyformat".into(), Value::Unsigned(3));
+        fields.insert("pbkdf2salt".into(), Value::Unsigned(0x1234));
+        fields.insert("pbkdf2iters".into(), Value::Unsigned(1));
+        fields.insert("from_ivset_guid".into(), Value::Unsigned(83));
+        let parsed = StreamCryptoKeydata::from_nvlist(&passphrase).unwrap();
+        assert_eq!(parsed.from_ivset_guid, Some(83));
+        assert_eq!(parsed.to_nvlist().unwrap(), passphrase);
     }
 }

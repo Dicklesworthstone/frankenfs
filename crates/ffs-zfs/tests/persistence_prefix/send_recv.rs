@@ -7,7 +7,7 @@ use super::*;
 use ffs_ondisk::zfs::crypto::{ZioEncrypt, verify_objset_macs};
 use ffs_ondisk::zfs::send_stream::{
     DMU_BACKUP_FEATURE_COMPRESSED, DMU_REPLAY_RECORD_BYTES, DrrRecord, Fletcher4Stream,
-    ReceiveResumeToken, StreamHeaderType,
+    ReceiveResumeToken, StreamCryptoKeydata, StreamHeaderType, StreamMetaDnode,
 };
 use ffs_zfs::reader::dmu::properties::PropertyValue;
 use ffs_zfs::reader::dmu::zpl::PathPolicy;
@@ -948,6 +948,92 @@ fn restamp_raw_keydata(
     });
     assert_eq!(changed, 1);
     output
+}
+
+fn raw_stream_keydata(stream: &[u8]) -> StreamCryptoKeydata {
+    let (_, record, payload) = checked_substream_records(stream, true)
+        .into_iter()
+        .next()
+        .unwrap();
+    assert!(matches!(record, DrrRecord::Begin(_)));
+    let envelope = ffs_ondisk::zfs::nvlist::NvList::parse_exact(&payload).unwrap();
+    assert_eq!(envelope.fields.len(), 1);
+    let keydata = envelope.list("crypt_keydata").unwrap();
+    for (name, length) in [
+        ("DSL_CRYPTO_IV", 12),
+        ("DSL_CRYPTO_MAC", 16),
+        ("DSL_CRYPTO_MASTER_KEY_1", 32),
+        ("DSL_CRYPTO_HMAC_KEY_1", 64),
+        ("portable_mac", 32),
+    ] {
+        let Some(ffs_ondisk::zfs::nvlist::Value::UnsignedBytes(bytes)) = keydata.fields.get(name)
+        else {
+            panic!("native raw header field {name} must use DATA_TYPE_UINT8_ARRAY (26)");
+        };
+        assert_eq!(bytes.len(), length, "native {name} length");
+    }
+    assert!(
+        keydata
+            .unsigned("to_ivset_guid")
+            .is_some_and(|value| value != 0)
+    );
+    assert!(keydata.unsigned("from_ivset_guid").is_some());
+    StreamCryptoKeydata::from_nvlist(&envelope).unwrap()
+}
+
+fn raw_dataset_objectset(
+    cx: &Cx,
+    mos: &mut ffs_zfs::Objects,
+    device: &FaultableMemberDevice,
+    dataset: &[Vec<u8>],
+    snapshot: Option<&[u8]>,
+) -> (BlockPointer, ObjectSet) {
+    let object = if let Some(snapshot) = snapshot {
+        mos.snapshots(cx, dataset)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.name == snapshot)
+            .unwrap()
+            .object
+    } else {
+        // Public dataset inventory intentionally hides incomplete receives.
+        // Inspect the native DSL path so checkpoints can be checked without
+        // making private staging visible through the filesystem namespace.
+        let mut directory = mos
+            .zap_values(cx, 1)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.name == b"root_dataset")
+            .unwrap()
+            .scalar()
+            .unwrap();
+        for component in dataset {
+            let node = mos.object(cx, directory).unwrap();
+            let children = node.order().u64(node.bonus(), 32).unwrap();
+            directory = mos
+                .zap_values(cx, children)
+                .unwrap()
+                .into_iter()
+                .find(|entry| entry.name == *component)
+                .unwrap()
+                .scalar()
+                .unwrap();
+        }
+        let node = mos.object(cx, directory).unwrap();
+        node.order().u64(node.bonus(), 8).unwrap()
+    };
+    let node = mos.object(cx, object).unwrap();
+    let pointer = BlockPointer::parse(&node.bonus()[128..256], node.order()).unwrap();
+    let media = device.durable_snapshot();
+    let offset = usize::try_from(DATA_OFFSET + pointer.data_dvas().unwrap()[0].offset).unwrap();
+    let raw = ffs_ondisk::zfs::decompress(
+        &media[offset..offset + pointer.physical_bytes()],
+        pointer.compression(),
+        pointer.logical_bytes(),
+    )
+    .unwrap();
+    let objectset = ObjectSet::parse(&raw, pointer.payload_order()).unwrap();
+    (pointer, objectset)
 }
 
 #[test]
@@ -2351,7 +2437,7 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
     };
     let wrapping_key = ZfsKeyMaterial::Raw([0x3C_u8; 32]);
 
-    // 1. Source encrypted dataset with two snapshots @e1 and @e2.
+    // 1. Source encrypted dataset with data snapshots and an unchanged @e3-empty.
     let src_built = build_clean_zfs_pool(&send_recv_pool_spec(32 * 1024 * 1024));
     let src_devs: Vec<_> = src_built
         .members
@@ -2448,6 +2534,41 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
         )
         .into_result()
         .unwrap();
+
+    // Grow beyond the three direct metadata leaves, then free every upper
+    // object. The source retains its two-level metadata tree and high-water
+    // mark even though only table zero remains allocated. Raw receive must
+    // reproduce that authenticated shape rather than infer it from OBJECTs.
+    for index in 0..96 {
+        let name = format!("meta-shape-{index:03}");
+        src_engine
+            .create_file(
+                &cx,
+                &vault_src,
+                root_obj,
+                name.as_bytes(),
+                0o600,
+                0,
+                0,
+                ts,
+                ZfsDataChecksum::Inherit,
+            )
+            .into_result()
+            .unwrap();
+    }
+    for index in 0..96 {
+        let name = format!("meta-shape-{index:03}");
+        src_engine
+            .unlink_entry(&cx, &vault_src, root_obj, name.as_bytes(), false, ts)
+            .into_result()
+            .unwrap();
+    }
+    assert_pool_scrub_and_allocation_clean(
+        &cx,
+        &src_devs,
+        src_built.pool_guid,
+        Some(src_engine.committed_slot()),
+    );
     src_engine
         .create_snapshot(&cx, &vault_src, b"e1", ts)
         .into_result()
@@ -2483,6 +2604,10 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
         .create_snapshot(&cx, &vault_src, b"e2", ts)
         .into_result()
         .unwrap();
+    src_engine
+        .create_snapshot(&cx, &vault_src, b"e3-empty", ts)
+        .into_result()
+        .unwrap();
 
     // 2. Open FRESH KEYLESS reader on source (`key_status == Unavailable`) and emit raw `-w` streams!
     let mut keyless_src_mos = open_mos(
@@ -2496,12 +2621,58 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
         ZfsKeyStatus::Unavailable
     );
 
+    let (_, source_e1) = raw_dataset_objectset(
+        &cx,
+        &mut keyless_src_mos,
+        &src_devs[0],
+        &vault_src,
+        Some(b"e1"),
+    );
+    assert!(source_e1.meta.levels() >= 2);
+    assert!(source_e1.meta.max_block() >= 3);
+    assert!(
+        source_e1.meta.pointers()[1..]
+            .iter()
+            .all(BlockPointer::hole)
+    );
+    let meta_indirect = &source_e1.meta.pointers()[0];
+    assert_eq!(meta_indirect.level(), 1);
+    let allocated_meta_leaves: Vec<_> = {
+        let source_media = src_devs[0].durable_snapshot();
+        let meta_offset =
+            usize::try_from(DATA_OFFSET + meta_indirect.data_dvas().unwrap()[0].offset).unwrap();
+        let meta_payload = ffs_ondisk::zfs::decompress(
+            &source_media[meta_offset..meta_offset + meta_indirect.physical_bytes()],
+            meta_indirect.compression(),
+            meta_indirect.logical_bytes(),
+        )
+        .unwrap();
+        meta_payload
+            .chunks_exact(128)
+            .enumerate()
+            .filter_map(|(block, bytes)| {
+                let pointer = BlockPointer::parse(bytes, meta_indirect.payload_order()).unwrap();
+                (!pointer.hole()).then_some(block)
+            })
+            .collect()
+    };
+    assert_eq!(
+        allocated_meta_leaves,
+        vec![0],
+        "source must retain sparse overheight with no allocated upper metadata leaves"
+    );
     let mut raw_e1 = Vec::new();
     let mut req_e1 = ZfsSendRequest::full(vault_src.clone(), b"e1".to_vec());
     req_e1.raw = true;
     req_e1.large_blocks = true;
     let report_e1 = send_stream(&cx, &mut keyless_src_mos, &req_e1, &mut raw_e1).unwrap();
     assert!(report_e1.raw);
+    let keydata_e1 = raw_stream_keydata(&raw_e1);
+    assert_eq!(
+        keydata_e1.meta_dnode,
+        StreamMetaDnode::from_dnode(&source_e1.meta).unwrap()
+    );
+    assert_eq!(keydata_e1.portable_mac, source_e1.portable_mac().unwrap());
     let mut raw_spills = 0;
     for (_, record, _) in checked_substream_records(&raw_e1, true) {
         if let DrrRecord::Spill(spill) = record
@@ -2525,6 +2696,34 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
     req_e2.large_blocks = true;
     let report_e2 = send_stream(&cx, &mut keyless_src_mos, &req_e2, &mut raw_e2).unwrap();
     assert!(report_e2.raw && report_e2.from_guid == report_e1.to_guid);
+    let keydata_e2 = raw_stream_keydata(&raw_e2);
+    let (_, source_e2) = raw_dataset_objectset(
+        &cx,
+        &mut keyless_src_mos,
+        &src_devs[0],
+        &vault_src,
+        Some(b"e2"),
+    );
+    assert_eq!(
+        keydata_e2.meta_dnode,
+        StreamMetaDnode::from_dnode(&source_e2.meta).unwrap()
+    );
+    assert_eq!(keydata_e2.from_ivset_guid, Some(keydata_e1.to_ivset_guid));
+    let mut req_e3 = ZfsSendRequest::full(vault_src.clone(), b"e3-empty".to_vec());
+    req_e3.from = Some(ZfsSendFrom::Snapshot(b"e2".to_vec()));
+    req_e3.raw = true;
+    let mut raw_e3 = Vec::new();
+    send_stream(&cx, &mut keyless_src_mos, &req_e3, &mut raw_e3).unwrap();
+    let records_e3 = checked_substream_records(&raw_e3, true);
+    assert_eq!(
+        records_e3.len(),
+        2,
+        "unchanged snapshot must emit only BEGIN and END"
+    );
+    assert!(matches!(records_e3[1].1, DrrRecord::End(_)));
+    let keydata_e3 = raw_stream_keydata(&raw_e3);
+    assert_eq!(keydata_e3.meta_dnode, keydata_e2.meta_dnode);
+    assert_eq!(keydata_e3.from_ivset_guid, Some(keydata_e2.to_ivset_guid));
 
     // Raw compressed WRITE records retain the source BP algorithm and logical
     // geometry. Refuse either missing feature without publishing the dataset.
@@ -2578,7 +2777,7 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
         );
     }
 
-    // 3. Receive BOTH raw encrypted streams on a fresh KEYLESS destination pool!
+    // 3. Receive the raw encrypted streams on a fresh KEYLESS destination pool.
     let dst_built = build_clean_zfs_pool(&send_recv_pool_spec(32 * 1024 * 1024));
     let dst_devs: Vec<_> = dst_built
         .members
@@ -2615,16 +2814,52 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
             .unwrap()
             .is_none()
     );
-    for malformed_slots in [false, true] {
+    for (field, value) in [
+        ("mdn_nlevels", None),
+        ("mdn_blksz", Some(8192)),
+        ("mdn_nlevels", Some(8)),
+        ("to_ivset_guid", Some(0)),
+    ] {
+        let invalid = restamp_raw_keydata(&raw_e1, |envelope| {
+            use ffs_ondisk::zfs::nvlist::Value;
+            let Some(Value::List(keydata)) = envelope.fields.get_mut("crypt_keydata") else {
+                panic!("missing source keydata")
+            };
+            if let Some(value) = value {
+                keydata
+                    .fields
+                    .insert(field.to_owned(), Value::Unsigned(value));
+            } else {
+                assert!(keydata.fields.remove(field).is_some());
+            }
+        });
+        let before = snapshot_media_bytes(&dst_devs);
+        assert!(
+            matches!(
+                dst_engine.receive_stream(&cx, &receive, &mut Cursor::new(invalid)),
+                ZfsTxOutcome::NotCommitted(_)
+            ),
+            "invalid raw field {field}={value:?}"
+        );
+        assert_media_unchanged(&dst_devs, &before);
+        assert!(
+            dst_engine
+                .inspect_receive_resume_state(&cx, &vault_dst)
+                .unwrap()
+                .is_none()
+        );
+    }
+    for malformed_range in 0..3 {
         let mut changed = false;
         let malformed = restamp_substream(&raw_e1, true, |mut record, payload| {
             if let DrrRecord::ObjectRange(range) = &mut record
                 && !changed
             {
-                if malformed_slots {
-                    range.numslots = u64::MAX;
-                } else {
-                    range.firstobj = 1;
+                match malformed_range {
+                    0 => range.firstobj = 1,
+                    1 => range.numslots = u64::MAX,
+                    2 => range.flags ^= ffs_ondisk::zfs::send_stream::DRR_RAW_BYTESWAP,
+                    _ => unreachable!(),
                 }
                 changed = true;
             }
@@ -2670,6 +2905,13 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
         ZfsTxOutcome::NotCommitted(_)
     ));
     assert_eq!(&dsl_block_feature_counts(&cx, &dst_engine)[..2], &[1, 1]);
+    let mut checkpoint_mos = dst_engine.open_read_objects(&cx).unwrap();
+    let (_, checkpoint_os) =
+        raw_dataset_objectset(&cx, &mut checkpoint_mos, &dst_devs[0], &vault_dst, None);
+    assert_eq!(
+        StreamMetaDnode::from_dnode(&checkpoint_os.meta).unwrap(),
+        keydata_e1.meta_dnode
+    );
     let state = dst_engine
         .inspect_receive_resume_state(&cx, &vault_dst)
         .unwrap()
@@ -2680,6 +2922,26 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
     resume.large_blocks = true;
     let mut resumed_e1 = Vec::new();
     send_stream(&cx, &mut keyless_src_mos, &resume, &mut resumed_e1).unwrap();
+    assert_eq!(
+        raw_stream_keydata(&resumed_e1).meta_dnode,
+        keydata_e1.meta_dnode
+    );
+    let changed_resume_geometry = restamp_raw_keydata(&resumed_e1, |envelope| {
+        use ffs_ondisk::zfs::nvlist::Value;
+        let Some(Value::List(keydata)) = envelope.fields.get_mut("crypt_keydata") else {
+            panic!("missing source keydata")
+        };
+        keydata.fields.insert(
+            "mdn_nlevels".to_owned(),
+            Value::Unsigned(u64::from(keydata_e1.meta_dnode.levels) + 1),
+        );
+    });
+    let before_geometry = snapshot_media_bytes(&dst_devs);
+    assert!(matches!(
+        dst_engine.receive_stream(&cx, &receive, &mut Cursor::new(changed_resume_geometry)),
+        ZfsTxOutcome::NotCommitted(_)
+    ));
+    assert_media_unchanged(&dst_devs, &before_geometry);
     let downgraded = restamp_substream(&resumed_e1, true, |mut record, payload| {
         if let DrrRecord::Begin(begin) = &mut record {
             begin.features = ffs_ondisk::zfs::send_stream::SendFeatureFlags::from_bits(
@@ -2706,17 +2968,23 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
         .expect("keyless raw recv @e1");
     assert!(r_e1.raw && r_e1.final_snapshot == "e1");
     assert_eq!(&dsl_block_feature_counts(&cx, &dst_engine)[..2], &[2, 2]);
+    let mut full_mos = dst_engine.open_read_objects(&cx).unwrap();
+    let (_, full_os) = raw_dataset_objectset(&cx, &mut full_mos, &dst_devs[0], &vault_dst, None);
+    assert_eq!(
+        StreamMetaDnode::from_dnode(&full_os.meta).unwrap(),
+        keydata_e1.meta_dnode
+    );
 
-    for case in 0..4 {
-        let invalid = restamp_raw_keydata(&raw_e2, |keydata| {
+    for case in 0..5 {
+        let invalid = restamp_raw_keydata(&raw_e2, |envelope| {
             use ffs_ondisk::zfs::nvlist::Value;
+            let Some(Value::List(keydata)) = envelope.fields.get_mut("crypt_keydata") else {
+                panic!("missing source keydata")
+            };
             match case {
                 0 => {
-                    let Some(Value::List(crypto)) = keydata.fields.get_mut("crypt_keydata") else {
-                        panic!("missing source keydata")
-                    };
-                    let guid = crypto.unsigned("DSL_CRYPTO_GUID").unwrap();
-                    crypto
+                    let guid = keydata.unsigned("DSL_CRYPTO_GUID").unwrap();
+                    keydata
                         .fields
                         .insert("DSL_CRYPTO_GUID".to_owned(), Value::Unsigned(guid ^ 1));
                 }
@@ -2733,6 +3001,11 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
                     keydata
                         .fields
                         .insert("from_ivset_guid".to_owned(), Value::Unsigned(ivset ^ 1));
+                }
+                4 => {
+                    keydata
+                        .fields
+                        .insert("mdn_indblkshift".to_owned(), Value::Unsigned(16));
                 }
                 _ => unreachable!(),
             }
@@ -2787,9 +3060,58 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
         .expect("keyless raw incremental recv @e2");
     assert!(r_e2.raw && r_e2.final_snapshot == "e2");
     assert_eq!(&dsl_block_feature_counts(&cx, &dst_engine)[..2], &[3, 3]);
+    let mut before_empty_mos =
+        open_mos(&cx, &dst_devs, dst_built.pool_guid, tok_e2.published_slot());
+    let (before_empty_root, before_empty_os) =
+        raw_dataset_objectset(&cx, &mut before_empty_mos, &dst_devs[0], &vault_dst, None);
+    assert_eq!(
+        StreamMetaDnode::from_dnode(&before_empty_os.meta).unwrap(),
+        keydata_e2.meta_dnode
+    );
+    let (empty_report, tok_e3) = dst_engine
+        .receive_stream(
+            &cx,
+            &ZfsRecvRequest::new(vault_dst.clone()),
+            &mut Cursor::new(&raw_e3),
+        )
+        .into_result()
+        .unwrap();
+    assert_eq!(empty_report.final_snapshot, "e3-empty");
+    let mut after_empty_mos = dst_engine.open_read_objects(&cx).unwrap();
+    let (after_empty_root, after_empty_os) =
+        raw_dataset_objectset(&cx, &mut after_empty_mos, &dst_devs[0], &vault_dst, None);
+    assert!(
+        after_empty_root.birth() > before_empty_root.birth(),
+        "even an empty raw stream must publish its ObjectSet authentication metadata"
+    );
+    assert_eq!(
+        StreamMetaDnode::from_dnode(&after_empty_os.meta).unwrap(),
+        keydata_e3.meta_dnode
+    );
+    assert_eq!(after_empty_os.portable_mac(), Some(keydata_e3.portable_mac));
+    assert_eq!(after_empty_os.local_mac(), Some([0; 32]));
+    assert_eq!(after_empty_os.flags & 1, 0);
+    assert_eq!(&dsl_block_feature_counts(&cx, &dst_engine)[..2], &[4, 4]);
 
     // 4. Verify locked behavior, keyless scrub, and exact keyed decryption + MAC verification!
-    let mut dst_mos = open_mos(&cx, &dst_devs, dst_built.pool_guid, tok_e2.published_slot());
+    let fresh_dst: Vec<_> = dst_devs
+        .iter()
+        .map(FaultableMemberDevice::fresh_from_durable)
+        .collect();
+    let mut dst_mos = open_mos(
+        &cx,
+        &fresh_dst,
+        dst_built.pool_guid,
+        tok_e3.published_slot(),
+    );
+    let (_, reopened_os) =
+        raw_dataset_objectset(&cx, &mut dst_mos, &fresh_dst[0], &vault_dst, None);
+    assert_eq!(
+        StreamMetaDnode::from_dnode(&reopened_os.meta).unwrap(),
+        keydata_e3.meta_dnode
+    );
+    assert_eq!(reopened_os.portable_mac(), Some(keydata_e3.portable_mac));
+    assert_eq!(reopened_os.local_mac(), Some([0; 32]));
     assert_eq!(
         dst_mos.key_status(&cx, &vault_dst).unwrap(),
         ZfsKeyStatus::Unavailable
@@ -2867,7 +3189,7 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
         &cx,
         &dst_devs,
         dst_built.pool_guid,
-        Some(tok_e2.published_slot()),
+        Some(tok_e3.published_slot()),
     );
 }
 
