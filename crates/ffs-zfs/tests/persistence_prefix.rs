@@ -8,6 +8,8 @@
 mod creation_project;
 #[path = "persistence_prefix/growth.rs"]
 mod growth;
+#[path = "persistence_prefix/mixed_order.rs"]
+mod mixed_order;
 #[path = "persistence_prefix/permissions.rs"]
 mod permissions;
 #[path = "persistence_prefix/projects.rs"]
@@ -100,6 +102,9 @@ struct PoolFixtureSpec {
     mirror_width: usize,
     zpl_version: u64,
     zpl_order: Option<Endian>,
+    zpl_contents_order: Option<Endian>,
+    extra_zpl_leaf_order: Option<Endian>,
+    zvol_orders: Option<(Endian, Endian)>,
     with_sa_spill: bool,
     with_sa_spill_timestamps: bool,
     user_accounting: bool,
@@ -139,6 +144,9 @@ impl Default for PoolFixtureSpec {
             mirror_width: 1,
             zpl_version: 5,
             zpl_order: None,
+            zpl_contents_order: None,
+            extra_zpl_leaf_order: None,
+            zvol_orders: None,
             with_sa_spill: false,
             with_sa_spill_timestamps: false,
             user_accounting: false,
@@ -807,7 +815,13 @@ fn build_zpl_objectset(
     birth: u64,
     order: Endian,
 ) -> (BlockPointer, u64, Vec<u8>) {
-    let order = spec.zpl_order.unwrap_or(order);
+    if head_object == 18
+        && let Some((objectset_order, contents_order)) = spec.zvol_orders
+    {
+        return mixed_order::build_zvol_objectset(arena, birth, objectset_order, contents_order);
+    }
+    let objectset_order = spec.zpl_order.unwrap_or(order);
+    let order = spec.zpl_contents_order.unwrap_or(objectset_order);
     let mut table = vec![0_u8; DNODE_BLOCK_BYTES];
     let acct_flags = if spec.user_accounting || spec.project_accounting {
         DNODE_FLAG_USERUSED_ACCOUNTED | DNODE_FLAG_USEROBJUSED_ACCOUNTED
@@ -1327,6 +1341,62 @@ fn build_zpl_objectset(
         write_dnode_at(&mut table, owner_index, &owner_node).unwrap();
     }
 
+    let extra_table = spec
+        .extra_zpl_leaf_order
+        .filter(|_| populate_snapshot_files)
+        .map(|leaf_order| {
+            assert_eq!(spec.zpl_version, 5);
+            assert!(!spec.user_accounting && !spec.project_accounting);
+            let mut extra = vec![0_u8; DNODE_BLOCK_BYTES];
+            for (slot, name, fill) in [
+                (0, b"foreign.bin".as_slice(), 0x71),
+                (1, b"neighbor.bin", 0x72),
+            ] {
+                let data = vec![fill; 512];
+                let pointer = arena.alloc_block(&data, 19, 0, birth, leaf_order);
+                let meta = Metadata {
+                    kind: Kind::Regular,
+                    mode: (Kind::Regular.to_tag() << 12) | 0o644,
+                    size: 512,
+                    links: 1,
+                    parent: 2,
+                    uid: 1000,
+                    gid: 1000,
+                    flags: 0x408,
+                    generation: birth,
+                    times: [ts; 4],
+                    inline_symlink: None,
+                };
+                let (bonus_type, mut bonus, spill) = encode_zpl_bonus_for_fixture(
+                    &meta,
+                    5,
+                    sa_reg.as_ref(),
+                    SaSpillFixture::None,
+                    arena,
+                    birth,
+                    leaf_order,
+                );
+                assert!(bonus.len() <= 256 && spill.is_none());
+                bonus.resize(256, 0);
+                let node = make_dnode(
+                    19,
+                    512,
+                    vec![pointer],
+                    bonus_type,
+                    bonus,
+                    None,
+                    0,
+                    leaf_order,
+                );
+                write_dnode_at(&mut extra, slot, &node).unwrap();
+                root_entries.push((
+                    name,
+                    encode_directory_reference(32 + slot as u64, Kind::Regular).unwrap(),
+                ));
+            }
+            (extra, leaf_order)
+        });
+
     let root_raw = mzap(&root_entries, 0x88, order);
     let root_bp = arena.alloc_block(&root_raw, 20, 0, birth, order);
     let root_meta = Metadata {
@@ -1372,16 +1442,19 @@ fn build_zpl_objectset(
     );
     write_dnode_at(&mut table, 2, &root_dn).expect("write root dn");
 
-    let table_bp = arena.alloc_block(&table, DMU_OT_DNODE, 0, birth, order);
+    let mut table_pointers = vec![arena.alloc_block(&table, DMU_OT_DNODE, 0, birth, order)];
+    if let Some((extra, leaf_order)) = extra_table {
+        table_pointers.push(arena.alloc_block(&extra, DMU_OT_DNODE, 0, birth, leaf_order));
+    }
     let meta_dn = make_dnode(
         DMU_OT_DNODE,
         DNODE_BLOCK_BYTES,
-        vec![table_bp],
+        table_pointers,
         0,
         Vec::new(),
         None,
         0,
-        order,
+        objectset_order,
     );
 
     let zil_header = if spec.dirty_zil {
@@ -1539,15 +1612,15 @@ fn build_zpl_objectset(
                 Vec::new(),
                 None,
                 0,
-                order,
+                objectset_order,
             );
             os_obj
                 .set_embedded_dnode(offset, Some(&node))
                 .expect("accounting dnode");
         }
     }
-    let encoded_os = os_obj.encode(order).expect("encode zpl os");
-    let os_bp = arena.alloc_block(&encoded_os, DMU_OT_OBJSET, 0, birth, order);
+    let encoded_os = os_obj.encode(objectset_order).expect("encode zpl os");
+    let os_bp = arena.alloc_block(&encoded_os, DMU_OT_OBJSET, 0, birth, objectset_order);
     let referenced = os_obj.meta.used_bytes() + bp_allocated_bytes(&os_bp);
     (os_bp, referenced, snap_hello_bytes)
 }

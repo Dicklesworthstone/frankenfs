@@ -816,9 +816,16 @@ profile requires complete native accounting and canonical limit tables in the
 writer's byte order. Empty files consume one object and the native 512-byte
 dnode charge; allocated data adds its native usage. Net growth past a limit
 returns EDQUOT, while exact-boundary changes and reclamation remain possible.
-Malformed limits, missing or understated accounting for touched objects, and
-unsupported mixed-order quota metadata refuse mutation; ordinary reads remain
-available.
+Malformed limits and missing or understated accounting for touched objects
+refuse mutation; ordinary reads remain available.
+
+Native ZPL/ZVOL writes require matching byte order for retained ObjectSet
+metadata and for each existing dnode-table leaf being rewritten. The leaf check
+uses its own block pointer, including in trees with mixed byte orders, and
+covers both ordinary COW and final MOS replay before backing writes. Untouched
+subtrees retain their original pointers and remain readable. ObjectSet byte-order
+conversion remains outside the writable profile; the ZVOL restriction is
+conservative even when its retained tail happens to contain only zeroes.
 The writable FsOps adapter handles nonempty writes, file-range copies, truncation
 and supported sparse range edits by clearing native S_ISUID and executable
 S_ISGID bits in the same TXG as the data change. Non-executable S_ISGID is retained,

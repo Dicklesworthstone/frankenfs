@@ -1,5 +1,21 @@
 # FEATURE_PARITY
 
+> **ZFS mixed-byte-order write admission (2026-11-23):**
+> Normal COW and final fixed-DVA replay refuse replacing an existing DNODE leaf
+> whose block-pointer payload order differs from commit order. This protects
+> untouched dnodes in copied table blocks, including heterogeneous native trees;
+> structural header parsing does not establish safe conversion. New/hole leaves,
+> whole-leaf deletion and untouched subtrees retain their existing contracts.
+> ZPL and ZVOL mutation also refuse unsupported retained ObjectSet order;
+> read/info paths remain available. The ZVOL ObjectSet gate is conservative for
+> zero tails. An executed probe using the real `ffs-ondisk` library confirms the
+> SA256 hazard in both directions: structural counting succeeds while the wrong
+> order turns a valid 256-byte SA bonus into one byte and metadata decoding fails.
+> One guard unit test and three native transaction regressions are authored;
+> their execution remains blocked by the runtime dependency build. Workspace
+> formatting, independent review and the three-file UBS static fallback pass.
+> This does not claim native interchange or full mixed-order write support.
+
 > **ZFS native owner quota enforcement (2026-11-23):**
 > Native COW mutations enforce byte and object limits for users, groups and
 > projects before backing writes or TXG publication. Per-owner net deltas

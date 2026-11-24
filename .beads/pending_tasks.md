@@ -2,7 +2,7 @@
 
 Created by CC agent 2026-04-22. Import when bead database clears.
 
-## Current execution — 2026-11-23, native FAT protection and ZFS owner quotas
+## Current execution — 2026-11-23, FAT protection, ZFS quotas and metadata order
 
 Started at `f9ce14528328e8eb7f9a9bd1a0e21bf058b6ec86`. These are substantive
 increments toward `bd-tqrnc` and `bd-jdned`; their complete native-interchange,
@@ -65,8 +65,32 @@ canonical issue graph or claiming closure of blocked broad milestones.
   lease; verify the remote head and preserve the remaining ZFS work. The actual
   pre-push script accepts its documented emergency exception with both the
   commit trailer and `FFS_PRE_PUSH_BYPASS=1`; no gate pass is inferred from it.
-- [x] Prepare the separate ZFS implementation, regression and supported-profile
-  checkpoint; preserve the original broad Bead acceptance and dependencies.
+- [x] Publish ZFS owner quotas directly to `main` as
+  `356ccbc5bfea64a7388d9bda74a3f69d26243340` with the same explicit emergency
+  gate, expected-head lease and verified remote head. Preserve broad Beads.
+- [x] Find the additional foreign-order DNODE-copy hazard: valid 256-byte SA
+  bonuses can pass the old structural counter in the wrong order as one byte.
+  Execute a standalone Cargo probe against the real current `ffs-ondisk` path
+  dependency, with no replacement codec types or repository configuration
+  changes: both Big-to-Little and Little-to-Big controls pass (exit 0). Native
+  source SA metadata reads correctly; opposite-order structural count stays 1,
+  bonus length becomes 1 and metadata decode fails; geometry 512 becomes 131072.
+  This proves the codec hazard, not execution of the new transaction guards.
+- [x] Refuse unsafe DNODE leaf replacement in normal COW and fixed-DVA replay;
+  preserve new/hole leaves, full-leaf deletion and untouched subtrees. Generalize
+  ZPL retained ObjectSet admission beyond quota limits and guard all four ZVOL
+  mutation callers while preserving independent read/info APIs. The ZVOL
+  ObjectSet boundary is conservative for zero tails.
+- [x] Add one guard unit test and three native transaction regressions covering
+  valid SA256 neighbors, separate ObjectSet/leaf byte orders, no backing writes,
+  normal-order controls, cold reopen and native ZVOL read/resize behavior.
+  Independently review both COW paths, ZPL and ZVOL; no blocking findings.
+- [x] Final third-increment workspace/direct-test formatting and diff checks
+  pass. UBS static fallback on the three changed production files exits 0 with
+  0 critical findings; added-line notices are only test imports/assertions.
+- [ ] Execute `cargo test -p ffs-zfs --lib mixed_order` and
+  `cargo test -p ffs-zfs --test persistence_prefix mixed_order` on a host that
+  can compile `asupersync`; the native transaction tests remain unexecuted here.
 - [ ] Native OpenZFS and mounted-syscall qualification remain independent:
   this environment has no native filesystem oracle tools or `/dev/fuse`.
 

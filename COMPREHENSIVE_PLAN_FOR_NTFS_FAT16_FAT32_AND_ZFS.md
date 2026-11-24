@@ -721,6 +721,16 @@ for objects in touched dnode blocks refuses mutation before backing writes.
 Dataset quotas, quota administration, native interchange and broader lifecycle
 qualification remain separate work; this does not close the writer milestone.
 
+Native mutation now checks the actual payload order of every committed DNODE
+leaf being replaced, in both ordinary COW and final fixed-DVA MOS replay. An
+ObjectSet-level comparison alone cannot protect heterogeneous native trees.
+Foreign-order copied leaf bytes are refused before backing writes; new/hole
+leaves, whole-leaf deletion and untouched subtrees retain their existing
+contracts. ZPL and ZVOL mutation also refuse incompatible retained ObjectSet
+order until general tail conversion is supported. Reads continue to honor each
+native block's recorded order. The ZVOL ObjectSet restriction is conservative
+for zero tails; copied DNODE metadata is the demonstrated corruption hazard.
+
 Read snapshots at their selected immutable root. Enumerate datasets, properties,
 clones, and snapshots independently of which dataset is mounted. Parent/child
 dataset boundaries and mount policy cannot be inferred solely from a ZPL file

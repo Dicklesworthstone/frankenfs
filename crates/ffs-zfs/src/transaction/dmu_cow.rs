@@ -937,6 +937,28 @@ fn lookup_existing_bp_at_level(
     }
 }
 
+fn admit_rewritten_dnode_leaf(
+    object_type: u8,
+    replaces_payload: bool,
+    old: &BlockPointer,
+    order: Endian,
+) -> Result<()> {
+    // The caller preserves untouched dnodes as raw bytes. Parsing those bytes
+    // in the new order is not conversion: e.g. a 256-byte SA bonus becomes a
+    // valid one-byte bonus header and corrupts its untouched owner on reopen.
+    // Indirect-pointer blocks have their own explicit conversion below.
+    if object_type == DMU_OT_DNODE
+        && replaces_payload
+        && !old.hole()
+        && old.payload_order() != order
+    {
+        return Err(unsupported(
+            "rewriting mixed-order native dnode table leaves",
+        ));
+    }
+    Ok(())
+}
+
 /// Bottom-up COW update of one dnode's data and indirect blocks.
 pub(super) fn cow_update_dnode(
     cx: &Cx,
@@ -1022,6 +1044,12 @@ pub(super) fn cow_update_dnode(
             && let Some((old_bp, _)) =
                 lookup_existing_bp_at_level(cx, view, old_node, old_ceiling, 0, block_id)?
         {
+            admit_rewritten_dnode_leaf(
+                spec.object_type,
+                maybe_bytes.is_some(),
+                &old_bp,
+                spec.order,
+            )?;
             retired_bps.push(old_bp);
         }
         let new_bp = if let Some(payload) = maybe_bytes {
@@ -3220,6 +3248,12 @@ impl<'a> FixedDvaReplay<'a> {
                 && let Some((old_bp, _)) =
                     lookup_existing_bp_at_level(cx, view, old_node, old_ceiling, 0, block_id)?
             {
+                admit_rewritten_dnode_leaf(
+                    spec.object_type,
+                    maybe_bytes.is_some(),
+                    &old_bp,
+                    spec.order,
+                )?;
                 retired_bps.push(old_bp);
             }
             let new_bp = if let Some(payload) = maybe_bytes {
@@ -3440,6 +3474,52 @@ impl<'a> FixedDvaReplay<'a> {
 
 #[allow(dead_code)]
 fn _assert_btree_set_used(_: &BTreeSet<u64>) {}
+
+#[cfg(test)]
+mod mixed_order_tests {
+    use super::*;
+
+    #[test]
+    fn mixed_order_dnode_guard_preserves_holes_deletions_and_nonmetadata_payloads() {
+        let payload = vec![0; DNODE_BLOCK_BYTES];
+        for order in [Endian::Little, Endian::Big] {
+            let old = BlockPointer::new_regular(&RegularBlockSpec {
+                dvas: &[Dva {
+                    vdev: 0,
+                    offset: 0,
+                    allocated_bytes: DNODE_BLOCK_BYTES as u64,
+                    gang: false,
+                }],
+                physical: &payload,
+                logical_bytes: payload.len(),
+                compression: 2,
+                checksum_type: 7,
+                object_type: DMU_OT_DNODE,
+                level: 0,
+                payload_order: order,
+                birth: 1,
+                fill: 1,
+            })
+            .unwrap();
+            let foreign = if order == Endian::Little {
+                Endian::Big
+            } else {
+                Endian::Little
+            };
+            admit_rewritten_dnode_leaf(DMU_OT_DNODE, true, &old, order).unwrap();
+            assert_eq!(
+                admit_rewritten_dnode_leaf(DMU_OT_DNODE, true, &old, foreign)
+                    .unwrap_err()
+                    .to_errno(),
+                libc::EOPNOTSUPP
+            );
+            admit_rewritten_dnode_leaf(DMU_OT_DNODE, false, &old, foreign).unwrap();
+            admit_rewritten_dnode_leaf(DMU_OT_PLAIN_FILE_CONTENTS, true, &old, foreign).unwrap();
+        }
+        let hole = BlockPointer::born_hole(DNODE_BLOCK_BYTES, DMU_OT_DNODE, 0, 1).unwrap();
+        admit_rewritten_dnode_leaf(DMU_OT_DNODE, true, &hole, Endian::Little).unwrap();
+    }
+}
 
 #[cfg(test)]
 mod owner_quota_tests {
