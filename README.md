@@ -332,6 +332,26 @@ The historical `97/97` parity figure describes rows in the original feature
 table. It is not a six-format completeness percentage, a passing test count,
 or a release-readiness score.
 
+## FAT: held files and directories after removal
+
+Experimental writable FAT16/FAT32 mounts retain files and empty directories
+while open handles or transport inode references still need them. Unlink,
+`rmdir` and rename-overwrite remove the public name while preserving the held
+inode and its allocation. A held directory keeps `.` and its original `..`,
+including across replacement from another parent; its original parent remains
+pinned until that reference is released. Removed directories cannot acquire new
+children. Final release/FORGET reclaims the native entry and allocation, including
+parents held only by a removed child's `..` reference.
+
+Retention uses ordinary native `Fxxxxxxx.DEL` recovery entries hidden only from
+the mount that owns them. Each entry still occupies its physical parent, which
+cannot be removed until reclamation. After an interrupted mount, these are
+ordinary recoverable files or directories; a new mount never deletes an entry
+merely because its name resembles a recovery record. This bounded profile does
+not make FAT namespace changes crash-atomic. Directory-lifetime regressions are
+authored in `crates/ffs-fat/src/filesystem/lifetime/tests.rs`; execution and native
+mounted qualification for this increment remain pending.
+
 ## FAT: create a file in an existing image
 
 The offline writer can create a new file with a native short or long name,

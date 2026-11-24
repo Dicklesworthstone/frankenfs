@@ -32,18 +32,28 @@ existing pending ledger preserves work without rewriting the issue graph.
   is inferred. The four tests remain authored, not executed.
 - [x] Independently review the complete sidecar fix and all four tests; scoped
   pinned-toolchain rustfmt checking and git diff whitespace checks pass.
-- [~] Extend existing FAT retention to removed/overwritten pinned directories,
+- [x] Extend existing FAT retention to removed/overwritten pinned directories,
   preserving logical parent identity, delayed reclamation and namespace refusal.
-- [ ] Cover FAT16/FAT32 rmdir, directory replacement, parent cleanup, capacity,
-  read-only behavior and write/sync failures through the actual FsOps adapter.
+- [x] Author five FsOps regression groups for FAT16/FAT32 rmdir and directory
+  replacement, original-parent cleanup, name/inode reuse, capacity/read-only/
+  cancellation refusals, ownership-scoped reopen/destroy and write/sync failures.
+  These are formatter-backed adapter tests, not executed kernel-mount evidence.
+- [x] Independently review FAT lifetime changes; fix the maximum-length parent
+  chain's terminal-probe boundary. Scoped rustfmt and diff whitespace checks pass.
+- [ ] Execute the FAT lifetime tests and required compiler/strict-Clippy gates;
+  retain the physical-parent recovery-slot and non-atomic interruption limits.
 - [~] Remove Linux file capabilities atomically with admitted ZFS data changes
   using native SA inline xattrs and the existing TXG publication path.
 - [ ] Keep set-ID-only editor policy distinct, preserve unrelated xattrs and
   snapshot metadata, and retain refusal of external capability representations.
 - [ ] Exercise ZFS write/truncate/copy/range/compound-setattr and persistence
   cuts, including no-op and prepublication refusal controls.
-- [ ] Publish each reviewed coherent increment directly to main using GitHub
-  with an expected-head lease; update this ledger without broad Bead closure.
+- [x] Publish the independently reviewed sidecar increment directly to main via
+  GitHub expected-head lease as `000301d215e6a350d948624a7f7e049f8c2ab2e7`.
+  The documented gate exception was exercised with its commit trailer and
+  `FFS_PRE_PUSH_BYPASS=1`; compilation/runtime validation remains explicitly open.
+- [~] Publish the reviewed FAT and ZFS increments separately using GitHub
+  expected-head leases; update this ledger without broad Bead closure.
 
 Validation environment: baseline workspace formatting passed before changes.
 The initial workspace check was interrupted during dependency compilation when

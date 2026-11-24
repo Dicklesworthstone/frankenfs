@@ -260,6 +260,14 @@ impl FatFs {
     }
 
     fn child_path(&self, parent: InodeNumber, name: &OsStr) -> Result<(String, String)> {
+        // A held directory inode remains readable after rmdir/overwrite, but
+        // its recovery record must never become a new namespace parent.
+        if self.retained(parent)? {
+            return Err(FfsError::NotFound(format!(
+                "FAT directory {} has been removed",
+                parent.0
+            )));
+        }
         let name_str = name.to_str().ok_or_else(|| {
             FfsError::UnsupportedFeature("FAT requires a UTF-8 presentation name".into())
         })?;
@@ -312,7 +320,6 @@ impl FatFs {
         }
         if let Some(target) = &dst_before
             && target.offset != src_before.offset
-            && !target.native.is_directory()
         {
             let target_ino = self.state()?.slot_to_ino.get(&target.offset).copied();
             if let Some(target_ino) = target_ino
@@ -591,7 +598,7 @@ impl FatFs {
         {
             let directory = node.directory()?;
             let size = self.volume.directory_size(cx, directory)?;
-            let children = self.volume.list(cx, directory)?;
+            let children = self.visible_entries(self.volume.list(cx, directory)?)?;
             let nlink = 2 + children
                 .iter()
                 .filter(|entry| entry.native.is_directory())
@@ -829,10 +836,14 @@ impl FsOps for FatFs {
         match name {
             "." => self.attributes(cx, parent, &node),
             ".." => {
-                let ancestor = self.node(cx, node.parent)?;
-                self.attributes(cx, node.parent, &ancestor)
+                let parent = self.directory_parent(parent, node.parent)?;
+                let ancestor = self.node(cx, parent)?;
+                self.attributes(cx, parent, &ancestor)
             }
             _ => {
+                if self.retained(parent)? {
+                    return Err(FfsError::NotFound(name.to_owned()));
+                }
                 let entry = self.visible_lookup(cx, directory, name)?;
                 let ino = self.register(cx, parent, entry)?;
                 self.attributes(cx, ino, &self.node(cx, ino)?)
@@ -851,15 +862,13 @@ impl FsOps for FatFs {
         let node = self.node(cx, ino)?;
         let entries = self.visible_entries(self.volume.list(cx, node.directory()?)?)?;
         let names = Self::checked_names(&entries)?;
+        let parent = self.directory_parent(ino, node.parent)?;
         if self.writable {
-            return self.mutable_readdir(cx, ino, node.parent, offset, entries, names);
+            return self.mutable_readdir(cx, ino, parent, offset, entries, names);
         }
         let end_cookie = entries.len() as u64 + 2;
         let mut page = Vec::new();
-        for (cookie, target, name) in [
-            (1, ino, b".".as_slice()),
-            (2, node.parent, b"..".as_slice()),
-        ] {
+        for (cookie, target, name) in [(1, ino, b".".as_slice()), (2, parent, b"..".as_slice())] {
             if cookie > offset {
                 page.push(DirEntry {
                     ino: target,
@@ -1184,7 +1193,7 @@ impl FsOps for FatFs {
         if let Some(ino) = existing_ino
             && self.pinned(ino)?
         {
-            self.retain_unlink_locked(cx, parent, &path, &existing_entry, ino)?;
+            self.retain_remove_locked(cx, parent, &path, &existing_entry, ino)?;
             return operation.complete(());
         }
         unlink_in_volume(cx, &self.volume, &path, false).map_err(map_mutation_error)?;
@@ -1214,6 +1223,17 @@ impl FsOps for FatFs {
         let existing_entry = self.visible_lookup(cx, parent_dir, &name_str)?;
         if !existing_entry.native.is_directory() {
             return Err(FfsError::NotDirectory);
+        }
+        let existing_ino = self
+            .state()?
+            .slot_to_ino
+            .get(&existing_entry.offset)
+            .copied();
+        if let Some(ino) = existing_ino
+            && self.pinned(ino)?
+        {
+            self.retain_remove_locked(cx, parent, &path, &existing_entry, ino)?;
+            return operation.complete(());
         }
         rmdir_in_volume(cx, &self.volume, &path, false).map_err(map_mutation_error)?;
         let mut state = self.state()?;
