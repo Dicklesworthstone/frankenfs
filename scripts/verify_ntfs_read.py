@@ -774,11 +774,19 @@ def main() -> None:
         prefix.with_suffix(".stderr").write_bytes(result.stderr)
         prefix.with_suffix(".status").write_text(str(result.returncode) + "\n")
         if failure is None:
-            require(result.returncode == 0, f"command failed: {argv!r}; see {prefix}.stderr")
+            stderr_preview = result.stderr.decode("utf-8", errors="replace").strip()
+            if len(stderr_preview) > 2000:
+                stderr_preview = stderr_preview[:2000] + "... [truncated]"
+            detail = f"; stderr={stderr_preview!r}" if stderr_preview else ""
+            require(
+                result.returncode == 0,
+                f"command failed (exit {result.returncode}): {argv!r}; see {prefix}.stderr{detail}",
+            )
         else:
+            stderr_preview = result.stderr.decode("utf-8", errors="replace").strip()[:2000]
             require(result.returncode != 0 and result.stdout == b""
                     and failure.encode() in result.stderr,
-                    f"expected typed failure without output: {argv!r}; see {prefix}.stderr")
+                    f"expected typed failure without output: {argv!r}; see {prefix}.stderr; stderr={stderr_preview!r}")
         return result.stdout
 
     try:

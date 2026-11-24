@@ -702,14 +702,6 @@ pub fn decode_mapping_pairs(
     }
 }
 
-fn unsigned_width(value: u64) -> usize {
-    let mut width = 1_usize;
-    while width < 8 && (value >> (width * 8)) != 0 {
-        width += 1;
-    }
-    width
-}
-
 fn signed_width(value: i64) -> usize {
     let bytes = value.to_le_bytes();
     let mut width = 8_usize;
@@ -762,7 +754,12 @@ pub fn encode_mapping_pairs(
             .checked_add(run.clusters)
             .filter(|&end| end <= (i64::MAX as u64) + 1)
             .ok_or_else(|| invalid("ntfs.runlist", "VCN interval overflow"))?;
-        let len_width = unsigned_width(run.clusters);
+        // NTFS decoders (Windows, Linux ntfs3, ntfs-3g) sign-extend mapping-pair
+        // run lengths and reject negative results; use minimal signed width so
+        // values with MSB bit 7 set (e.g. 128 = 0x80) carry a trailing 0x00 byte.
+        let clusters_i64 = i64::try_from(run.clusters)
+            .map_err(|_| invalid("ntfs.runlist", "run length overflows i64"))?;
+        let len_width = signed_width(clusters_i64);
         let len_le = run.clusters.to_le_bytes();
         if let Some(lcn) = run.lcn {
             if lcn
@@ -1656,7 +1653,7 @@ pub fn encode_standard_ntfs_attr_def_table() -> Vec<u8> {
             0,
             u64::MAX,
         ),
-        ("$BITMAP", 0xB0, 0, 0, 0, u64::MAX),
+        ("$BITMAP", 0xB0, 0, ATTR_DEF_NON_RESIDENT_LOG, 0, u64::MAX),
         (
             "$REPARSE_POINT",
             REPARSE_POINT,

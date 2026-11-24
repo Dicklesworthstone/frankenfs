@@ -476,3 +476,48 @@ fn boot_sector_encoder_standard_attrdef_and_ntfs30_record_header_roundtrip() {
     .expect("encode $SDH");
     assert!(!sii.is_empty() && !sdh.is_empty());
 }
+
+#[test]
+fn mapping_pairs_encoder_preserves_positive_signed_length_for_high_bit_runs() {
+    let volume_clusters = 1_u64 << 28;
+    for (clusters, expected_len_width) in [
+        (1_u64, 1_usize),
+        (127, 1),
+        (128, 2),
+        (255, 2),
+        (256, 2),
+        (32_767, 2),
+        (32_768, 3),
+        (65_535, 3),
+        (0x0080_0000, 4),
+    ] {
+        let runs = [NtfsRun {
+            vcn: 0,
+            clusters,
+            lcn: Some(112),
+        }];
+        let (encoded, last_vcn) =
+            encode_mapping_pairs(&runs, 0, volume_clusters).expect("encode mapping pairs");
+        assert_eq!(last_vcn, clusters - 1);
+        let len_width = usize::from(encoded[0] & 0x0F);
+        assert_eq!(
+            len_width, expected_len_width,
+            "clusters={clusters} encoded as {encoded:02x?}"
+        );
+        // Sign-extending NTFS decoders (Windows, Linux ntfs3, ntfs-3g) require MSB bit 7 == 0.
+        assert_eq!(
+            encoded[len_width] & 0x80,
+            0,
+            "MSB sign bit must be clear for clusters={clusters}: {encoded:02x?}"
+        );
+        // Independently sign-extend the encoded length bytes just like ntfs-3g's runlist.c.
+        let mut signed_len = i64::from(encoded[len_width].cast_signed());
+        for &byte in encoded[1..len_width].iter().rev() {
+            signed_len = (signed_len << 8) | i64::from(byte);
+        }
+        assert_eq!(signed_len, i64::try_from(clusters).unwrap());
+        let decoded = decode_mapping_pairs(&encoded, 0, last_vcn, volume_clusters)
+            .expect("round-trip decode");
+        assert_eq!(decoded, runs);
+    }
+}

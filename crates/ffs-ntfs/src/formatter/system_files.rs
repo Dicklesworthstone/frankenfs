@@ -1136,7 +1136,7 @@ pub fn build_bootstrap_volume(
             layout.record_bytes,
             9,
             9,
-            0x0001,
+            0x0009,
             1,
             &attrs,
             5,
@@ -1373,6 +1373,25 @@ pub fn build_bootstrap_volume(
             0,
             &attrs,
             1,
+        )?;
+        place_record(slot, &raw);
+    }
+
+    // Unused reserved slots (16..24) and free initial slots (27..mft_records):
+    // format as valid empty USA-protected FILE records with flags = 0 (matching mkntfs).
+    let mft_records_u32 =
+        u32::try_from(layout.mft_records).map_err(|_| format_err("mft_records overflow"))?;
+    for slot in (16_u32..24).chain(27_u32..mft_records_u32) {
+        let seq = u16::try_from(slot).unwrap_or(1);
+        let raw = encode_file_record(
+            layout.version,
+            layout.record_bytes,
+            slot,
+            seq,
+            0x0000,
+            0,
+            &[],
+            0,
         )?;
         place_record(slot, &raw);
     }
