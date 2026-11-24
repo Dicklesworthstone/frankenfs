@@ -747,11 +747,13 @@ pub(super) struct DnodeCowSpec<'a> {
 }
 
 /// Native per-dataset feature ownership required by newly born blocks.
-/// Property changes alone do not acquire or release these references.
+/// Actual block births acquire these references even when no property is local.
+/// Explicit ZSTD property activation is also handled by the DSL property owner.
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct DatasetFeatureUsage {
     large_blocks: bool,
     sha512: bool,
+    zstd: bool,
 }
 
 impl DatasetFeatureUsage {
@@ -759,21 +761,26 @@ impl DatasetFeatureUsage {
         if !bp.hole() {
             self.large_blocks |= bp.logical_bytes() > 131_072;
             self.sha512 |= bp.checksum_type() == 11;
+            self.zstd |= bp.compression() == 16;
         }
     }
 
     pub fn extend(&mut self, other: Self) {
         self.large_blocks |= other.large_blocks;
         self.sha512 |= other.sha512;
+        self.zstd |= other.zstd;
     }
 
     pub fn required_features(self) -> Vec<&'static str> {
-        let mut required = Vec::with_capacity(2);
+        let mut required = Vec::with_capacity(3);
         if self.large_blocks {
             required.push("org.open-zfs:large_blocks");
         }
         if self.sha512 {
             required.push("org.illumos:sha512");
+        }
+        if self.zstd {
+            required.push("org.freebsd:zstd_compress");
         }
         required
     }
@@ -1122,33 +1129,164 @@ fn admit_rewritten_dnode_leaf(
     Ok(())
 }
 
-/// Per-TXG encryption and compression writer state for an encrypted dataset.
+/// Per-TXG encryption writer state. Compression policy also applies to plain datasets.
 pub(super) struct DatasetWriteCrypto {
     pub key: Arc<UnwrappedDslKey>,
     pub nonces: ZfsNonceGenerator,
-    /// Effective ZFS compression algorithm (`2` = off, `14` = zle, `15` = lz4,
-    /// `5..=13` = gzip-1..9, `16` = zstd).
-    pub compression: u8,
-    pub zstd_level: Option<u8>,
 }
 
-/// Decode a native ZFS `compression` property integer into `(algorithm, zstd_level)`.
-#[must_use]
-pub(super) fn decode_compression_property(raw: u64) -> (u8, Option<u8>) {
-    if raw == 0 || raw == 2 {
-        (2, None)
-    } else if raw == 1 {
-        (15, None) // ON -> LZ4
-    } else if raw & 127 == 16 {
-        let lvl = u8::try_from(raw >> 7)
-            .ok()
-            .filter(|v| (1..=19).contains(v))
-            .unwrap_or(3);
-        (16, Some(lvl))
-    } else if matches!(raw, 5..=15) {
-        (raw as u8, None)
-    } else {
-        (2, None)
+/// Resolved codec for one block, after dataset inheritance and metadata policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct BlockCompression {
+    algorithm: u8,
+    zstd_level: Option<u8>,
+}
+
+impl BlockCompression {
+    pub const OFF: Self = Self {
+        algorithm: 2,
+        zstd_level: None,
+    };
+
+    const EMPTY: Self = Self {
+        algorithm: 4,
+        zstd_level: None,
+    };
+
+    fn encode(self, logical: &[u8], align: usize) -> Result<(Vec<u8>, u8)> {
+        compress_block(logical, self.algorithm, self.zstd_level, align).map_err(|e| parse_err(&e))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NativeCompressionPolicy {
+    data: BlockCompression,
+    on_algorithm: u8,
+    object_zstd_level: Option<u8>,
+    zstd_enabled: bool,
+}
+
+/// Dataset compression is independent of encryption and of the persisted dnode
+/// selector. Metadata always uses native `ON`; only nonmetadata leaves inherit
+/// the dataset codec or honor an explicit `dn_compress` override.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct DatasetCompression(Option<NativeCompressionPolicy>);
+
+impl DatasetCompression {
+    /// Internal MOS writers reserve fixed physical sizes during convergence.
+    /// Dataset callers must construct a native policy, including for `off`.
+    pub const OFF: Self = Self(None);
+
+    pub fn from_property(raw: u64, features: &MosFeatureState) -> Result<Self> {
+        let on_algorithm = if features
+            .read_features
+            .get("org.illumos:lz4_compress")
+            .is_some_and(|&count| count != 0)
+        {
+            15
+        } else {
+            3
+        };
+        let zstd_enabled = features
+            .read_features
+            .contains_key("org.freebsd:zstd_compress")
+            && features
+                .read_features
+                .contains_key("com.delphix:extensible_dataset");
+        let data = match raw {
+            0 | 2 => BlockCompression::OFF,
+            4 => BlockCompression::EMPTY,
+            1 => BlockCompression {
+                algorithm: on_algorithm,
+                zstd_level: None,
+            },
+            3 | 5..=15 => BlockCompression {
+                algorithm: raw as u8,
+                zstd_level: None,
+            },
+            raw if raw & 127 == 16 && raw >> 7 <= 19 => {
+                let level = (raw >> 7) as u8;
+                BlockCompression {
+                    algorithm: 16,
+                    zstd_level: Some(if level == 0 { 3 } else { level }),
+                }
+            }
+            _ => {
+                return Err(unsupported(format!(
+                    "unsupported native ZFS compression property {raw}"
+                )));
+            }
+        };
+        let policy = NativeCompressionPolicy {
+            data,
+            on_algorithm,
+            object_zstd_level: if matches!(data.algorithm, 5..=13) {
+                // Native gzip properties also carry COMPLEVEL_DEFAULT, which
+                // becomes ZSTD's default level for an explicit dnode override.
+                Some(3)
+            } else {
+                data.zstd_level
+            },
+            zstd_enabled,
+        };
+        Self::admit_codec(policy, data.algorithm)?;
+        Ok(Self(Some(policy)))
+    }
+
+    fn admit_codec(policy: NativeCompressionPolicy, algorithm: u8) -> Result<()> {
+        if algorithm == 15 && policy.on_algorithm != 15 {
+            return Err(unsupported(
+                "native LZ4 writes require an active org.illumos:lz4_compress feature",
+            ));
+        }
+        if algorithm == 16 && !policy.zstd_enabled {
+            return Err(unsupported(
+                "native ZSTD writes require org.freebsd:zstd_compress and com.delphix:extensible_dataset enabled",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn for_block(
+        self,
+        dnode_compress: u8,
+        object_type: u8,
+        level: u8,
+    ) -> Result<BlockCompression> {
+        let Some(policy) = self.0 else {
+            return Ok(BlockCompression::OFF);
+        };
+        if level > 0 || dmu_ot_is_metadata(object_type) {
+            return Ok(BlockCompression {
+                algorithm: policy.on_algorithm,
+                zstd_level: None,
+            });
+        }
+        let algorithm = match dnode_compress {
+            0 => return Ok(policy.data),
+            1 => policy.on_algorithm,
+            2 => return Ok(BlockCompression::OFF),
+            4 => return Ok(BlockCompression::EMPTY),
+            3 | 5..=16 => dnode_compress,
+            _ => {
+                return Err(unsupported(format!(
+                    "unsupported native ZFS dnode compression selector {dnode_compress}"
+                )));
+            }
+        };
+        Self::admit_codec(policy, algorithm)?;
+        if algorithm == 16 && policy.object_zstd_level.is_none() {
+            // Native dmu_write_policy uses the dataset's compression level for
+            // explicit object overrides. A level-less parent has no such level,
+            // so zio_compress_data falls back to an uncompressed block.
+            return Ok(BlockCompression::OFF);
+        }
+        Ok(BlockCompression {
+            algorithm,
+            zstd_level: (algorithm == 16)
+                .then_some(policy.object_zstd_level)
+                .flatten(),
+        })
     }
 }
 
@@ -1167,21 +1305,37 @@ pub(super) fn write_dataset_block(
     new_txg: u64,
     fill: u64,
     bucket: WriteBucket,
+    compression: BlockCompression,
     crypto: Option<&mut DatasetWriteCrypto>,
     staged_writes: &mut Vec<StagedBlockWrite>,
 ) -> Result<BlockPointer> {
+    let compression = if crypto.is_some() && level == 0 && object_type == DMU_OT_DNODE {
+        // Native encrypted dnode leaves use EMPTY: zero tables are holes and
+        // all other tables retain their selectively encrypted fixed layout.
+        BlockCompression::EMPTY
+    } else {
+        compression
+    };
+    if compression.algorithm != 2 && !logical.is_empty() && logical.iter().all(|&byte| byte == 0) {
+        return make_hole_bp(
+            logical.len(),
+            object_type,
+            level,
+            new_txg,
+            alloc.hole_birth_active,
+        );
+    }
     let effective_cksum = if matches!(checksum_type, 6..=8 | 11) {
         checksum_type
     } else {
         7
     };
+    let align = (1_usize << alloc.ashift).max(512);
     if let Some(wc) = crypto {
-        let align = (1_usize << alloc.ashift).max(512);
         if level > 0 {
             let mac = compute_indirect_block_mac(logical, order, wc.key.version)
                 .map_err(|e| parse_err(&e))?;
-            let (phys, comp_alg) = compress_block(logical, wc.compression, wc.zstd_level, align)
-                .map_err(|e| parse_err(&e))?;
+            let (phys, comp_alg) = compression.encode(logical, align)?;
             let dva = alloc.allocate(phys.len())?;
             let bp = BlockPointer::new_protected(&ProtectedBlockSpec {
                 dvas: &[dva],
@@ -1209,9 +1363,7 @@ pub(super) fn write_dataset_block(
                     .map_err(|e| parse_err(&e))?;
                 (ct, 2_u8, mac)
             } else {
-                let (comp, comp_alg) =
-                    compress_block(logical, wc.compression, wc.zstd_level, align)
-                        .map_err(|e| parse_err(&e))?;
+                let (comp, comp_alg) = compression.encode(logical, align)?;
                 let (ct, mac) =
                     encrypt_regular_block(&wc.key, &salt, &iv, &comp).map_err(|e| parse_err(&e))?;
                 (ct, comp_alg, mac)
@@ -1237,8 +1389,7 @@ pub(super) fn write_dataset_block(
             return Ok(bp);
         }
         // Authenticated-only level-0 non-objset block (e.g. userused/groupused/projectused).
-        let (comp, comp_alg) = compress_block(logical, wc.compression, wc.zstd_level, align)
-            .map_err(|e| parse_err(&e))?;
+        let (comp, comp_alg) = compression.encode(logical, align)?;
         let mac = compute_authenticated_block_mac(&wc.key.hmac_key, &comp);
         let dva = alloc.allocate(comp.len())?;
         let bp = BlockPointer::new_protected(&ProtectedBlockSpec {
@@ -1261,12 +1412,13 @@ pub(super) fn write_dataset_block(
         return Ok(bp);
     }
 
-    let dva = alloc.allocate(logical.len())?;
+    let (physical, comp_alg) = compression.encode(logical, align)?;
+    let dva = alloc.allocate(physical.len())?;
     let bp = BlockPointer::new_regular(&RegularBlockSpec {
         dvas: &[dva],
-        physical: logical,
+        physical: &physical,
         logical_bytes: logical.len(),
-        compression: 2,
+        compression: comp_alg,
         checksum_type: effective_cksum,
         object_type,
         level,
@@ -1275,7 +1427,7 @@ pub(super) fn write_dataset_block(
         fill,
     })
     .map_err(|e| parse_err(&e))?;
-    staged_writes.push(StagedBlockWrite::from_dva(bucket, dva, logical.to_vec()));
+    staged_writes.push(StagedBlockWrite::from_dva(bucket, dva, physical));
     Ok(bp)
 }
 
@@ -1287,6 +1439,7 @@ pub(super) fn write_dataset_objset_block(
     checksum_type: u8,
     order: Endian,
     new_txg: u64,
+    compression: DatasetCompression,
     crypto: Option<&DatasetWriteCrypto>,
     staged_writes: &mut Vec<StagedBlockWrite>,
 ) -> Result<BlockPointer> {
@@ -1330,12 +1483,15 @@ pub(super) fn write_dataset_objset_block(
     }
 
     let os_bytes = os.encode(order).map_err(|e| parse_err(&e))?;
-    let os_dva = alloc.allocate(os_bytes.len())?;
+    let (physical, comp_alg) = compression
+        .for_block(0, DMU_OT_OBJSET, 0)?
+        .encode(&os_bytes, (1_usize << alloc.ashift).max(512))?;
+    let os_dva = alloc.allocate(physical.len())?;
     let bp = BlockPointer::new_regular(&RegularBlockSpec {
         dvas: &[os_dva],
-        physical: &os_bytes,
+        physical: &physical,
         logical_bytes: os_bytes.len(),
-        compression: 2,
+        compression: comp_alg,
         checksum_type: effective_cksum,
         object_type: DMU_OT_OBJSET,
         level: 0,
@@ -1347,7 +1503,7 @@ pub(super) fn write_dataset_objset_block(
     staged_writes.push(StagedBlockWrite::from_dva(
         WriteBucket::DatasetMetadata,
         os_dva,
-        os_bytes,
+        physical,
     ));
     Ok(bp)
 }
@@ -1423,7 +1579,17 @@ pub(super) fn cow_update_dnode(
     dirty_leaves: &BTreeMap<u64, Option<Vec<u8>>>,
     staged_writes: &mut Vec<StagedBlockWrite>,
 ) -> Result<DnodeCowOutput> {
-    cow_update_dnode_with_crypto(cx, view, alloc, spec, dirty_leaves, 0, None, staged_writes)
+    cow_update_dnode_with_crypto(
+        cx,
+        view,
+        alloc,
+        spec,
+        dirty_leaves,
+        0,
+        DatasetCompression::OFF,
+        None,
+        staged_writes,
+    )
 }
 
 /// Bottom-up COW update of one dnode's data and indirect blocks with optional dataset encryption.
@@ -1435,6 +1601,7 @@ pub(super) fn cow_update_dnode_with_crypto(
     spec: DnodeCowSpec<'_>,
     dirty_leaves: &BTreeMap<u64, Option<Vec<u8>>>,
     object_id: u64,
+    compression: DatasetCompression,
     crypto: Option<&mut DatasetWriteCrypto>,
     staged_writes: &mut Vec<StagedBlockWrite>,
 ) -> Result<DnodeCowOutput> {
@@ -1454,6 +1621,7 @@ pub(super) fn cow_update_dnode_with_crypto(
         spec,
         &converted,
         object_id,
+        compression,
         crypto,
         None,
         staged_writes,
@@ -1471,6 +1639,7 @@ pub(super) fn cow_update_dnode_with_staged_leaves(
     spec: DnodeCowSpec<'_>,
     dirty_leaves: &BTreeMap<u64, StagedLeafUpdate>,
     object_id: u64,
+    compression: DatasetCompression,
     mut crypto: Option<&mut DatasetWriteCrypto>,
     raw_protected: Option<(u64, u8)>,
     staged_writes: &mut Vec<StagedBlockWrite>,
@@ -1587,6 +1756,7 @@ pub(super) fn cow_update_dnode_with_staged_leaves(
                     spec.new_txg,
                     fill,
                     spec.leaf_bucket,
+                    compression.for_block(spec.compress_type, spec.object_type, 0)?,
                     crypto.as_deref_mut(),
                     staged_writes,
                 )?;
@@ -1748,12 +1918,15 @@ pub(super) fn cow_update_dnode_with_staged_leaves(
                 {
                     let mac = compute_indirect_block_mac(&raw_block, spec.order, enc_ver)
                         .map_err(|e| parse_err(&e))?;
-                    let dva = alloc.allocate(raw_block.len())?;
+                    let (physical, comp_alg) = compression
+                        .for_block(spec.compress_type, spec.object_type, parent_level)?
+                        .encode(&raw_block, (1_usize << alloc.ashift).max(512))?;
+                    let dva = alloc.allocate(physical.len())?;
                     let bp = BlockPointer::new_protected(&ProtectedBlockSpec {
                         dvas: &[dva],
-                        physical: &raw_block,
+                        physical: &physical,
                         logical_bytes: raw_block.len(),
-                        compression: 2,
+                        compression: comp_alg,
                         checksum_type: effective_cksum,
                         object_type: spec.object_type,
                         level: parent_level,
@@ -1768,7 +1941,7 @@ pub(super) fn cow_update_dnode_with_staged_leaves(
                     staged_writes.push(StagedBlockWrite::from_dva(
                         spec.indirect_bucket,
                         dva,
-                        raw_block,
+                        physical,
                     ));
                     bp
                 } else {
@@ -1784,6 +1957,11 @@ pub(super) fn cow_update_dnode_with_staged_leaves(
                         spec.new_txg,
                         fill_sum,
                         spec.indirect_bucket,
+                        compression.for_block(
+                            spec.compress_type,
+                            spec.object_type,
+                            parent_level,
+                        )?,
                         crypto.as_deref_mut(),
                         staged_writes,
                     )?
@@ -2255,6 +2433,7 @@ pub(super) fn apply_objectset_quota_deltas(
     limits: &OwnerQuotaLimits,
     order: Endian,
     new_txg: u64,
+    compression: DatasetCompression,
     mut write_crypto: Option<&mut DatasetWriteCrypto>,
     staged_writes: &mut Vec<StagedBlockWrite>,
     born_out: &mut SpaceDelta,
@@ -2342,7 +2521,7 @@ pub(super) fn apply_objectset_quota_deltas(
                 object_type: emb_dn.object_type(),
                 bonus_type: emb_dn.bonus_type(),
                 checksum_type: 7,
-                compress_type: 2,
+                compress_type: emb_dn.compress_type(),
                 user_flags: 0,
                 indirect_shift: emb_dn.indirect_shift(),
                 data_bytes: bsize,
@@ -2358,6 +2537,7 @@ pub(super) fn apply_objectset_quota_deltas(
             },
             &dirty,
             slot_offset as u64,
+            compression,
             write_crypto.as_deref_mut(),
             staged_writes,
         )?;
@@ -4021,6 +4201,134 @@ impl<'a> FixedDvaReplay<'a> {
 
 #[allow(dead_code)]
 fn _assert_btree_set_used(_: &BTreeSet<u64>) {}
+
+#[cfg(test)]
+mod compression_policy_tests {
+    use super::*;
+
+    #[test]
+    fn native_metadata_on_and_data_overrides_are_independent() {
+        for (lz4_refcount, expected_metadata) in [(None, 3), (Some(0), 3), (Some(1), 15)] {
+            let mut features = MosFeatureState::default();
+            if let Some(count) = lz4_refcount {
+                features
+                    .read_features
+                    .insert("org.illumos:lz4_compress".into(), count);
+            }
+            for property in [2, 3, 5, 13, 14] {
+                let policy = DatasetCompression::from_property(property, &features).unwrap();
+                assert_eq!(
+                    policy
+                        .for_block(0, DMU_OT_PLAIN_FILE_CONTENTS, 0)
+                        .unwrap()
+                        .algorithm,
+                    property as u8
+                );
+                assert_eq!(
+                    policy.for_block(2, DMU_OT_PLAIN_FILE_CONTENTS, 0).unwrap(),
+                    BlockCompression::OFF
+                );
+                assert_eq!(
+                    policy
+                        .for_block(5, DMU_OT_PLAIN_FILE_CONTENTS, 0)
+                        .unwrap()
+                        .algorithm,
+                    5
+                );
+                for (object_type, level) in [
+                    (DMU_OT_DIRECTORY_CONTENTS, 0),
+                    (DMU_OT_DNODE, 0),
+                    (DMU_OT_OBJSET, 0),
+                    (DMU_OT_PLAIN_FILE_CONTENTS, 1),
+                ] {
+                    assert_eq!(
+                        policy.for_block(2, object_type, level).unwrap().algorithm,
+                        expected_metadata
+                    );
+                    assert_eq!(
+                        policy.for_block(5, object_type, level).unwrap().algorithm,
+                        expected_metadata
+                    );
+                }
+            }
+            assert_eq!(
+                DatasetCompression::from_property(1, &features)
+                    .unwrap()
+                    .for_block(0, DMU_OT_PLAIN_FILE_CONTENTS, 0)
+                    .unwrap()
+                    .algorithm,
+                expected_metadata
+            );
+            if expected_metadata == 3 {
+                assert!(DatasetCompression::from_property(15, &features).is_err());
+                let policy = DatasetCompression::from_property(2, &features).unwrap();
+                assert!(policy.for_block(15, DMU_OT_PLAIN_FILE_CONTENTS, 0).is_err());
+            }
+        }
+        assert_eq!(
+            DatasetCompression::OFF
+                .for_block(15, DMU_OT_DNODE, 0)
+                .unwrap(),
+            BlockCompression::OFF
+        );
+    }
+
+    #[test]
+    fn native_zstd_levels_and_unsupported_selectors_fail_closed() {
+        let mut features = MosFeatureState::default();
+        assert!(DatasetCompression::from_property(16, &features).is_err());
+        features
+            .read_features
+            .insert("org.freebsd:zstd_compress".into(), 0);
+        assert!(DatasetCompression::from_property(16, &features).is_err());
+        features
+            .read_features
+            .insert("com.delphix:extensible_dataset".into(), 0);
+        for (level, expected) in [(0, 3), (1, 1), (3, 3), (19, 19)] {
+            let policy = DatasetCompression::from_property(16 | (level << 7), &features).unwrap();
+            for selector in [0, 16] {
+                assert_eq!(
+                    policy
+                        .for_block(selector, DMU_OT_PLAIN_FILE_CONTENTS, 0)
+                        .unwrap(),
+                    BlockCompression {
+                        algorithm: 16,
+                        zstd_level: Some(expected)
+                    }
+                );
+            }
+            assert_eq!(
+                policy.for_block(0, DMU_OT_DNODE, 0).unwrap(),
+                BlockCompression {
+                    algorithm: 3,
+                    zstd_level: None
+                }
+            );
+        }
+        let off = DatasetCompression::from_property(2, &features).unwrap();
+        assert_eq!(
+            off.for_block(16, DMU_OT_PLAIN_FILE_CONTENTS, 0).unwrap(),
+            BlockCompression::OFF
+        );
+        let gzip = DatasetCompression::from_property(9, &features).unwrap();
+        assert_eq!(
+            gzip.for_block(16, DMU_OT_PLAIN_FILE_CONTENTS, 0).unwrap(),
+            BlockCompression {
+                algorithm: 16,
+                zstd_level: Some(3),
+            }
+        );
+        for raw in [17, 127, 128, 16 | (20 << 7), u64::MAX] {
+            assert!(DatasetCompression::from_property(raw, &features).is_err());
+        }
+        for selector in [17, 127, 255] {
+            assert!(
+                off.for_block(selector, DMU_OT_PLAIN_FILE_CONTENTS, 0)
+                    .is_err()
+            );
+        }
+    }
+}
 
 #[cfg(test)]
 mod mixed_order_tests {

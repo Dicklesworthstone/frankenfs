@@ -6,9 +6,9 @@
 //! NEVER select host paths, devices, pools, key files, or import authority.
 
 use super::dmu_cow::{
-    DatasetFeatureUsage, DnodeCowSpec, PoolSpaceAllocator, SpaceDelta, StagedBlockWrite,
-    StagedLeafUpdate, WriteBucket, allocate_object_id, collect_non_hole_bps_from,
-    cow_update_dnode_with_staged_leaves, enqueue_into_dataset_deadlist,
+    DatasetCompression, DatasetFeatureUsage, DnodeCowSpec, MosFeatureState, PoolSpaceAllocator,
+    SpaceDelta, StagedBlockWrite, StagedLeafUpdate, WriteBucket, allocate_object_id,
+    collect_non_hole_bps_from, cow_update_dnode_with_staged_leaves, enqueue_into_dataset_deadlist,
     ensure_dnode_table_block_loaded, put_dnode_in_table, read_staged_or_committed_dnode,
     remove_dnode_from_table, write_dataset_objset_block, write_dataset_objset_block_raw_protected,
     zap_optional_u64,
@@ -16,15 +16,15 @@ use super::dmu_cow::{
 use super::dsl_ops::{
     DMU_OT_DSL_DATASET, DMU_OT_DSL_DIR_CHILD_MAP, DMU_OT_DSL_DS_SNAP_MAP, DMU_OT_DSL_PROPS,
     DS_FLAG_UNIQUE_ACCURATE, ObjectSetWalkMode, activate_dataset_block_features,
-    adjust_dsl_crypto_key_refcount, allocate_fresh_deadlist,
+    activate_initial_compression_feature, adjust_dsl_crypto_key_refcount, allocate_fresh_deadlist,
     bump_filesystem_limits_counter_if_present, dataset_block_feature_owners,
     dataset_feature_entries, derive_fsid_guid, derive_unique_guid,
-    enforce_dataset_quotas_for_growth, enforce_pool_reservations_for_growth,
-    free_deadlist_containers, free_mos_object_completely, link_dataset_to_origin_snapshot,
-    lookup_pool_origin_snapshot, propagate_dsl_dir_space_delta, put_new_dsl_dir_in_mos,
-    reject_busy, reject_einval, release_dataset_block_features, resolve_dataset_ids,
-    stage_destroy_dataset_by_ids, validate_dsl_component, walk_objectset_above_txg,
-    write_zap_dnode_in_mos,
+    effective_compression_for_new_dataset, enforce_dataset_quotas_for_growth,
+    enforce_pool_reservations_for_growth, free_deadlist_containers, free_mos_object_completely,
+    link_dataset_to_origin_snapshot, lookup_pool_origin_snapshot, propagate_dsl_dir_space_delta,
+    put_new_dsl_dir_in_mos, reject_busy, reject_einval, release_dataset_block_features,
+    resolve_dataset_ids, stage_destroy_dataset_by_ids, validate_dsl_component,
+    walk_objectset_above_txg, write_zap_dnode_in_mos,
 };
 use super::{
     ZfsDurableToken, ZfsPropertySetValue, ZfsTransactionEngine, ZfsTxOutcome, checkpoint, corrupt,
@@ -287,6 +287,19 @@ struct StagedSubstreamMeta {
     crypto_version: u64,
     portable_mac: [u8; 32],
     to_ivset_guid: Option<u64>,
+    compression: DatasetCompression,
+}
+
+fn admit_received_compression(compression: u8, features: &MosFeatureState) -> Result<()> {
+    // Raw, compressed, embedded and spill records all carry native codecs.
+    // LZ4 is pool-wide and must already be active; ZSTD requires both enabled
+    // per-dataset capabilities before its ownership can be staged atomically.
+    if !matches!(compression, 0 | 2 | 3 | 5..=16) {
+        return Err(FfsError::Format(format!(
+            "invalid compressed receive block selector {compression}"
+        )));
+    }
+    DatasetCompression::from_property(u64::from(compression), features).map(|_| ())
 }
 
 // ── ZAP Helpers for Resume State ────────────────────────────────────────────
@@ -820,6 +833,18 @@ impl ZfsTransactionEngine {
                 begin.objset_type
             )));
         }
+        for (name, value) in compound_props {
+            if name == "compression" {
+                let ZfsPropertySetValue::Number(raw) = value else {
+                    return ZfsTxOutcome::NotCommitted(FfsError::Format(
+                        "received compression property must be a native numeric selector".into(),
+                    ));
+                };
+                if let Err(error) = DatasetCompression::from_property(*raw, &self.mos_features) {
+                    return ZfsTxOutcome::NotCommitted(error);
+                }
+            }
+        }
         let snap_name = match &req.snapshot_override {
             Some(name) => {
                 if let Err(e) = validate_dsl_component(name, true) {
@@ -1160,27 +1185,10 @@ impl ZfsTransactionEngine {
                             ),
                         );
                     }
-                    if w.compressiontype == 15
-                        && !self
-                            .mos_features
-                            .read_features
-                            .contains_key("org.illumos:lz4_compress")
+                    if let Err(error) =
+                        admit_received_compression(w.compressiontype, &self.mos_features)
                     {
-                        return cleanup_on_abort(
-                            self,
-                            unsupported("pool lacks org.illumos:lz4_compress for compressed write"),
-                        );
-                    }
-                    if w.compressiontype == 16
-                        && !self
-                            .mos_features
-                            .read_features
-                            .contains_key("org.freebsd:zstd_compress")
-                    {
-                        return cleanup_on_abort(
-                            self,
-                            unsupported("pool lacks org.freebsd:zstd_compress for zstd write"),
-                        );
+                        return cleanup_on_abort(self, error);
                     }
                     last_obj = w.object;
                     last_offset = w.offset.saturating_add(w.logical_size);
@@ -1189,6 +1197,11 @@ impl ZfsTransactionEngine {
                     pending_ops.push(RecvOp::Write { rec: w, payload });
                 }
                 DrrRecord::WriteEmbedded(e) => {
+                    if let Err(error) =
+                        admit_received_compression(e.compression, &self.mos_features)
+                    {
+                        return cleanup_on_abort(self, error);
+                    }
                     if e.toguid != 0 && e.toguid != begin.toguid {
                         return cleanup_on_abort(
                             self,
@@ -1250,6 +1263,11 @@ impl ZfsTransactionEngine {
                     pending_ops.push(RecvOp::Free(f));
                 }
                 DrrRecord::Spill(s) => {
+                    if let Err(error) =
+                        admit_received_compression(s.compressiontype, &self.mos_features)
+                    {
+                        return cleanup_on_abort(self, error);
+                    }
                     if s.toguid != 0 && s.toguid != begin.toguid {
                         return cleanup_on_abort(
                             self,
@@ -1419,6 +1437,21 @@ impl ZfsTransactionEngine {
         } else {
             (1, [0_u8; 32], state.ivsetguid)
         };
+        // A full receive is hidden from ordinary dataset queries until promotion;
+        // its empty property catalog inherits from the visible parent. The
+        // private incremental child inherits the existing target's policy.
+        let policy_parent = if staging.is_pct_recv_child {
+            target_dataset
+        } else {
+            &target_dataset[..target_dataset.len() - 1]
+        };
+        let compression = effective_compression_for_new_dataset(
+            cx,
+            &mut mos,
+            policy_parent,
+            &[],
+            &self.mos_features,
+        )?;
         Ok((
             StagedSubstreamMeta {
                 stage_dd_obj: staging.directory_object,
@@ -1432,6 +1465,7 @@ impl ZfsTransactionEngine {
                 crypto_version,
                 portable_mac,
                 to_ivset_guid,
+                compression,
             },
             ChunkProgress {
                 object: state.object,
@@ -1507,6 +1541,9 @@ impl ZfsTransactionEngine {
                     }
                     let parent_path = &target_dataset[..target_dataset.len() - 1];
                     let leaf_name = target_dataset.last().expect("nonempty");
+                    let compression = effective_compression_for_new_dataset(
+                        cx, mos, parent_path, &[], features,
+                    )?;
                     let (parent_dd_obj, _, pool_guid) = resolve_dataset_ids(cx, mos, parent_path)?;
                     let (parent_dd_dn, _) = read_staged_or_committed_dnode(
                         cx,
@@ -1692,7 +1729,7 @@ impl ZfsTransactionEngine {
                             staged_writes,
                         )?
                     } else {
-                        write_dataset_objset_block(&mut os, alloc, 7, order, new_txg, None, staged_writes)?
+                        write_dataset_objset_block(&mut os, alloc, 7, order, new_txg, compression, None, staged_writes)?
                     };
                     let os_space = SpaceDelta::from_bp(&os_bp)?;
 
@@ -1846,6 +1883,7 @@ impl ZfsTransactionEngine {
                         crypto_version: kd_cloned.as_ref().map_or(1, |k| k.version),
                         portable_mac: kd_cloned.as_ref().map_or([0_u8; 32], |k| k.portable_mac),
                         to_ivset_guid: kd_cloned.as_ref().map(|k| k.to_ivset_guid),
+                        compression,
                     };
                     Ok((meta, head_obj))
                 } else {
@@ -1855,6 +1893,9 @@ impl ZfsTransactionEngine {
                             "incremental receive requires an existing target dataset".into(),
                         ));
                     };
+                    let compression = effective_compression_for_new_dataset(
+                        cx, mos, &target_dataset, &[], features,
+                    )?;
                     let (target_head_dn, _) = read_staged_or_committed_dnode(
                         cx,
                         mos,
@@ -2144,6 +2185,7 @@ impl ZfsTransactionEngine {
                         crypto_version: kd_cloned.as_ref().map_or(1, |k| k.version),
                         portable_mac: kd_cloned.as_ref().map_or([0_u8; 32], |k| k.portable_mac),
                         to_ivset_guid: kd_cloned.as_ref().map(|k| k.to_ivset_guid),
+                        compression,
                     };
                     Ok((meta, recv_head_obj))
                 }
@@ -2710,6 +2752,7 @@ impl ZfsTransactionEngine {
                         },
                         &draft.leaves,
                         obj_id,
+                        stage_cloned.compression,
                         None,
                         raw_enc_ver.map(|v| (v, draft.nlevels)),
                         staged_writes,
@@ -2820,6 +2863,7 @@ impl ZfsTransactionEngine {
                         },
                         &meta_leaves,
                         0,
+                        stage_cloned.compression,
                         None,
                         raw_enc_ver.map(|v| (v, old_meta.levels())),
                         staged_writes,
@@ -2844,7 +2888,7 @@ impl ZfsTransactionEngine {
                         staged_writes,
                     )?
                 } else {
-                    write_dataset_objset_block(&mut os, alloc, 7, order, new_txg, None, staged_writes)?
+                    write_dataset_objset_block(&mut os, alloc, 7, order, new_txg, stage_cloned.compression, None, staged_writes)?
                 };
                 born_space.add_assign(SpaceDelta::from_bp(&new_os_bp)?)?;
                 feature_usage.observe(&new_os_bp);
@@ -3064,13 +3108,25 @@ impl ZfsTransactionEngine {
                 let stage_deadlist = order
                     .u64(stage_head_dn.bonus(), 64)
                     .map_err(|e| parse_err(&e))?;
-                let stage_entries = dataset_feature_entries(
+                let mut stage_entries = dataset_feature_entries(
                     cx,
                     mos,
                     stage_cloned.stage_head_obj,
                     &stage_head_dn,
                     features,
                 )?;
+                if !stage_cloned.is_pct_recv_child {
+                    // A newly received filesystem owns explicitly selected ZSTD
+                    // before its final snapshot is created, even for an empty
+                    // stream. Incremental clone-swap instead replaces the target's
+                    // old ownership with the staged block/ancestor ownership.
+                    activate_initial_compression_feature(
+                        &mut stage_entries,
+                        &props_owned,
+                        features,
+                        new_txg,
+                    )?;
+                }
                 let stage_owners = dataset_block_feature_owners(&stage_entries, features)?;
                 let mut snapshot_entries = Vec::new();
                 if let Some(ivg) = stage_cloned.to_ivset_guid.filter(|&v| v != 0) {

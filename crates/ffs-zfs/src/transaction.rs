@@ -1790,7 +1790,12 @@ impl ZfsTransactionEngine {
         cx: &Cx,
         dataset_components: &[Vec<u8>],
     ) -> Result<Vec<ZfsUnlinkedObject>> {
-        zpl_ops::pending_unlinks(cx, &mut self.open_read_objects(cx)?, dataset_components)
+        zpl_ops::pending_unlinks(
+            cx,
+            &mut self.open_read_objects(cx)?,
+            dataset_components,
+            &self.mos_features,
+        )
     }
 
     /// Reclaim one generation-bound, zero-link regular file and remove its

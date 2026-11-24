@@ -25,10 +25,10 @@ use crate::reader::dmu::{DatasetCryptoContext, Objects};
 
 use super::dmu_cow::{
     DMU_OT_DIRECTORY_CONTENTS, DMU_OT_PLAIN_FILE_CONTENTS, DMU_OT_SA, DMU_OT_ZNODE,
-    DatasetFeatureUsage, DatasetWriteCrypto, DnodeCowOutput, DnodeCowSpec, MosFeatureState,
-    OwnerQuotaLimits, PoolSpaceAllocator, QuotaDelta, SpaceDelta, StagedBlockWrite, WriteBucket,
-    allocate_object_id, allocated_leaf_blocks_in_range, apply_objectset_quota_deltas,
-    collect_non_hole_bps_from, cow_update_dnode_with_crypto, decode_compression_property,
+    DatasetCompression, DatasetFeatureUsage, DatasetWriteCrypto, DnodeCowOutput, DnodeCowSpec,
+    MosFeatureState, OwnerQuotaLimits, PoolSpaceAllocator, QuotaDelta, SpaceDelta,
+    StagedBlockWrite, WriteBucket, allocate_object_id, allocated_leaf_blocks_in_range,
+    apply_objectset_quota_deltas, collect_non_hole_bps_from, cow_update_dnode_with_crypto,
     encode_zap_blocks_for_dnode, enqueue_into_dataset_deadlist, load_owner_quota_limits,
     objectset_user_accounting_flags, put_dnode_in_table, read_staged_or_committed_dnode,
     remove_dnode_from_table, write_dataset_block, write_dataset_objset_block, zap_optional_u64,
@@ -417,6 +417,7 @@ struct DatasetContext {
     sa_lay_dirty: bool,
     recordsize: usize,
     checksum: u8,
+    compression: DatasetCompression,
     new_features: DatasetFeatureUsage,
     unlinked_set: Option<u64>,
     write_crypto: Option<DatasetWriteCrypto>,
@@ -502,6 +503,7 @@ fn open_head_dataset_context(
     cx: &Cx,
     mos: &mut Objects,
     dataset_components: &[Vec<u8>],
+    features: &MosFeatureState,
     new_txg: u64,
 ) -> Result<(DatasetContext, Objects)> {
     checkpoint(cx)?;
@@ -549,7 +551,7 @@ fn open_head_dataset_context(
         Some(PropertyValue::Number(raw)) => *raw,
         _ => 2,
     };
-    let (compression, zstd_level) = decode_compression_property(compression_raw);
+    let compression = DatasetCompression::from_property(compression_raw, features)?;
 
     let crypto_info = mos.dataset_crypto_info(cx, dataset_components)?;
     let loaded_key = if let Some(ref info) = crypto_info {
@@ -666,8 +668,6 @@ fn open_head_dataset_context(
         let wc = DatasetWriteCrypto {
             nonces: ZfsNonceGenerator::new(cx, ivset_guid, info.record.guid, new_txg, &[])?,
             key,
-            compression,
-            zstd_level,
         };
         let vc = Arc::new(DatasetCryptoContext {
             info,
@@ -740,6 +740,7 @@ fn open_head_dataset_context(
             sa_lay_dirty: false,
             recordsize,
             checksum,
+            compression,
             new_features: DatasetFeatureUsage::default(),
             unlinked_set,
             write_crypto,
@@ -999,6 +1000,7 @@ fn file_capability_xattr_update(
                 acct_flags,
                 order,
                 new_txg,
+                context.compression,
                 context.write_crypto.as_mut(),
                 staged_writes,
                 born,
@@ -1142,6 +1144,7 @@ fn encode_updated_zpl_bonus_with_options(
                             new_txg,
                             1,
                             WriteBucket::ChildBlocks,
+                            ds_ctx.compression.for_block(0, DMU_OT_SA, 0)?,
                             ds_ctx.write_crypto.as_mut(),
                             staged_writes,
                         )?;
@@ -1167,6 +1170,7 @@ fn encode_updated_zpl_bonus_with_options(
                         new_txg,
                         1,
                         WriteBucket::ChildBlocks,
+                        ds_ctx.compression.for_block(0, DMU_OT_SA, 0)?,
                         ds_ctx.write_crypto.as_mut(),
                         staged_writes,
                     )?;
@@ -1189,6 +1193,7 @@ fn encode_updated_zpl_bonus(
     alloc: &mut PoolSpaceAllocator,
     order: Endian,
     new_txg: u64,
+    compression: DatasetCompression,
     write_crypto: Option<&mut DatasetWriteCrypto>,
     staged_writes: &mut Vec<StagedBlockWrite>,
 ) -> Result<(Vec<u8>, Option<BlockPointer>)> {
@@ -1227,6 +1232,7 @@ fn encode_updated_zpl_bonus(
                             new_txg,
                             1,
                             WriteBucket::ChildBlocks,
+                            compression.for_block(0, DMU_OT_SA, 0)?,
                             write_crypto,
                             staged_writes,
                         )?;
@@ -1429,6 +1435,7 @@ fn flush_dir_node(
     acct_flags: u8,
     order: Endian,
     new_txg: u64,
+    compression: DatasetCompression,
     mut write_crypto: Option<&mut DatasetWriteCrypto>,
     staged_writes: &mut Vec<StagedBlockWrite>,
     zpl_born: &mut SpaceDelta,
@@ -1456,6 +1463,7 @@ fn flush_dir_node(
         alloc,
         order,
         new_txg,
+        compression,
         write_crypto.as_deref_mut(),
         staged_writes,
     )?;
@@ -1469,7 +1477,7 @@ fn flush_dir_node(
             object_type: DMU_OT_DIRECTORY_CONTENTS,
             bonus_type: dir_loaded.dnode.bonus_type(),
             checksum_type: 7,
-            compress_type: 2,
+            compress_type: dir_loaded.dnode.compress_type(),
             user_flags: acct_flags,
             indirect_shift: dir_loaded.dnode.indirect_shift(),
             data_bytes: bsize,
@@ -1485,6 +1493,7 @@ fn flush_dir_node(
         },
         &dirty,
         dir_obj,
+        compression,
         write_crypto,
         staged_writes,
     )?;
@@ -1727,9 +1736,11 @@ pub(super) fn pending_unlinks(
     cx: &Cx,
     mos: &mut Objects,
     dataset_components: &[Vec<u8>],
+    features: &MosFeatureState,
 ) -> Result<Vec<ZfsUnlinkedObject>> {
     let mos_txg = mos.txg;
-    let (context, mut view) = open_head_dataset_context(cx, mos, dataset_components, mos_txg)?;
+    let (context, mut view) =
+        open_head_dataset_context(cx, mos, dataset_components, features, mos_txg)?;
     if context.unlinked_set.is_none() {
         return Ok(Vec::new());
     }
@@ -1832,7 +1843,7 @@ fn stage_unlinked_set_change(
             object_type: DMU_OT_UNLINKED_SET,
             bonus_type: node.bonus_type(),
             checksum_type: 7,
-            compress_type: 2,
+            compress_type: node.compress_type(),
             user_flags: 0,
             indirect_shift: node.indirect_shift(),
             data_bytes: block_size,
@@ -1848,6 +1859,7 @@ fn stage_unlinked_set_change(
         },
         &dirty,
         object,
+        context.compression,
         context.write_crypto.as_mut(),
         staged_writes,
     )?;
@@ -1884,7 +1896,7 @@ pub(super) fn stage_zpl_mutation(
 ) -> Result<u64> {
     checkpoint(cx)?;
     let (mut ds_ctx, mut os_view) =
-        open_head_dataset_context(cx, mos, dataset_components, new_txg)?;
+        open_head_dataset_context(cx, mos, dataset_components, features, new_txg)?;
     // ObjectSet retains its embedded usage dnodes in the source byte order.
     // Until that tail is converted as a unit, a transaction must not rewrite
     // selected fields and retain the remaining counters in a different order.
@@ -1988,7 +2000,7 @@ pub(super) fn stage_zpl_mutation(
                     object_type: DMU_OT_PLAIN_FILE_CONTENTS,
                     bonus_type,
                     checksum_type: ds_ctx.data_checksum(*checksum, None)?,
-                    compress_type: 2,
+                    compress_type: 0,
                     user_flags: acct_flags,
                     indirect_shift: 17,
                     data_bytes,
@@ -2004,6 +2016,7 @@ pub(super) fn stage_zpl_mutation(
                 },
                 &file_dirty,
                 new_obj,
+                ds_ctx.compression,
                 ds_ctx.write_crypto.as_mut(),
                 staged_writes,
             )?;
@@ -2060,6 +2073,7 @@ pub(super) fn stage_zpl_mutation(
                 acct_flags,
                 order,
                 new_txg,
+                ds_ctx.compression,
                 ds_ctx.write_crypto.as_mut(),
                 staged_writes,
                 &mut zpl_born,
@@ -2144,7 +2158,7 @@ pub(super) fn stage_zpl_mutation(
                     object_type: DMU_OT_DIRECTORY_CONTENTS,
                     bonus_type,
                     checksum_type: 7,
-                    compress_type: 2,
+                    compress_type: 0,
                     user_flags: acct_flags,
                     indirect_shift: 17,
                     data_bytes: bsize,
@@ -2160,6 +2174,7 @@ pub(super) fn stage_zpl_mutation(
                 },
                 &dir_dirty,
                 new_obj,
+                ds_ctx.compression,
                 ds_ctx.write_crypto.as_mut(),
                 staged_writes,
             )?;
@@ -2208,6 +2223,7 @@ pub(super) fn stage_zpl_mutation(
                 acct_flags,
                 order,
                 new_txg,
+                ds_ctx.compression,
                 ds_ctx.write_crypto.as_mut(),
                 staged_writes,
                 &mut zpl_born,
@@ -2310,6 +2326,7 @@ pub(super) fn stage_zpl_mutation(
                 alloc,
                 order,
                 new_txg,
+                ds_ctx.compression,
                 ds_ctx.write_crypto.as_mut(),
                 staged_writes,
             )?;
@@ -2338,6 +2355,7 @@ pub(super) fn stage_zpl_mutation(
                 },
                 &BTreeMap::new(),
                 *source_object,
+                ds_ctx.compression,
                 ds_ctx.write_crypto.as_mut(),
                 staged_writes,
             )?;
@@ -2385,6 +2403,7 @@ pub(super) fn stage_zpl_mutation(
                 acct_flags,
                 order,
                 new_txg,
+                ds_ctx.compression,
                 ds_ctx.write_crypto.as_mut(),
                 staged_writes,
                 &mut zpl_born,
@@ -2474,6 +2493,7 @@ pub(super) fn stage_zpl_mutation(
                     alloc,
                     order,
                     new_txg,
+                    ds_ctx.compression,
                     ds_ctx.write_crypto.as_mut(),
                     staged_writes,
                 )?;
@@ -2486,7 +2506,7 @@ pub(super) fn stage_zpl_mutation(
                         object_type: DMU_OT_PLAIN_FILE_CONTENTS,
                         bonus_type: loaded.dnode.bonus_type(),
                         checksum_type: ds_ctx.data_checksum(*checksum, Some(&loaded.dnode))?,
-                        compress_type: 2,
+                        compress_type: loaded.dnode.compress_type(),
                         user_flags: acct_flags,
                         indirect_shift: loaded.dnode.indirect_shift(),
                         data_bytes: loaded.dnode.data_bytes(),
@@ -2502,6 +2522,7 @@ pub(super) fn stage_zpl_mutation(
                     },
                     &dirty_leaves,
                     *file_obj,
+                    ds_ctx.compression,
                     ds_ctx.write_crypto.as_mut(),
                     staged_writes,
                 )?;
@@ -2673,7 +2694,7 @@ pub(super) fn stage_zpl_mutation(
                     object_type: DMU_OT_PLAIN_FILE_CONTENTS,
                     bonus_type: loaded.dnode.bonus_type(),
                     checksum_type: cksum_code,
-                    compress_type: 2,
+                    compress_type: loaded.dnode.compress_type(),
                     user_flags: acct_flags,
                     indirect_shift: loaded.dnode.indirect_shift(),
                     data_bytes: target_bsize,
@@ -2689,6 +2710,7 @@ pub(super) fn stage_zpl_mutation(
                 },
                 &dirty_leaves,
                 *file_obj,
+                ds_ctx.compression,
                 ds_ctx.write_crypto.as_mut(),
                 staged_writes,
             )?;
@@ -2833,6 +2855,7 @@ pub(super) fn stage_zpl_mutation(
                     },
                     &dirty_leaves,
                     *file_obj,
+                    ds_ctx.compression,
                     ds_ctx.write_crypto.as_mut(),
                     staged_writes,
                 )?;
@@ -3041,6 +3064,7 @@ pub(super) fn stage_zpl_mutation(
                     },
                     &dirty_leaves,
                     *file_obj,
+                    ds_ctx.compression,
                     ds_ctx.write_crypto.as_mut(),
                     staged_writes,
                 )?
@@ -3331,6 +3355,7 @@ pub(super) fn stage_zpl_mutation(
                     order,
                     new_txg,
                     *timestamp,
+                    ds_ctx.compression,
                     ds_ctx.write_crypto.as_mut(),
                     staged_writes,
                     &mut zpl_born,
@@ -3378,6 +3403,7 @@ pub(super) fn stage_zpl_mutation(
                     acct_flags,
                     order,
                     new_txg,
+                    ds_ctx.compression,
                     ds_ctx.write_crypto.as_mut(),
                     staged_writes,
                     &mut zpl_born,
@@ -3417,6 +3443,7 @@ pub(super) fn stage_zpl_mutation(
                     acct_flags,
                     order,
                     new_txg,
+                    ds_ctx.compression,
                     ds_ctx.write_crypto.as_mut(),
                     staged_writes,
                     &mut zpl_born,
@@ -3463,6 +3490,7 @@ pub(super) fn stage_zpl_mutation(
                     acct_flags,
                     order,
                     new_txg,
+                    ds_ctx.compression,
                     ds_ctx.write_crypto.as_mut(),
                     staged_writes,
                     &mut zpl_born,
@@ -3494,6 +3522,7 @@ pub(super) fn stage_zpl_mutation(
                 alloc,
                 order,
                 new_txg,
+                ds_ctx.compression,
                 ds_ctx.write_crypto.as_mut(),
                 staged_writes,
             )?;
@@ -3506,7 +3535,7 @@ pub(super) fn stage_zpl_mutation(
                     object_type: src_obj_loaded.dnode.object_type(),
                     bonus_type: src_obj_loaded.dnode.bonus_type(),
                     checksum_type: 7,
-                    compress_type: 2,
+                    compress_type: src_obj_loaded.dnode.compress_type(),
                     user_flags: acct_flags,
                     indirect_shift: src_obj_loaded.dnode.indirect_shift(),
                     data_bytes: src_obj_loaded.dnode.data_bytes(),
@@ -3522,6 +3551,7 @@ pub(super) fn stage_zpl_mutation(
                 },
                 &BTreeMap::new(),
                 source_obj,
+                ds_ctx.compression,
                 ds_ctx.write_crypto.as_mut(),
                 staged_writes,
             )?;
@@ -3732,6 +3762,7 @@ pub(super) fn stage_zpl_mutation(
                     acct_flags,
                     order,
                     new_txg,
+                    ds_ctx.compression,
                     ds_ctx.write_crypto.as_mut(),
                     staged_writes,
                     &mut zpl_born,
@@ -3762,6 +3793,7 @@ pub(super) fn stage_zpl_mutation(
                     alloc,
                     order,
                     new_txg,
+                    ds_ctx.compression,
                     ds_ctx.write_crypto.as_mut(),
                     staged_writes,
                 )?;
@@ -3774,7 +3806,7 @@ pub(super) fn stage_zpl_mutation(
                         object_type: loaded.dnode.object_type(),
                         bonus_type: loaded.dnode.bonus_type(),
                         checksum_type: 7,
-                        compress_type: 2,
+                        compress_type: loaded.dnode.compress_type(),
                         user_flags: acct_flags,
                         indirect_shift: loaded.dnode.indirect_shift(),
                         data_bytes: loaded.dnode.data_bytes(),
@@ -3790,6 +3822,7 @@ pub(super) fn stage_zpl_mutation(
                     },
                     &BTreeMap::new(),
                     obj_id,
+                    ds_ctx.compression,
                     ds_ctx.write_crypto.as_mut(),
                     staged_writes,
                 )?;
@@ -3920,6 +3953,7 @@ pub(super) fn stage_zpl_mutation(
                 acct_flags,
                 order,
                 new_txg,
+                ds_ctx.compression,
                 ds_ctx.write_crypto.as_mut(),
                 staged_writes,
                 &mut zpl_born,
@@ -3954,6 +3988,7 @@ pub(super) fn stage_zpl_mutation(
                 order,
                 new_txg,
                 *timestamp,
+                ds_ctx.compression,
                 ds_ctx.write_crypto.as_mut(),
                 staged_writes,
                 &mut zpl_born,
@@ -4006,6 +4041,7 @@ pub(super) fn stage_zpl_mutation(
                 order,
                 new_txg,
                 loaded.metadata.times[2],
+                ds_ctx.compression,
                 ds_ctx.write_crypto.as_mut(),
                 staged_writes,
                 &mut zpl_born,
@@ -4070,6 +4106,7 @@ fn retire_or_decrement_zpl_target(
     order: Endian,
     new_txg: u64,
     timestamp: Timestamp,
+    compression: DatasetCompression,
     mut write_crypto: Option<&mut DatasetWriteCrypto>,
     staged_writes: &mut Vec<StagedBlockWrite>,
     zpl_born: &mut SpaceDelta,
@@ -4109,6 +4146,7 @@ fn retire_or_decrement_zpl_target(
             alloc,
             order,
             new_txg,
+            compression,
             write_crypto.as_deref_mut(),
             staged_writes,
         )?;
@@ -4121,7 +4159,7 @@ fn retire_or_decrement_zpl_target(
                 object_type: target_loaded.dnode.object_type(),
                 bonus_type: target_loaded.dnode.bonus_type(),
                 checksum_type: 7,
-                compress_type: 2,
+                compress_type: target_loaded.dnode.compress_type(),
                 user_flags: acct_flags,
                 indirect_shift: target_loaded.dnode.indirect_shift(),
                 data_bytes: target_loaded.dnode.data_bytes(),
@@ -4137,6 +4175,7 @@ fn retire_or_decrement_zpl_target(
             },
             &BTreeMap::new(),
             target_obj,
+            compression,
             write_crypto,
             staged_writes,
         )?;
@@ -4419,6 +4458,7 @@ fn flush_sa_table_zap(
     alloc: &mut PoolSpaceAllocator,
     order: Endian,
     new_txg: u64,
+    compression: DatasetCompression,
     write_crypto: Option<&mut DatasetWriteCrypto>,
     staged_writes: &mut Vec<StagedBlockWrite>,
     zpl_born: &mut SpaceDelta,
@@ -4459,7 +4499,7 @@ fn flush_sa_table_zap(
             object_type: expected_type,
             bonus_type: existing_dn.bonus_type(),
             checksum_type: 7,
-            compress_type: 2,
+            compress_type: existing_dn.compress_type(),
             user_flags: 0,
             indirect_shift: existing_dn.indirect_shift(),
             data_bytes: bsize,
@@ -4475,6 +4515,7 @@ fn flush_sa_table_zap(
         },
         &dirty,
         obj_id,
+        compression,
         write_crypto,
         staged_writes,
     )?;
@@ -4606,6 +4647,7 @@ fn finalize_dataset_to_mos(
             alloc,
             order,
             new_txg,
+            ds_ctx.compression,
             ds_ctx.write_crypto.as_mut(),
             staged_writes,
             &mut zpl_born,
@@ -4627,6 +4669,7 @@ fn finalize_dataset_to_mos(
             alloc,
             order,
             new_txg,
+            ds_ctx.compression,
             ds_ctx.write_crypto.as_mut(),
             staged_writes,
             &mut zpl_born,
@@ -4644,6 +4687,7 @@ fn finalize_dataset_to_mos(
         &ds_ctx.owner_quota_limits,
         order,
         new_txg,
+        ds_ctx.compression,
         ds_ctx.write_crypto.as_mut(),
         staged_writes,
         &mut zpl_born,
@@ -4683,6 +4727,7 @@ fn finalize_dataset_to_mos(
         },
         &zpl_meta_dirty,
         0,
+        ds_ctx.compression,
         ds_ctx.write_crypto.as_mut(),
         staged_writes,
     )?;
@@ -4702,6 +4747,7 @@ fn finalize_dataset_to_mos(
         zpl_os_cksum,
         order,
         new_txg,
+        ds_ctx.compression,
         ds_ctx.write_crypto.as_ref(),
         staged_writes,
     )?;
