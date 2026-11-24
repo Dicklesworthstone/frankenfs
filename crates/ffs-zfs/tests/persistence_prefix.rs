@@ -84,6 +84,8 @@ enum AuxiliaryOwnership {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum XattrOwnershipFault {
+    DirectoryRootAlias,
+    ValueRootAlias,
     DirectoryParent,
     DirectoryPublic,
     DirectoryLinks,
@@ -160,6 +162,7 @@ struct PoolFixtureSpec {
     auxiliary_ownership: Option<(u64, AuxiliaryOwnership)>,
     auxiliary_xattr_fault: Option<XattrOwnershipFault>,
     auxiliary_xattr_owner_ids: Option<(u64, u64)>,
+    auxiliary_capability_with_retained_value: bool,
 }
 
 impl Default for PoolFixtureSpec {
@@ -208,6 +211,7 @@ impl Default for PoolFixtureSpec {
             auxiliary_ownership: None,
             auxiliary_xattr_fault: None,
             auxiliary_xattr_owner_ids: None,
+            auxiliary_capability_with_retained_value: false,
         }
     }
 }
@@ -942,7 +946,14 @@ fn build_zpl_objectset(
 
     let mut master_pairs: Vec<(&[u8], u64)> = vec![
         (b"VERSION", spec.zpl_version),
-        (b"ROOT", 2),
+        (
+            b"ROOT",
+            match spec.auxiliary_xattr_fault {
+                Some(XattrOwnershipFault::DirectoryRootAlias) if populate_snapshot_files => 13,
+                Some(XattrOwnershipFault::ValueRootAlias) if populate_snapshot_files => 14,
+                _ => 2,
+            },
+        ),
         (b"DELETE_QUEUE", 3),
     ];
     if spec.zpl_version == 5 {
@@ -1393,6 +1404,25 @@ fn build_zpl_objectset(
                 let mut pairs = vec![(name, value_reference)];
                 if fault == Some(XattrOwnershipFault::DuplicateValue) {
                     pairs.push((b"user.aliased", value_reference));
+                }
+                if spec.auxiliary_capability_with_retained_value {
+                    assert_eq!(auxiliary, AuxiliaryOwnership::CapabilityXattr);
+                    let retained_bp = arena.alloc_block(&padded, 19, 0, birth, order);
+                    let retained = make_dnode(
+                        19,
+                        padded.len(),
+                        vec![retained_bp],
+                        17,
+                        value_meta.encode_legacy(None, order).unwrap(),
+                        None,
+                        acct_flags,
+                        order,
+                    );
+                    write_dnode_at(&mut table, 15, &retained).unwrap();
+                    pairs.push((
+                        b"user.retained",
+                        encode_directory_reference(15, Kind::Regular).unwrap(),
+                    ));
                 }
                 let entries = mzap(&pairs, 0xA113, order);
                 let directory_bp = arena.alloc_block(&entries, 20, 0, birth, order);

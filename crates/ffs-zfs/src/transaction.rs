@@ -1190,9 +1190,9 @@ impl ZfsTransactionEngine {
     }
 
     /// Write data, clear set-user-ID and executable set-group-ID permissions, and
-    /// remove native SA file capabilities in the same TXG. Empty writes preserve
-    /// size, timestamps, and privileges. Directory-backed capability values refuse
-    /// the whole mutation before publication.
+    /// remove native SA and directory-backed file capabilities in the same TXG.
+    /// Empty writes preserve size, timestamps, and privileges. Malformed private
+    /// ownership refuses the whole mutation before publication.
     #[allow(clippy::too_many_arguments)]
     pub fn write_file_data_clearing_privileges(
         &mut self,
@@ -1307,9 +1307,10 @@ impl ZfsTransactionEngine {
         )
     }
 
-    /// Edit a sparse range while clearing set-ID permissions and native SA file
-    /// capabilities atomically. A size-preserving range wholly beyond EOF retains
-    /// all privileges. Directory-backed capabilities refuse the whole mutation.
+    /// Edit a sparse range while clearing set-ID permissions and native SA and
+    /// directory-backed file capabilities atomically. A size-preserving range
+    /// wholly beyond EOF retains all privileges. Malformed private ownership
+    /// refuses the whole mutation.
     #[allow(clippy::too_many_arguments)]
     pub fn edit_file_range_clearing_privileges(
         &mut self,

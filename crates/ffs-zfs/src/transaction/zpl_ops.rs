@@ -227,8 +227,8 @@ pub struct ZfsPosixSetAttr {
     /// Clear set-user-ID and executable set-group-ID after applying `mode`.
     /// Non-executable set-group-ID and directory permissions are preserved.
     pub clear_suid_sgid: bool,
-    /// Remove the exact native `security.capability` SA xattr in this TXG.
-    /// Directory-backed capability values refuse the whole mutation.
+    /// Remove the exact native `security.capability` xattr from both stores in
+    /// this TXG. Private value objects require validated exclusive ownership.
     pub clear_file_capabilities: bool,
 }
 
@@ -898,13 +898,25 @@ fn decode_zpl_node(
     })
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn file_capability_xattr_update(
     cx: &Cx,
-    mos: &mut Objects,
-    dataset_components: &[Vec<u8>],
+    view: &mut Objects,
+    context: &mut DatasetContext,
+    meta: &Dnode,
+    ceiling: u64,
+    dirty: &mut BTreeMap<u64, Vec<u8>>,
     file_obj: u64,
     loaded: &LoadedZplNode,
-    sa_registry: Option<&SaRegistry>,
+    timestamp: Timestamp,
+    alloc: &mut PoolSpaceAllocator,
+    acct_flags: u8,
+    order: Endian,
+    new_txg: u64,
+    staged_writes: &mut Vec<StagedBlockWrite>,
+    born: &mut SpaceDelta,
+    retired: &mut Vec<BlockPointer>,
+    quota_deltas: &mut Vec<QuotaDelta>,
 ) -> Result<Option<BTreeMap<String, Vec<u8>>>> {
     checkpoint(cx)?;
     if loaded.metadata.kind != Kind::Regular {
@@ -914,7 +926,9 @@ fn file_capability_xattr_update(
     }
     let mut source = match loaded.dnode.bonus_type() {
         DMU_OT_ZNODE => XattrSources::legacy(loaded.dnode.bonus(), loaded.dnode.order()),
-        DMU_OT_SA => sa_registry
+        DMU_OT_SA => context
+            .sa_registry
+            .as_ref()
             .ok_or_else(|| corrupt("missing SA registry"))?
             .decode(loaded.dnode.bonus(), loaded.spill_bytes.as_deref())
             .and_then(|attrs| attrs.xattrs()),
@@ -922,11 +936,83 @@ fn file_capability_xattr_update(
     }
     .map_err(|error| parse_err(&error))?;
     if source.directory != 0 {
-        // Reuse the reader's bounded catalog and private-object ownership
-        // checks. A directory shadow cannot survive an SA capability removal.
-        return mos
-            .zpl(cx, dataset_components)?
-            .file_capability_removal_xattrs(cx, file_obj);
+        // Validate the entire committed ownership graph before staging either
+        // store. Aliases and extra hard links cannot authorize freeing a value.
+        let mut private = private_xattr_ownership(
+            cx,
+            view,
+            meta,
+            ceiling,
+            dirty,
+            context.sa_registry.as_ref(),
+            context.root_dir,
+            file_obj,
+            source.directory,
+            order,
+        )?;
+        let mut entries = view.zap_values(cx, source.directory)?;
+        if entries.len().saturating_add(source.inline.len()) > XATTR_COUNT {
+            return Err(unsupported("xattr catalog exceeds 4096 native names"));
+        }
+        if let Some(position) = entries
+            .iter()
+            .position(|entry| entry.name == b"security.capability")
+        {
+            let (directory, dir_loaded) = private
+                .pop()
+                .ok_or_else(|| corrupt("missing validated private xattr directory"))?;
+            let reference = entries
+                .remove(position)
+                .scalar()
+                .map_err(|error| parse_err(&error))?;
+            let (value_object, _) =
+                directory_reference(reference).map_err(|error| parse_err(&error))?;
+            let (_, value) = private
+                .into_iter()
+                .find(|(object, _)| *object == value_object)
+                .ok_or_else(|| {
+                    corrupt("capability value is outside its validated private graph")
+                })?;
+            let mut metadata = dir_loaded.metadata.clone();
+            metadata.size = entries.len() as u64 + 2;
+            metadata.times[1] = timestamp;
+            metadata.times[2] = timestamp;
+            // Keep the directory attached, including when it becomes empty.
+            // Final unlink reclaims it through the same native ownership path.
+            let node = flush_dir_node(
+                cx,
+                view,
+                alloc,
+                directory,
+                &dir_loaded,
+                &metadata,
+                &entries,
+                context.sa_registry.as_ref(),
+                acct_flags,
+                order,
+                new_txg,
+                context.write_crypto.as_mut(),
+                staged_writes,
+                born,
+                retired,
+                quota_deltas,
+            )?;
+            put_dnode_in_table(cx, view, meta, ceiling, dirty, directory, &node)?;
+            // Charge this object's actual owners and retain historical blocks
+            // through the dataset deadlist, exactly like final-link retirement.
+            retire_zpl_object(
+                cx,
+                view,
+                meta,
+                ceiling,
+                dirty,
+                value_object,
+                &value,
+                order,
+                retired,
+                quota_deltas,
+            )?;
+        }
     }
     Ok(source
         .inline
@@ -1479,7 +1565,7 @@ fn admit_zpl_reclamation(loaded: &LoadedZplNode, registry: Option<&SaRegistry>) 
 /// retiring its owner. Private values must be regular files, with no public hard
 /// links or recursive private directories. Parent, flag and link checks are
 /// ownership evidence; following a raw object number cannot authorize its free.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 fn private_xattr_reclamation(
     cx: &Cx,
     view: &mut Objects,
@@ -1487,16 +1573,39 @@ fn private_xattr_reclamation(
     ceiling: u64,
     dirty: &BTreeMap<u64, Vec<u8>>,
     registry: Option<&SaRegistry>,
+    root: u64,
     owner: u64,
     loaded: &LoadedZplNode,
     order: Endian,
 ) -> Result<Vec<(u64, LoadedZplNode)>> {
     let directory = admit_zpl_reclamation(loaded, registry)?;
+    private_xattr_ownership(
+        cx, view, meta, ceiling, dirty, registry, root, owner, directory, order,
+    )
+}
+
+/// Validate private values independently of retiring their owner. Killpriv
+/// preserves the owner's ACL and does not need to reclaim its external objects.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn private_xattr_ownership(
+    cx: &Cx,
+    view: &mut Objects,
+    meta: &Dnode,
+    ceiling: u64,
+    dirty: &BTreeMap<u64, Vec<u8>>,
+    registry: Option<&SaRegistry>,
+    root: u64,
+    owner: u64,
+    directory: u64,
+    order: Endian,
+) -> Result<Vec<(u64, LoadedZplNode)>> {
     if directory == 0 {
         return Ok(Vec::new());
     }
-    if directory == owner {
-        return Err(corrupt("private xattr directory aliases its owner"));
+    if directory == owner || directory == root {
+        return Err(corrupt(
+            "private xattr directory aliases its owner or dataset root",
+        ));
     }
     let (node, node_ceiling) =
         read_staged_or_committed_dnode(cx, view, meta, ceiling, dirty, directory, order)?;
@@ -1525,7 +1634,7 @@ fn private_xattr_reclamation(
             "private xattr directory size disagrees with its entries",
         ));
     }
-    let mut objects = BTreeSet::from([owner, directory]);
+    let mut objects = BTreeSet::from([root, owner, directory]);
     let mut names = BTreeSet::new();
     let mut private = Vec::with_capacity(entries.len() + 1);
     for entry in entries {
@@ -1638,6 +1747,7 @@ pub(super) fn pending_unlinks(
             context.old_os_bp.birth(),
             &BTreeMap::new(),
             context.sa_registry.as_ref(),
+            context.root_dir,
             object,
             &loaded,
             context.os.meta.order(),
@@ -2506,11 +2616,22 @@ pub(super) fn stage_zpl_mutation(
             let inline_xattrs = if *clear_file_capabilities {
                 file_capability_xattr_update(
                     cx,
-                    mos,
-                    dataset_components,
+                    &mut os_view,
+                    &mut ds_ctx,
+                    &zpl_meta_base,
+                    zpl_ceiling,
+                    &mut zpl_dirty_dnodes,
                     *file_obj,
                     &loaded,
-                    ds_ctx.sa_registry.as_ref(),
+                    *timestamp,
+                    alloc,
+                    acct_flags,
+                    order,
+                    new_txg,
+                    staged_writes,
+                    &mut zpl_born,
+                    &mut zpl_retired,
+                    &mut quota_deltas,
                 )?
             } else {
                 None
@@ -2624,11 +2745,22 @@ pub(super) fn stage_zpl_mutation(
                 let inline_xattrs = if *clear_file_capabilities {
                     file_capability_xattr_update(
                         cx,
-                        mos,
-                        dataset_components,
+                        &mut os_view,
+                        &mut ds_ctx,
+                        &zpl_meta_base,
+                        zpl_ceiling,
+                        &mut zpl_dirty_dnodes,
                         *file_obj,
                         &loaded,
-                        ds_ctx.sa_registry.as_ref(),
+                        *timestamp,
+                        alloc,
+                        acct_flags,
+                        order,
+                        new_txg,
+                        staged_writes,
+                        &mut zpl_born,
+                        &mut zpl_retired,
+                        &mut quota_deltas,
                     )?
                 } else {
                     None
@@ -2834,11 +2966,22 @@ pub(super) fn stage_zpl_mutation(
             let inline_xattrs = if attrs.clear_file_capabilities {
                 file_capability_xattr_update(
                     cx,
-                    mos,
-                    dataset_components,
+                    &mut os_view,
+                    &mut ds_ctx,
+                    &zpl_meta_base,
+                    zpl_ceiling,
+                    &mut zpl_dirty_dnodes,
                     *file_obj,
                     &loaded,
-                    ds_ctx.sa_registry.as_ref(),
+                    *timestamp,
+                    alloc,
+                    acct_flags,
+                    order,
+                    new_txg,
+                    staged_writes,
+                    &mut zpl_born,
+                    &mut zpl_retired,
+                    &mut quota_deltas,
                 )?
             } else {
                 None
@@ -3164,6 +3307,7 @@ pub(super) fn stage_zpl_mutation(
                     &target_loaded,
                     target_is_dir,
                     retain,
+                    ds_ctx.root_dir,
                     ds_ctx.sa_registry.as_ref(),
                     acct_flags,
                     alloc,
@@ -3784,6 +3928,7 @@ pub(super) fn stage_zpl_mutation(
                 &target_loaded,
                 target_is_dir,
                 retain,
+                ds_ctx.root_dir,
                 ds_ctx.sa_registry.as_ref(),
                 acct_flags,
                 alloc,
@@ -3835,6 +3980,7 @@ pub(super) fn stage_zpl_mutation(
                 &loaded,
                 false,
                 false,
+                ds_ctx.root_dir,
                 ds_ctx.sa_registry.as_ref(),
                 acct_flags,
                 alloc,
@@ -3899,6 +4045,7 @@ fn retire_or_decrement_zpl_target(
     target_loaded: &LoadedZplNode,
     target_is_dir: bool,
     retain_unlinked: bool,
+    root: u64,
     sa_registry: Option<&SaRegistry>,
     acct_flags: u8,
     alloc: &mut PoolSpaceAllocator,
@@ -3924,6 +4071,7 @@ fn retire_or_decrement_zpl_target(
             zpl_ceiling,
             zpl_dirty_dnodes,
             sa_registry,
+            root,
             target_obj,
             target_loaded,
             order,

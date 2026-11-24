@@ -4038,3 +4038,83 @@ fn private_xattr_reclamation_crash_prefixes_keep_all_owners_or_retire_them_toget
         );
     }
 }
+
+#[test]
+fn private_xattr_root_aliases_refuse_killpriv_and_reclamation_before_writes() {
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    let timestamp = Timestamp {
+        seconds: 1_715_000_453,
+        nanos: 43,
+    };
+    for (zpl_version, mirror_width, ashift) in [(4, 1, 9), (5, 2, 12)] {
+        for fault in [
+            XattrOwnershipFault::DirectoryRootAlias,
+            XattrOwnershipFault::ValueRootAlias,
+        ] {
+            // Both private nodes have valid kind, parent, flag and link metadata.
+            // Only the authoritative master ROOT identity makes them reserved.
+            // Use native engine operations: mounting this deliberately malformed
+            // namespace could reject the root before testing private ownership.
+            let (mut engine, devices) = writer_fixture(
+                &cx,
+                &PoolFixtureSpec {
+                    zpl_version,
+                    mirror_width,
+                    ashift,
+                    hello_mode: 0o6755,
+                    deadlist_mode: DeadlistMode::NativeDeadlist,
+                    auxiliary_ownership: Some((4, AuxiliaryOwnership::CapabilityXattr)),
+                    auxiliary_xattr_fault: Some(fault),
+                    ..PoolFixtureSpec::default()
+                },
+            );
+            let before: Vec<_> = devices
+                .iter()
+                .map(FaultableMemberDevice::durable_snapshot)
+                .collect();
+            assert_native_write_refused(&mut engine, &devices, libc::EIO, |writer| {
+                writer.write_file_data_clearing_privileges(
+                    &cx,
+                    &dataset,
+                    4,
+                    0,
+                    b"must not publish",
+                    timestamp,
+                    ZfsDataChecksum::Inherit,
+                )
+            });
+            assert_native_write_refused(&mut engine, &devices, libc::EIO, |writer| {
+                writer.unlink_entry(&cx, &dataset, 2, b"hello.txt", false, timestamp)
+            });
+            assert_native_write_refused(&mut engine, &devices, libc::EIO, |writer| {
+                writer.unlink_open_file(
+                    &cx,
+                    &dataset,
+                    2,
+                    b"hello.txt",
+                    ZfsUnlinkedObject {
+                        object: 4,
+                        generation: SNAP_TXG,
+                    },
+                    timestamp,
+                )
+            });
+            assert_native_write_refused(&mut engine, &devices, libc::EIO, |writer| {
+                writer.rename_entry(
+                    &cx,
+                    &dataset,
+                    2,
+                    b"keep.bin",
+                    2,
+                    b"hello.txt",
+                    Some(5),
+                    timestamp,
+                )
+            });
+            for (device, original) in devices.iter().zip(before) {
+                assert_eq!(device.durable_snapshot(), original, "{fault:?}");
+            }
+        }
+    }
+}

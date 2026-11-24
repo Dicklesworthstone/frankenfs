@@ -76,8 +76,8 @@ impl ZfsFs {
     /// Without caller credentials, data mutations conservatively clear SUID and
     /// group-executable SGID atomically with the data. Non-executable SGID remains;
     /// frontends may remove it through a clearing-only `setattr` for other callers.
-    /// SA file capabilities are removed in that same TXG. Directory-backed
-    /// capability values remain outside the data-mutation profile.
+    /// SA and directory-backed file capabilities are removed in that same TXG.
+    /// Private values require validated, exclusive native ownership.
     /// Open regular files survive final unlink in the native unlinked set. A
     /// fresh owner drains pending regular-file reclamation before exposing the
     /// mount. Snapshot and control-directory operations remain read-only.
