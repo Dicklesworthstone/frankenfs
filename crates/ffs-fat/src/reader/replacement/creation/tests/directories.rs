@@ -688,6 +688,47 @@ fn torn_live_binding_cannot_publish_mixed_directory_or_file_metadata() {
     }
 }
 
+#[test]
+fn torn_rename_binding_preserves_exact_alias_spelling_and_payload() {
+    let cx = Cx::for_testing();
+    for kind in [FatKind::Fat16, FatKind::Fat32] {
+        // An 8.3 rename reuses the existing slot. Mixed case needs an LFN
+        // and relocates the first root entry because nothing precedes it.
+        for (name, relocated) in [("/NEXT.BIN", false), ("/Keep.bin", true)] {
+            let control = Image::new(kind, 512, false);
+            let ordinary = control.volume();
+            mkdir::rename_in_volume(&cx, &ordinary, "/KEEP.BIN", name, false).unwrap();
+            let entry = ordinary.resolve(&cx, name).unwrap().unwrap();
+            let slot = control.base + entry.offset;
+            assert_eq!(slot != control.root, relocated);
+            let expected = control.bytes(slot, 32);
+
+            let image = Image::new(kind, 512, false);
+            let volume = FatVolume::from_device(
+                &cx,
+                Box::new(TornBinding {
+                    device: image.device.clone(),
+                    slot,
+                    prefix: 1,
+                }),
+                image.base,
+                image.geometry.volume_bytes(),
+            )
+            .unwrap();
+            let error =
+                mkdir::rename_in_volume(&cx, &volume, "/KEEP.BIN", name, false).unwrap_err();
+            assert!(format!("{error:#}").contains("torn live binding"));
+            assert_eq!(image.bytes(slot, 32), expected);
+            assert_eq!(
+                volume.resolve(&cx, name).unwrap().unwrap().name().unwrap(),
+                &name[1..]
+            );
+            assert_eq!(contents(&volume, name), b"SAFE");
+            image.guards();
+        }
+    }
+}
+
 impl ByteDevice for LostRetirement {
     fn len_bytes(&self) -> u64 {
         self.device.len_bytes()

@@ -8,9 +8,9 @@
 use super::super::super::super::{Directory, Entry, FatVolume};
 use super::super::names::NativeName;
 use super::{
-    Extension, Namespace, NativeMutation, Slot, checkpoint, delete_entry_slots, deleted_slot,
-    find_entry_slots, parent, patch_slot, read_slot, rename_chain, reserve_clusters, reserve_slots,
-    retired_slot, set_dirty, set_hints, validate_boot_state, validate_entry_slots,
+    EntryPublication, Extension, Namespace, NativeMutation, Slot, checkpoint, delete_entry_slots,
+    deleted_slot, find_entry_slots, parent, patch_slot, read_slot, rename_chain, reserve_clusters,
+    reserve_slots, retired_slot, set_dirty, set_hints, validate_boot_state, validate_entry_slots,
 };
 use anyhow::{Context, Result, bail};
 use asupersync::Cx;
@@ -201,6 +201,7 @@ pub(super) fn rename(
     if dry_run {
         return Ok(report);
     }
+    let mut publication = EntryPublication::new(volume, placement.offset(&short))?;
     let native = NativeMutation::begin(cx, volume)?;
     let mut phase = "publishing dirty state";
     let result = (|| -> Result<serde_json::Value> {
@@ -213,6 +214,7 @@ pub(super) fn rename(
                 // FAT16 root. No transient unlink or new directory slot needed.
                 phase = "publishing short-name case flags";
                 patch_slot(cx, volume, short.offset, &short.bytes, &updated)?;
+                volume.device.sync(cx)?;
             }
             Placement::Reuse(name) => {
                 phase = "retiring the old long-name set";
@@ -238,7 +240,7 @@ pub(super) fn rename(
                     }
                 }
                 phase = "publishing the renamed short entry";
-                patch_slot(cx, volume, short.offset, &retired_slot(&short), &updated)?;
+                publication.publish_binding(cx, volume, &retired_slot(&short), &updated)?;
             }
             Placement::Relocate(namespace) => {
                 phase = "preparing complete new directory storage";
@@ -254,10 +256,9 @@ pub(super) fn rename(
                 } else {
                     deleted_slot()
                 };
-                patch_slot(cx, volume, namespace.entry.offset, &expected, &updated)?;
+                publication.publish_binding(cx, volume, &expected, &updated)?;
             }
         }
-        volume.device.sync(cx)?;
         phase = "verifying native spelling and identity";
         let published = volume
             .resolve(cx, to)?
