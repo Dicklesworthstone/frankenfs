@@ -3,18 +3,20 @@
 //! nonce uniqueness, and persistence-prefix fault-cut rollback integration tests.
 
 use super::*;
-use ffs_core::{FsOps, RequestScope};
+use ffs_core::{FsOps, RequestScope, SetAttrRequest};
 use ffs_ondisk::zfs::crypto::{
-    DSL_CRYPTO_MAC, DSL_DIR_CRYPTO_KEY_OBJ, ZfsKeyFormat, ZioEncrypt, bp_crypt_iv, bp_crypt_salt,
-    decrypt_dnode_block, decrypt_regular_block, encode_crypt_mac_words, encrypt_regular_block,
-    verify_objset_macs,
+    DSL_CRYPTO_MAC, DSL_DATASET_IVSET_GUID, DSL_DIR_CRYPTO_KEY_OBJ, ZfsKeyFormat, ZioEncrypt,
+    bp_crypt_iv, bp_crypt_salt, decrypt_dnode_block, decrypt_regular_block, encode_crypt_mac_words,
+    encrypt_regular_block, verify_objset_macs,
 };
 use ffs_zfs::reader::dmu::properties::PropertyValue;
 use ffs_zfs::{
     ZfsEncryptionCreateOptions, ZfsFs, ZfsKeyMaterial, ZfsKeyStatus, ZfsMountWriteOptions,
-    ZfsPropertySetValue, ZfsXattrSetMode, ZfsZvolCreateOptions,
+    ZfsPropertySetValue, ZfsRecvRequest, ZfsSendFrom, ZfsSendRequest, ZfsXattrSetMode,
+    ZfsZvolCreateOptions, send_stream,
 };
 use std::collections::BTreeSet;
+use std::io::Cursor;
 
 const OBJSET_PORTABLE_MAC_OFFSET: usize = 720;
 const OBJSET_LOCAL_MAC_OFFSET: usize = 752;
@@ -65,6 +67,266 @@ fn hex_key_from_byte(seed: u8) -> String {
 
 fn find_dva_physical_offset(dva: Dva) -> usize {
     usize::try_from(DATA_OFFSET + dva.offset).unwrap()
+}
+
+fn snapshot_ivset_guid(
+    cx: &Cx,
+    mos: &mut ffs_zfs::Objects,
+    dataset: &[Vec<u8>],
+    name: &[u8],
+) -> u64 {
+    let snapshot = mos
+        .snapshots(cx, dataset)
+        .unwrap()
+        .into_iter()
+        .find(|snapshot| snapshot.name == name)
+        .unwrap();
+    let guid = mos
+        .zap(cx, snapshot.object)
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.name == DSL_DATASET_IVSET_GUID)
+        .unwrap()
+        .value;
+    assert_ne!(guid, 0);
+    guid
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn encrypted_snapshots_after_raw_receive_get_fresh_ivsets_and_replicate() {
+    let cx = Cx::for_testing();
+    let timestamp = Timestamp {
+        seconds: 1_736_400_001,
+        nanos: 0,
+    };
+    let material = ZfsKeyMaterial::Raw([0xC2; 32]);
+    let source = vec![b"data".to_vec(), b"origin".to_vec()];
+    let replica = vec![b"data".to_vec(), b"replica".to_vec()];
+    let source_pool = build_clean_zfs_pool(&encryption_pool_spec(1));
+    let source_devices: Vec<_> = source_pool
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut source_engine = open_engine_on_devices(
+        &cx,
+        &source_devices,
+        default_write_opts(source_pool.pool_guid, source_pool.initial_slot),
+    )
+    .unwrap();
+    source_engine
+        .create_encrypted_dataset(
+            &cx,
+            &[b"data".to_vec()],
+            b"origin",
+            &[],
+            &ZfsEncryptionCreateOptions {
+                suite: ZioEncrypt::Aes256Gcm,
+                key_material: Some(material.clone()),
+                keylocation: Some(b"prompt".to_vec()),
+                pbkdf2_iters: None,
+                extra_entropy: b"snapshot-ivset-regression".to_vec(),
+            },
+            timestamp,
+        )
+        .into_result()
+        .unwrap();
+    source_engine.load_key(&cx, &source, &material).unwrap();
+    let (object, _) = source_engine
+        .create_file(
+            &cx,
+            &source,
+            NEW_ZPL_ROOT_OBJ,
+            b"replicated.bin",
+            0o600,
+            0,
+            0,
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    let original = vec![0x64; 8192];
+    source_engine
+        .write_file_data(
+            &cx,
+            &source,
+            object,
+            0,
+            &original,
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    source_engine
+        .create_snapshot(&cx, &source, b"first", timestamp)
+        .into_result()
+        .unwrap();
+    let source_patch = b"source incremental change";
+    let mut second = original.clone();
+    second[17..17 + source_patch.len()].copy_from_slice(source_patch);
+    source_engine
+        .write_file_data(
+            &cx,
+            &source,
+            object,
+            17,
+            source_patch,
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    source_engine
+        .create_snapshot(&cx, &source, b"second", timestamp)
+        .into_result()
+        .unwrap();
+    let mut source_view = open_pool_objects(
+        &cx,
+        &source_devices,
+        source_pool.pool_guid,
+        source_engine.committed_slot(),
+    );
+    let first_ivset = snapshot_ivset_guid(&cx, &mut source_view, &source, b"first");
+    let second_ivset = snapshot_ivset_guid(&cx, &mut source_view, &source, b"second");
+    assert_ne!(first_ivset, second_ivset);
+    let mut full = Vec::new();
+    let mut send = ZfsSendRequest::full(source.clone(), b"first".to_vec());
+    send.raw = true;
+    send_stream(&cx, &mut source_view, &send, &mut full).unwrap();
+    let mut incremental = Vec::new();
+    send.to_snapshot = b"second".to_vec();
+    send.from = Some(ZfsSendFrom::Snapshot(b"first".to_vec()));
+    send_stream(&cx, &mut source_view, &send, &mut incremental).unwrap();
+
+    let replica_pool = build_clean_zfs_pool(&encryption_pool_spec(1));
+    let replica_devices: Vec<_> = replica_pool
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut replica_engine = open_engine_on_devices(
+        &cx,
+        &replica_devices,
+        default_write_opts(replica_pool.pool_guid, replica_pool.initial_slot),
+    )
+    .unwrap();
+    let receive = ZfsRecvRequest::new(replica.clone());
+    for stream in [&full, &incremental] {
+        replica_engine
+            .receive_stream(&cx, &receive, &mut Cursor::new(stream))
+            .into_result()
+            .unwrap();
+    }
+    // Snapshotting a locked replica must assign a fresh identity, even though
+    // its received head still carries the first stream's older nonce domain.
+    replica_engine
+        .create_snapshot(&cx, &replica, b"locked-copy", timestamp)
+        .into_result()
+        .unwrap();
+    let mut replica_view = replica_engine.open_read_objects(&cx).unwrap();
+    assert_eq!(
+        replica_view.key_status(&cx, &replica).unwrap(),
+        ZfsKeyStatus::Unavailable
+    );
+    assert_eq!(
+        snapshot_ivset_guid(&cx, &mut replica_view, &replica, b"first"),
+        first_ivset
+    );
+    assert_eq!(
+        snapshot_ivset_guid(&cx, &mut replica_view, &replica, b"second"),
+        second_ivset
+    );
+    let locked_ivset = snapshot_ivset_guid(&cx, &mut replica_view, &replica, b"locked-copy");
+    assert_ne!(locked_ivset, first_ivset);
+    assert_ne!(locked_ivset, second_ivset);
+
+    replica_engine.load_key(&cx, &replica, &material).unwrap();
+    let local_patch = b"replica becomes the replication source";
+    let mut expected = second.clone();
+    expected[29..29 + local_patch.len()].copy_from_slice(local_patch);
+    replica_engine
+        .write_file_data(
+            &cx,
+            &replica,
+            object,
+            29,
+            local_patch,
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    replica_engine
+        .create_snapshot(&cx, &replica, b"local", timestamp)
+        .into_result()
+        .unwrap();
+    let replica_slot = replica_engine.committed_slot();
+    drop(replica_engine);
+    let durable_replica: Vec<_> = replica_devices
+        .iter()
+        .map(FaultableMemberDevice::fresh_from_durable)
+        .collect();
+    let mut replica_view =
+        open_pool_objects(&cx, &durable_replica, replica_pool.pool_guid, replica_slot);
+    let local_ivset = snapshot_ivset_guid(&cx, &mut replica_view, &replica, b"local");
+    for previous in [first_ivset, second_ivset, locked_ivset] {
+        assert_ne!(local_ivset, previous);
+    }
+    let mut return_stream = Vec::new();
+    let mut send_back = ZfsSendRequest::full(replica.clone(), b"local".to_vec());
+    send_back.raw = true;
+    send_back.from = Some(ZfsSendFrom::Snapshot(b"second".to_vec()));
+    send_stream(&cx, &mut replica_view, &send_back, &mut return_stream).unwrap();
+    source_engine
+        .receive_stream(
+            &cx,
+            &ZfsRecvRequest::new(source.clone()),
+            &mut Cursor::new(&return_stream),
+        )
+        .into_result()
+        .unwrap();
+    let mut source_view = source_engine.open_read_objects(&cx).unwrap();
+    assert_eq!(
+        snapshot_ivset_guid(&cx, &mut source_view, &source, b"local"),
+        local_ivset
+    );
+    replica_view.load_key(&cx, &replica, &material).unwrap();
+    for (view, dataset) in [(&mut source_view, &source), (&mut replica_view, &replica)] {
+        assert_eq!(
+            view.zpl_snapshot(&cx, dataset, b"local")
+                .unwrap()
+                .read(&cx, object, 0, expected.len() + 1)
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            view.zpl_snapshot(&cx, dataset, b"second")
+                .unwrap()
+                .read(&cx, object, 0, second.len() + 1)
+                .unwrap(),
+            second
+        );
+        assert!(
+            view.scrub_dataset(&cx, dataset, None, ScrubLimits::default())
+                .unwrap()
+                .is_clean()
+        );
+    }
+    assert_pool_scrub_and_allocation_clean(
+        &cx,
+        &source_devices,
+        source_pool.pool_guid,
+        Some(source_engine.committed_slot()),
+    );
+    assert_pool_scrub_and_allocation_clean(
+        &cx,
+        &durable_replica,
+        replica_pool.pool_guid,
+        Some(replica_slot),
+    );
 }
 
 /// Read an encrypted file's `(os_bp, l1_bp, l0_bps)` directly from raw disk media bytes using
@@ -125,6 +387,170 @@ fn inspect_raw_encrypted_file_bps(
         l0_bps.push(bp);
     }
     (os_bp, l1_bp, l0_bps)
+}
+
+#[test]
+fn encrypted_fsops_mutations_preserve_inherited_checksum_policy() {
+    assert_encrypted_fsops_inherited_checksum_policy(16_384, 8);
+}
+
+#[test]
+fn encrypted_large_records_activate_native_sha512_and_large_block_ownership() {
+    assert_encrypted_fsops_inherited_checksum_policy(262_144, 11);
+}
+
+#[allow(clippy::too_many_lines)]
+fn assert_encrypted_fsops_inherited_checksum_policy(recordsize: usize, checksum: u8) {
+    let cx = Cx::for_testing();
+    let parent_ds = vec![b"data".to_vec()];
+    let dataset = vec![b"data".to_vec(), b"checksummed".to_vec()];
+    let material = ZfsKeyMaterial::Raw([0x5C; 32]);
+    let mut spec = PoolFixtureSpec {
+        data_properties: vec![
+            (b"checksum", u64::from(checksum)),
+            (b"recordsize", recordsize as u64),
+            (b"compression", 15),
+        ],
+        ..encryption_pool_spec(1)
+    };
+    spec.additional_read_features.extend([
+        (b"org.open-zfs:large_blocks".as_slice(), 0),
+        (b"org.illumos:sha512".as_slice(), 0),
+    ]);
+    let built = build_clean_zfs_pool(&spec);
+    let devices: Vec<_> = built
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut engine = open_engine_on_devices(
+        &cx,
+        &devices,
+        default_write_opts(built.pool_guid, built.initial_slot),
+    )
+    .unwrap();
+    engine
+        .create_encrypted_dataset(
+            &cx,
+            &parent_ds,
+            b"checksummed",
+            &[],
+            &ZfsEncryptionCreateOptions {
+                suite: ZioEncrypt::Aes256Gcm,
+                key_material: Some(material.clone()),
+                keylocation: Some(b"prompt".to_vec()),
+                pbkdf2_iters: None,
+                extra_entropy: b"inherited-checksum-policy".to_vec(),
+            },
+            Timestamp {
+                seconds: 1_730_000_000,
+                nanos: 0,
+            },
+        )
+        .into_result()
+        .unwrap();
+    let fs = ZfsFs::with_writer(&cx, engine, dataset.clone()).unwrap();
+    let mut scope = RequestScope::empty();
+    let file = fs
+        .create(
+            &cx,
+            &mut scope,
+            ffs_types::InodeNumber(1),
+            std::ffi::OsStr::new("payload"),
+            0o640,
+            1000,
+            1000,
+        )
+        .unwrap();
+    let payload: Vec<u8> = (0..5_u8)
+        .flat_map(|block| std::iter::repeat_n(0x41 + block, recordsize))
+        .collect();
+    assert_eq!(
+        fs.write(&cx, &mut scope, file.ino, 0, &payload).unwrap(),
+        payload.len() as u32
+    );
+    let retained_len = 4 * recordsize + 1111;
+    fs.setattr(
+        &cx,
+        &mut scope,
+        file.ino,
+        &SetAttrRequest {
+            size: Some(retained_len as u64),
+            ..SetAttrRequest::default()
+        },
+    )
+    .unwrap();
+    fs.fallocate(
+        &cx,
+        &mut scope,
+        file.ino,
+        17,
+        61,
+        libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+    )
+    .unwrap();
+    let token = fs.last_durable_token().unwrap().unwrap();
+    drop(fs);
+
+    let durable: Vec<_> = devices
+        .iter()
+        .map(FaultableMemberDevice::fresh_from_durable)
+        .collect();
+    let mut mos = open_pool_objects(&cx, &durable, built.pool_guid, token.published_slot());
+    assert!(matches!(
+        mos.zpl(&cx, &dataset),
+        Err(FfsError::PermissionDenied)
+    ));
+    mos.load_key(&cx, &dataset, &material).unwrap();
+    let mut view = mos.zpl(&cx, &dataset).unwrap();
+    let object = view.resolve(&cx, b"/payload").unwrap();
+    let mut expected = payload[..retained_len].to_vec();
+    expected[17..78].fill(0);
+    assert_eq!(view.read(&cx, object, 0, payload.len()).unwrap(), expected);
+
+    let media = durable[0].durable_snapshot();
+    let (_, indirect, leaves) =
+        inspect_raw_encrypted_file_bps(&cx, &mut mos, &media, &dataset, object);
+    assert_eq!(indirect.checksum_type(), checksum);
+    for pointer in leaves {
+        assert!(!pointer.hole());
+        assert!(pointer.is_encrypted());
+        assert_eq!(pointer.checksum_type(), checksum);
+        assert_eq!(pointer.logical_bytes(), recordsize);
+        assert_eq!(pointer.compression(), 15);
+    }
+    let scrub = mos
+        .scrub_dataset(&cx, &dataset, None, ScrubLimits::default())
+        .unwrap();
+    assert!(scrub.is_clean(), "keyed scrub failed: {scrub:?}");
+    let ownership = open_engine_on_devices(
+        &cx,
+        &durable,
+        default_write_opts(built.pool_guid, token.published_slot()),
+    )
+    .unwrap();
+    for (feature, active) in [
+        (
+            b"org.open-zfs:large_blocks".as_slice(),
+            recordsize > 131_072,
+        ),
+        (b"org.illumos:sha512".as_slice(), checksum == 11),
+    ] {
+        assert_native_dataset_feature(
+            &cx,
+            &ownership,
+            &dataset,
+            feature,
+            active,
+            u64::from(active),
+        );
+    }
+    assert_pool_scrub_and_allocation_clean(
+        &cx,
+        &durable,
+        built.pool_guid,
+        Some(token.published_slot()),
+    );
 }
 
 #[test]
@@ -1285,4 +1711,484 @@ fn encrypted_tamper_rejection_nonce_uniqueness_and_fault_cut_rollback() {
             seed_payload
         );
     }
+}
+
+fn entropy_regression_options(
+    suite: ZioEncrypt,
+    material: &ZfsKeyMaterial,
+) -> ZfsEncryptionCreateOptions {
+    ZfsEncryptionCreateOptions {
+        suite,
+        key_material: Some(material.clone()),
+        keylocation: Some(b"prompt".to_vec()),
+        pbkdf2_iters: None,
+        extra_entropy: Vec::new(),
+    }
+}
+
+fn assert_missing_entropy_authority<T>(outcome: ZfsTxOutcome<T>) {
+    assert!(matches!(
+        outcome,
+        ZfsTxOutcome::NotCommitted(FfsError::PermissionDenied)
+    ));
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn encrypted_roots_and_rewraps_do_not_repeat_from_identical_public_inputs() {
+    let cx = Cx::for_testing();
+    let timestamp = Timestamp {
+        seconds: 1_736_500_001,
+        nanos: 0,
+    };
+    let material = ZfsKeyMaterial::Raw([0x5D; 32]);
+    let replacement = ZfsKeyMaterial::Raw([0xB3; 32]);
+    let parent = vec![b"data".to_vec()];
+    let dataset = vec![b"data".to_vec(), b"random-root".to_vec()];
+    let built = build_clean_zfs_pool(&encryption_pool_spec(1));
+    let mut records = Vec::new();
+    let mut public_domains = Vec::new();
+    let mut encrypted_seed = None;
+
+    // Reproduce the CLI's empty extra_entropy on identical pool images. Public
+    // pool/dataset GUIDs and the target TXG must not determine either secret key.
+    for attempt in 0..2 {
+        let devices = [FaultableMemberDevice::new(built.members[0].clone())];
+        let mut engine = open_engine_on_devices(
+            &cx,
+            &devices,
+            default_write_opts(built.pool_guid, built.initial_slot),
+        )
+        .unwrap();
+        engine
+            .create_encrypted_dataset(
+                &cx,
+                &parent,
+                b"random-root",
+                &[],
+                &entropy_regression_options(ZioEncrypt::Aes256Gcm, &material),
+                timestamp,
+            )
+            .into_result()
+            .unwrap();
+        let mut mos = open_pool_objects(&cx, &devices, built.pool_guid, engine.committed_slot());
+        assert_eq!(
+            mos.key_status(&cx, &dataset).unwrap(),
+            ZfsKeyStatus::Unavailable
+        );
+        mos.load_key(&cx, &dataset, &material).unwrap();
+        let row = mos
+            .datasets(&cx)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.components == dataset)
+            .unwrap();
+        public_domains.push((built.pool_guid, row.guid, engine.committed_txg()));
+        records.push(
+            mos.dataset_crypto_info(&cx, &dataset)
+                .unwrap()
+                .unwrap()
+                .record,
+        );
+        if attempt == 0 {
+            encrypted_seed = Some((devices[0].durable_snapshot(), engine.committed_slot()));
+        }
+    }
+    assert_eq!(public_domains[0], public_domains[1]);
+    let first_key = records[0].unwrap(&[0x5D; 32]).unwrap();
+    let second_key = records[1].unwrap(&[0x5D; 32]).unwrap();
+    assert!(
+        first_key.active_master_key() != second_key.active_master_key(),
+        "identical public creation inputs repeated a native master key"
+    );
+    assert!(
+        first_key.hmac_key != second_key.hmac_key,
+        "identical public creation inputs repeated a native HMAC key"
+    );
+    assert_ne!(records[0].iv, records[1].iv);
+
+    // Rewrapping preserves both data keys, but retrying the same public key/TXG
+    // domain must still obtain a fresh AEAD wrapping IV.
+    let (seed_image, seed_slot) = encrypted_seed.unwrap();
+    let mut wrapping_ivs = Vec::new();
+    for _ in 0..2 {
+        let devices = [FaultableMemberDevice::new(seed_image.clone())];
+        let mut engine = open_engine_on_devices(
+            &cx,
+            &devices,
+            default_write_opts(built.pool_guid, seed_slot),
+        )
+        .unwrap();
+        engine.load_key(&cx, &dataset, &material).unwrap();
+        engine
+            .change_key(&cx, &dataset, &replacement, None, None, &[])
+            .into_result()
+            .unwrap();
+        let mut mos = open_pool_objects(&cx, &devices, built.pool_guid, engine.committed_slot());
+        assert!(matches!(
+            mos.load_key(&cx, &dataset, &material),
+            Err(FfsError::PermissionDenied)
+        ));
+        mos.load_key(&cx, &dataset, &replacement).unwrap();
+        let record = mos
+            .dataset_crypto_info(&cx, &dataset)
+            .unwrap()
+            .unwrap()
+            .record;
+        assert_eq!(record.guid, records[0].guid);
+        let rewrapped = record.unwrap(&[0xB3; 32]).unwrap();
+        assert!(rewrapped.active_master_key() == first_key.active_master_key());
+        assert!(rewrapped.hmac_key == first_key.hmac_key);
+        assert_ne!(record.iv, records[0].iv);
+        wrapping_ivs.push(record.iv);
+    }
+    assert_ne!(wrapping_ivs[0], wrapping_ivs[1]);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn encrypted_failed_publication_reopen_retry_never_reuses_data_nonces() {
+    let cx = Cx::for_testing();
+    let timestamp = Timestamp {
+        seconds: 1_736_500_002,
+        nanos: 0,
+    };
+    let material = ZfsKeyMaterial::Raw([0x7A; 32]);
+    let root = vec![b"data".to_vec(), b"nonce-root".to_vec()];
+    let child = vec![b"data".to_vec(), b"nonce-root".to_vec(), b"child".to_vec()];
+    let attempted_plaintext = vec![0xA5; 20 * 1024];
+    let retried_plaintext = vec![0x5A; 20 * 1024];
+
+    for suite in [ZioEncrypt::Aes256Gcm, ZioEncrypt::Aes256Ccm] {
+        let built = build_clean_zfs_pool(&encryption_pool_spec(1));
+        let devices = [FaultableMemberDevice::new(built.members[0].clone())];
+        let mut engine = open_engine_on_devices(
+            &cx,
+            &devices,
+            default_write_opts(built.pool_guid, built.initial_slot),
+        )
+        .unwrap();
+        engine
+            .create_encrypted_dataset(
+                &cx,
+                &[b"data".to_vec()],
+                b"nonce-root",
+                &[
+                    ("compression".to_owned(), ZfsPropertySetValue::Number(2)),
+                    ("recordsize".to_owned(), ZfsPropertySetValue::Number(4096)),
+                ],
+                &entropy_regression_options(suite, &material),
+                timestamp,
+            )
+            .into_result()
+            .unwrap();
+        engine
+            .create_dataset(&cx, &root, b"child", &[], timestamp)
+            .into_result()
+            .unwrap();
+        let (file, _) = engine
+            .create_file(
+                &cx,
+                &child,
+                NEW_ZPL_ROOT_OBJ,
+                b"retry.bin",
+                0o600,
+                0,
+                0,
+                timestamp,
+                ZfsDataChecksum::Sha256,
+            )
+            .into_result()
+            .unwrap();
+        let before_txg = engine.committed_txg();
+        let before_slot = engine.committed_slot();
+        let mut before_mos = engine.open_read_objects(&cx).unwrap();
+        let row = before_mos
+            .datasets(&cx)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.components == child)
+            .unwrap();
+        let order = before_mos.object(&cx, row.head_object).unwrap().order();
+        let ivset_before = before_mos
+            .zap(&cx, row.head_object)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.name == DSL_DATASET_IVSET_GUID)
+            .unwrap()
+            .value;
+        let crypto_before = before_mos
+            .dataset_crypto_info(&cx, &child)
+            .unwrap()
+            .unwrap();
+        let key = before_mos
+            .keyring()
+            .get(crypto_before.encryption_root_ddobj)
+            .unwrap();
+        let event_start = engine.persistence_events().len();
+        engine.with_fault_hook(|event| {
+            if matches!(event.stage, ZfsPersistenceStage::UberblockWrite { .. }) {
+                Err(FfsError::Io(std::io::Error::other(
+                    "fail after encrypted children are durable, before root publication",
+                )))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(
+            engine.write_file_data(
+                &cx,
+                &child,
+                file,
+                0,
+                &attempted_plaintext,
+                timestamp,
+                ZfsDataChecksum::Sha256,
+            ),
+            ZfsTxOutcome::NotCommitted(FfsError::Io(_))
+        ));
+        assert_eq!(engine.committed_txg(), before_txg);
+        assert_eq!(engine.committed_slot(), before_slot);
+
+        // Inspect the actual durable, unpublished indirect block. Its five
+        // encrypted leaves prove the failed attempt already exposed ciphertext;
+        // an in-memory RNG comparison would miss this storage-level failure.
+        let events = &engine.persistence_events()[event_start..];
+        let indirect_writes: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                matches!(event.stage, ZfsPersistenceStage::ChildBlocksWrite { .. })
+                    && event.bytes > 4096
+            })
+            .collect();
+        assert_eq!(indirect_writes.len(), 1);
+        let indirect = indirect_writes[0];
+        let failed_media = devices[0].durable_snapshot();
+        let indirect_offset = usize::try_from(indirect.offset).unwrap();
+        let indirect_bytes = &failed_media[indirect_offset..indirect_offset + indirect.bytes];
+        let mut failed_pairs = BTreeSet::new();
+        for (index, pointer_bytes) in indirect_bytes.chunks_exact(128).take(5).enumerate() {
+            let pointer = BlockPointer::parse(pointer_bytes, order).unwrap();
+            assert!(pointer.is_encrypted());
+            assert_eq!(pointer.birth(), before_txg + 1);
+            assert_eq!(pointer.logical_bytes(), 4096);
+            assert_eq!(pointer.compression(), 2);
+            let physical_offset = find_dva_physical_offset(pointer.data_dvas().unwrap()[0]);
+            assert!(events.iter().any(|event| {
+                matches!(event.stage, ZfsPersistenceStage::ChildBlocksWrite { .. })
+                    && event.offset == physical_offset as u64
+                    && event.bytes == pointer.physical_bytes()
+            }));
+            let ciphertext =
+                &failed_media[physical_offset..physical_offset + pointer.physical_bytes()];
+            assert_eq!(
+                decrypt_regular_block(&key, &pointer, ciphertext).unwrap(),
+                attempted_plaintext[index * 4096..(index + 1) * 4096]
+            );
+            assert!(failed_pairs.insert((bp_crypt_salt(&pointer), bp_crypt_iv(&pointer))));
+        }
+        assert_eq!(failed_pairs.len(), 5);
+        drop(engine);
+        devices[0].state.lock().unwrap().crash_drop_unsynced();
+
+        let fresh = [devices[0].fresh_from_durable()];
+        let mut retry = open_engine_on_devices(
+            &cx,
+            &fresh,
+            default_write_opts(built.pool_guid, before_slot),
+        )
+        .unwrap();
+        retry.load_key(&cx, &root, &material).unwrap();
+        assert_eq!(retry.committed_txg(), before_txg);
+        let mut recovered = retry.open_read_objects(&cx).unwrap();
+        assert!(
+            recovered
+                .zpl(&cx, &child)
+                .unwrap()
+                .read(&cx, file, 0, attempted_plaintext.len())
+                .unwrap()
+                .is_empty()
+        );
+        let crypto_recovered = recovered.dataset_crypto_info(&cx, &child).unwrap().unwrap();
+        assert!(crypto_recovered.record == crypto_before.record);
+        assert_eq!(
+            recovered
+                .zap(&cx, row.head_object)
+                .unwrap()
+                .into_iter()
+                .find(|entry| entry.name == DSL_DATASET_IVSET_GUID)
+                .unwrap()
+                .value,
+            ivset_before
+        );
+        retry
+            .write_file_data(
+                &cx,
+                &child,
+                file,
+                0,
+                &retried_plaintext,
+                timestamp,
+                ZfsDataChecksum::Sha256,
+            )
+            .into_result()
+            .unwrap();
+        assert_eq!(retry.committed_txg(), before_txg + 1);
+        let mut after = open_pool_objects(&cx, &fresh, built.pool_guid, retry.committed_slot());
+        after.load_key(&cx, &root, &material).unwrap();
+        let (_, _, retried_pointers) = inspect_raw_encrypted_file_bps(
+            &cx,
+            &mut after,
+            &fresh[0].durable_snapshot(),
+            &child,
+            file,
+        );
+        assert_eq!(retried_pointers.len(), failed_pairs.len());
+        for pointer in retried_pointers {
+            assert!(
+                !failed_pairs.contains(&(bp_crypt_salt(&pointer), bp_crypt_iv(&pointer))),
+                "a reopened retry reused a nonce for different plaintext at the same TXG"
+            );
+        }
+        assert_eq!(
+            after
+                .zpl(&cx, &child)
+                .unwrap()
+                .read(&cx, file, 0, retried_plaintext.len())
+                .unwrap(),
+            retried_plaintext
+        );
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn encrypted_mutations_require_entropy_authority_before_backing_writes() {
+    let cx = Cx::for_testing();
+    let timestamp = Timestamp {
+        seconds: 1_736_500_003,
+        nanos: 0,
+    };
+    let material = ZfsKeyMaterial::Raw([0x2C; 32]);
+    let parent = vec![b"data".to_vec()];
+    let root = vec![b"data".to_vec(), b"authority-root".to_vec()];
+    let volume = vec![
+        b"data".to_vec(),
+        b"authority-root".to_vec(),
+        b"disk".to_vec(),
+    ];
+    let built = build_clean_zfs_pool(&encryption_pool_spec(1));
+    let devices = [FaultableMemberDevice::new(built.members[0].clone())];
+    let mut engine = open_engine_on_devices(
+        &cx,
+        &devices,
+        default_write_opts(built.pool_guid, built.initial_slot),
+    )
+    .unwrap();
+    engine
+        .create_encrypted_dataset(
+            &cx,
+            &parent,
+            b"authority-root",
+            &[],
+            &entropy_regression_options(ZioEncrypt::Aes256Gcm, &material),
+            timestamp,
+        )
+        .into_result()
+        .unwrap();
+    let (file, _) = engine
+        .create_file(
+            &cx,
+            &root,
+            NEW_ZPL_ROOT_OBJ,
+            b"untouched.bin",
+            0o600,
+            0,
+            0,
+            timestamp,
+            ZfsDataChecksum::Sha256,
+        )
+        .into_result()
+        .unwrap();
+    let volume_options = ZfsZvolCreateOptions {
+        volsize: 64 * 1024,
+        volblocksize: 4096,
+        sparse: true,
+        initial_props: Vec::new(),
+        timestamp,
+    };
+    engine
+        .zvol_create(&cx, &root, b"disk", &volume_options)
+        .into_result()
+        .unwrap();
+    let restricted = {
+        let narrowed = cx.restrict::<asupersync::cx::cap::CapSet<true, true, false, true, true>>();
+        let _guard = narrowed.set_current_restricted();
+        Cx::current().unwrap()
+    };
+    assert!(restricted.capabilities().io);
+    assert!(!restricted.capabilities().entropy);
+    let before_media = devices[0].durable_snapshot();
+    let before_counts = {
+        let state = devices[0].state.lock().unwrap();
+        (state.write_calls, state.sync_calls)
+    };
+    let before_state = (engine.committed_txg(), engine.committed_slot());
+    let before_roots = engine.keyring().loaded_roots();
+    let before_events = engine.persistence_events().len();
+    assert_missing_entropy_authority(engine.create_encrypted_dataset(
+        &restricted,
+        &parent,
+        b"denied-root",
+        &[],
+        &entropy_regression_options(ZioEncrypt::Aes256Gcm, &material),
+        timestamp,
+    ));
+    assert_missing_entropy_authority(engine.create_dataset(
+        &restricted,
+        &root,
+        b"denied-child",
+        &[],
+        timestamp,
+    ));
+    assert_missing_entropy_authority(engine.zvol_create(
+        &restricted,
+        &root,
+        b"denied-volume",
+        &volume_options,
+    ));
+    assert_missing_entropy_authority(engine.write_file_data(
+        &restricted,
+        &root,
+        file,
+        0,
+        b"must not be encrypted without authority",
+        timestamp,
+        ZfsDataChecksum::Sha256,
+    ));
+    assert_missing_entropy_authority(engine.zvol_write_at(
+        &restricted,
+        &volume,
+        0,
+        &[0x9A; 4096],
+        ZfsDataChecksum::Sha256,
+    ));
+    assert_missing_entropy_authority(engine.change_key(
+        &restricted,
+        &root,
+        &ZfsKeyMaterial::Raw([0x94; 32]),
+        None,
+        None,
+        &[],
+    ));
+    assert_eq!(
+        (engine.committed_txg(), engine.committed_slot()),
+        before_state
+    );
+    assert_eq!(engine.keyring().loaded_roots(), before_roots);
+    assert_eq!(engine.persistence_events().len(), before_events);
+    assert_eq!(devices[0].durable_snapshot(), before_media);
+    let state = devices[0].state.lock().unwrap();
+    assert_eq!((state.write_calls, state.sync_calls), before_counts);
+    assert!(state.volatile.is_empty());
 }

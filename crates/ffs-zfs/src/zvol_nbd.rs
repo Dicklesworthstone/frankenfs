@@ -444,6 +444,81 @@ pub struct ZfsZvolSession {
     staged_bytes: usize,
 }
 
+enum ZvolCacheUndo {
+    Remove(u64),
+    Restore(u64, Option<Vec<u8>>),
+}
+
+/// Per-command undo log for changes to the session's writeback cache. Native
+/// reads, cancellation, and FUA publication can all fail after the first block.
+struct StagedEdit<'a> {
+    blocks: &'a mut BTreeMap<u64, Option<Vec<u8>>>,
+    bytes: &'a mut usize,
+    original_bytes: usize,
+    undo: Vec<ZvolCacheUndo>,
+}
+
+impl<'a> StagedEdit<'a> {
+    fn new(blocks: &'a mut BTreeMap<u64, Option<Vec<u8>>>, bytes: &'a mut usize) -> Self {
+        Self {
+            original_bytes: *bytes,
+            blocks,
+            bytes,
+            undo: Vec::new(),
+        }
+    }
+
+    fn replace(&mut self, id: u64, block: Option<Vec<u8>>) {
+        let new_bytes = block.as_ref().map_or(0, Vec::len);
+        let old = self.blocks.insert(id, block);
+        let old_bytes = old.as_ref().and_then(Option::as_ref).map_or(0, Vec::len);
+        *self.bytes = *self.bytes - old_bytes + new_bytes;
+        self.undo.push(match old {
+            Some(block) => ZvolCacheUndo::Restore(id, block),
+            None => ZvolCacheUndo::Remove(id),
+        });
+    }
+
+    fn finish(
+        mut self,
+        cx: &Cx,
+        engine: &mut ZfsTransactionEngine,
+        dataset: &[Vec<u8>],
+        checksum: ZfsDataChecksum,
+        durable: bool,
+    ) -> Result<(ZvolAckKind, Option<ZfsCommitReceipt>)> {
+        let ack = if durable || *self.bytes > MAX_STAGED_VOLATILE_BYTES {
+            let (receipt, _) = engine
+                .zvol_batch_apply(cx, dataset, self.blocks, checksum)
+                .into_result()?;
+            self.blocks.clear();
+            *self.bytes = 0;
+            (ZvolAckKind::DurableTxg, Some(receipt))
+        } else {
+            (ZvolAckKind::StagedVolatile, None)
+        };
+        self.undo.clear();
+        self.original_bytes = *self.bytes;
+        Ok(ack)
+    }
+}
+
+impl Drop for StagedEdit<'_> {
+    fn drop(&mut self) {
+        for entry in self.undo.drain(..).rev() {
+            match entry {
+                ZvolCacheUndo::Remove(id) => {
+                    self.blocks.remove(&id);
+                }
+                ZvolCacheUndo::Restore(id, block) => {
+                    self.blocks.insert(id, block);
+                }
+            }
+        }
+        *self.bytes = self.original_bytes;
+    }
+}
+
 impl Drop for ZfsZvolSession {
     fn drop(&mut self) {
         if let Ok(mut guard) = self.state.lock() {
@@ -504,6 +579,12 @@ impl ZfsZvolSession {
     }
 
     fn verify_epoch(&self, guard: &ManagerState) -> Result<()> {
+        if guard.engine.requires_recovery() {
+            return Err(reject_errno(
+                libc::EIO,
+                "uncertain ZVOL publication requires a fresh engine",
+            ));
+        }
         let cur = guard.epochs.get(&self.dataset_guid).copied().unwrap_or(1);
         if cur != self.open_epoch {
             return Err(reject_errno(
@@ -624,7 +705,7 @@ impl ZfsZvolSession {
             return Ok((ZvolAckKind::DurableTxg, Some(receipt)));
         }
 
-        // Stage into `staged_dirty` (`FlushBarrier`, or flushing residual staged blocks).
+        let mut edit = StagedEdit::new(&mut self.staged_dirty, &mut self.staged_bytes);
         if !data.is_empty() {
             let bs = self.volblocksize as u64;
             let end = offset + data.len() as u64;
@@ -641,14 +722,9 @@ impl ZfsZvolSession {
                 let count = (write_end - write_start) as usize;
 
                 if count == self.volblocksize {
-                    let was_some = matches!(self.staged_dirty.get(&bid), Some(Some(_)));
-                    self.staged_dirty
-                        .insert(bid, Some(data[in_data..in_data + count].to_vec()));
-                    if !was_some {
-                        self.staged_bytes += self.volblocksize;
-                    }
+                    edit.replace(bid, Some(data[in_data..in_data + count].to_vec()));
                 } else {
-                    let mut buf = match self.staged_dirty.get(&bid) {
+                    let mut buf = match edit.blocks.get(&bid) {
                         Some(Some(existing)) => existing.clone(),
                         Some(None) => vec![0_u8; self.volblocksize],
                         None => {
@@ -665,29 +741,18 @@ impl ZfsZvolSession {
                     };
                     buf[in_block..in_block + count]
                         .copy_from_slice(&data[in_data..in_data + count]);
-                    let was_some = matches!(self.staged_dirty.get(&bid), Some(Some(_)));
-                    self.staged_dirty.insert(bid, Some(buf));
-                    if !was_some {
-                        self.staged_bytes += self.volblocksize;
-                    }
+                    edit.replace(bid, Some(buf));
                 }
             }
         }
 
-        if fua
-            || self.sync_policy == ZvolSyncPolicy::Always
-            || self.staged_bytes > MAX_STAGED_VOLATILE_BYTES
-        {
-            let (receipt, _) = guard
-                .engine
-                .zvol_batch_apply(cx, &self.dataset, &self.staged_dirty, self.checksum)
-                .into_result()?;
-            self.staged_dirty.clear();
-            self.staged_bytes = 0;
-            return Ok((ZvolAckKind::DurableTxg, Some(receipt)));
-        }
-
-        Ok((ZvolAckKind::StagedVolatile, None))
+        edit.finish(
+            cx,
+            &mut guard.engine,
+            &self.dataset,
+            self.checksum,
+            fua || self.sync_policy == ZvolSyncPolicy::Always,
+        )
     }
 
     /// Sector-aligned discard / TRIM.
@@ -696,6 +761,17 @@ impl ZfsZvolSession {
         cx: &Cx,
         offset: u64,
         len: u64,
+    ) -> Result<(ZvolAckKind, Option<ZfsCommitReceipt>)> {
+        self.discard_with_fua(cx, offset, len, false)
+    }
+
+    /// Discard a range and optionally persist the session's pending I/O before returning.
+    pub fn discard_with_fua(
+        &mut self,
+        cx: &Cx,
+        offset: u64,
+        len: u64,
+        fua: bool,
     ) -> Result<(ZvolAckKind, Option<ZfsCommitReceipt>)> {
         checkpoint(cx)?;
         if self.read_only {
@@ -714,7 +790,7 @@ impl ZfsZvolSession {
             .map_err(|_| FfsError::Io(std::io::Error::other("ZFS volume manager lock poisoned")))?;
         self.verify_epoch(&guard)?;
 
-        if self.sync_policy == ZvolSyncPolicy::Always && self.staged_dirty.is_empty() {
+        if (fua || self.sync_policy == ZvolSyncPolicy::Always) && self.staged_dirty.is_empty() {
             let (receipt, _) = guard
                 .engine
                 .zvol_discard(cx, &self.dataset, offset, len, self.checksum)
@@ -722,6 +798,7 @@ impl ZfsZvolSession {
             return Ok((ZvolAckKind::DurableTxg, Some(receipt)));
         }
 
+        let mut edit = StagedEdit::new(&mut self.staged_dirty, &mut self.staged_bytes);
         if len > 0 {
             let bs = self.volblocksize as u64;
             let end = offset + len;
@@ -734,11 +811,9 @@ impl ZfsZvolSession {
                 let cut_start = offset.max(block_start);
                 let cut_end = end.min(block_end);
                 if cut_start == block_start && cut_end == block_end {
-                    if matches!(self.staged_dirty.insert(bid, None), Some(Some(_))) {
-                        self.staged_bytes = self.staged_bytes.saturating_sub(self.volblocksize);
-                    }
+                    edit.replace(bid, None);
                 } else {
-                    let mut buf = match self.staged_dirty.get(&bid) {
+                    let mut buf = match edit.blocks.get(&bid) {
                         Some(Some(existing)) => existing.clone(),
                         Some(None) => continue,
                         None => {
@@ -756,32 +831,19 @@ impl ZfsZvolSession {
                     let in_start = (cut_start - block_start) as usize;
                     let in_end = (cut_end - block_start) as usize;
                     buf[in_start..in_end].fill(0);
-                    if buf.iter().all(|&b| b == 0) {
-                        if matches!(self.staged_dirty.insert(bid, None), Some(Some(_))) {
-                            self.staged_bytes = self.staged_bytes.saturating_sub(self.volblocksize);
-                        }
-                    } else {
-                        let was_some = matches!(self.staged_dirty.get(&bid), Some(Some(_)));
-                        self.staged_dirty.insert(bid, Some(buf));
-                        if !was_some {
-                            self.staged_bytes += self.volblocksize;
-                        }
-                    }
+                    let nonzero = buf.iter().any(|&b| b != 0);
+                    edit.replace(bid, nonzero.then_some(buf));
                 }
             }
         }
 
-        if self.sync_policy == ZvolSyncPolicy::Always {
-            let (receipt, _) = guard
-                .engine
-                .zvol_batch_apply(cx, &self.dataset, &self.staged_dirty, self.checksum)
-                .into_result()?;
-            self.staged_dirty.clear();
-            self.staged_bytes = 0;
-            return Ok((ZvolAckKind::DurableTxg, Some(receipt)));
-        }
-
-        Ok((ZvolAckKind::StagedVolatile, None))
+        edit.finish(
+            cx,
+            &mut guard.engine,
+            &self.dataset,
+            self.checksum,
+            fua || self.sync_policy == ZvolSyncPolicy::Always,
+        )
     }
 
     /// Flush all staged `FlushBarrier` dirty blocks into one durable TXG, or verify a
@@ -915,9 +977,10 @@ impl NbdBackend {
         cx: &Cx,
         offset: u64,
         len: u64,
+        fua: bool,
     ) -> Result<(ZvolAckKind, Option<ZfsCommitReceipt>)> {
         match self {
-            Self::Session(s) => s.discard(cx, offset, len),
+            Self::Session(s) => s.discard_with_fua(cx, offset, len, fua),
             Self::ReadOnlyZvol(_) => Err(FfsError::ReadOnly),
         }
     }
@@ -1555,13 +1618,13 @@ impl ZfsZvolNbdServer {
                         }
                     }
                 }
-                NBD_CMD_TRIM => match self.backend.discard(cx, offset, u64::from(length)) {
+                NBD_CMD_TRIM => match self.backend.discard(cx, offset, u64::from(length), fua) {
                     Ok((ack_kind, receipt)) => {
                         self.record_audit(
                             "TRIM",
                             offset,
                             u64::from(length),
-                            false,
+                            fua,
                             NBD_OK,
                             ack_kind,
                             receipt.as_ref(),
@@ -1574,7 +1637,7 @@ impl ZfsZvolNbdServer {
                             "TRIM",
                             offset,
                             u64::from(length),
-                            false,
+                            fua,
                             code,
                             ZvolAckKind::Rejected,
                             None,
@@ -2001,6 +2064,11 @@ impl ZfsZvolNbdClient {
     }
 
     pub fn trim(&self, cx: &Cx, offset: u64, len: u64) -> Result<()> {
+        self.trim_with_fua(cx, offset, len, false)
+    }
+
+    /// Discard a range, optionally requiring native durability before acknowledgment.
+    pub fn trim_with_fua(&self, cx: &Cx, offset: u64, len: u64, fua: bool) -> Result<()> {
         checkpoint(cx)?;
         let len_u32 = u32::try_from(len)
             .map_err(|_| reject_errno(libc::EINVAL, "NBD TRIM length exceeds u32"))?;
@@ -2008,7 +2076,9 @@ impl ZfsZvolNbdClient {
             .inner
             .lock()
             .map_err(|_| FfsError::Io(std::io::Error::other("NBD client lock poisoned")))?;
-        let handle = Self::send_request(cx, &mut guard, NBD_CMD_TRIM, 0, offset, len_u32, None)?;
+        let flags = if fua { NBD_CMD_FLAG_FUA } else { 0 };
+        let handle =
+            Self::send_request(cx, &mut guard, NBD_CMD_TRIM, flags, offset, len_u32, None)?;
         Self::read_reply(cx, &mut guard, handle, "TRIM", None)
     }
 

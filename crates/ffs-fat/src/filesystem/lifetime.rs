@@ -1,26 +1,30 @@
 //! Mount-lifetime retention using ordinary native short-name recovery records.
 //!
-//! Unlink hides a collision-checked, same-slot native rename from this mount,
+//! Unlink/rmdir hide a collision-checked, same-slot native rename from this mount,
 //! rather than freeing clusters still pinned by an open handle or the transport.
 //! The record keeps exact EOF, metadata and allocation durable, so all existing
 //! positioned I/O, truncate, allocation, copy and fsync paths continue to work.
 //! No checker exception, synthetic FAT, temporary payload copy or dirty-admission
-//! bypass is needed. Last release/FORGET reclaims through the native unlink path.
+//! bypass is needed. Last release/FORGET reclaims through native unlink/rmdir.
+//! Held directories retain their original `..` identity even if overwrite
+//! exchanges the recovery record into another physical parent. That logical
+//! parent stays pinned until the last retained child releases it. Removed
+//! directories cannot gain new children through their surviving inode IDs.
 //!
 //! This is a deliberately bounded retention profile, not full POSIX parity:
-//! each retained file still occupies its native directory slot, and prevents
+//! each retained object still occupies its native directory slot, and prevents
 //! removing that physical parent while retained. A crash can leave Fxxxxxxx.DEL
-//! records, including an intermediate exchanged namespace after interrupted
+//! file or directory records, including an exchanged namespace after interrupted
 //! rename-overwrite; interruption during a name rewrite can also leave lost
 //! allocation requiring the existing native recovery/salvage tools. Pinned
 //! overwrite retains exchange's conservative read-only-attribute admission.
-//! On a fresh mount completed recovery records are ORDINARY recoverable files;
+//! On a fresh mount completed recovery records are ORDINARY native entries;
 //! never infer ownership or delete a pre-existing file from its name. Runtime
 //! visibility comes only from this mount's registry. No crash atomicity claimed.
 
 use super::{
     Directory, Entry, FatFs, FfsError, InodeNumber, OsStr, Result, checkpoint, map_mutation_error,
-    rename_in_volume, set_attr_in_volume, unlink_in_volume,
+    rename_in_volume, rmdir_in_volume, set_attr_in_volume, unlink_in_volume,
 };
 use asupersync::Cx;
 use ffs_core::vfs::OpenHandleOracle;
@@ -34,6 +38,10 @@ const MAX_RETAINED: usize = 4_096;
 struct Retained {
     slot: u64,
     visible_to_handles: bool,
+    // An overwritten directory may physically move into the source's old
+    // footprint. Keep its held inode's original '..' identity separately from
+    // Node::parent, which follows the recovery record for native I/O.
+    directory_parent: Option<InodeNumber>,
 }
 
 #[derive(Default)]
@@ -189,15 +197,18 @@ impl FatFs {
     }
 
     pub(super) fn pinned(&self, ino: InodeNumber) -> Result<bool> {
-        let (own, oracle) = {
+        let (own, child, oracle) = {
             let state = locked(&self.lifetime)?;
             (
                 state.counts.get(&ino).copied().unwrap_or(0),
+                state.retained.values().any(|record| {
+                    record.visible_to_handles && record.directory_parent == Some(ino)
+                }),
                 state.oracle.clone(),
             )
         };
         // No registry/namespace mutex is held while invoking transport code.
-        Ok(own != 0 || oracle.is_some_and(|oracle| oracle(ino) != 0))
+        Ok(own != 0 || child || oracle.is_some_and(|oracle| oracle(ino) != 0))
     }
 
     pub(super) fn retained(&self, ino: InodeNumber) -> Result<bool> {
@@ -205,6 +216,19 @@ impl FatFs {
             .retained
             .get(&ino)
             .is_some_and(|record| record.visible_to_handles))
+    }
+
+    pub(super) fn directory_parent(
+        &self,
+        ino: InodeNumber,
+        physical_parent: InodeNumber,
+    ) -> Result<InodeNumber> {
+        Ok(locked(&self.lifetime)?
+            .retained
+            .get(&ino)
+            .filter(|record| record.visible_to_handles)
+            .and_then(|record| record.directory_parent)
+            .unwrap_or(physical_parent))
     }
 
     pub(super) fn visible_lookup(
@@ -250,7 +274,18 @@ impl FatFs {
         Ok(entries)
     }
 
-    fn reserve_retention(&self, ino: InodeNumber, slot: u64) -> Result<RetentionReservation<'_>> {
+    fn reserve_retention(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        slot: u64,
+    ) -> Result<RetentionReservation<'_>> {
+        let node = self.node(cx, ino)?;
+        let directory_parent = node
+            .entry
+            .as_ref()
+            .filter(|entry| entry.native.is_directory())
+            .map(|_| node.parent);
         let mut state = locked(&self.lifetime)?;
         if state.retained.len() >= MAX_RETAINED {
             return Err(errno(libc::ENOSPC));
@@ -268,6 +303,7 @@ impl FatFs {
             Retained {
                 slot,
                 visible_to_handles: false,
+                directory_parent,
             },
         );
         Ok(RetentionReservation {
@@ -319,8 +355,9 @@ impl FatFs {
     }
 
     /// The supplied source is already resolved through the visible namespace.
-    /// Ordinary unlink policy (including native read-only attributes) applies.
-    pub(super) fn retain_unlink_locked(
+    /// Ordinary removal policy (including empty-directory and native read-only
+    /// checks) applies before reserving or changing the recovery record.
+    pub(super) fn retain_remove_locked(
         &self,
         cx: &Cx,
         parent: InodeNumber,
@@ -328,15 +365,20 @@ impl FatFs {
         entry: &Entry,
         ino: InodeNumber,
     ) -> Result<()> {
-        unlink_in_volume(cx, &self.volume, path, true).map_err(map_mutation_error)?;
+        if entry.native.is_directory() {
+            rmdir_in_volume(cx, &self.volume, path, true).map_err(map_mutation_error)?;
+        } else {
+            unlink_in_volume(cx, &self.volume, path, true).map_err(map_mutation_error)?;
+        }
         let recovery = self.recovery_name(cx, parent)?;
         rename_in_volume(cx, &self.volume, path, &recovery, true).map_err(map_mutation_error)?;
-        let reservation = self.reserve_retention(ino, entry.offset)?;
+        let reservation = self.reserve_retention(cx, ino, entry.offset)?;
         rename_in_volume(cx, &self.volume, path, &recovery, false).map_err(map_mutation_error)?;
-        let node = self.refresh_node_from_path(cx, ino, &recovery)?;
-        let slot = node.entry.ok_or(FfsError::IsDirectory)?.offset;
-        reservation.publish(slot)?;
-        checkpoint(cx)
+        cx.masked(|| {
+            let node = self.refresh_node_from_path(cx, ino, &recovery)?;
+            let slot = node.entry.ok_or(FfsError::IsDirectory)?.offset;
+            reservation.publish(slot)
+        })
     }
 
     /// A pinned overwrite target must not be freed or disappear on a later
@@ -364,14 +406,15 @@ impl FatFs {
             .volume
             .resolve(cx, &from)?
             .ok_or(FfsError::IsDirectory)?;
-        let reservation = self.reserve_retention(target_ino, source.offset)?;
+        let reservation = self.reserve_retention(cx, target_ino, source.offset)?;
         self.exchange_locked(cx, parent, name, new_parent, new_name)?;
         // Do not recurse through public rename/unlink: this operation retains
         // one writer guard and has already reserved the displaced object's ID.
         rename_in_volume(cx, &self.volume, &from, &recovery, false).map_err(map_mutation_error)?;
-        let node = self.refresh_node_from_path(cx, target_ino, &recovery)?;
-        reservation.publish(node.entry.ok_or(FfsError::IsDirectory)?.offset)?;
-        checkpoint(cx)
+        cx.masked(|| {
+            let node = self.refresh_node_from_path(cx, target_ino, &recovery)?;
+            reservation.publish(node.entry.ok_or(FfsError::IsDirectory)?.offset)
+        })
     }
 
     /// Called under the operation writer gate by RELEASE, FORGET or destroy.
@@ -382,10 +425,41 @@ impl FatFs {
         ino: InodeNumber,
         destroying: bool,
     ) -> Result<bool> {
-        checkpoint(cx)?;
-        if !self.retained(ino)? || (!destroying && self.pinned(ino)?) {
-            return Ok(false);
+        let (reclaimed, mut parent) = self.reap_one_retained_locked(cx, ino, destroying)?;
+        // Last FORGET may have already arrived for an original directory
+        // parent held only by this recovery record. Release those implicit
+        // pins here instead of waiting for a callback that will not recur.
+        // Every nonterminal step removes a record; cap work by the registry's
+        // hard bound, including a final probe of the live original parent.
+        for _ in 0..MAX_RETAINED {
+            let Some(ancestor) = parent else {
+                return Ok(reclaimed);
+            };
+            let (_, next) = self.reap_one_retained_locked(cx, ancestor, destroying)?;
+            parent = next;
         }
+        if parent.is_some() {
+            return Err(FfsError::Corruption {
+                block: 0,
+                detail: "FAT retained directory parent chain exceeds its registry bound".into(),
+            });
+        }
+        Ok(reclaimed)
+    }
+
+    fn reap_one_retained_locked(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        destroying: bool,
+    ) -> Result<(bool, Option<InodeNumber>)> {
+        // A completed child can leave cancellation pending. A final probe of
+        // its live/pinned parent performs no further native work and must not
+        // turn that completed reclamation into an interrupted mutation.
+        if !self.retained(ino)? || (!destroying && self.pinned(ino)?) {
+            return Ok((false, None));
+        }
+        checkpoint(cx)?;
         self.ensure_writable()?;
         let path = self.path_for_inode(ino)?;
         let node = self.node(cx, ino)?;
@@ -402,21 +476,25 @@ impl FatFs {
         if entry.offset != expected.slot
             || actual.offset != expected.slot
             || actual.native != entry.native
-            || actual.native.is_directory()
+            || actual.native.is_directory() != expected.directory_parent.is_some()
         {
             return Err(FfsError::Corruption {
                 block: expected.slot / 512,
                 detail: "retained FAT record changed before final reclamation".into(),
             });
         }
-        // chmod through a held inode can set DOS read-only AFTER unlink.
-        // Last-close reclamation is not a new user unlink permission decision.
+        // chmod through a held inode can set DOS read-only AFTER removal.
+        // Final reclamation is not a new user unlink/rmdir permission decision.
         if actual.native.attributes & 1 != 0 {
             set_attr_in_volume(cx, &self.volume, &path, Some(false), None, None)
                 .map_err(map_mutation_error)?;
-            self.refresh_node_from_path(cx, ino, &path)?;
+            cx.masked(|| self.refresh_node_from_path(cx, ino, &path))?;
         }
-        unlink_in_volume(cx, &self.volume, &path, false).map_err(map_mutation_error)?;
+        if actual.native.is_directory() {
+            rmdir_in_volume(cx, &self.volume, &path, false).map_err(map_mutation_error)?;
+        } else {
+            unlink_in_volume(cx, &self.volume, &path, false).map_err(map_mutation_error)?;
+        }
         {
             let mut state = self.state()?;
             if state.slot_to_ino.get(&expected.slot) != Some(&ino) {
@@ -431,8 +509,7 @@ impl FatFs {
             state.free_clusters = None;
         }
         locked(&self.lifetime)?.retained.remove(&ino);
-        checkpoint(cx)?;
-        Ok(true)
+        Ok((true, expected.directory_parent))
     }
 
     pub(super) fn reap_all_retained_locked(&self, cx: &Cx) -> Result<()> {
@@ -442,7 +519,8 @@ impl FatFs {
             .filter_map(|(&ino, record)| record.visible_to_handles.then_some(ino))
             .collect();
         for ino in ids {
-            checkpoint(cx)?;
+            // The inner reaper checkpoints before each actual native removal.
+            // IDs reclaimed by an earlier parent cascade are now no-op probes.
             self.reap_retained_locked(cx, ino, true)?;
         }
         Ok(())

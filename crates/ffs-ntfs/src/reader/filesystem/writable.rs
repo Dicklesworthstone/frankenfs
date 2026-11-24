@@ -79,12 +79,23 @@ impl NtfsFs {
                 "NTFS writer requires recovery before filesystem admission",
             ));
         }
-        let last_token = engine.recover_retained_files(cx)?;
+        // Validate the host namespace and security projection before reclaiming
+        // retained files. An unsupported mount must not begin recovery writes.
         let volume = engine.volume_view(cx)?;
         let mut fs = Self::new_with_policy(cx, volume, policy)?;
+        let last_token = engine.recover_retained_files(cx)?;
+        if last_token.is_some() {
+            // Recovery changes allocation and directory contents, but preserves
+            // the root identity and UpCase table admitted above. Drop the old
+            // reader's cached native metadata before exposing the writable view.
+            // A cancellation after native publication must not interrupt this
+            // in-memory refresh.
+            fs.volume = cx.masked(|| engine.volume_view(cx))?;
+        }
         fs.writer = Some(Mutex::new(engine));
         fs.last_token = Mutex::new(last_token);
-        // Construction populated attributes using read-only permissions.
+        // Construction populated attributes using read-only permissions and
+        // may have cached directory entries removed by retained-file recovery.
         *fs.cache()? = Cache::default();
         Ok(fs)
     }
@@ -1221,11 +1232,8 @@ impl NtfsFs {
                 if no_replace {
                     return Err(FfsError::Exists);
                 }
-                if self.has_pinned_ads(ino)? {
-                    return Err(unsupported(
-                        "rename over an open NTFS destination requires atomic retention",
-                    ));
-                }
+                // A stream handle pins the entire destination FILE record, including
+                // all named DATA. Its remaining hard link or retained name owns it.
                 if dst_attr.nlink == 1 {
                     for _ in 0..16 {
                         let sequence = RETAINED_SEQUENCE

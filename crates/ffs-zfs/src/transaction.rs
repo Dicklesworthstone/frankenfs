@@ -882,6 +882,7 @@ impl ZfsTransactionEngine {
             let default_sw = if version == 5000 { 5000 } else { version };
             let selected_order = current_uberblock.order;
             current_uberblock.order = *expected_order;
+            let mut protection = pool.defer_protection(cx)?;
             for wave_labels in [[0_usize, 1], [2, 3]] {
                 for (m_idx, member) in members.iter().enumerate() {
                     for l_idx in wave_labels {
@@ -903,6 +904,9 @@ impl ZfsTransactionEngine {
                 for member in members {
                     member.sync_raw(cx)?;
                 }
+            }
+            for hold in &mut protection {
+                hold.complete();
             }
             // The native copies use label order; retain the selected in-memory
             // representation after reconciliation without cloning its root.
@@ -1255,7 +1259,7 @@ impl ZfsTransactionEngine {
         timestamp: Timestamp,
         checksum: ZfsDataChecksum,
     ) -> ZfsTxOutcome<u64> {
-        self.write_file_data_with_setid_policy(
+        self.write_file_data_with_privilege_policy(
             cx,
             dataset_components,
             file_obj,
@@ -1263,6 +1267,7 @@ impl ZfsTransactionEngine {
             data,
             timestamp,
             checksum,
+            false,
             false,
         )
     }
@@ -1284,7 +1289,7 @@ impl ZfsTransactionEngine {
         timestamp: Timestamp,
         checksum: ZfsDataChecksum,
     ) -> ZfsTxOutcome<u64> {
-        self.write_file_data_with_setid_policy(
+        self.write_file_data_with_privilege_policy(
             cx,
             dataset_components,
             file_obj,
@@ -1293,11 +1298,40 @@ impl ZfsTransactionEngine {
             timestamp,
             checksum,
             true,
+            false,
+        )
+    }
+
+    /// Write data, clear set-user-ID and executable set-group-ID permissions, and
+    /// remove native SA and directory-backed file capabilities in the same TXG.
+    /// Empty writes preserve size, timestamps, and privileges. Malformed private
+    /// ownership refuses the whole mutation before publication.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_file_data_clearing_privileges(
+        &mut self,
+        cx: &Cx,
+        dataset_components: &[Vec<u8>],
+        file_obj: u64,
+        offset: u64,
+        data: &[u8],
+        timestamp: Timestamp,
+        checksum: ZfsDataChecksum,
+    ) -> ZfsTxOutcome<u64> {
+        self.write_file_data_with_privilege_policy(
+            cx,
+            dataset_components,
+            file_obj,
+            offset,
+            data,
+            timestamp,
+            checksum,
+            true,
+            true,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn write_file_data_with_setid_policy(
+    fn write_file_data_with_privilege_policy(
         &mut self,
         cx: &Cx,
         dataset_components: &[Vec<u8>],
@@ -1307,6 +1341,7 @@ impl ZfsTransactionEngine {
         timestamp: Timestamp,
         checksum: ZfsDataChecksum,
         clear_suid_sgid: bool,
+        clear_file_capabilities: bool,
     ) -> ZfsTxOutcome<u64> {
         self.execute_zpl_txg(
             cx,
@@ -1316,6 +1351,7 @@ impl ZfsTransactionEngine {
                 offset,
                 data: data.to_vec(),
                 clear_suid_sgid,
+                clear_file_capabilities,
                 timestamp,
                 checksum,
             },
@@ -1338,7 +1374,7 @@ impl ZfsTransactionEngine {
         timestamp: Timestamp,
         checksum: ZfsDataChecksum,
     ) -> ZfsTxOutcome<u64> {
-        self.edit_file_range_with_setid_policy(
+        self.edit_file_range_with_privilege_policy(
             cx,
             dataset_components,
             file_obj,
@@ -1347,6 +1383,7 @@ impl ZfsTransactionEngine {
             operation,
             timestamp,
             checksum,
+            false,
             false,
         )
     }
@@ -1369,7 +1406,7 @@ impl ZfsTransactionEngine {
         timestamp: Timestamp,
         checksum: ZfsDataChecksum,
     ) -> ZfsTxOutcome<u64> {
-        self.edit_file_range_with_setid_policy(
+        self.edit_file_range_with_privilege_policy(
             cx,
             dataset_components,
             file_obj,
@@ -1379,11 +1416,42 @@ impl ZfsTransactionEngine {
             timestamp,
             checksum,
             true,
+            false,
+        )
+    }
+
+    /// Edit a sparse range while clearing set-ID permissions and native SA and
+    /// directory-backed file capabilities atomically. A size-preserving range
+    /// wholly beyond EOF retains all privileges. Malformed private ownership
+    /// refuses the whole mutation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn edit_file_range_clearing_privileges(
+        &mut self,
+        cx: &Cx,
+        dataset_components: &[Vec<u8>],
+        file_obj: u64,
+        offset: u64,
+        length: u64,
+        operation: ZfsFileRangeOperation,
+        timestamp: Timestamp,
+        checksum: ZfsDataChecksum,
+    ) -> ZfsTxOutcome<u64> {
+        self.edit_file_range_with_privilege_policy(
+            cx,
+            dataset_components,
+            file_obj,
+            offset,
+            length,
+            operation,
+            timestamp,
+            checksum,
+            true,
+            true,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn edit_file_range_with_setid_policy(
+    fn edit_file_range_with_privilege_policy(
         &mut self,
         cx: &Cx,
         dataset_components: &[Vec<u8>],
@@ -1394,6 +1462,7 @@ impl ZfsTransactionEngine {
         timestamp: Timestamp,
         checksum: ZfsDataChecksum,
         clear_suid_sgid: bool,
+        clear_file_capabilities: bool,
     ) -> ZfsTxOutcome<u64> {
         if length == 0
             || offset
@@ -1417,6 +1486,7 @@ impl ZfsTransactionEngine {
                 length,
                 operation,
                 clear_suid_sgid,
+                clear_file_capabilities,
                 timestamp,
                 checksum,
             },
@@ -1517,7 +1587,7 @@ impl ZfsTransactionEngine {
         )
     }
 
-    /// Publish size, POSIX mode/uid/gid, set-ID clearing, and native timestamps
+    /// Publish size, POSIX mode/uid/gid, privilege clearing, and native timestamps
     /// atomically in one TXG, rebuilding trivial NFSv4 DACL on chmod and
     /// transferring embedded `userused`/`groupused` quota accounting on chown.
     pub fn set_posix_attributes(
@@ -2212,6 +2282,11 @@ impl ZfsTransactionEngine {
         data: &[u8],
         checksum: ZfsDataChecksum,
     ) -> ZfsTxOutcome<ZfsCommitReceipt> {
+        if checksum == ZfsDataChecksum::Inherit {
+            return ZfsTxOutcome::NotCommitted(unsupported(
+                "checksum inheritance is only supported for native ZPL writes",
+            ));
+        }
         let empty_bpobj_id = self.empty_bpobj_id;
         let order = self.order;
         let outcome = self.execute_staged_txg(
@@ -2249,6 +2324,11 @@ impl ZfsTransactionEngine {
         len: u64,
         checksum: ZfsDataChecksum,
     ) -> ZfsTxOutcome<ZfsCommitReceipt> {
+        if checksum == ZfsDataChecksum::Inherit {
+            return ZfsTxOutcome::NotCommitted(unsupported(
+                "checksum inheritance is only supported for native ZPL writes",
+            ));
+        }
         let empty_bpobj_id = self.empty_bpobj_id;
         let order = self.order;
         let outcome = self.execute_staged_txg(
@@ -2284,6 +2364,11 @@ impl ZfsTransactionEngine {
         dirty_blocks: &BTreeMap<u64, Option<Vec<u8>>>,
         checksum: ZfsDataChecksum,
     ) -> ZfsTxOutcome<ZfsCommitReceipt> {
+        if checksum == ZfsDataChecksum::Inherit {
+            return ZfsTxOutcome::NotCommitted(unsupported(
+                "checksum inheritance is only supported for native ZPL writes",
+            ));
+        }
         let empty_bpobj_id = self.empty_bpobj_id;
         let order = self.order;
         let outcome = self.execute_staged_txg(
@@ -2396,8 +2481,7 @@ impl ZfsTransactionEngine {
                     dataset_components,
                     mutation,
                     mos_dirty_dnodes,
-                    &mut draft_features.write_features,
-                    &mut draft_features.write_dirty,
+                    draft_features,
                     empty_bpobj_id,
                     draft_alloc,
                     order,
@@ -2600,7 +2684,14 @@ impl ZfsTransactionEngine {
 
         // 2. Persist any pre-commit topology reflow writes + strictly child-before-parent
         //    blocks across all members BEFORE touching Uberblocks!
-        let member_count = self.pool.leaves().len();
+        // Retain independent handles to the same admitted devices while updating
+        // engine state. Every early return drops all guards and aborts the epoch.
+        let pool = self.pool.clone();
+        let mut protection = match pool.defer_protection(cx) {
+            Ok(holds) => holds,
+            Err(error) => return ZfsTxOutcome::NotCommitted(error),
+        };
+        let member_count = pool.leaves().len();
         if !pre_commit_writes.is_empty() {
             for (m_idx, phys_off, bytes) in pre_commit_writes {
                 if *m_idx >= member_count {
@@ -2608,12 +2699,12 @@ impl ZfsTransactionEngine {
                         "pre-commit write member index out of bounds",
                     ));
                 }
-                if let Err(err) = self.pool.leaves()[*m_idx].write_raw(cx, *phys_off, bytes) {
+                if let Err(err) = pool.leaves()[*m_idx].write_raw(cx, *phys_off, bytes) {
                     return ZfsTxOutcome::NotCommitted(err);
                 }
             }
             for m_idx in 0..member_count {
-                if let Err(err) = self.pool.leaves()[m_idx].sync_raw(cx) {
+                if let Err(err) = pool.leaves()[m_idx].sync_raw(cx) {
                     return ZfsTxOutcome::NotCommitted(err);
                 }
             }
@@ -2774,6 +2865,9 @@ impl ZfsTransactionEngine {
         // and allocator before observing any further cancellation or reply fault.
         // A cancelled reply cannot make this durable TXG uncertain, poison the
         // owner, or leave subsequent requests using the predecessor allocator.
+        for hold in &mut protection {
+            hold.complete();
+        }
         let allow_v2 = converged_alloc.spacemap_v2_active;
         for ms in &mut converged_alloc.metaslabs {
             if ms.is_dirty() {

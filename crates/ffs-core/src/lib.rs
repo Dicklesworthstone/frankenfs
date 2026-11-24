@@ -24969,7 +24969,9 @@ impl OpenFs {
         dev: &dyn BlockDevice,
         inode: &Ext4Inode,
     ) -> Result<bool, FfsError> {
-        Self::ext4_reject_inline_data_dir(inode)?;
+        if Self::ext4_inode_uses_inline_data(inode) {
+            return Ok(self.read_ext4_inline_dir(cx, inode)?.len() == 2);
+        }
         let block_size = self.block_size();
         let num_blocks = dir_logical_block_count(inode.size, u64::from(block_size))?;
         for extent in self.ext4_dir_extents_from_device(cx, dev, inode)? {
@@ -33618,6 +33620,15 @@ impl OpenFs {
         tstamp_secs: u64,
         tstamp_nanos: u32,
     ) -> ffs_error::Result<()> {
+        // Convert within the caller's private transaction, so allocation,
+        // existing entries and the new child become visible together.
+        let converted;
+        let parent_inode = if Self::ext4_inode_uses_inline_data(parent_inode) {
+            converted = self.ext4_convert_inline_dir(cx, dev, backend, parent, parent_inode)?;
+            &converted
+        } else {
+            parent_inode
+        };
         // Namespace composition can change mapping blocks and directory
         // leaves before insertion. Use the transaction's exact view for
         // both, rather than a current-view mapping or directory cache.
@@ -33768,6 +33779,163 @@ impl OpenFs {
             tstamp_secs,
             tstamp_nanos,
         )
+    }
+
+    /// Expand both independent inline dirent regions into a normal directory
+    /// block. The caller publishes the returned inode with its namespace edit.
+    fn ext4_convert_inline_dir(
+        &self,
+        cx: &Cx,
+        dev: &dyn BlockDevice,
+        backend: &mut dyn DirAllocBackend,
+        ino: InodeNumber,
+        inode: &Ext4Inode,
+    ) -> ffs_error::Result<Ext4Inode> {
+        let entries = self.read_ext4_inline_dir(cx, inode)?;
+        let geo = backend.dir_geo();
+        let ino_u32 = u32::try_from(ino.0)
+            .map_err(|_| FfsError::Format("inode number exceeds ext4 32-bit limit".into()))?;
+        let block_size = usize::try_from(geo.block_size)
+            .map_err(|_| FfsError::Format("block size does not fit usize".into()))?;
+        let reserved_tail = self.ext4_dir_reserved_tail();
+        let mut block = vec![0_u8; block_size];
+        ffs_dir::init_dir_block(&mut block, ino_u32, entries[1].inode, reserved_tail)?;
+        for entry in entries.iter().skip(2) {
+            ffs_dir::add_entry(
+                &mut block,
+                entry.inode,
+                &entry.name,
+                entry.file_type,
+                reserved_tail,
+            )?;
+        }
+        self.stamp_ext4_dir_block(&mut block, ino_u32, inode.generation);
+
+        // Preserve unrelated attributes, including an external xattr block.
+        // Reject an unsupported ibody rewrite before allocating anything.
+        let mut converted = inode.clone();
+        if !ffs_xattr::remove_xattr(
+            &mut converted,
+            None,
+            "system.data",
+            ffs_xattr::XattrWriteAccess {
+                has_cap_sys_admin: true,
+                ..ffs_xattr::XattrWriteAccess::default()
+            },
+        )? {
+            return Err(FfsError::Corruption {
+                block: 0,
+                detail: "inline directory lost its system.data attribute".into(),
+            });
+        }
+        converted.blocks = Self::ext4_blocks_after_adding_data(
+            inode,
+            ino,
+            1,
+            u64::from(geo.block_size / EXT4_SECTOR_SIZE),
+        )?;
+        converted.size = u64::from(geo.block_size);
+        converted.flags &= !ffs_types::EXT4_INLINE_DATA_FL;
+        let indirect = !geo
+            .feature_incompat
+            .contains(ffs_ondisk::Ext4IncompatFeatures::EXTENTS);
+        let mut root = [0_u8; 60];
+        if !indirect {
+            converted.flags |= ffs_types::EXT4_EXTENTS_FL;
+            root[..2].copy_from_slice(&0xF30A_u16.to_le_bytes());
+            root[4..6].copy_from_slice(&4_u16.to_le_bytes());
+        }
+        let hint = self.numa_allocation_hint(
+            &geo,
+            AllocHint {
+                goal_group: Some(ffs_types::inode_to_group(ino, geo.inodes_per_group)),
+                ..AllocHint::default()
+            },
+            "ext4_inline_dir_conversion",
+            Some(ino),
+        );
+        let allocated = backend.dir_alloc_blocks(cx, dev, 1, &hint)?;
+        Self::ext4_dir_map_extent(
+            cx,
+            dev,
+            backend,
+            indirect,
+            &mut root,
+            Ext4Extent {
+                logical_block: 0,
+                raw_len: 1,
+                physical_start: allocated.start.0,
+            },
+            ino_u32,
+            inode.generation,
+            hint,
+        )?;
+        Self::set_extent_root(&mut converted, &root);
+        dev.write_block(cx, allocated.start, &block)?;
+        Ok(converted)
+    }
+
+    /// Remove in place so unlink/rmdir never need a free data block merely
+    /// to shrink an inline parent. Full validation precedes either edit.
+    fn ext4_remove_inline_dir_entry(
+        &self,
+        cx: &Cx,
+        dev: &dyn BlockDevice,
+        inode: &mut Ext4Inode,
+        name: &[u8],
+    ) -> ffs_error::Result<Option<u32>> {
+        let Some(entry) = self.lookup_name(cx, inode, name)? else {
+            return Ok(None);
+        };
+        if let Some((removed, _)) =
+            ffs_dir::remove_entry_take_inode_tracked(&mut inode.extent_bytes[4..], &entry.name, 0)?
+        {
+            return Ok(Some(removed));
+        }
+        let (_, mut continuation, _) = ffs_ondisk::find_ibody_xattr_by_index_name(
+            inode,
+            ffs_types::EXT4_XATTR_INDEX_SYSTEM,
+            b"data",
+        )
+        .map_err(|error| parse_to_ffs_error(&error))?
+        .ok_or_else(|| FfsError::Corruption {
+            block: 0,
+            detail: "inline directory lost its system.data attribute".into(),
+        })?;
+        let Some((removed, _)) =
+            ffs_dir::remove_entry_take_inode_tracked(&mut continuation, &entry.name, 0)?
+        else {
+            return Err(FfsError::Corruption {
+                block: 0,
+                detail: "inline directory entry disappeared during removal".into(),
+            });
+        };
+        let mut external = if inode.file_acl == 0 {
+            None
+        } else {
+            Some(
+                dev.read_block(cx, BlockNumber(inode.file_acl))?
+                    .as_slice()
+                    .to_vec(),
+            )
+        };
+        let storage = ffs_xattr::set_xattr(
+            inode,
+            external.as_deref_mut(),
+            "system.data",
+            &continuation,
+            ffs_xattr::XattrWriteAccess {
+                has_cap_sys_admin: true,
+                ..ffs_xattr::XattrWriteAccess::default()
+            },
+        )?;
+        if storage != ffs_xattr::XattrStorage::Inline {
+            return Err(FfsError::Corruption {
+                block: 0,
+                detail: "inline directory system.data moved out of its inode".into(),
+            });
+        }
+        Ok(Some(removed))
     }
 
     /// Grow a full linear directory by one block holding the new entry: the
@@ -35044,10 +35212,15 @@ impl OpenFs {
         if !parent_inode.is_dir() {
             return Err(FfsError::NotDirectory);
         }
-        Self::ext4_reject_inline_data_dir(&parent_inode)?;
-
-        let extents = self.ext4_dir_extents_from_device(cx, tx_dev, &parent_inode)?;
-        let mut removed_ino: Option<u32> = None;
+        let (extents, mut removed_ino) = if Self::ext4_inode_uses_inline_data(&parent_inode) {
+            let removed = self.ext4_remove_inline_dir_entry(cx, tx_dev, &mut parent_inode, name)?;
+            (Vec::new(), removed)
+        } else {
+            (
+                self.ext4_dir_extents_from_device(cx, tx_dev, &parent_inode)?,
+                None,
+            )
+        };
         let mut pending_dir_write: Option<(BlockNumber, Vec<u8>)> = None;
         let reserved_tail = self.ext4_dir_reserved_tail();
         let parent_ino_u32 = u32::try_from(parent.0)
@@ -38220,6 +38393,10 @@ impl OpenFs {
         inode: &Ext4Inode,
         name: &[u8],
     ) -> ffs_error::Result<Option<Ext4DirEntry>> {
+        if Self::ext4_inode_uses_inline_data(inode) {
+            // All bytes are in the supplied transaction-view inode.
+            return self.lookup_name(cx, inode, name);
+        }
         let extents = self.ext4_dir_extents_from_device(cx, dev, inode)?;
         let casefold = inode.flags & ffs_types::EXT4_CASEFOLD_FL != 0;
         let sb = self
@@ -39728,11 +39905,16 @@ impl OpenFs {
         // Remove first so an already-cached inode can replace itself even when
         // the bounded cache is full; a cache admission failure is transparent.
         self.ext4_inode_xattr_cache.remove(&ino.0);
-        self.ext4_inode_xattr_cache.insert_within(
-            ino.0,
-            Arc::clone(&entries),
-            EXT4_INODE_XATTR_BLOCK_CACHE_LIMIT,
-        );
+        // Namespace edits change an inline directory's system.data outside
+        // xattr transactions. Never retain that unversioned catalog: a reader
+        // that began before conversion must not reinstall it after publication.
+        if !(inode.is_dir() && Self::ext4_inode_uses_inline_data(inode)) {
+            self.ext4_inode_xattr_cache.insert_within(
+                ino.0,
+                Arc::clone(&entries),
+                EXT4_INODE_XATTR_BLOCK_CACHE_LIMIT,
+            );
+        }
         Ok(entries)
     }
 
@@ -40425,13 +40607,14 @@ impl OpenFs {
     ///
     /// Inline-data directories store their entries inside the inode (i_block +
     /// the `system.data` ibody xattr), not in extent-mapped blocks. Reads decode
-    /// that layout, but mutation paths still require a block directory. Keep
-    /// them guarded until inline updates and conversion are implemented: an
-    /// empty extent view must never authorize rmdir or overwrite inline data.
+    /// that layout, and namespace helpers handle inline mutation explicitly.
+    /// Block-map consumers must still reject it: an empty extent view must
+    /// never authorize an operation on bytes that actually live in the inode.
     fn ext4_reject_inline_data_dir(inode: &Ext4Inode) -> Result<(), FfsError> {
         if Self::ext4_inode_uses_inline_data(inode) {
             return Err(FfsError::UnsupportedFeature(
-                "ext4 inline_data directory mutation is not yet supported (bd-4y9ca)".to_owned(),
+                "ext4 inline_data directory requires conversion for this operation (bd-4y9ca)"
+                    .to_owned(),
             ));
         }
         Ok(())
@@ -66648,6 +66831,570 @@ mod tests {
         image
     }
 
+    /// Give the format-only inline fixture consistent writable allocation
+    /// metadata. A full bitmap exercises rollback after inode reservation and
+    /// proves that removing an entry does not require parent conversion.
+    fn open_writable_inline_dir_fixture(full: bool) -> (OpenFs, TestDevice) {
+        let head = inline_dir_region(56, &[(11, b"hello.txt")]);
+        let continuation = inline_dir_region(24, &[(12, b"later.txt")]);
+        let mut image = build_ext4_image_with_inline_dir(&head, &continuation);
+        let free_blocks = if full { 0_u32 } else { 48_u32 };
+        image[EXT4_SUPERBLOCK_OFFSET + 0x0C..EXT4_SUPERBLOCK_OFFSET + 0x10]
+            .copy_from_slice(&free_blocks.to_le_bytes());
+        image[EXT4_SUPERBLOCK_OFFSET + 0x10..EXT4_SUPERBLOCK_OFFSET + 0x14]
+            .copy_from_slice(&116_u32.to_le_bytes());
+        image[EXT4_SUPERBLOCK_OFFSET + 0x3A..EXT4_SUPERBLOCK_OFFSET + 0x3C]
+            .copy_from_slice(&1_u16.to_le_bytes());
+        image[4096 + 0x0C..4096 + 0x0E]
+            .copy_from_slice(&u16::try_from(free_blocks).unwrap().to_le_bytes());
+        image[4096 + 0x0E..4096 + 0x10].copy_from_slice(&116_u16.to_le_bytes());
+        image[4096 + 0x10..4096 + 0x12].copy_from_slice(&1_u16.to_le_bytes());
+        image[2 * 4096..3 * 4096].fill(0xFF);
+        if !full {
+            image[2 * 4096 + 2..2 * 4096 + 8].fill(0);
+        }
+        image[3 * 4096..4 * 4096].fill(0xFF);
+        image[3 * 4096..3 * 4096 + 16].fill(0);
+        image[3 * 4096] = 0xFF;
+        image[3 * 4096 + 1] = 0x0F;
+        for (index, sectors) in [(10, 8_u32), (11, 16_u32)] {
+            let off = 4 * 4096 + index * 256 + 0x1C;
+            image[off..off + 4].copy_from_slice(&sectors.to_le_bytes());
+        }
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let mut fs =
+            OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default()).unwrap();
+        fs.enable_writes(&cx).unwrap();
+        (fs, dev)
+    }
+
+    #[test]
+    fn ext4_inline_directory_births_convert_both_regions_and_preserve_xattrs() {
+        for operation in ["create", "mkdir", "link", "symlink", "mknod"] {
+            let (fs, dev) = open_writable_inline_dir_fixture(false);
+            let cx = Cx::for_testing();
+            let root = InodeNumber(2);
+            fs.setxattr(&cx, root, "user.keep", b"kept", XattrSetMode::Set)
+                .unwrap();
+            fs.setxattr(&cx, root, "user.external", &[0xA5; 512], XattrSetMode::Set)
+                .unwrap();
+            let before = fs.read_inode(&cx, root).unwrap();
+            assert_ne!(before.flags & ffs_types::EXT4_INLINE_DATA_FL, 0);
+            assert_ne!(before.file_acl, 0);
+            let external = fs
+                .read_block_vec(&cx, BlockNumber(before.file_acl))
+                .unwrap();
+            assert!(fs.getxattr(&cx, root, "system.data").unwrap().is_some());
+            assert!(
+                fs.listxattr(&cx, root)
+                    .unwrap()
+                    .contains(&"system.data".to_owned())
+            );
+            let name = OsStr::new("added");
+            let child = match operation {
+                "create" => fs.create(&cx, root, name, 0o644, 0, 0),
+                "mkdir" => fs.mkdir(&cx, root, name, 0o755, 0, 0),
+                "link" => fs.link(&cx, InodeNumber(11), root, name),
+                "symlink" => fs.symlink(&cx, root, name, Path::new("hello.txt"), 0, 0),
+                "mknod" => fs.mknod(&cx, root, name, 0o010_644, 0, 0, 0),
+                _ => unreachable!(),
+            }
+            .unwrap_or_else(|error| panic!("{operation}: {error}"));
+            let after = fs.read_inode(&cx, root).unwrap();
+            assert_eq!(after.flags & ffs_types::EXT4_INLINE_DATA_FL, 0);
+            assert_ne!(after.flags & ffs_types::EXT4_EXTENTS_FL, 0);
+            assert_eq!(after.size, 4096);
+            assert_eq!(after.blocks, before.blocks + 8);
+            assert_eq!(after.file_acl, before.file_acl);
+            assert_eq!(
+                fs.read_block_vec(&cx, BlockNumber(after.file_acl)).unwrap(),
+                external
+            );
+            assert_eq!(fs.getxattr(&cx, root, "system.data").unwrap(), None);
+            assert!(
+                !fs.listxattr(&cx, root)
+                    .unwrap()
+                    .contains(&"system.data".to_owned())
+            );
+            assert_eq!(
+                fs.getxattr(&cx, root, "user.external").unwrap(),
+                Some(vec![0xA5; 512])
+            );
+            assert_eq!(
+                after.links_count,
+                before.links_count + u16::from(operation == "mkdir")
+            );
+            assert_eq!(
+                ffs_xattr::get_xattr(&after, None, "user.keep").unwrap(),
+                Some(b"kept".to_vec())
+            );
+            assert_eq!(
+                ffs_ondisk::find_ibody_xattr_by_index_name(
+                    &after,
+                    ffs_types::EXT4_XATTR_INDEX_SYSTEM,
+                    b"data",
+                )
+                .unwrap(),
+                None
+            );
+            for (name, expected) in [
+                (b".".as_slice(), root),
+                (b"..", root),
+                (b"hello.txt", InodeNumber(11)),
+                (b"later.txt", InodeNumber(12)),
+                (b"added", child.ino),
+            ] {
+                let entry = fs.lookup_name(&cx, &after, name).unwrap().unwrap();
+                assert_eq!(u64::from(entry.inode), expected.0, "{operation}");
+            }
+            assert_eq!(
+                fs.read(&cx, InodeNumber(11), 0, 14).unwrap(),
+                b"Hello, extent!"
+            );
+            assert_eq!(
+                fs.read(&cx, InodeNumber(12), 0, 14).unwrap(),
+                b"Index extent!\n"
+            );
+            if operation == "mkdir" {
+                let child_inode = fs.read_inode(&cx, child.ino).unwrap();
+                assert_eq!(
+                    fs.lookup_name(&cx, &child_inode, b"..")
+                        .unwrap()
+                        .unwrap()
+                        .inode,
+                    2
+                );
+            }
+            fs.flush_mvcc_to_device(&cx).unwrap();
+            let reopened = OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(dev.snapshot_bytes())),
+                &OpenOptions::default(),
+            )
+            .unwrap();
+            let persisted = reopened.read_inode(&cx, root).unwrap();
+            assert_eq!(reopened.read_dir(&cx, &persisted).unwrap().len(), 5);
+            assert_eq!(persisted.extent_bytes, after.extent_bytes);
+            assert_eq!(persisted.xattr_ibody, after.xattr_ibody);
+        }
+    }
+
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    #[test]
+    fn ext4_inline_directory_sharded_birth_and_retirement_balance_allocations() {
+        for is_dir in [false, true] {
+            let (fs, _dev) = open_writable_inline_dir_fixture(false);
+            fs.set_bhh0i_sharded_ops(true);
+            let cx = Cx::for_testing();
+            let root = InodeNumber(2);
+            let before = fs.statfs(&cx, root).unwrap();
+            assert!(fs.getxattr(&cx, root, "system.data").unwrap().is_some());
+            let name = OsStr::new("sharded");
+            let child = if is_dir {
+                fs.mkdir(&cx, root, name, 0o755, 0, 0)
+            } else {
+                fs.create(&cx, root, name, 0o644, 0, 0)
+            }
+            .unwrap();
+            assert!(
+                fs.bhh0i_sharded_alloc_happened
+                    .load(AtomicOrdering::Relaxed),
+                "the test must exercise the sharded backend"
+            );
+            let inode = fs.read_inode(&cx, root).unwrap();
+            assert_eq!(inode.flags & ffs_types::EXT4_INLINE_DATA_FL, 0);
+            assert_eq!(fs.getxattr(&cx, root, "system.data").unwrap(), None);
+            let after = fs.statfs(&cx, root).unwrap();
+            assert_eq!(after.files_free + 1, before.files_free);
+            assert_eq!(
+                after.blocks_free + if is_dir { 2 } else { 1 },
+                before.blocks_free
+            );
+            assert_eq!(fs.lookup(&cx, root, name).unwrap().ino, child.ino);
+            if is_dir {
+                fs.rmdir(&cx, root, name).unwrap();
+            } else {
+                fs.unlink(&cx, root, name).unwrap();
+            }
+            let retired = fs.statfs(&cx, root).unwrap();
+            assert_eq!(retired.files_free, before.files_free);
+            assert_eq!(retired.blocks_free + 1, before.blocks_free);
+            fs.flush_mvcc_to_device(&cx).unwrap();
+            assert_eq!(
+                fs.read_dir(&cx, &fs.read_inode(&cx, root).unwrap())
+                    .unwrap()
+                    .len(),
+                4
+            );
+        }
+    }
+
+    #[test]
+    fn ext4_inline_directory_enospc_birth_rolls_back_and_unlink_needs_no_block() {
+        let (fs, dev) = open_writable_inline_dir_fixture(true);
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        let before = fs.read_inode(&cx, root).unwrap();
+        let stats = fs.statfs(&cx, root).unwrap();
+        let high = fs.current_snapshot().high;
+        let bytes = dev.snapshot_bytes();
+        assert_eq!(stats.blocks_free, 0);
+        assert!(matches!(
+            fs.create(&cx, root, OsStr::new("no-space"), 0o644, 0, 0),
+            Err(FfsError::NoSpace)
+        ));
+        assert_eq!(fs.current_snapshot().high, high);
+        assert_eq!(fs.read_inode(&cx, root).unwrap(), before);
+        assert_eq!(fs.statfs(&cx, root).unwrap().files_free, stats.files_free);
+        assert_eq!(dev.snapshot_bytes(), bytes);
+
+        // The first removal is in i_block; the second is in system.data.
+        for name in ["hello.txt", "later.txt"] {
+            assert!(fs.getxattr(&cx, root, "system.data").unwrap().is_some());
+            fs.unlink(&cx, root, OsStr::new(name)).unwrap();
+            let after = fs.read_inode(&cx, root).unwrap();
+            assert_eq!(
+                fs.getxattr(&cx, root, "system.data").unwrap(),
+                ffs_xattr::get_xattr(&after, None, "system.data").unwrap()
+            );
+            assert_ne!(after.flags & ffs_types::EXT4_INLINE_DATA_FL, 0);
+            assert_eq!(after.size, before.size);
+            assert_eq!(after.blocks, before.blocks);
+            assert!(
+                fs.lookup_name(&cx, &after, name.as_bytes())
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let after = fs.read_inode(&cx, root).unwrap();
+        assert_eq!(fs.read_dir(&cx, &after).unwrap().len(), 2);
+        assert!(
+            fs.ext4_directory_is_empty_from_device(&cx, &fs.block_device_adapter(), &after)
+                .unwrap()
+        );
+        let stats_after = fs.statfs(&cx, root).unwrap();
+        assert_eq!(stats_after.files_free, stats.files_free + 2);
+        assert_eq!(stats_after.blocks_free, 3);
+        fs.flush_mvcc_to_device(&cx).unwrap();
+        let reopened = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(dev.snapshot_bytes())),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        let persisted = reopened.read_inode(&cx, root).unwrap();
+        assert_eq!(reopened.read_dir(&cx, &persisted).unwrap().len(), 2);
+        assert_ne!(persisted.flags & ffs_types::EXT4_INLINE_DATA_FL, 0);
+    }
+
+    #[test]
+    fn ext4_inline_directory_corrupt_continuation_never_publishes_mutation() {
+        let (fs, dev) = open_writable_inline_dir_fixture(false);
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        let mut inode = fs.read_inode(&cx, root).unwrap();
+        let mut corrupt = inline_dir_region(24, &[(12, b"later.txt")]);
+        corrupt[4..6].copy_from_slice(&8_u16.to_le_bytes());
+        ffs_xattr::set_xattr(
+            &mut inode,
+            None,
+            "system.data",
+            &corrupt,
+            ffs_xattr::XattrWriteAccess {
+                has_cap_sys_admin: true,
+                ..ffs_xattr::XattrWriteAccess::default()
+            },
+        )
+        .unwrap();
+        fs.persist_ext4_inode_for_testing(&cx, root, &inode)
+            .unwrap();
+        let before = fs.read_inode(&cx, root).unwrap();
+        let high = fs.current_snapshot().high;
+        let bytes = dev.snapshot_bytes();
+        for result in [
+            fs.create(&cx, root, OsStr::new("new"), 0o644, 0, 0)
+                .map(|_| ()),
+            fs.unlink(&cx, root, OsStr::new("hello.txt")),
+        ] {
+            assert!(matches!(result, Err(FfsError::Corruption { .. })));
+        }
+        assert_eq!(fs.current_snapshot().high, high);
+        assert_eq!(fs.read_inode(&cx, root).unwrap(), before);
+        assert_eq!(dev.snapshot_bytes(), bytes);
+    }
+
+    fn open_native_inline_directory_fixture() -> Option<(OpenFs, TestDevice, tempfile::TempDir)> {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let image = tmp.path().join("inline.ext4");
+        std::fs::File::create(&image)
+            .and_then(|file| file.set_len(32 * 1024 * 1024))
+            .unwrap();
+        let Ok(output) = spawn_gated_output(
+            std::process::Command::new("mkfs.ext4")
+                .args([
+                    "-q",
+                    "-F",
+                    "-b",
+                    "4096",
+                    "-I",
+                    "256",
+                    "-O",
+                    "inline_data,metadata_csum",
+                ])
+                .arg(&image),
+        ) else {
+            oracle_unavailable("mkfs.ext4");
+            return None;
+        };
+        assert!(
+            output.status.success(),
+            "mkfs.ext4 failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let payload = tmp.path().join("payload");
+        std::fs::write(&payload, b"native inline payload\n").unwrap();
+        let mut commands = String::new();
+        for directory in ["create", "mkdir", "link", "symlink", "mknod", "remove"] {
+            commands.push_str(&format!("mkdir /{directory}\n"));
+            commands.push_str(&format!("ea_set /{directory} user.keep kept\n"));
+            for name in ["head-001", "head-002", "head-003", "tail-004"] {
+                commands.push_str(&format!(
+                    "write {} /{directory}/{name}\n",
+                    payload.display()
+                ));
+            }
+        }
+        commands.push_str("mkdir /empty\n");
+        let script = tmp.path().join("debugfs.commands");
+        std::fs::write(&script, commands).unwrap();
+        let Ok(output) = spawn_gated_output(
+            std::process::Command::new("debugfs")
+                .arg("-w")
+                .arg("-f")
+                .arg(&script)
+                .arg(&image),
+        ) else {
+            oracle_unavailable("debugfs");
+            return None;
+        };
+        assert!(
+            output.status.success(),
+            "debugfs failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let (clean, output) = run_e2fsck(&image)?;
+        assert!(clean, "native inline fixture must start clean:\n{output}");
+        let dev = TestDevice::from_vec(std::fs::read(&image).unwrap());
+        let cx = Cx::for_testing();
+        let mut fs = OpenFs::from_device(
+            &cx,
+            Box::new(dev.clone()),
+            &OpenOptions {
+                ext4_journal_replay_mode: Ext4JournalReplayMode::Apply,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        fs.enable_writes(&cx).unwrap();
+        // Seed external storage through the existing xattr writer, then make
+        // its native consistency an independent pre-mutation control.
+        for directory in ["create", "mkdir", "link", "symlink", "mknod", "remove"] {
+            let ino = fs
+                .lookup(&cx, InodeNumber(2), OsStr::new(directory))
+                .unwrap()
+                .ino;
+            fs.setxattr(&cx, ino, "user.external", &[0xA5; 512], XattrSetMode::Set)
+                .unwrap();
+            assert_ne!(fs.read_inode(&cx, ino).unwrap().file_acl, 0);
+        }
+        fs.flush_mvcc_to_device(&cx).unwrap();
+        let seeded = tmp.path().join("seeded.ext4");
+        std::fs::write(&seeded, dev.snapshot_bytes()).unwrap();
+        let (clean, output) = run_e2fsck(&seeded)?;
+        assert!(
+            clean,
+            "external-xattr seed must start native-clean:\n{output}"
+        );
+        Some((fs, dev, tmp))
+    }
+
+    #[test]
+    fn ext4_inline_native_mutation_lifecycle_is_e2fsck_clean() {
+        let Some((fs, dev, tmp)) = open_native_inline_directory_fixture() else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        let source_parent = fs.lookup(&cx, root, OsStr::new("create")).unwrap().ino;
+        let source = fs
+            .lookup(&cx, source_parent, OsStr::new("head-001"))
+            .unwrap()
+            .ino;
+        for operation in ["create", "mkdir", "link", "symlink", "mknod"] {
+            let parent = fs.lookup(&cx, root, OsStr::new(operation)).unwrap().ino;
+            let before = fs.read_inode(&cx, parent).unwrap();
+            assert_ne!(before.flags & ffs_types::EXT4_INLINE_DATA_FL, 0);
+            assert_ne!(before.file_acl, 0);
+            let external = fs
+                .read_block_vec(&cx, BlockNumber(before.file_acl))
+                .unwrap();
+            assert!(fs.getxattr(&cx, parent, "system.data").unwrap().is_some());
+            let (_, continuation, _) = ffs_ondisk::find_ibody_xattr_by_index_name(
+                &before,
+                ffs_types::EXT4_XATTR_INDEX_SYSTEM,
+                b"data",
+            )
+            .unwrap()
+            .unwrap();
+            assert!(
+                !continuation.is_empty(),
+                "fixture must exercise both regions"
+            );
+            assert_eq!(fs.read_dir(&cx, &before).unwrap().len(), 6);
+            let name = OsStr::new("added");
+            let child = match operation {
+                "create" => fs.create(&cx, parent, name, 0o644, 0, 0),
+                "mkdir" => fs.mkdir(&cx, parent, name, 0o755, 0, 0),
+                "link" => fs.link(&cx, source, parent, name),
+                "symlink" => fs.symlink(&cx, parent, name, Path::new("head-001"), 0, 0),
+                "mknod" => fs.mknod(&cx, parent, name, 0o010_644, 0, 0, 0),
+                _ => unreachable!(),
+            }
+            .unwrap_or_else(|error| panic!("{operation}: {error}"));
+            let after = fs.read_inode(&cx, parent).unwrap();
+            assert_eq!(after.flags & ffs_types::EXT4_INLINE_DATA_FL, 0);
+            assert_ne!(after.flags & ffs_types::EXT4_EXTENTS_FL, 0);
+            assert_eq!(after.blocks, before.blocks + 8);
+            assert_eq!(after.file_acl, before.file_acl);
+            assert_eq!(
+                fs.read_block_vec(&cx, BlockNumber(after.file_acl)).unwrap(),
+                external
+            );
+            assert_eq!(fs.getxattr(&cx, parent, "system.data").unwrap(), None);
+            assert_eq!(
+                fs.getxattr(&cx, parent, "user.external").unwrap(),
+                Some(vec![0xA5; 512])
+            );
+            assert_eq!(fs.read_dir(&cx, &after).unwrap().len(), 7);
+            assert_eq!(fs.lookup(&cx, parent, name).unwrap().ino, child.ino);
+            assert_eq!(
+                fs.getxattr(&cx, parent, "user.keep").unwrap(),
+                Some(b"kept".to_vec())
+            );
+            for name in ["head-001", "head-002", "head-003", "tail-004"] {
+                let ino = fs.lookup(&cx, parent, OsStr::new(name)).unwrap().ino;
+                assert_eq!(
+                    fs.read(&cx, ino, 0, 32).unwrap(),
+                    b"native inline payload\n"
+                );
+            }
+        }
+
+        let remove = fs.lookup(&cx, root, OsStr::new("remove")).unwrap().ino;
+        let before = fs.read_inode(&cx, remove).unwrap();
+        assert_ne!(before.flags & ffs_types::EXT4_INLINE_DATA_FL, 0);
+        let external = fs
+            .read_block_vec(&cx, BlockNumber(before.file_acl))
+            .unwrap();
+        let high = fs.current_snapshot().high;
+        let error = fs.rmdir(&cx, root, OsStr::new("remove")).unwrap_err();
+        assert_eq!(error.to_errno(), libc::ENOTEMPTY);
+        assert_eq!(fs.current_snapshot().high, high);
+        assert_eq!(fs.read_inode(&cx, remove).unwrap(), before);
+
+        // Rename still requires a block source parent. Its late refusal must
+        // roll back a staged destination insertion or overwrite completely.
+        let destination = fs.read_inode(&cx, source_parent).unwrap();
+        let destination_entries = fs.read_dir(&cx, &destination).unwrap();
+        let victim = fs
+            .lookup(&cx, source_parent, OsStr::new("added"))
+            .unwrap()
+            .ino;
+        let victim_inode = fs.read_inode(&cx, victim).unwrap();
+        for new_name in ["moved", "added"] {
+            assert!(matches!(
+                fs.rename(
+                    &cx,
+                    remove,
+                    OsStr::new("head-001"),
+                    source_parent,
+                    OsStr::new(new_name),
+                ),
+                Err(FfsError::UnsupportedFeature(_))
+            ));
+            assert_eq!(fs.current_snapshot().high, high);
+            assert_eq!(fs.read_inode(&cx, remove).unwrap(), before);
+            assert_eq!(fs.read_inode(&cx, source_parent).unwrap(), destination);
+            assert_eq!(fs.read_dir(&cx, &destination).unwrap(), destination_entries);
+            assert_eq!(fs.read_inode(&cx, victim).unwrap(), victim_inode);
+        }
+
+        // Remove the head and continuation first, then the remaining entries.
+        for name in ["head-001", "tail-004", "head-002", "head-003"] {
+            assert!(fs.getxattr(&cx, remove, "system.data").unwrap().is_some());
+            fs.unlink(&cx, remove, OsStr::new(name)).unwrap();
+            let after = fs.read_inode(&cx, remove).unwrap();
+            assert_ne!(after.flags & ffs_types::EXT4_INLINE_DATA_FL, 0);
+            assert_eq!(after.size, before.size);
+            assert_eq!(after.blocks, before.blocks);
+            assert_eq!(after.file_acl, before.file_acl);
+            assert_eq!(
+                fs.read_block_vec(&cx, BlockNumber(after.file_acl)).unwrap(),
+                external
+            );
+            assert_eq!(
+                fs.getxattr(&cx, remove, "system.data").unwrap(),
+                ffs_xattr::get_xattr(&after, Some(&external), "system.data").unwrap()
+            );
+            assert_eq!(
+                fs.getxattr(&cx, remove, "user.keep").unwrap(),
+                Some(b"kept".to_vec())
+            );
+        }
+        fs.rmdir(&cx, root, OsStr::new("remove")).unwrap();
+        fs.rmdir(&cx, root, OsStr::new("empty")).unwrap();
+        fs.flush_mvcc_to_device(&cx).unwrap();
+
+        let bytes = dev.snapshot_bytes();
+        let image = tmp.path().join("mutated.ext4");
+        std::fs::write(&image, &bytes).unwrap();
+        let Some((clean, output)) = run_e2fsck(&image) else {
+            return;
+        };
+        assert!(
+            clean,
+            "inline namespace mutations must remain native-clean:\n{output}"
+        );
+        let reopened = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(bytes)),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        for directory in ["create", "mkdir", "link", "symlink", "mknod"] {
+            let parent = reopened
+                .lookup(&cx, root, OsStr::new(directory))
+                .unwrap()
+                .ino;
+            reopened.lookup(&cx, parent, OsStr::new("added")).unwrap();
+            assert_eq!(
+                reopened.getxattr(&cx, parent, "user.keep").unwrap(),
+                Some(b"kept".to_vec())
+            );
+            assert_eq!(
+                reopened.getxattr(&cx, parent, "user.external").unwrap(),
+                Some(vec![0xA5; 512])
+            );
+        }
+        for name in ["remove", "empty"] {
+            assert!(matches!(
+                reopened.lookup(&cx, root, OsStr::new(name)),
+                Err(FfsError::NotFound(_))
+            ));
+        }
+    }
+
     #[test]
     fn ext4_inline_directory_empty_synthesizes_dot_entries() {
         let image = build_ext4_image_with_inline_dir(&inline_dir_region(56, &[]), &[]);
@@ -66675,13 +67422,13 @@ mod tests {
         assert_eq!(page.len(), 2);
         assert!(page.iter().all(|entry| entry.ino == InodeNumber(1)));
 
-        // Read support must not let a block-only mutator treat an inline
-        // directory as an empty extent tree, even when it actually is empty.
         let dev = fs.block_device_adapter();
-        assert!(matches!(
-            fs.ext4_directory_is_empty_from_device(&cx, &dev, &inode),
-            Err(FfsError::UnsupportedFeature(_))
-        ));
+        assert!(
+            fs.ext4_directory_is_empty_from_device(&cx, &dev, &inode)
+                .unwrap()
+        );
+        // A block-only operation still requires explicit conversion.
+
         assert!(matches!(
             fs.ext4_dir_extents_from_device(&cx, &dev, &inode),
             Err(FfsError::UnsupportedFeature(_))

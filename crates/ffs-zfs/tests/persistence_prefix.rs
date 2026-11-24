@@ -87,6 +87,26 @@ enum AuxiliaryOwnership {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum XattrOwnershipFault {
+    DirectoryRootAlias,
+    ValueRootAlias,
+    DirectoryParent,
+    DirectoryPublic,
+    DirectoryLinks,
+    DirectorySize,
+    DirectoryNested,
+    ValueParent,
+    ValuePublic,
+    ValueLinks,
+    ValueAlias,
+    DuplicateValue,
+    DotName,
+    ValueNested,
+    ValueExternalAcl,
+    OversizedValue,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SaSpillFixture {
     None,
     Opaque,
@@ -135,11 +155,18 @@ struct PoolFixtureSpec {
     zpl_flags: BTreeMap<u64, u64>,
     hello_size: Option<u64>,
     hello_mode: u16,
+    hello_sa_xattrs: BTreeMap<String, Vec<u8>>,
+    hello_sa_xattrs_in_spill: bool,
     root_ids: (u64, u64),
     hello_ownership: Option<ffs_ondisk::zfs_zpl::ReclamationOwnership>,
     root_properties: Vec<(&'static [u8], u64)>,
     data_properties: Vec<(&'static [u8], u64)>,
+    data_head_features: Vec<(&'static [u8], u64)>,
+    data_objectset_checksum: Option<u8>,
     auxiliary_ownership: Option<(u64, AuxiliaryOwnership)>,
+    auxiliary_xattr_fault: Option<XattrOwnershipFault>,
+    auxiliary_xattr_owner_ids: Option<(u64, u64)>,
+    auxiliary_capability_with_retained_value: bool,
 }
 
 impl Default for PoolFixtureSpec {
@@ -177,11 +204,18 @@ impl Default for PoolFixtureSpec {
             zpl_flags: BTreeMap::new(),
             hello_size: None,
             hello_mode: 0o644,
+            hello_sa_xattrs: BTreeMap::new(),
+            hello_sa_xattrs_in_spill: false,
             root_ids: (0, 0),
             hello_ownership: None,
             root_properties: Vec::new(),
             data_properties: Vec::new(),
+            data_head_features: Vec::new(),
+            data_objectset_checksum: None,
             auxiliary_ownership: None,
+            auxiliary_xattr_fault: None,
+            auxiliary_xattr_owner_ids: None,
+            auxiliary_capability_with_retained_value: false,
         }
     }
 }
@@ -278,6 +312,45 @@ fn pack_xdr_nvlist(pairs: &[Vec<u8>]) -> Vec<u8> {
     let mut out = vec![1, 1, 0, 0]; // NV_ENCODE_XDR (1), big-endian XDR stream (1)
     out.extend_from_slice(&nv_list_body(pairs));
     out
+}
+
+// Independent XDR byte-array encoding, rather than the production SA writer,
+// so capability-removal tests start from externally representable attributes.
+fn fixture_sa_xattrs(values: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
+    let pairs: Vec<_> = values
+        .iter()
+        .map(|(name, value)| {
+            let mut padded = value.clone();
+            padded.resize(padded.len().next_multiple_of(4), 0);
+            nv_pair(
+                name,
+                10,
+                u32::try_from(value.len()).unwrap(),
+                &padded,
+                value.len(),
+            )
+        })
+        .collect();
+    pack_xdr_nvlist(&pairs)
+}
+
+fn fixture_sa_xattr_header(layout: u16, length: usize, order: Endian) -> Vec<u8> {
+    let mut header = vec![0_u8; 8];
+    let layout = (1_u16 << 10) | layout;
+    let length = u16::try_from(length).unwrap();
+    match order {
+        Endian::Little => {
+            header[..4].copy_from_slice(&[0x5a, 0x50, 0x2f, 0]);
+            header[4..6].copy_from_slice(&layout.to_le_bytes());
+            header[6..8].copy_from_slice(&length.to_le_bytes());
+        }
+        Endian::Big => {
+            header[..4].copy_from_slice(&[0, 0x2f, 0x50, 0x5a]);
+            header[4..6].copy_from_slice(&layout.to_be_bytes());
+            header[6..8].copy_from_slice(&length.to_be_bytes());
+        }
+    }
+    header
 }
 
 // ---------------------------------------------------------------------------
@@ -494,6 +567,7 @@ fn build_sa_registry_objects(
     order: Endian,
     malformed_project_id: bool,
     with_reclamation_ownership: bool,
+    with_sa_xattrs: bool,
 ) -> (SaRegistry, Dnode, Dnode, Dnode) {
     // Attribute IDs matching OpenZFS `SaRegistry::LEGACY` (0..16) + custom attr 18:
     // 0: ATIME(16,0), 1: MTIME(16,0), 2: CTIME(16,0), 3: CRTIME(16,0), 4: GEN(8,0),
@@ -654,6 +728,29 @@ fn build_sa_registry_objects(
             values: vec![9, 15, 19],
             collision: 0,
         });
+    }
+    if with_sa_xattrs {
+        reg_entries.push(RawZapEntry {
+            name: b"ZPL_DXATTR".to_vec(),
+            integer_bytes: 8,
+            values: vec![(3_u64 << 16) | 20],
+            collision: 0,
+        });
+        for (layout, values) in [
+            (
+                b"10".as_slice(),
+                vec![5, 6, 4, 12, 13, 7, 11, 0, 1, 2, 3, 8, 20],
+            ),
+            (b"11", vec![20]),
+            (b"12", vec![9, 20]),
+        ] {
+            lay_entries.push(RawZapEntry {
+                name: layout.to_vec(),
+                integer_bytes: 2,
+                values,
+                collision: 0,
+            });
+        }
     }
     let registry = SaRegistry::from_zaps(&reg_entries, &lay_entries).expect("valid SaRegistry");
 
@@ -844,6 +941,7 @@ fn build_zpl_objectset(
             order,
             spec.malformed_project_id,
             spec.hello_ownership.is_some(),
+            !spec.hello_sa_xattrs.is_empty(),
         );
         (Some(r), Some((m_dn, r_dn, l_dn)))
     } else {
@@ -852,7 +950,14 @@ fn build_zpl_objectset(
 
     let mut master_pairs: Vec<(&[u8], u64)> = vec![
         (b"VERSION", spec.zpl_version),
-        (b"ROOT", 2),
+        (
+            b"ROOT",
+            match spec.auxiliary_xattr_fault {
+                Some(XattrOwnershipFault::DirectoryRootAlias) if populate_snapshot_files => 13,
+                Some(XattrOwnershipFault::ValueRootAlias) if populate_snapshot_files => 14,
+                _ => 2,
+            },
+        ),
         (b"DELETE_QUEUE", 3),
     ];
     if spec.zpl_version == 5 {
@@ -1044,6 +1149,30 @@ fn build_zpl_objectset(
                 spill = Some(arena.alloc_block(&raw, 44, 0, birth, order));
             }
         }
+        if !spec.hello_sa_xattrs.is_empty()
+            && !spec
+                .auxiliary_ownership
+                .is_some_and(|(object, _)| object == 4)
+        {
+            assert_eq!(spec.zpl_version, 5);
+            assert!(spill.is_none());
+            let packed = fixture_sa_xattrs(&spec.hello_sa_xattrs);
+            if spec.hello_sa_xattrs_in_spill {
+                let mut raw = fixture_sa_xattr_header(11, packed.len(), order);
+                raw.extend_from_slice(&packed);
+                raw.resize(
+                    raw.len()
+                        .next_power_of_two()
+                        .max(1_usize << spec.ashift)
+                        .max(512),
+                    0,
+                );
+                spill = Some(arena.alloc_block(&raw, 44, 0, birth, order));
+            } else {
+                bbytes[..8].copy_from_slice(&fixture_sa_xattr_header(10, packed.len(), order));
+                bbytes.extend_from_slice(&packed);
+            }
+        }
         let hello_dn = make_dnode(
             19,
             snap_hello_bytes.len(),
@@ -1218,11 +1347,12 @@ fn build_zpl_objectset(
         };
         let (attribute, layout, payload) = match auxiliary {
             AuxiliaryOwnership::XattrDirectory | AuxiliaryOwnership::CapabilityXattr => {
+                let fault = spec.auxiliary_xattr_fault;
                 let value = b"private value survives namespace changes";
                 let mut padded = value.to_vec();
                 padded.resize((1_usize << spec.ashift).max(512), 0);
                 let value_bp = arena.alloc_block(&padded, 19, 0, birth, order);
-                let value_meta = Metadata {
+                let mut value_meta = Metadata {
                     mode: (Kind::Regular.to_tag() << 12) | 0o600,
                     kind: Kind::Regular,
                     size: value.len() as u64,
@@ -1232,44 +1362,103 @@ fn build_zpl_objectset(
                     inline_symlink: None,
                     ..metadata
                 };
+                if let Some((uid, gid)) = spec.auxiliary_xattr_owner_ids {
+                    value_meta.uid = uid;
+                    value_meta.gid = gid;
+                }
+                match fault {
+                    Some(XattrOwnershipFault::ValueParent) => value_meta.parent = owner,
+                    Some(XattrOwnershipFault::ValuePublic) => value_meta.flags = 0,
+                    Some(XattrOwnershipFault::ValueLinks) => value_meta.links = 2,
+                    Some(XattrOwnershipFault::OversizedValue) => value_meta.size = 65_537,
+                    _ => {}
+                }
+                let mut value_bonus = value_meta.encode_legacy(None, order).unwrap();
+                if fault == Some(XattrOwnershipFault::ValueNested) {
+                    value_bonus[104..112].copy_from_slice(&order.encode(13));
+                }
+                if fault == Some(XattrOwnershipFault::ValueExternalAcl) {
+                    value_bonus[176..184].copy_from_slice(&order.encode(13));
+                }
                 let value_node = make_dnode(
                     19,
                     padded.len(),
                     vec![value_bp],
                     17,
-                    value_meta.encode_legacy(None, order).unwrap(),
+                    value_bonus,
                     None,
                     acct_flags,
                     order,
                 );
                 write_dnode_at(&mut table, 14, &value_node).unwrap();
-                let name: &[u8] = if auxiliary == AuxiliaryOwnership::CapabilityXattr {
+                let name: &[u8] = if fault == Some(XattrOwnershipFault::DotName) {
+                    b"."
+                } else if auxiliary == AuxiliaryOwnership::CapabilityXattr {
                     b"security.capability"
                 } else {
                     b"user.retained"
                 };
-                let entries = mzap(
-                    &[(name, encode_directory_reference(14, Kind::Regular).unwrap())],
-                    0xA113,
-                    order,
-                );
+                let value_object = if fault == Some(XattrOwnershipFault::ValueAlias) {
+                    owner
+                } else {
+                    14
+                };
+                let value_reference =
+                    encode_directory_reference(value_object, Kind::Regular).unwrap();
+                let mut pairs = vec![(name, value_reference)];
+                if fault == Some(XattrOwnershipFault::DuplicateValue) {
+                    pairs.push((b"user.aliased", value_reference));
+                }
+                if spec.auxiliary_capability_with_retained_value {
+                    assert_eq!(auxiliary, AuxiliaryOwnership::CapabilityXattr);
+                    let retained_bp = arena.alloc_block(&padded, 19, 0, birth, order);
+                    let retained = make_dnode(
+                        19,
+                        padded.len(),
+                        vec![retained_bp],
+                        17,
+                        value_meta.encode_legacy(None, order).unwrap(),
+                        None,
+                        acct_flags,
+                        order,
+                    );
+                    write_dnode_at(&mut table, 15, &retained).unwrap();
+                    pairs.push((
+                        b"user.retained",
+                        encode_directory_reference(15, Kind::Regular).unwrap(),
+                    ));
+                }
+                let entries = mzap(&pairs, 0xA113, order);
                 let directory_bp = arena.alloc_block(&entries, 20, 0, birth, order);
-                let directory_meta = Metadata {
+                let mut directory_meta = Metadata {
                     mode: (Kind::Directory.to_tag() << 12) | 0o700,
                     kind: Kind::Directory,
-                    size: 3,
+                    size: pairs.len() as u64 + 2,
                     parent: owner,
                     links: 2,
                     flags: 1,
                     inline_symlink: None,
                     ..metadata
                 };
+                match fault {
+                    Some(XattrOwnershipFault::DirectoryParent) => {
+                        directory_meta.parent = owner + 1;
+                    }
+                    Some(XattrOwnershipFault::DirectoryPublic) => directory_meta.flags = 0,
+                    Some(XattrOwnershipFault::DirectoryLinks) => directory_meta.links = 3,
+                    Some(XattrOwnershipFault::DirectorySize) => directory_meta.size += 1,
+                    _ => {}
+                }
+                let mut directory_bonus = directory_meta.encode_legacy(None, order).unwrap();
+                if fault == Some(XattrOwnershipFault::DirectoryNested) {
+                    directory_bonus[104..112].copy_from_slice(&order.encode(14));
+                }
                 let directory_node = make_dnode(
                     20,
                     entries.len(),
                     vec![directory_bp],
                     17,
-                    directory_meta.encode_legacy(None, order).unwrap(),
+                    directory_bonus,
                     None,
                     acct_flags,
                     order,
@@ -1326,7 +1515,25 @@ fn build_zpl_objectset(
             }
         };
         let mut bonus = owner_node.bonus().to_vec();
-        let spill = if spec.zpl_version == 4 {
+        let spill = if owner == 4 && !spec.hello_sa_xattrs.is_empty() {
+            assert_eq!(spec.zpl_version, 5);
+            assert!(matches!(
+                auxiliary,
+                AuxiliaryOwnership::XattrDirectory | AuxiliaryOwnership::CapabilityXattr
+            ));
+            let packed = fixture_sa_xattrs(&spec.hello_sa_xattrs);
+            let mut raw = fixture_sa_xattr_header(12, packed.len(), order);
+            raw.extend_from_slice(&payload);
+            raw.extend_from_slice(&packed);
+            raw.resize(
+                raw.len()
+                    .next_power_of_two()
+                    .max(1_usize << spec.ashift)
+                    .max(512),
+                0,
+            );
+            Some(arena.alloc_block(&raw, 44, 0, birth, order))
+        } else if spec.zpl_version == 4 {
             bonus[attribute..attribute + payload.len()].copy_from_slice(&payload);
             None
         } else {
@@ -1627,8 +1834,25 @@ fn build_zpl_objectset(
                 .expect("accounting dnode");
         }
     }
-    let encoded_os = os_obj.encode(objectset_order).expect("encode zpl os");
-    let os_bp = arena.alloc_block(&encoded_os, DMU_OT_OBJSET, 0, birth, objectset_order);
+    let mut encoded_os = os_obj.encode(objectset_order).expect("encode zpl os");
+    let os_bp = if head_object == 18
+        && let Some(checksum) = spec.data_objectset_checksum
+    {
+        let min_block = usize::try_from(arena.sector).unwrap().max(512);
+        encoded_os.resize(encoded_os.len().max(min_block).next_multiple_of(512), 0);
+        arena.alloc_raw_compressed(
+            &encoded_os,
+            &encoded_os,
+            DMU_OT_OBJSET,
+            0,
+            2,
+            checksum,
+            birth,
+            objectset_order,
+        )
+    } else {
+        arena.alloc_block(&encoded_os, DMU_OT_OBJSET, 0, birth, objectset_order)
+    };
     let referenced = os_obj.meta.used_bytes() + bp_allocated_bytes(&os_bp);
     (os_bp, referenced, snap_hello_bytes)
 }
@@ -2076,11 +2300,23 @@ fn build_clean_zfs_pool(spec: &PoolFixtureSpec) -> BuiltPool {
         &data_os_bp,
         order,
     );
-    set_mos(
-        &mut mos_tables,
-        18,
-        &make_dnode(16, 512, Vec::new(), 16, data_ds_bonus, None, 0, order),
-    );
+    let data_head = if spec.data_head_features.is_empty() {
+        make_dnode(16, 512, Vec::new(), 16, data_ds_bonus, None, 0, order)
+    } else {
+        let raw = mzap(&spec.data_head_features, 0x112, order);
+        let pointer = arena.alloc_block(&raw, 196, 0, INITIAL_TXG, order);
+        make_dnode(
+            196,
+            pointer.logical_bytes(),
+            vec![pointer],
+            16,
+            data_ds_bonus,
+            None,
+            0,
+            order,
+        )
+    };
+    set_mos(&mut mos_tables, 18, &data_head);
 
     // Object 17: `data` `DSL_DIR` & Object 2: root `DSL_DIR`
     let data_dir_bonus = encode_dsl_dir_bonus(18, 2, 26, 19, 20, data_ref_bytes, order);
@@ -2101,7 +2337,10 @@ fn build_clean_zfs_pool(spec: &PoolFixtureSpec) -> BuiltPool {
     let mut rf_entries: Vec<(&[u8], u64)> = vec![
         (b"org.illumos:lz4_compress", 1),
         (b"com.delphix:hole_birth", 1),
-        (b"com.delphix:extensible_dataset", 0),
+        (
+            b"com.delphix:extensible_dataset",
+            u64::from(!spec.data_head_features.is_empty()),
+        ),
     ];
     for &(name, count) in &spec.additional_read_features {
         rf_entries.push((name, count));
@@ -2680,6 +2919,11 @@ struct MemberMediaState {
     write_calls: usize,
     sync_calls: usize,
     fault: DeviceFault,
+    protection_depth: usize,
+    protection_completed: usize,
+    protection_aborted: usize,
+    unprotected_io: usize,
+    refuse_protection: bool,
 }
 
 impl MemberMediaState {
@@ -2690,6 +2934,11 @@ impl MemberMediaState {
             write_calls: 0,
             sync_calls: 0,
             fault: DeviceFault::None,
+            protection_depth: 0,
+            protection_completed: 0,
+            protection_aborted: 0,
+            unprotected_io: 0,
+            refuse_protection: false,
         }
     }
 
@@ -2788,6 +3037,9 @@ impl ByteDevice for FaultableMemberDevice {
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         let mut st = self.state.lock().unwrap();
         let call = st.write_calls;
+        if st.protection_depth == 0 {
+            st.unprotected_io += 1;
+        }
         st.write_calls += 1;
         let start = usize::try_from(offset.0).unwrap();
         if start + buf.len() > st.durable.len() {
@@ -2830,6 +3082,9 @@ impl ByteDevice for FaultableMemberDevice {
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         let mut st = self.state.lock().unwrap();
         let idx = st.sync_calls;
+        if st.protection_depth == 0 {
+            st.unprotected_io += 1;
+        }
         st.sync_calls += 1;
         if let DeviceFault::FailSyncOnCall { sync_index } = st.fault
             && idx == sync_index
@@ -2843,6 +3098,28 @@ impl ByteDevice for FaultableMemberDevice {
             st.durable[start..start + pw.bytes.len()].copy_from_slice(&pw.bytes);
         }
         Ok(())
+    }
+
+    fn begin_durability_commit(&self, cx: &Cx) -> Result<()> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        let mut state = self.state.lock().unwrap();
+        if state.refuse_protection {
+            return Err(FfsError::ReadOnly);
+        }
+        state.protection_depth += 1;
+        Ok(())
+    }
+
+    fn complete_durability_commit(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.protection_depth -= 1;
+        state.protection_completed += 1;
+    }
+
+    fn abort_durability_commit(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.protection_depth -= 1;
+        state.protection_aborted += 1;
     }
 }
 
@@ -4476,6 +4753,1184 @@ fn partition_slice_open_files_at_preserves_prefix_and_suffix_canaries() {
 // 3. Snapshotted dataset COW + Deadlist (`DMU_OT_BPOBJ` & `DMU_OT_DEADLIST`)
 // ---------------------------------------------------------------------------
 
+fn native_zpl_file_dnode(
+    cx: &Cx,
+    engine: &ZfsTransactionEngine,
+    device: &FaultableMemberDevice,
+    dataset: &[Vec<u8>],
+    object: u64,
+) -> Dnode {
+    let mut mos = engine.open_read_objects(cx).unwrap();
+    let dataset = mos
+        .datasets(cx)
+        .unwrap()
+        .into_iter()
+        .find(|row| row.components == dataset)
+        .unwrap();
+    let head = mos.object(cx, dataset.head_object).unwrap();
+    let root = BlockPointer::parse(&head.bonus()[128..256], head.order()).unwrap();
+    let image = device.durable_snapshot();
+    let read = |pointer: &BlockPointer| {
+        let dva = pointer.regular_dvas().unwrap()[0];
+        let start = usize::try_from(DATA_OFFSET + dva.offset).unwrap();
+        ffs_ondisk::zfs::decompress(
+            &image[start..start + pointer.physical_bytes()],
+            pointer.compression(),
+            pointer.logical_bytes(),
+        )
+        .unwrap()
+    };
+    let objectset = ObjectSet::parse(&read(&root), root.payload_order()).unwrap();
+    assert_eq!(objectset.meta.levels(), 1);
+    let slot = usize::try_from(object).unwrap();
+    let slots_per_block = DNODE_BLOCK_BYTES / DNODE_BYTES;
+    let table_pointer = &objectset.meta.pointers()[slot / slots_per_block];
+    ffs_ondisk::zfs_dmu::dnode_at(
+        &read(table_pointer),
+        slot % slots_per_block,
+        table_pointer.payload_order(),
+    )
+    .unwrap()
+    .unwrap()
+}
+
+#[test]
+fn native_writes_resolve_effective_recordsize_before_choosing_file_geometry() {
+    const RECORDSIZE: &[u8] = b"recordsize";
+    const RECEIVED: &[u8] = b"recordsize$recvd";
+    const INHERIT: &[u8] = b"recordsize$inherit";
+    let cases = [
+        ("default", vec![], vec![], 131_072_usize),
+        ("inherited", vec![(RECORDSIZE, 4096)], vec![], 4096),
+        (
+            "local-override",
+            vec![(RECORDSIZE, 512)],
+            vec![(RECORDSIZE, 8192)],
+            8192,
+        ),
+        (
+            "received",
+            vec![(RECORDSIZE, 4096)],
+            vec![(RECEIVED, 8192)],
+            8192,
+        ),
+        (
+            "inherit-suppresses-received",
+            vec![(RECORDSIZE, 4096)],
+            vec![(RECEIVED, 8192), (INHERIT, 1)],
+            4096,
+        ),
+        (
+            "local-precedes-inherit",
+            vec![(RECORDSIZE, 8192)],
+            vec![(RECORDSIZE, 2048), (RECEIVED, 512), (INHERIT, 1)],
+            2048,
+        ),
+        ("inherited-received", vec![(RECEIVED, 1024)], vec![], 1024),
+    ];
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    let timestamp = Timestamp {
+        seconds: 1_715_000_198,
+        nanos: 19,
+    };
+    for zpl_version in [4, 5] {
+        for (case, root_properties, data_properties, recordsize) in &cases {
+            let built = build_clean_zfs_pool(&PoolFixtureSpec {
+                zpl_version,
+                deadlist_mode: DeadlistMode::NativeDeadlist,
+                root_properties: root_properties.clone(),
+                data_properties: data_properties.clone(),
+                ..PoolFixtureSpec::default()
+            });
+            let devices: Vec<_> = built
+                .members
+                .into_iter()
+                .map(FaultableMemberDevice::new)
+                .collect();
+            let mut engine = open_engine_on_devices(
+                &cx,
+                &devices,
+                default_write_opts(built.pool_guid, built.initial_slot),
+            )
+            .unwrap();
+            let (object, _) = engine
+                .create_file(
+                    &cx,
+                    &dataset,
+                    2,
+                    b"geometry.bin",
+                    0o644,
+                    1000,
+                    1000,
+                    timestamp,
+                    ZfsDataChecksum::Fletcher4,
+                )
+                .into_result()
+                .unwrap_or_else(|error| panic!("{case}: {error}"));
+            let payload: Vec<_> = (0..recordsize * 2 + 17)
+                .map(|index| u8::try_from(index % 251).unwrap())
+                .collect();
+            let (_, token) = engine
+                .write_file_data(
+                    &cx,
+                    &dataset,
+                    object,
+                    0,
+                    &payload,
+                    timestamp,
+                    ZfsDataChecksum::Fletcher4,
+                )
+                .into_result()
+                .unwrap_or_else(|error| panic!("{case}: {error}"));
+            engine.verify_token(&token).unwrap();
+            let slot = engine.committed_slot();
+            drop(engine);
+
+            let durable: Vec<_> = devices
+                .iter()
+                .map(FaultableMemberDevice::fresh_from_durable)
+                .collect();
+            let reopened =
+                open_engine_on_devices(&cx, &durable, default_write_opts(built.pool_guid, slot))
+                    .unwrap();
+            let node = native_zpl_file_dnode(&cx, &reopened, &durable[0], &dataset, object);
+            assert_eq!(node.data_bytes(), *recordsize, "{case}");
+            let mut mos = reopened.open_read_objects(&cx).unwrap();
+            let mut zpl = mos.zpl(&cx, &dataset).unwrap();
+            assert_eq!(
+                zpl.resolve(&cx, b"/geometry.bin").unwrap(),
+                object,
+                "{case}"
+            );
+            assert_eq!(
+                zpl.read(&cx, object, 0, payload.len() + 1).unwrap(),
+                payload,
+                "{case}"
+            );
+            let mut snapshot = mos.zpl_snapshot(&cx, &dataset, b"before").unwrap();
+            assert!(matches!(
+                snapshot.resolve(&cx, b"/geometry.bin"),
+                Err(FfsError::NotFound(_))
+            ));
+            assert_pool_scrub_and_allocation_clean(&cx, &durable, built.pool_guid, Some(slot));
+        }
+    }
+}
+
+#[test]
+fn native_writes_reject_invalid_effective_recordsize_without_backing_writes() {
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    let timestamp = Timestamp {
+        seconds: 1_715_000_198,
+        nanos: 0,
+    };
+    for invalid in [0, 511, 513, 1_048_577, u64::MAX] {
+        for (root_properties, data_properties) in [
+            (vec![(b"recordsize".as_slice(), invalid)], vec![]),
+            (vec![], vec![(b"recordsize".as_slice(), invalid)]),
+            (vec![], vec![(b"recordsize$recvd".as_slice(), invalid)]),
+        ] {
+            let built = build_clean_zfs_pool(&PoolFixtureSpec {
+                root_properties,
+                data_properties,
+                ..PoolFixtureSpec::default()
+            });
+            let devices: Vec<_> = built
+                .members
+                .into_iter()
+                .map(FaultableMemberDevice::new)
+                .collect();
+            let mut engine = open_engine_on_devices(
+                &cx,
+                &devices,
+                default_write_opts(built.pool_guid, built.initial_slot),
+            )
+            .unwrap();
+            assert_native_write_refused(&mut engine, &devices, libc::EIO, |writer| {
+                writer.write_file_data(
+                    &cx,
+                    &dataset,
+                    4,
+                    0,
+                    b"must not be published",
+                    timestamp,
+                    ZfsDataChecksum::Fletcher4,
+                )
+            });
+        }
+    }
+}
+
+#[test]
+fn native_zpl_writes_resolve_dataset_checksum_sources() {
+    const SHA512: &[u8] = b"org.illumos:sha512";
+    const CHECKSUM: &[u8] = b"checksum";
+    const RECEIVED: &[u8] = b"checksum$recvd";
+    const INHERIT: &[u8] = b"checksum$inherit";
+    let cases = [
+        ("default", vec![], vec![], 7_u8),
+        ("on", vec![(CHECKSUM, 1)], vec![], 7),
+        ("inherited-sha256", vec![(CHECKSUM, 8)], vec![], 8),
+        ("local-sha256", vec![(CHECKSUM, 7)], vec![(CHECKSUM, 8)], 8),
+        (
+            "local-fletcher4",
+            vec![(CHECKSUM, 8)],
+            vec![(CHECKSUM, 7)],
+            7,
+        ),
+        (
+            "received-sha256",
+            vec![(CHECKSUM, 7)],
+            vec![(RECEIVED, 8)],
+            8,
+        ),
+        (
+            "inherit-suppresses-received",
+            vec![(CHECKSUM, 8)],
+            vec![(RECEIVED, 7), (INHERIT, 1)],
+            8,
+        ),
+        (
+            "local-precedes-inherit",
+            vec![(CHECKSUM, 8)],
+            vec![(CHECKSUM, 7), (RECEIVED, 8), (INHERIT, 1)],
+            7,
+        ),
+        ("inherited-received", vec![(RECEIVED, 8)], vec![], 8),
+        ("fletcher2", vec![(CHECKSUM, 6)], vec![], 6),
+        ("owned-inherited-sha512", vec![(CHECKSUM, 11)], vec![], 11),
+        (
+            "owned-local-sha512",
+            vec![(CHECKSUM, 7)],
+            vec![(CHECKSUM, 11)],
+            11,
+        ),
+    ];
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    let time = Timestamp {
+        seconds: 1_715_000_800,
+        nanos: 0,
+    };
+    for (case, root_properties, data_properties, expected_checksum) in cases {
+        let owns_sha512 = expected_checksum == 11;
+        let built = build_clean_zfs_pool(&PoolFixtureSpec {
+            root_properties,
+            data_properties,
+            data_head_features: if owns_sha512 {
+                vec![(SHA512, 0)]
+            } else {
+                Vec::new()
+            },
+            additional_read_features: if owns_sha512 {
+                vec![(SHA512, 1)]
+            } else {
+                Vec::new()
+            },
+            ..PoolFixtureSpec::default()
+        });
+        let devices: Vec<_> = built
+            .members
+            .into_iter()
+            .map(FaultableMemberDevice::new)
+            .collect();
+        let mut engine = open_engine_on_devices(
+            &cx,
+            &devices,
+            default_write_opts(built.pool_guid, built.initial_slot),
+        )
+        .unwrap();
+        let (object, _) = engine
+            .create_file(
+                &cx,
+                &dataset,
+                2,
+                b"checksummed",
+                0o644,
+                1000,
+                1000,
+                time,
+                ZfsDataChecksum::Inherit,
+            )
+            .into_result()
+            .unwrap();
+        let check = |engine: &ZfsTransactionEngine| {
+            let node = native_zpl_file_dnode(&cx, engine, &devices[0], &dataset, object);
+            assert_eq!(
+                node.checksum_type(),
+                0,
+                "{case}: inherited policy was pinned"
+            );
+            assert_eq!(node.levels(), 1, "{case}");
+            assert!(!node.pointers()[0].hole(), "{case}");
+            assert_eq!(
+                node.pointers()[0].checksum_type(),
+                expected_checksum,
+                "{case}: durable data block used the wrong checksum"
+            );
+        };
+        let payload = vec![0x5B; 8192];
+        engine
+            .write_file_data(
+                &cx,
+                &dataset,
+                object,
+                0,
+                &payload,
+                time,
+                ZfsDataChecksum::Inherit,
+            )
+            .into_result()
+            .unwrap();
+        check(&engine);
+        engine
+            .truncate_file(&cx, &dataset, object, 3333, time, ZfsDataChecksum::Inherit)
+            .into_result()
+            .unwrap();
+        check(&engine);
+        engine
+            .edit_file_range(
+                &cx,
+                &dataset,
+                object,
+                13,
+                71,
+                ffs_zfs::ZfsFileRangeOperation::PunchHole,
+                time,
+                ZfsDataChecksum::Inherit,
+            )
+            .into_result()
+            .unwrap();
+        check(&engine);
+        let slot = engine.committed_slot();
+        drop(engine);
+        let durable: Vec<_> = devices
+            .iter()
+            .map(FaultableMemberDevice::fresh_from_durable)
+            .collect();
+        let reopened =
+            open_engine_on_devices(&cx, &durable, default_write_opts(built.pool_guid, slot))
+                .unwrap();
+        let mut view = reopened
+            .open_read_objects(&cx)
+            .unwrap()
+            .zpl(&cx, &dataset)
+            .unwrap();
+        let mut expected = vec![0x5B; 3333];
+        expected[13..84].fill(0);
+        assert_eq!(view.read(&cx, object, 0, 8192).unwrap(), expected, "{case}");
+        let node = native_zpl_file_dnode(&cx, &reopened, &durable[0], &dataset, object);
+        assert_eq!(
+            node.pointers()[0].checksum_type(),
+            expected_checksum,
+            "{case}"
+        );
+        if owns_sha512 {
+            let mut mos = reopened.open_read_objects(&cx).unwrap();
+            assert_eq!(mos.object(&cx, 18).unwrap().object_type(), 196, "{case}");
+            let ownership = mos.zap(&cx, 18).unwrap();
+            assert_eq!(
+                ownership
+                    .iter()
+                    .find(|entry| entry.name == SHA512)
+                    .map(|entry| entry.value),
+                Some(0),
+                "{case}: native dataset ownership must survive rewrites"
+            );
+            let features = mos.zap(&cx, 10).unwrap();
+            for feature in [SHA512, b"com.delphix:extensible_dataset".as_slice()] {
+                assert_eq!(
+                    features
+                        .iter()
+                        .find(|entry| entry.name == feature)
+                        .map(|entry| entry.value),
+                    Some(1),
+                    "{case}: continuing owned SHA512 must preserve feature refcounts"
+                );
+            }
+        }
+        assert_pool_scrub_and_allocation_clean(&cx, &durable, built.pool_guid, Some(slot));
+    }
+}
+
+#[test]
+fn native_checksum_changes_preserve_explicit_sha256_objects() {
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    let time = Timestamp {
+        seconds: 1_715_000_801,
+        nanos: 0,
+    };
+    let built = build_clean_zfs_pool(&PoolFixtureSpec {
+        root_properties: vec![(b"checksum", 8)],
+        ..PoolFixtureSpec::default()
+    });
+    let devices: Vec<_> = built
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut engine = open_engine_on_devices(
+        &cx,
+        &devices,
+        default_write_opts(built.pool_guid, built.initial_slot),
+    )
+    .unwrap();
+    let (inherited, _) = engine
+        .create_file(
+            &cx,
+            &dataset,
+            2,
+            b"inherited",
+            0o644,
+            1000,
+            1000,
+            time,
+            ZfsDataChecksum::Inherit,
+        )
+        .into_result()
+        .unwrap();
+    let (pinned, _) = engine
+        .create_file(
+            &cx,
+            &dataset,
+            2,
+            b"pinned",
+            0o644,
+            1000,
+            1000,
+            time,
+            ZfsDataChecksum::Sha256,
+        )
+        .into_result()
+        .unwrap();
+    let payload = vec![0x5A; 8192];
+    for object in [inherited, pinned] {
+        engine
+            .write_file_data(
+                &cx,
+                &dataset,
+                object,
+                0,
+                &payload,
+                time,
+                ZfsDataChecksum::Inherit,
+            )
+            .into_result()
+            .unwrap();
+        let node = native_zpl_file_dnode(&cx, &engine, &devices[0], &dataset, object);
+        assert_eq!(node.pointers()[0].checksum_type(), 8);
+    }
+    engine
+        .set_property(
+            &cx,
+            &dataset,
+            "checksum",
+            ffs_zfs::ZfsPropertySetValue::Number(7),
+        )
+        .into_result()
+        .unwrap();
+    for (object, expected_checksum, expected_override) in [(inherited, 7, 0), (pinned, 8, 8)] {
+        engine
+            .write_file_data(
+                &cx,
+                &dataset,
+                object,
+                7,
+                b"next",
+                time,
+                ZfsDataChecksum::Inherit,
+            )
+            .into_result()
+            .unwrap();
+        let node = native_zpl_file_dnode(&cx, &engine, &devices[0], &dataset, object);
+        assert_eq!(node.pointers()[0].checksum_type(), expected_checksum);
+        assert_eq!(node.checksum_type(), expected_override);
+        engine
+            .truncate_file(
+                &cx,
+                &dataset,
+                object,
+                3073,
+                time,
+                ZfsDataChecksum::Fletcher4,
+            )
+            .into_result()
+            .unwrap();
+        let node = native_zpl_file_dnode(&cx, &engine, &devices[0], &dataset, object);
+        assert_eq!(node.pointers()[0].checksum_type(), expected_checksum);
+        engine
+            .edit_file_range(
+                &cx,
+                &dataset,
+                object,
+                20,
+                11,
+                ffs_zfs::ZfsFileRangeOperation::PunchHole,
+                time,
+                ZfsDataChecksum::Inherit,
+            )
+            .into_result()
+            .unwrap();
+        let node = native_zpl_file_dnode(&cx, &engine, &devices[0], &dataset, object);
+        assert_eq!(node.pointers()[0].checksum_type(), expected_checksum);
+    }
+    // An explicit Fletcher4 request remains explicit. A subsequent inherited
+    // request sees the current dataset property because dn_checksum stayed zero.
+    engine
+        .set_property(
+            &cx,
+            &dataset,
+            "checksum",
+            ffs_zfs::ZfsPropertySetValue::Number(8),
+        )
+        .into_result()
+        .unwrap();
+    for (selection, expected_checksum) in [
+        (ZfsDataChecksum::Fletcher4, 7),
+        (ZfsDataChecksum::Inherit, 8),
+    ] {
+        engine
+            .write_file_data(&cx, &dataset, inherited, 0, b"tail", time, selection)
+            .into_result()
+            .unwrap();
+        let node = native_zpl_file_dnode(&cx, &engine, &devices[0], &dataset, inherited);
+        assert_eq!(node.pointers()[0].checksum_type(), expected_checksum);
+        assert_eq!(node.checksum_type(), 0);
+    }
+    let slot = engine.committed_slot();
+    drop(engine);
+    let durable: Vec<_> = devices
+        .iter()
+        .map(FaultableMemberDevice::fresh_from_durable)
+        .collect();
+    let reopened =
+        open_engine_on_devices(&cx, &durable, default_write_opts(built.pool_guid, slot)).unwrap();
+    let mut view = reopened
+        .open_read_objects(&cx)
+        .unwrap()
+        .zpl(&cx, &dataset)
+        .unwrap();
+    for object in [inherited, pinned] {
+        let mut expected = vec![0x5A; 3073];
+        expected[7..11].copy_from_slice(b"next");
+        expected[20..31].fill(0);
+        if object == inherited {
+            expected[..4].copy_from_slice(b"tail");
+        }
+        assert_eq!(view.read(&cx, object, 0, 8192).unwrap(), expected);
+        let node = native_zpl_file_dnode(&cx, &reopened, &durable[0], &dataset, object);
+        assert_eq!(node.pointers()[0].checksum_type(), 8);
+    }
+    assert_pool_scrub_and_allocation_clean(&cx, &durable, built.pool_guid, Some(slot));
+}
+
+#[test]
+fn native_zpl_checksum_policy_refuses_unadmitted_algorithms_before_writes() {
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    let time = Timestamp {
+        seconds: 1_715_000_802,
+        nanos: 0,
+    };
+    for value in [0, 2, 9, 11, u64::MAX] {
+        let built = build_clean_zfs_pool(&PoolFixtureSpec {
+            root_properties: vec![(b"checksum", value)],
+            ..PoolFixtureSpec::default()
+        });
+        let devices: Vec<_> = built
+            .members
+            .into_iter()
+            .map(FaultableMemberDevice::new)
+            .collect();
+        let mut engine = open_engine_on_devices(
+            &cx,
+            &devices,
+            default_write_opts(built.pool_guid, built.initial_slot),
+        )
+        .unwrap();
+        assert_native_write_refused(&mut engine, &devices, libc::EOPNOTSUPP, |writer| {
+            writer.create_file(
+                &cx,
+                &dataset,
+                2,
+                b"refused",
+                0o644,
+                1000,
+                1000,
+                time,
+                ZfsDataChecksum::Inherit,
+            )
+        });
+        assert_native_write_refused(&mut engine, &devices, libc::EOPNOTSUPP, |writer| {
+            writer.write_file_data(
+                &cx,
+                &dataset,
+                4,
+                0,
+                b"must not publish",
+                time,
+                ZfsDataChecksum::Inherit,
+            )
+        });
+        let mut view = engine
+            .open_read_objects(&cx)
+            .unwrap()
+            .zpl(&cx, &dataset)
+            .unwrap();
+        assert_eq!(
+            view.read(&cx, 4, 0, 8192).unwrap(),
+            built.snap_hello_expected
+        );
+        assert!(matches!(
+            view.resolve(&cx, b"/refused"),
+            Err(FfsError::NotFound(_))
+        ));
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn native_sha512_writes_refuse_invalid_existing_ownership_or_disabled_features() {
+    const SHA512: &[u8] = b"org.illumos:sha512";
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    let timestamp = Timestamp {
+        seconds: 1_715_000_803,
+        nanos: 0,
+    };
+    let cases = [
+        ("disabled-feature", None, None, None, 11),
+        ("inactive-feature", Some(0), Some(0), None, 11),
+        ("missing-feature", Some(0), None, None, 11),
+        ("malformed-owner", Some(1), Some(1), None, 11),
+        ("old-root-missing-owner", None, Some(1), Some(11), 7),
+        ("old-root-inactive-feature", Some(0), Some(0), Some(11), 7),
+    ];
+    for (case, owner, feature, old_root_checksum, checksum) in cases {
+        let built = build_clean_zfs_pool(&PoolFixtureSpec {
+            deadlist_mode: DeadlistMode::NativeDeadlist,
+            data_properties: vec![(b"checksum", checksum)],
+            data_head_features: owner.into_iter().map(|value| (SHA512, value)).collect(),
+            additional_read_features: feature.into_iter().map(|value| (SHA512, value)).collect(),
+            data_objectset_checksum: old_root_checksum,
+            ..PoolFixtureSpec::default()
+        });
+        let devices: Vec<_> = built
+            .members
+            .into_iter()
+            .map(FaultableMemberDevice::new)
+            .collect();
+        let mut engine = open_engine_on_devices(
+            &cx,
+            &devices,
+            default_write_opts(built.pool_guid, built.initial_slot),
+        )
+        .unwrap();
+        for requested in [ZfsDataChecksum::Inherit, ZfsDataChecksum::Fletcher4] {
+            assert_native_write_refused(&mut engine, &devices, libc::EOPNOTSUPP, |writer| {
+                writer.write_file_data(
+                    &cx,
+                    &dataset,
+                    4,
+                    0,
+                    b"must not publish",
+                    timestamp,
+                    requested,
+                )
+            });
+        }
+        // A metadata-only update also rewrites the old object-set root. Its
+        // SHA512 ownership must be admitted even with a Fletcher4 data request.
+        assert_native_write_refused(&mut engine, &devices, libc::EOPNOTSUPP, |writer| {
+            writer.set_attributes(
+                &cx,
+                &dataset,
+                4,
+                &ffs_zfs::ZfsSetAttr {
+                    mtime: Some(timestamp),
+                    ..ffs_zfs::ZfsSetAttr::default()
+                },
+                timestamp,
+                ZfsDataChecksum::Fletcher4,
+            )
+        });
+        let mut view = engine
+            .open_read_objects(&cx)
+            .unwrap()
+            .zpl(&cx, &dataset)
+            .unwrap();
+        assert_eq!(
+            view.read(&cx, 4, 0, 8192).unwrap(),
+            built.snap_hello_expected,
+            "{case}"
+        );
+    }
+}
+
+fn assert_native_dataset_feature(
+    cx: &Cx,
+    engine: &ZfsTransactionEngine,
+    dataset: &[Vec<u8>],
+    feature: &[u8],
+    owned: bool,
+    count: u64,
+) {
+    let mut mos = engine.open_read_objects(cx).unwrap();
+    let row = mos
+        .datasets(cx)
+        .unwrap()
+        .into_iter()
+        .find(|row| row.components == dataset)
+        .unwrap();
+    let head = mos.object(cx, row.head_object).unwrap();
+    let marker = if head.object_type() == 196 {
+        mos.zap(cx, row.head_object)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.name == feature)
+            .map(|entry| entry.value)
+    } else {
+        None
+    };
+    assert_eq!(marker, owned.then_some(0));
+    let feature_object = mos
+        .zap(cx, 1)
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.name == b"features_for_read")
+        .unwrap()
+        .value;
+    assert_eq!(
+        mos.zap(cx, feature_object)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.name == feature)
+            .map(|entry| entry.value),
+        Some(count)
+    );
+}
+
+#[test]
+fn native_large_records_and_sha512_activate_on_first_block_and_survive_property_changes() {
+    const LARGE_BLOCKS: &[u8] = b"org.open-zfs:large_blocks";
+    const SHA512: &[u8] = b"org.illumos:sha512";
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    let timestamp = Timestamp {
+        seconds: 1_715_000_804,
+        nanos: 0,
+    };
+    for (zpl_version, recordsize, checksum, mirror_width) in
+        [(4, 262_144_usize, 7, 1), (5, 1_048_576, 11, 2)]
+    {
+        let built = build_clean_zfs_pool(&PoolFixtureSpec {
+            zpl_version,
+            mirror_width,
+            deadlist_mode: DeadlistMode::NativeDeadlist,
+            root_properties: vec![(b"recordsize", recordsize as u64), (b"checksum", checksum)],
+            additional_read_features: vec![(LARGE_BLOCKS, 0), (SHA512, 0)],
+            ..PoolFixtureSpec::default()
+        });
+        let devices: Vec<_> = built
+            .members
+            .into_iter()
+            .map(FaultableMemberDevice::new)
+            .collect();
+        let mut engine = open_engine_on_devices(
+            &cx,
+            &devices,
+            default_write_opts(built.pool_guid, built.initial_slot),
+        )
+        .unwrap();
+        let object = engine
+            .create_file(
+                &cx,
+                &dataset,
+                2,
+                b"large-records",
+                0o644,
+                1000,
+                1000,
+                timestamp,
+                ZfsDataChecksum::Inherit,
+            )
+            .into_result()
+            .unwrap()
+            .0;
+        for feature in [LARGE_BLOCKS, SHA512] {
+            assert_native_dataset_feature(&cx, &engine, &dataset, feature, false, 0);
+        }
+        let mut payload: Vec<_> = (0..recordsize * 2 + 17)
+            .map(|index| u8::try_from(index % 251).unwrap())
+            .collect();
+        let (_, token) = engine
+            .write_file_data(
+                &cx,
+                &dataset,
+                object,
+                0,
+                &payload,
+                timestamp,
+                ZfsDataChecksum::Inherit,
+            )
+            .into_result()
+            .unwrap();
+        engine.verify_token(&token).unwrap();
+        assert_native_dataset_feature(&cx, &engine, &dataset, LARGE_BLOCKS, true, 1);
+        assert_native_dataset_feature(
+            &cx,
+            &engine,
+            &dataset,
+            SHA512,
+            checksum == 11,
+            u64::from(checksum == 11),
+        );
+        let node = native_zpl_file_dnode(&cx, &engine, &devices[0], &dataset, object);
+        assert_eq!(node.data_bytes(), recordsize);
+        assert_eq!(node.levels(), 2);
+        assert_eq!(node.checksum_type(), 0);
+        let indirect = &node.pointers()[0];
+        assert_eq!(u64::from(indirect.checksum_type()), checksum);
+        let image = devices[0].durable_snapshot();
+        let dva = indirect.regular_dvas().unwrap()[0];
+        let offset = usize::try_from(DATA_OFFSET + dva.offset).unwrap();
+        for index in 0..3 {
+            let pointer = BlockPointer::parse(
+                &image[offset + index * 128..offset + (index + 1) * 128],
+                indirect.payload_order(),
+            )
+            .unwrap();
+            assert!(!pointer.hole());
+            assert_eq!(pointer.logical_bytes(), recordsize);
+            assert_eq!(u64::from(pointer.checksum_type()), checksum);
+        }
+
+        // Lowering a property cannot release ownership of blocks that remain
+        // in this head, snapshots, or later clones.
+        for (name, value) in [("recordsize", 4096), ("checksum", 7)] {
+            engine
+                .set_property(
+                    &cx,
+                    &dataset,
+                    name,
+                    ffs_zfs::ZfsPropertySetValue::Number(value),
+                )
+                .into_result()
+                .unwrap();
+        }
+        engine
+            .write_file_data(
+                &cx,
+                &dataset,
+                object,
+                31,
+                b"after-property-change",
+                timestamp,
+                ZfsDataChecksum::Inherit,
+            )
+            .into_result()
+            .unwrap();
+        payload[31..52].copy_from_slice(b"after-property-change");
+        let slot = engine.committed_slot();
+        drop(engine);
+        let durable: Vec<_> = devices
+            .iter()
+            .map(FaultableMemberDevice::fresh_from_durable)
+            .collect();
+        let reopened =
+            open_engine_on_devices(&cx, &durable, default_write_opts(built.pool_guid, slot))
+                .unwrap();
+        assert_native_dataset_feature(&cx, &reopened, &dataset, LARGE_BLOCKS, true, 1);
+        assert_native_dataset_feature(
+            &cx,
+            &reopened,
+            &dataset,
+            SHA512,
+            checksum == 11,
+            u64::from(checksum == 11),
+        );
+        let node = native_zpl_file_dnode(&cx, &reopened, &durable[0], &dataset, object);
+        assert_eq!(node.data_bytes(), recordsize);
+        let mut mos = reopened.open_read_objects(&cx).unwrap();
+        assert_eq!(
+            mos.zpl(&cx, &dataset)
+                .unwrap()
+                .read(&cx, object, 0, payload.len() + 1)
+                .unwrap(),
+            payload
+        );
+        assert!(matches!(
+            mos.zpl_snapshot(&cx, &dataset, b"before")
+                .unwrap()
+                .resolve(&cx, b"/large-records"),
+            Err(FfsError::NotFound(_))
+        ));
+        assert_pool_scrub_and_allocation_clean(&cx, &durable, built.pool_guid, Some(slot));
+    }
+}
+
+#[test]
+fn native_large_record_first_use_refuses_disabled_feature_without_writes() {
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    let timestamp = Timestamp {
+        seconds: 1_715_000_805,
+        nanos: 0,
+    };
+    let built = build_clean_zfs_pool(&PoolFixtureSpec {
+        deadlist_mode: DeadlistMode::NativeDeadlist,
+        data_properties: vec![(b"recordsize", 262_144)],
+        ..PoolFixtureSpec::default()
+    });
+    let devices: Vec<_> = built
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut engine = open_engine_on_devices(
+        &cx,
+        &devices,
+        default_write_opts(built.pool_guid, built.initial_slot),
+    )
+    .unwrap();
+    let payload = vec![0xAD; 262_144];
+    assert_native_write_refused(&mut engine, &devices, libc::EOPNOTSUPP, |writer| {
+        writer.write_file_data(
+            &cx,
+            &dataset,
+            4,
+            0,
+            &payload,
+            timestamp,
+            ZfsDataChecksum::Inherit,
+        )
+    });
+}
+
+#[test]
+fn native_block_feature_first_use_crash_cuts_publish_data_and_ownership_together() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    let timestamp = Timestamp {
+        seconds: 1_715_000_806,
+        nanos: 0,
+    };
+    let built = build_clean_zfs_pool(&PoolFixtureSpec {
+        deadlist_mode: DeadlistMode::NativeDeadlist,
+        data_properties: vec![(b"recordsize", 262_144), (b"checksum", 11)],
+        additional_read_features: vec![
+            (b"org.open-zfs:large_blocks", 0),
+            (b"org.illumos:sha512", 0),
+        ],
+        ..PoolFixtureSpec::default()
+    });
+    let payload = vec![0xBC; 262_161];
+    for stage in 0..6_u8 {
+        let devices: Vec<_> = built
+            .members
+            .iter()
+            .cloned()
+            .map(FaultableMemberDevice::new)
+            .collect();
+        let mut engine = open_engine_on_devices(
+            &cx,
+            &devices,
+            default_write_opts(built.pool_guid, built.initial_slot),
+        )
+        .unwrap();
+        let tripped = Arc::new(AtomicBool::new(false));
+        let hook_tripped = Arc::clone(&tripped);
+        engine.with_fault_hook(move |event| {
+            let cut = matches!(
+                (stage, event.stage),
+                (0, ZfsPersistenceStage::ChildBlocksWrite { .. })
+                    | (1, ZfsPersistenceStage::DatasetMetadataBarrier { .. })
+                    | (2, ZfsPersistenceStage::MosSpaceMapBarrier { .. })
+                    | (3, ZfsPersistenceStage::MosRootBarrier { .. })
+                    | (4, ZfsPersistenceStage::UberblockWrite { label: 2, .. })
+                    | (5, ZfsPersistenceStage::BeforeAcknowledge)
+            );
+            if cut {
+                hook_tripped.store(true, Ordering::SeqCst);
+                Err(FfsError::Cancelled)
+            } else {
+                Ok(())
+            }
+        });
+        let outcome = engine.write_file_data(
+            &cx,
+            &dataset,
+            4,
+            0,
+            &payload,
+            timestamp,
+            ZfsDataChecksum::Inherit,
+        );
+        assert!(tripped.load(Ordering::SeqCst), "missed feature cut {stage}");
+        let published = stage >= 4;
+        let slot = match outcome {
+            ZfsTxOutcome::NotCommitted(FfsError::Cancelled) if !published => built.initial_slot,
+            ZfsTxOutcome::Uncertain { target_slot, .. } if stage == 4 => {
+                assert!(engine.requires_recovery());
+                target_slot
+            }
+            ZfsTxOutcome::Committed { token, .. } if stage == 5 => token.published_slot(),
+            other => panic!("unexpected feature activation outcome at {stage}: {other:?}"),
+        };
+        drop(engine);
+        let durable: Vec<_> = devices
+            .iter()
+            .map(FaultableMemberDevice::fresh_from_durable)
+            .collect();
+        let mut options = default_write_opts(built.pool_guid, slot);
+        options.reconcile_torn_uberblocks = stage == 4;
+        let mut recovered = open_engine_on_devices(&cx, &durable, options).unwrap();
+        assert_eq!(
+            recovered.committed_txg(),
+            INITIAL_TXG + u64::from(published)
+        );
+        assert_eq!(
+            dsl_block_feature_counts(&cx, &recovered),
+            [u64::from(published); 3]
+        );
+        for feature in [
+            b"org.open-zfs:large_blocks".as_slice(),
+            b"org.illumos:sha512".as_slice(),
+        ] {
+            assert_native_dataset_feature(
+                &cx,
+                &recovered,
+                &dataset,
+                feature,
+                published,
+                u64::from(published),
+            );
+        }
+        let mut mos = recovered.open_read_objects(&cx).unwrap();
+        assert_eq!(
+            mos.zpl(&cx, &dataset)
+                .unwrap()
+                .read(&cx, 4, 0, payload.len() + 1)
+                .unwrap(),
+            if published {
+                payload.as_slice()
+            } else {
+                built.snap_hello_expected.as_slice()
+            }
+        );
+        assert_eq!(
+            mos.zpl_snapshot(&cx, &dataset, b"before")
+                .unwrap()
+                .read(&cx, 4, 0, 8192)
+                .unwrap(),
+            built.snap_hello_expected
+        );
+        assert_pool_scrub_and_allocation_clean(&cx, &durable, built.pool_guid, Some(slot));
+
+        // Retrying either recovered state must acquire exactly one owner.
+        recovered
+            .write_file_data(
+                &cx,
+                &dataset,
+                4,
+                0,
+                &payload,
+                timestamp,
+                ZfsDataChecksum::Inherit,
+            )
+            .into_result()
+            .unwrap();
+        for feature in [
+            b"org.open-zfs:large_blocks".as_slice(),
+            b"org.illumos:sha512".as_slice(),
+        ] {
+            assert_native_dataset_feature(&cx, &recovered, &dataset, feature, true, 1);
+        }
+        assert_eq!(dsl_block_feature_counts(&cx, &recovered), [1; 3]);
+    }
+}
+
+#[test]
+fn native_zvol_refuses_unresolved_checksum_inheritance_before_publication() {
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    let built = build_clean_zfs_pool(&PoolFixtureSpec {
+        zvol_orders: Some((Endian::Little, Endian::Little)),
+        ..PoolFixtureSpec::default()
+    });
+    let devices: Vec<_> = built
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut engine = open_engine_on_devices(
+        &cx,
+        &devices,
+        default_write_opts(built.pool_guid, built.initial_slot),
+    )
+    .unwrap();
+    engine.zvol_info(&cx, &dataset, None).unwrap();
+    let txg = engine.committed_txg();
+    let events = engine.persistence_events().len();
+    let io_before: Vec<_> = devices
+        .iter()
+        .map(|device| {
+            let media = device.state.lock().unwrap();
+            (media.write_calls, media.sync_calls)
+        })
+        .collect();
+    let payload = [0x5A; 512];
+    let outcomes = [
+        engine.zvol_write_at(&cx, &dataset, 0, &payload, ZfsDataChecksum::Inherit),
+        engine.zvol_discard(&cx, &dataset, 0, 512, ZfsDataChecksum::Inherit),
+        engine.zvol_batch_apply(&cx, &dataset, &BTreeMap::new(), ZfsDataChecksum::Inherit),
+    ];
+    for outcome in outcomes {
+        match outcome {
+            ZfsTxOutcome::NotCommitted(FfsError::UnsupportedFeature(detail)) => {
+                assert_eq!(
+                    detail,
+                    "checksum inheritance is only supported for native ZPL writes"
+                );
+            }
+            other => panic!("expected checksum admission refusal, got {other:?}"),
+        }
+    }
+    assert_eq!(engine.committed_txg(), txg);
+    assert_eq!(engine.persistence_events().len(), events);
+    let io_after: Vec<_> = devices
+        .iter()
+        .map(|device| {
+            let media = device.state.lock().unwrap();
+            (media.write_calls, media.sync_calls)
+        })
+        .collect();
+    assert_eq!(io_after, io_before);
+    // Explicit volume checksums still publish and survive a fresh native open.
+    engine
+        .zvol_write_at(&cx, &dataset, 0, &payload, ZfsDataChecksum::Sha256)
+        .into_result()
+        .unwrap();
+    let slot = engine.committed_slot();
+    drop(engine);
+    let durable: Vec<_> = devices
+        .iter()
+        .map(FaultableMemberDevice::fresh_from_durable)
+        .collect();
+    let reopened =
+        open_engine_on_devices(&cx, &durable, default_write_opts(built.pool_guid, slot)).unwrap();
+    let mut actual = [0; 512];
+    reopened
+        .zvol_read_at(&cx, &dataset, None, 0, &mut actual)
+        .unwrap();
+    assert_eq!(actual, payload);
+}
+
 #[test]
 fn writes_preserve_existing_blocks_after_recordsize_reduction() {
     let cx = Cx::for_testing();
@@ -4663,7 +6118,7 @@ fn snapshotted_dataset_cow_preserves_historical_lzjb_snapshot_with_bpobj_and_dea
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn final_reclamation_refuses_auxiliary_ownership_without_leaking_native_objects() {
+fn final_reclamation_releases_private_xattrs_and_refuses_external_acls() {
     let cx = Cx::for_testing();
     let dataset = [b"data".to_vec()];
     let timestamp = Timestamp {
@@ -4724,21 +6179,31 @@ fn final_reclamation_refuses_auxiliary_ownership_without_leaking_native_objects(
                     .iter()
                     .map(FaultableMemberDevice::durable_snapshot)
                     .collect();
-                assert_native_write_refused(&mut engine, &devices, libc::EOPNOTSUPP, |writer| {
-                    writer.unlink_entry(&cx, &dataset, 2, name, directory, timestamp)
-                });
-                assert_native_write_refused(&mut engine, &devices, libc::EOPNOTSUPP, |writer| {
-                    writer.rename_entry(
-                        &cx,
-                        &dataset,
-                        2,
-                        b"replacement",
-                        2,
-                        name,
-                        Some(replacement),
-                        timestamp,
-                    )
-                });
+                if auxiliary == AuxiliaryOwnership::ExternalAcl {
+                    assert_native_write_refused(
+                        &mut engine,
+                        &devices,
+                        libc::EOPNOTSUPP,
+                        |writer| writer.unlink_entry(&cx, &dataset, 2, name, directory, timestamp),
+                    );
+                    assert_native_write_refused(
+                        &mut engine,
+                        &devices,
+                        libc::EOPNOTSUPP,
+                        |writer| {
+                            writer.rename_entry(
+                                &cx,
+                                &dataset,
+                                2,
+                                b"replacement",
+                                2,
+                                name,
+                                Some(replacement),
+                                timestamp,
+                            )
+                        },
+                    );
+                }
                 for (device, bytes) in devices.iter().zip(&before) {
                     let media = device.state.lock().unwrap();
                     assert_eq!(&media.durable, bytes);
@@ -4827,10 +6292,47 @@ fn final_reclamation_refuses_auxiliary_ownership_without_leaking_native_objects(
                         built.snap_hello_expected
                     );
                 }
-                assert_native_write_refused(&mut reopened, &fresh, libc::EOPNOTSUPP, |writer| {
-                    writer.unlink_entry(&cx, &dataset, 2, b"preserved", directory, timestamp)
-                });
-                assert_pool_scrub_and_allocation_clean(&cx, &fresh, built.pool_guid, Some(slot));
+                if auxiliary == AuxiliaryOwnership::XattrDirectory {
+                    reopened
+                        .unlink_entry(&cx, &dataset, 2, b"preserved", directory, timestamp)
+                        .into_result()
+                        .unwrap();
+                    let mut head = reopened
+                        .open_read_objects(&cx)
+                        .unwrap()
+                        .zpl(&cx, &dataset)
+                        .unwrap();
+                    for object in [owner, 13, 14] {
+                        assert!(matches!(head.stat(&cx, object), Err(FfsError::NotFound(_))));
+                    }
+                    let mut snapshot = head.open_snapshot(&cx, b"before").unwrap();
+                    assert_eq!(
+                        snapshot.getxattr(&cx, owner, "user.retained").unwrap(),
+                        Some(b"private value survives namespace changes".to_vec())
+                    );
+                } else {
+                    assert_native_write_refused(
+                        &mut reopened,
+                        &fresh,
+                        libc::EOPNOTSUPP,
+                        |writer| {
+                            writer.unlink_entry(
+                                &cx,
+                                &dataset,
+                                2,
+                                b"preserved",
+                                directory,
+                                timestamp,
+                            )
+                        },
+                    );
+                }
+                assert_pool_scrub_and_allocation_clean(
+                    &cx,
+                    &fresh,
+                    built.pool_guid,
+                    Some(reopened.committed_slot()),
+                );
             }
         }
     }
@@ -7180,6 +8682,100 @@ fn reconciliation_refuses_unadmitted_writers_without_rewriting_any_member() {
 }
 
 #[test]
+fn direct_zfs_publication_defers_every_mirror_member_until_final_barrier() {
+    let cx = Cx::for_testing();
+    let built = build_clean_zfs_pool(&PoolFixtureSpec {
+        mirror_width: 2,
+        ..PoolFixtureSpec::default()
+    });
+    let members: Vec<_> = built
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let options = ZfsWriteOptions {
+        reconcile_torn_uberblocks: true,
+        ..default_write_opts(built.pool_guid, built.initial_slot)
+    };
+    let mut engine = open_engine_on_devices(&cx, &members, options).unwrap();
+    let protection =
+        |s: &MemberMediaState| (s.protection_depth, s.protection_completed, s.unprotected_io);
+    for member in &members {
+        let state = member.state.lock().unwrap();
+        assert_eq!((state.write_calls, state.sync_calls), (4, 2));
+        assert_eq!(protection(&state), (0, 1, 0));
+    }
+    let create = |engine: &mut ZfsTransactionEngine, name: &[u8]| {
+        engine.create_file(
+            &cx,
+            &[b"data".to_vec()],
+            2,
+            name,
+            0o644,
+            0,
+            0,
+            Timestamp {
+                seconds: 1_715_000_500,
+                nanos: 0,
+            },
+            ZfsDataChecksum::Fletcher4,
+        )
+    };
+
+    // Failure to admit the second member unwinds the first before any source write.
+    members[1].state.lock().unwrap().refuse_protection = true;
+    assert!(matches!(
+        create(&mut engine, b"refused"),
+        ZfsTxOutcome::NotCommitted(FfsError::ReadOnly)
+    ));
+    for (i, member) in members.iter().enumerate() {
+        let state = member.state.lock().unwrap();
+        assert_eq!((state.write_calls, state.sync_calls), (4, 2));
+        assert_eq!(
+            (state.protection_depth, state.protection_aborted),
+            (0, usize::from(i == 0))
+        );
+    }
+    members[1].state.lock().unwrap().refuse_protection = false;
+
+    engine.begin_durability_commit(&cx).unwrap();
+    let (_, token) = create(&mut engine, b"protected").into_result().unwrap();
+    engine.verify_token(&token).unwrap();
+    for member in &members {
+        let state = member.state.lock().unwrap();
+        assert!(state.sync_calls > 4);
+        assert_eq!(protection(&state), (1, 2, 0));
+    }
+    engine.complete_durability_commit();
+    engine.sync_devices(&cx).unwrap();
+    for member in &members {
+        let state = member.state.lock().unwrap();
+        assert_eq!(protection(&state), (0, 3, 1));
+    }
+
+    // A second-wave fault makes the native outcome uncertain. Neither member
+    // may report completion or run an unprotected barrier over that epoch.
+    engine.with_fault_hook(|event| {
+        if matches!(
+            event.stage,
+            ZfsPersistenceStage::UberblockBarrier { wave: 2, .. }
+        ) {
+            return Err(FfsError::Io(std::io::Error::other("cut final publication")));
+        }
+        Ok(())
+    });
+    assert!(matches!(
+        create(&mut engine, b"cut"),
+        ZfsTxOutcome::Uncertain { .. }
+    ));
+    for (i, member) in members.iter().enumerate() {
+        let state = member.state.lock().unwrap();
+        assert_eq!(protection(&state), (0, 3, 1));
+        assert_eq!(state.protection_aborted, 1 + usize::from(i == 0));
+    }
+}
+
+#[test]
 fn native_writer_sync_reports_member_errors_without_minting_a_commit() {
     let cx = Cx::for_testing();
     let built = build_clean_zfs_pool(&PoolFixtureSpec {
@@ -7749,6 +9345,449 @@ fn dsl_dataset_snapshot_clone_hold_bookmark_defer_destroy_and_reclamation() {
     let _ = mos
         .allocation(&cx, AllocationLimits::default())
         .expect("clean allocation audit after full DSL lifecycle");
+}
+
+fn dsl_block_feature_counts(cx: &Cx, engine: &ZfsTransactionEngine) -> [u64; 3] {
+    let mut mos = engine.open_read_objects(cx).unwrap();
+    let rows = mos.zap(cx, 10).unwrap();
+    [
+        b"org.open-zfs:large_blocks".as_slice(),
+        b"org.illumos:sha512".as_slice(),
+        b"com.delphix:extensible_dataset".as_slice(),
+    ]
+    .map(|feature| rows.iter().find(|row| row.name == feature).unwrap().value)
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn dsl_block_feature_ownership_survives_properties_snapshots_clones_and_deferred_destroy() {
+    let cx = Cx::for_testing();
+    let built = build_clean_zfs_pool(&PoolFixtureSpec {
+        image_bytes: 32 * 1024 * 1024,
+        data_properties: vec![(b"recordsize", 262_144), (b"checksum", 11)],
+        data_head_features: vec![
+            (b"org.open-zfs:large_blocks", 0),
+            (b"org.illumos:sha512", 0),
+        ],
+        additional_read_features: vec![
+            (b"org.open-zfs:large_blocks", 1),
+            (b"org.illumos:sha512", 1),
+        ],
+        additional_write_features: vec![(b"com.delphix:bookmarks", 0)],
+        ..PoolFixtureSpec::default()
+    });
+    let devices: Vec<_> = built
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut engine = open_engine_on_devices(
+        &cx,
+        &devices,
+        default_write_opts(built.pool_guid, built.initial_slot),
+    )
+    .unwrap();
+    let dataset = vec![b"data".to_vec()];
+    let clone = vec![b"data".to_vec(), b"feature-clone".to_vec()];
+    let timestamp = Timestamp {
+        seconds: 1_720_000_100,
+        nanos: 0,
+    };
+    let (file, _) = engine
+        .create_file(
+            &cx,
+            &dataset,
+            2,
+            b"feature-data",
+            0o644,
+            1000,
+            1000,
+            timestamp,
+            ZfsDataChecksum::Inherit,
+        )
+        .into_result()
+        .unwrap();
+    let original = vec![0x6D; 300 * 1024];
+    engine
+        .write_file_data(
+            &cx,
+            &dataset,
+            file,
+            0,
+            &original,
+            timestamp,
+            ZfsDataChecksum::Inherit,
+        )
+        .into_result()
+        .unwrap();
+    assert_eq!(dsl_block_feature_counts(&cx, &engine), [1, 1, 1]);
+    let (snapshot, _) = engine
+        .create_snapshot(&cx, &dataset, b"origin", timestamp)
+        .into_result()
+        .unwrap();
+    assert_eq!(dsl_block_feature_counts(&cx, &engine), [2, 2, 2]);
+    engine
+        .create_bookmark(&cx, &dataset, b"anchor", b"origin", false)
+        .into_result()
+        .unwrap();
+    engine
+        .write_file_data(
+            &cx,
+            &dataset,
+            file,
+            31,
+            b"head-divergent",
+            timestamp,
+            ZfsDataChecksum::Inherit,
+        )
+        .into_result()
+        .unwrap();
+    assert_eq!(engine.list_bookmarks(&cx, &dataset).unwrap().len(), 1);
+    assert_eq!(dsl_block_feature_counts(&cx, &engine), [2, 2, 2]);
+
+    // Properties select future blocks. They do not release either owner's
+    // existing feature, even after every current head block is later retired.
+    for (name, value) in [("recordsize", 512), ("checksum", 7)] {
+        engine
+            .set_property(
+                &cx,
+                &dataset,
+                name,
+                ffs_zfs::ZfsPropertySetValue::Number(value),
+            )
+            .into_result()
+            .unwrap();
+        assert_eq!(dsl_block_feature_counts(&cx, &engine), [2, 2, 2]);
+    }
+    engine
+        .inherit_property(&cx, &dataset, "recordsize")
+        .into_result()
+        .unwrap();
+    assert_eq!(dsl_block_feature_counts(&cx, &engine), [2, 2, 2]);
+    let (clone_head, _) = engine
+        .create_clone(
+            &cx,
+            &dataset,
+            b"origin",
+            &dataset,
+            b"feature-clone",
+            &[],
+            timestamp,
+        )
+        .into_result()
+        .unwrap();
+    assert_eq!(dsl_block_feature_counts(&cx, &engine), [3, 3, 3]);
+    engine
+        .write_file_data(
+            &cx,
+            &clone,
+            file,
+            17,
+            b"clone-divergent",
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    assert_eq!(dsl_block_feature_counts(&cx, &engine), [3, 3, 3]);
+
+    let slot = engine.committed_slot();
+    drop(engine);
+    let durable: Vec<_> = devices
+        .iter()
+        .map(FaultableMemberDevice::fresh_from_durable)
+        .collect();
+    let mut engine =
+        open_engine_on_devices(&cx, &durable, default_write_opts(built.pool_guid, slot)).unwrap();
+    assert_eq!(dsl_block_feature_counts(&cx, &engine), [3, 3, 3]);
+    let mut mos = engine.open_read_objects(&cx).unwrap();
+    for object in [18, snapshot, clone_head] {
+        assert_eq!(mos.object(&cx, object).unwrap().object_type(), 196);
+        let rows = mos.zap(&cx, object).unwrap();
+        for feature in [
+            b"org.open-zfs:large_blocks".as_slice(),
+            b"org.illumos:sha512".as_slice(),
+        ] {
+            assert_eq!(
+                rows.iter().find(|row| row.name == feature).unwrap().value,
+                0
+            );
+        }
+    }
+    let mut head_bytes = original.clone();
+    head_bytes[31..31 + b"head-divergent".len()].copy_from_slice(b"head-divergent");
+    let mut clone_bytes = original.clone();
+    clone_bytes[17..17 + b"clone-divergent".len()].copy_from_slice(b"clone-divergent");
+    assert_eq!(
+        mos.zpl(&cx, &dataset)
+            .unwrap()
+            .read(&cx, file, 0, original.len())
+            .unwrap(),
+        head_bytes
+    );
+    assert_eq!(
+        mos.zpl(&cx, &clone)
+            .unwrap()
+            .read(&cx, file, 0, original.len())
+            .unwrap(),
+        clone_bytes
+    );
+    assert_eq!(
+        mos.zpl_snapshot(&cx, &dataset, b"origin")
+            .unwrap()
+            .read(&cx, file, 0, original.len())
+            .unwrap(),
+        original
+    );
+    drop(mos);
+
+    engine
+        .hold_snapshot(&cx, &dataset, b"origin", b"keep", timestamp)
+        .into_result()
+        .unwrap();
+    engine
+        .destroy_snapshot(&cx, &dataset, b"origin", true)
+        .into_result()
+        .unwrap();
+    assert_eq!(dsl_block_feature_counts(&cx, &engine), [3, 3, 3]);
+    engine.destroy_dataset(&cx, &clone).into_result().unwrap();
+    assert_eq!(dsl_block_feature_counts(&cx, &engine), [2, 2, 2]);
+    assert_eq!(
+        engine
+            .open_read_objects(&cx)
+            .unwrap()
+            .snapshots(&cx, &dataset)
+            .unwrap()
+            .len(),
+        1
+    );
+    engine
+        .release_snapshot(&cx, &dataset, b"origin", b"keep")
+        .into_result()
+        .unwrap();
+    assert_eq!(dsl_block_feature_counts(&cx, &engine), [1, 1, 1]);
+    assert!(
+        engine
+            .open_read_objects(&cx)
+            .unwrap()
+            .snapshots(&cx, &dataset)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(engine.list_bookmarks(&cx, &dataset).unwrap().len(), 1);
+    engine
+        .destroy_bookmark(&cx, &dataset, b"anchor")
+        .into_result()
+        .unwrap();
+    engine.destroy_dataset(&cx, &dataset).into_result().unwrap();
+    assert_eq!(dsl_block_feature_counts(&cx, &engine), [0, 0, 0]);
+    let slot = engine.committed_slot();
+    drop(engine);
+    let final_devices: Vec<_> = durable
+        .iter()
+        .map(FaultableMemberDevice::fresh_from_durable)
+        .collect();
+    let reopened = open_engine_on_devices(
+        &cx,
+        &final_devices,
+        default_write_opts(built.pool_guid, slot),
+    )
+    .unwrap();
+    assert_eq!(dsl_block_feature_counts(&cx, &reopened), [0, 0, 0]);
+    let mut mos = reopened.open_read_objects(&cx).unwrap();
+    assert!(
+        !mos.datasets(&cx)
+            .unwrap()
+            .iter()
+            .any(|row| row.components == dataset)
+    );
+    assert!(mos.scrub(&cx, ScrubLimits::default()).unwrap().is_clean());
+    mos.allocation(&cx, AllocationLimits::default()).unwrap();
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn dsl_block_feature_properties_do_not_create_or_steal_dataset_ownership() {
+    let cx = Cx::for_testing();
+    let timestamp = Timestamp {
+        seconds: 1_720_000_101,
+        nanos: 0,
+    };
+    for other_owner in [false, true] {
+        let expected = u64::from(other_owner);
+        let built = build_clean_zfs_pool(&PoolFixtureSpec {
+            data_head_features: if other_owner {
+                vec![
+                    (b"org.open-zfs:large_blocks", 0),
+                    (b"org.illumos:sha512", 0),
+                ]
+            } else {
+                Vec::new()
+            },
+            additional_read_features: vec![
+                (b"org.open-zfs:large_blocks", expected),
+                (b"org.illumos:sha512", expected),
+            ],
+            ..PoolFixtureSpec::default()
+        });
+        let devices: Vec<_> = built
+            .members
+            .into_iter()
+            .map(FaultableMemberDevice::new)
+            .collect();
+        let mut engine = open_engine_on_devices(
+            &cx,
+            &devices,
+            default_write_opts(built.pool_guid, built.initial_slot),
+        )
+        .unwrap();
+        let parent = vec![b"data".to_vec()];
+        let dataset = vec![b"data".to_vec(), b"configured-only".to_vec()];
+        let (head, _) = engine
+            .create_dataset(
+                &cx,
+                &parent,
+                b"configured-only",
+                &[
+                    (
+                        "recordsize".into(),
+                        ffs_zfs::ZfsPropertySetValue::Number(262_144),
+                    ),
+                    ("checksum".into(), ffs_zfs::ZfsPropertySetValue::Number(11)),
+                ],
+                timestamp,
+            )
+            .into_result()
+            .unwrap();
+        assert_eq!(dsl_block_feature_counts(&cx, &engine), [expected; 3]);
+        assert_eq!(
+            engine
+                .open_read_objects(&cx)
+                .unwrap()
+                .object(&cx, head)
+                .unwrap()
+                .object_type(),
+            16
+        );
+        for value in [512, 1_048_576] {
+            engine
+                .set_property(
+                    &cx,
+                    &dataset,
+                    "recordsize",
+                    ffs_zfs::ZfsPropertySetValue::Number(value),
+                )
+                .into_result()
+                .unwrap();
+            assert_eq!(dsl_block_feature_counts(&cx, &engine), [expected; 3]);
+        }
+        engine
+            .inherit_property(&cx, &dataset, "recordsize")
+            .into_result()
+            .unwrap();
+        assert_eq!(dsl_block_feature_counts(&cx, &engine), [expected; 3]);
+        engine
+            .set_property(
+                &cx,
+                &dataset,
+                "recordsize",
+                ffs_zfs::ZfsPropertySetValue::Number(262_144),
+            )
+            .into_result()
+            .unwrap();
+        engine
+            .create_snapshot(&cx, &dataset, b"empty", timestamp)
+            .into_result()
+            .unwrap();
+        assert_eq!(dsl_block_feature_counts(&cx, &engine), [expected; 3]);
+        engine
+            .destroy_snapshot(&cx, &dataset, b"empty", false)
+            .into_result()
+            .unwrap();
+        engine.destroy_dataset(&cx, &dataset).into_result().unwrap();
+        assert_eq!(dsl_block_feature_counts(&cx, &engine), [expected; 3]);
+        assert_pool_scrub_and_allocation_clean(
+            &cx,
+            &devices,
+            built.pool_guid,
+            Some(engine.committed_slot()),
+        );
+    }
+}
+
+#[test]
+fn dsl_block_feature_properties_require_enabled_pool_features_without_writes() {
+    let cx = Cx::for_testing();
+    let built = build_clean_zfs_pool(&PoolFixtureSpec::default());
+    let devices: Vec<_> = built
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut engine = open_engine_on_devices(
+        &cx,
+        &devices,
+        default_write_opts(built.pool_guid, built.initial_slot),
+    )
+    .unwrap();
+    let dataset = [b"data".to_vec()];
+    for (property, value) in [("recordsize", 262_144), ("checksum", 11)] {
+        assert_native_write_refused(&mut engine, &devices, libc::EOPNOTSUPP, |writer| {
+            writer.set_property(
+                &cx,
+                &dataset,
+                property,
+                ffs_zfs::ZfsPropertySetValue::Number(value),
+            )
+        });
+    }
+}
+
+#[test]
+fn dsl_block_feature_lifecycle_refuses_malformed_or_inactive_ownership_without_writes() {
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    let timestamp = Timestamp {
+        seconds: 1_720_000_102,
+        nanos: 0,
+    };
+    for feature in [
+        b"org.open-zfs:large_blocks".as_slice(),
+        b"org.illumos:sha512".as_slice(),
+    ] {
+        for (marker, count) in [(1, Some(1)), (0, Some(0)), (0, None)] {
+            let built = build_clean_zfs_pool(&PoolFixtureSpec {
+                data_head_features: vec![(feature, marker)],
+                additional_read_features: count.into_iter().map(|value| (feature, value)).collect(),
+                ..PoolFixtureSpec::default()
+            });
+            let devices: Vec<_> = built
+                .members
+                .into_iter()
+                .map(FaultableMemberDevice::new)
+                .collect();
+            let mut engine = open_engine_on_devices(
+                &cx,
+                &devices,
+                default_write_opts(built.pool_guid, built.initial_slot),
+            )
+            .unwrap();
+            assert_native_write_refused(&mut engine, &devices, libc::EIO, |writer| {
+                writer.create_snapshot(&cx, &dataset, b"refused", timestamp)
+            });
+            assert_native_write_refused(&mut engine, &devices, libc::EIO, |writer| {
+                writer.destroy_dataset(&cx, &dataset)
+            });
+            let mut mos = engine.open_read_objects(&cx).unwrap();
+            assert!(mos.snapshots(&cx, &dataset).unwrap().is_empty());
+            assert!(
+                mos.datasets(&cx)
+                    .unwrap()
+                    .iter()
+                    .any(|row| row.components == dataset)
+            );
+        }
+    }
 }
 
 #[test]

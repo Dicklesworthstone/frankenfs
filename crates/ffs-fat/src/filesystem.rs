@@ -260,6 +260,14 @@ impl FatFs {
     }
 
     fn child_path(&self, parent: InodeNumber, name: &OsStr) -> Result<(String, String)> {
+        // A held directory inode remains readable after rmdir/overwrite, but
+        // its recovery record must never become a new namespace parent.
+        if self.retained(parent)? {
+            return Err(FfsError::NotFound(format!(
+                "FAT directory {} has been removed",
+                parent.0
+            )));
+        }
         let name_str = name.to_str().ok_or_else(|| {
             FfsError::UnsupportedFeature("FAT requires a UTF-8 presentation name".into())
         })?;
@@ -312,7 +320,6 @@ impl FatFs {
         }
         if let Some(target) = &dst_before
             && target.offset != src_before.offset
-            && !target.native.is_directory()
         {
             let target_ino = self.state()?.slot_to_ino.get(&target.offset).copied();
             if let Some(target_ino) = target_ino
@@ -327,25 +334,27 @@ impl FatFs {
         rename_in_volume(cx, &self.volume, &from_path, &to_path, false)
             .map_err(map_mutation_error)?;
 
-        let new_entry = self.volume.lookup(cx, new_parent_dir, &to_name)?;
-        let mut state = self.state()?;
-        state.free_clusters = None;
-        if let Some(overwritten) = dst_before
-            && overwritten.offset != src_before.offset
-            && let Some(dst_ino) = state.slot_to_ino.remove(&overwritten.offset)
-            && dst_ino != src_ino
-        {
-            Self::invalidate_cached_chain(&mut state, dst_ino);
-            state.nodes.remove(&dst_ino);
-        }
-        state.slot_to_ino.remove(&src_before.offset);
-        state.slot_to_ino.insert(new_entry.offset, src_ino);
-        Self::invalidate_cached_chain(&mut state, src_ino);
-        if let Some(node) = state.nodes.get_mut(&src_ino) {
-            node.parent = new_parent;
-            node.entry = Some(new_entry);
-        }
-        Ok(())
+        cx.masked(|| {
+            let new_entry = self.volume.lookup(cx, new_parent_dir, &to_name)?;
+            let mut state = self.state()?;
+            state.free_clusters = None;
+            if let Some(overwritten) = dst_before
+                && overwritten.offset != src_before.offset
+                && let Some(dst_ino) = state.slot_to_ino.remove(&overwritten.offset)
+                && dst_ino != src_ino
+            {
+                Self::invalidate_cached_chain(&mut state, dst_ino);
+                state.nodes.remove(&dst_ino);
+            }
+            state.slot_to_ino.remove(&src_before.offset);
+            state.slot_to_ino.insert(new_entry.offset, src_ino);
+            Self::invalidate_cached_chain(&mut state, src_ino);
+            if let Some(node) = state.nodes.get_mut(&src_ino) {
+                node.parent = new_parent;
+                node.entry = Some(new_entry);
+            }
+            Ok(())
+        })
     }
 
     fn invalidate_cached_chain(state: &mut State, ino: InodeNumber) {
@@ -591,7 +600,7 @@ impl FatFs {
         {
             let directory = node.directory()?;
             let size = self.volume.directory_size(cx, directory)?;
-            let children = self.volume.list(cx, directory)?;
+            let children = self.visible_entries(self.volume.list(cx, directory)?)?;
             let nlink = 2 + children
                 .iter()
                 .filter(|entry| entry.native.is_directory())
@@ -829,10 +838,14 @@ impl FsOps for FatFs {
         match name {
             "." => self.attributes(cx, parent, &node),
             ".." => {
-                let ancestor = self.node(cx, node.parent)?;
-                self.attributes(cx, node.parent, &ancestor)
+                let parent = self.directory_parent(parent, node.parent)?;
+                let ancestor = self.node(cx, parent)?;
+                self.attributes(cx, parent, &ancestor)
             }
             _ => {
+                if self.retained(parent)? {
+                    return Err(FfsError::NotFound(name.to_owned()));
+                }
                 let entry = self.visible_lookup(cx, directory, name)?;
                 let ino = self.register(cx, parent, entry)?;
                 self.attributes(cx, ino, &self.node(cx, ino)?)
@@ -851,15 +864,13 @@ impl FsOps for FatFs {
         let node = self.node(cx, ino)?;
         let entries = self.visible_entries(self.volume.list(cx, node.directory()?)?)?;
         let names = Self::checked_names(&entries)?;
+        let parent = self.directory_parent(ino, node.parent)?;
         if self.writable {
-            return self.mutable_readdir(cx, ino, node.parent, offset, entries, names);
+            return self.mutable_readdir(cx, ino, parent, offset, entries, names);
         }
         let end_cookie = entries.len() as u64 + 2;
         let mut page = Vec::new();
-        for (cookie, target, name) in [
-            (1, ino, b".".as_slice()),
-            (2, node.parent, b"..".as_slice()),
-        ] {
+        for (cookie, target, name) in [(1, ino, b".".as_slice()), (2, parent, b"..".as_slice())] {
             if cookie > offset {
                 page.push(DirEntry {
                     ino: target,
@@ -931,7 +942,7 @@ impl FsOps for FatFs {
         if wants_write && !self.writable {
             return Err(FfsError::ReadOnly);
         }
-        let mut node = self.node(cx, ino)?;
+        let node = self.node(cx, ino)?;
         let entry = node.entry.as_ref().ok_or(FfsError::IsDirectory)?;
         if entry.native.is_directory() {
             return Err(FfsError::IsDirectory);
@@ -946,7 +957,12 @@ impl FsOps for FatFs {
             let path = self.path_for_inode(ino)?;
             truncate_in_volume(cx, &self.volume, &path, 0, now_unix_secs())
                 .map_err(map_mutation_error)?;
-            node = self.refresh_node_from_path(cx, ino, &path)?;
+            return operation.publish_committed(cx, || {
+                let node = self.refresh_node_from_path(cx, ino, &path)?;
+                let entry = node.entry.as_ref().ok_or(FfsError::IsDirectory)?;
+                self.file_allocation(cx, ino, entry)?;
+                Ok((handle.accept(), 0))
+            });
         }
         let entry = node.entry.as_ref().ok_or(FfsError::IsDirectory)?;
         self.file_allocation(cx, ino, entry)?;
@@ -973,11 +989,13 @@ impl FsOps for FatFs {
         let read_only = (mode & 0o222) == 0;
         create_in_volume(cx, &self.volume, &path, &[], now_unix_secs(), read_only)
             .map_err(map_mutation_error)?;
-        self.state()?.free_clusters = None;
-        let entry = self.volume.lookup(cx, parent_dir, &name_str)?;
-        let ino = self.register(cx, parent, entry)?;
-        let node = self.node(cx, ino)?;
-        operation.complete(self.attributes(cx, ino, &node)?)
+        operation.publish_committed(cx, || {
+            self.state()?.free_clusters = None;
+            let entry = self.volume.lookup(cx, parent_dir, &name_str)?;
+            let ino = self.register(cx, parent, entry)?;
+            let node = self.node(cx, ino)?;
+            self.attributes(cx, ino, &node)
+        })
     }
 
     fn mkdir(
@@ -999,11 +1017,13 @@ impl FsOps for FatFs {
         let (path, name_str) = self.child_path(parent, name)?;
         mkdir_in_volume(cx, &self.volume, &path, now_unix_secs(), false)
             .map_err(map_mutation_error)?;
-        self.state()?.free_clusters = None;
-        let entry = self.volume.lookup(cx, parent_dir, &name_str)?;
-        let ino = self.register(cx, parent, entry)?;
-        let node = self.node(cx, ino)?;
-        operation.complete(self.attributes(cx, ino, &node)?)
+        operation.publish_committed(cx, || {
+            self.state()?.free_clusters = None;
+            let entry = self.volume.lookup(cx, parent_dir, &name_str)?;
+            let ino = self.register(cx, parent, entry)?;
+            let node = self.node(cx, ino)?;
+            self.attributes(cx, ino, &node)
+        })
     }
 
     fn write(
@@ -1028,10 +1048,10 @@ impl FsOps for FatFs {
         let path = self.path_for_inode(ino)?;
         let written = write_range_in_volume(cx, &self.volume, &path, offset, data, now_unix_secs())
             .map_err(map_mutation_error)?;
-        self.refresh_node_from_path(cx, ino, &path)?;
-        let written = u32::try_from(written)
-            .map_err(|_| FfsError::Format("FAT write size overflow".into()))?;
-        operation.complete(written)
+        operation.publish_committed(cx, || {
+            self.refresh_node_from_path(cx, ino, &path)?;
+            u32::try_from(written).map_err(|_| FfsError::Format("FAT write size overflow".into()))
+        })
     }
 
     fn copy_file_range(
@@ -1058,11 +1078,14 @@ impl FsOps for FatFs {
             .volume
             .copy_range(cx, &from, offset_in, &to, offset_out, len, now_unix_secs())
             .map_err(map_mutation_error)?;
-        if copied != 0 {
-            self.refresh_node_from_path(cx, ino_out, &to)?;
+        if copied == 0 {
+            checkpoint(cx)?;
+            return operation.complete(0);
         }
-        checkpoint(cx)?;
-        operation.complete(copied)
+        operation.publish_committed(cx, || {
+            self.refresh_node_from_path(cx, ino_out, &to)?;
+            Ok(copied)
+        })
     }
 
     fn setattr(
@@ -1138,11 +1161,15 @@ impl FsOps for FatFs {
         // rejected without writes. The following native operations remain
         // separately durable, not an atomic multi-attribute transaction.
         let path = self.path_for_inode(ino)?;
+        let native_requested = attrs.size.is_some()
+            || read_only.is_some()
+            || modified_secs.is_some()
+            || accessed_secs.is_some();
         if let Some(new_size) = attrs.size {
             truncate_in_volume(cx, &self.volume, &path, new_size, now_unix_secs())
                 .map_err(map_mutation_error)?;
             // Do not retain the old chain if a later metadata update fails.
-            node = self.refresh_node_from_path(cx, ino, &path)?;
+            node = cx.masked(|| self.refresh_node_from_path(cx, ino, &path))?;
         }
         if read_only.is_some() || modified_secs.is_some() || accessed_secs.is_some() {
             set_attr_in_volume(
@@ -1154,9 +1181,13 @@ impl FsOps for FatFs {
                 accessed_secs,
             )
             .map_err(map_mutation_error)?;
-            node = self.refresh_node_from_path(cx, ino, &path)?;
+            node = cx.masked(|| self.refresh_node_from_path(cx, ino, &path))?;
         }
-        operation.complete(self.attributes(cx, ino, &node)?)
+        if native_requested {
+            operation.publish_committed(cx, || self.attributes(cx, ino, &node))
+        } else {
+            operation.complete(self.attributes(cx, ino, &node)?)
+        }
     }
 
     fn unlink(
@@ -1184,7 +1215,7 @@ impl FsOps for FatFs {
         if let Some(ino) = existing_ino
             && self.pinned(ino)?
         {
-            self.retain_unlink_locked(cx, parent, &path, &existing_entry, ino)?;
+            self.retain_remove_locked(cx, parent, &path, &existing_entry, ino)?;
             return operation.complete(());
         }
         unlink_in_volume(cx, &self.volume, &path, false).map_err(map_mutation_error)?;
@@ -1214,6 +1245,17 @@ impl FsOps for FatFs {
         let existing_entry = self.visible_lookup(cx, parent_dir, &name_str)?;
         if !existing_entry.native.is_directory() {
             return Err(FfsError::NotDirectory);
+        }
+        let existing_ino = self
+            .state()?
+            .slot_to_ino
+            .get(&existing_entry.offset)
+            .copied();
+        if let Some(ino) = existing_ino
+            && self.pinned(ino)?
+        {
+            self.retain_remove_locked(cx, parent, &path, &existing_entry, ino)?;
+            return operation.complete(());
         }
         rmdir_in_volume(cx, &self.volume, &path, false).map_err(map_mutation_error)?;
         let mut state = self.state()?;
@@ -1384,7 +1426,6 @@ impl FsOps for FatFs {
         if self.writable {
             sync_volume(cx, &self.volume).map_err(map_mutation_error)?;
         }
-        checkpoint(cx)?;
         operation.complete(())
     }
 
@@ -1393,7 +1434,6 @@ impl FsOps for FatFs {
         if self.writable {
             sync_volume(cx, &self.volume).map_err(map_mutation_error)?;
         }
-        checkpoint(cx)?;
         operation.complete(())
     }
 
@@ -1410,7 +1450,6 @@ impl FsOps for FatFs {
         if self.writable {
             sync_volume(cx, &self.volume).map_err(map_mutation_error)?;
         }
-        checkpoint(cx)?;
         operation.complete(())
     }
 
@@ -1430,15 +1469,15 @@ impl FsOps for FatFs {
     fn flush_on_destroy(&self, cx: &Cx) -> Result<()> {
         let operation = self.sync_operation(cx)?;
         if self.writable {
-            {
-                let mut deferral =
-                    ffs_block::DurabilityCommitDeferral::enter(cx, self.volume.device.as_ref())?;
-                self.reap_all_retained_locked(cx)?;
+            let mut deferral =
+                ffs_block::DurabilityCommitDeferral::enter(cx, self.volume.device.as_ref())?;
+            self.reap_all_retained_locked(cx)?;
+            return cx.masked(|| {
                 deferral.complete();
-            }
-            sync_volume(cx, &self.volume).map_err(map_mutation_error)?;
+                sync_volume(cx, &self.volume).map_err(map_mutation_error)?;
+                operation.complete(())
+            });
         }
-        checkpoint(cx)?;
         operation.complete(())
     }
 
@@ -1467,8 +1506,10 @@ impl FsOps for FatFs {
             .map_err(map_mutation_error)?;
         // KEEP_SIZE changes st_blocks and free space even though st_size and
         // the directory record may be unchanged. Invalidate both caches.
-        self.refresh_node_from_path(cx, ino, &path)?;
-        operation.complete(())
+        operation.publish_committed(cx, || {
+            self.refresh_node_from_path(cx, ino, &path)?;
+            Ok(())
+        })
     }
 
     fn fiemap(

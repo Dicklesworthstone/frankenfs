@@ -4092,16 +4092,22 @@ impl FrankenFuse {
         // nor allowed to evict. The write is already committed; the fsync makes
         // it durable before the reply, as O_SYNC/O_DSYNC require.
         if let Some(sync_mode) = intent.sync_mode() {
-            self.with_request_scope(&cx, RequestOp::Fsync, |cx, scope| {
-                self.inner.ops.fsync(
-                    cx,
-                    scope,
-                    InodeNumber(ino),
-                    intent.fh,
-                    sync_mode.datasync(),
-                )?;
-                self.inner.ops.commit_request_scope(cx, scope)?;
-                Ok(())
+            // A late cancellation cannot replace a committed write's result
+            // with EINTR before its mandatory durability continuation. Keep
+            // real fsync failures visible and leave cancellation pending for
+            // the next operation; admission and the write remain cancellable.
+            cx.masked(|| {
+                self.with_request_scope(&cx, RequestOp::Fsync, |cx, scope| {
+                    self.inner.ops.fsync(
+                        cx,
+                        scope,
+                        InodeNumber(ino),
+                        intent.fh,
+                        sync_mode.datasync(),
+                    )?;
+                    self.inner.ops.commit_request_scope(cx, scope)?;
+                    Ok(())
+                })
             })
             .map_err(|error| MutationDispatchError::Operation {
                 error,

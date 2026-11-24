@@ -332,6 +332,41 @@ The historical `97/97` parity figure describes rows in the original feature
 table. It is not a six-format completeness percentage, a passing test count,
 or a release-readiness score.
 
+## FAT: held files and directories after removal
+
+Experimental writable FAT16/FAT32 mounts retain files and empty directories
+while open handles or transport inode references still need them. Unlink,
+`rmdir` and rename-overwrite remove the public name while preserving the held
+inode and its allocation. A held directory keeps `.` and its original `..`,
+including across replacement from another parent; its original parent remains
+pinned until that reference is released. Removed directories cannot acquire new
+children. Final release/FORGET reclaims the native entry and allocation, including
+parents held only by a removed child's `..` reference.
+
+Retention uses ordinary native `Fxxxxxxx.DEL` recovery entries hidden only from
+the mount that owns them. Each entry still occupies its physical parent, which
+cannot be removed until reclamation. After an interrupted mount, these are
+ordinary recoverable files or directories; a new mount never deletes an entry
+merely because its name resembles a recovery record. This bounded profile does
+not make FAT namespace changes crash-atomic. Directory-lifetime regressions are
+authored in `crates/ffs-fat/src/filesystem/lifetime/tests.rs`; execution and native
+mounted qualification for this increment remain pending.
+
+Completed FAT mutations finish their final clean-state barriers, protection
+acknowledgment and mounted cache/reply publication with cancellation masked.
+A cancellation arriving during that finalization cannot turn a successful
+mutation into an interruption that invites an unsafe retry. Cancellation remains
+observable before finalization and between separately durable phases of compound
+requests; actual I/O, verification and cache-publication failures still fence
+the mount. Explicit sync barriers follow the same completion rule. FUSE also
+finishes the required `O_SYNC` / `O_DSYNC` flush after a successful write while
+retaining real flush errors and leaving cancellation pending afterward.
+
+Regressions cover both FAT dialects, native and mounted operations, real sidecar
+acknowledgments, subsequent access and cold reopen, plus synchronous FUSE write
+continuations. These tests are authored and source-reviewed; runtime execution
+and compiler/strict-Clippy qualification remain pending for this increment.
+
 ## FAT: create a file in an existing image
 
 The offline writer can create a new file with a native short or long name,
@@ -796,8 +831,9 @@ final removal of inline-only metadata.
 Cached lookups alone do not prevent a closed file from being removed. Directory
 continuation cookies become stale after a committed mutation, and
 removed-directory references cannot alias a reused object.
-Changing mode or ownership and creating/deleting datasets or snapshots remain
-outside this mount profile. Existing native project IDs are retained and charged
+Authorized writable mounts support native mode and ownership updates;
+creating/deleting datasets or snapshots remain outside this mount profile.
+Existing native project IDs are retained and charged
 to their own usage records through mutation and final reclamation. Regular files
 and directories created under an admitted project-inheriting directory inherit
 its project ID and inheritance flag; other new children and symlinks use project
@@ -830,9 +866,17 @@ The writable FsOps adapter handles nonempty writes, file-range copies, truncatio
 and supported sparse range edits by clearing native S_ISUID and executable
 S_ISGID bits in the same TXG as the data change. Non-executable S_ISGID is retained,
 empty writes leave metadata unchanged, and snapshots retain their original data
-and permissions. Files with Linux file
-capabilities are still refused before data mutation because atomic capability
-xattr removal is not implemented.
+and permissions. Native SA `security.capability` attributes are removed in that
+same TXG, including attributes stored in SA spill blocks. Unrelated xattrs are
+preserved. Regular-file ownership requests also clear privileges atomically,
+including requests that specify the current owner IDs. Exact capability removal
+is available to the kernel's killpriv path; other security xattrs remain opaque.
+Directory-backed capability values, including values shadowed by an SA copy,
+still refuse the complete mutation before publication. Explicit native editor
+APIs retain their separate set-ID-only and full privilege-clearing policies.
+Capability regressions cover cold reopen, snapshots, native flag admission,
+compound requests and modeled persistence cuts; their runtime execution and
+native mounted qualification remain pending for this increment.
 
 Write and truncate growth initialize newly visible bytes even when an existing
 checksummed, compressed record contains nonzero bytes beyond the old logical

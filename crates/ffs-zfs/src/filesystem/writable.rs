@@ -76,7 +76,8 @@ impl ZfsFs {
     /// Without caller credentials, data mutations conservatively clear SUID and
     /// group-executable SGID atomically with the data. Non-executable SGID remains;
     /// frontends may remove it through a clearing-only `setattr` for other callers.
-    /// Files with native capabilities remain outside the data-mutation profile.
+    /// SA and directory-backed file capabilities are removed in that same TXG.
+    /// Private values require validated, exclusive native ownership.
     /// Open regular files survive final unlink in the native unlinked set. A
     /// fresh owner drains pending regular-file reclamation before exposing the
     /// mount. Snapshot and control-directory operations remain read-only.
@@ -324,7 +325,7 @@ impl ZfsFs {
                 u64::from(uid),
                 u64::from(gid),
                 timestamp,
-                crate::ZfsDataChecksum::default(),
+                crate::ZfsDataChecksum::Inherit,
             )
         })?;
         let attr = state.publish_committed(|state| {
@@ -603,20 +604,6 @@ impl State {
         Ok((inherited_mode, inherited_gid))
     }
 
-    pub(super) fn admit_data_mutation(&mut self, cx: &Cx, ino: InodeNumber) -> Result<()> {
-        // Set-ID removal is part of each native data transaction, including
-        // streaming copies that reach WRITE without a preceding SETATTR.
-        // Native capabilities still require atomic xattr removal, so refuse
-        // those files before staging any data or permission changes.
-        let object = self.head.nodes[&ino].object;
-        if self.head.view.has_file_capabilities(cx, object)? {
-            return Err(unsupported(
-                "native ZPL data mutation cannot clear file capabilities",
-            ));
-        }
-        Ok(())
-    }
-
     pub(super) fn child(
         &mut self,
         cx: &Cx,
@@ -655,21 +642,16 @@ impl State {
             return Err(errno(libc::EOVERFLOW));
         }
         let writer = self.writer.as_mut().ok_or(FfsError::ReadOnly)?;
-        writer.engine.begin_durability_commit(cx)?;
+        checkpoint(cx)?;
         match operation(&mut writer.engine, &writer.dataset) {
             ZfsTxOutcome::Committed { value, token } => {
-                writer.engine.complete_durability_commit();
                 writer.last_token = Some(token);
                 writer.refresh_needed = true;
                 view.revision += 1;
                 Ok(value)
             }
-            ZfsTxOutcome::NotCommitted(error) => {
-                writer.engine.abort_durability_commit();
-                Err(error)
-            }
+            ZfsTxOutcome::NotCommitted(error) => Err(error),
             ZfsTxOutcome::Uncertain { reason, .. } => {
-                writer.engine.abort_durability_commit();
                 self.recovery_required = true;
                 Err(reason)
             }

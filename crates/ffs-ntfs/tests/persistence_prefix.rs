@@ -9281,7 +9281,7 @@ fn native_rename_replacement_rejects_malformed_source_and_victim_catalogs_before
 }
 
 #[test]
-fn writable_rename_replacement_refuses_pinned_ads_and_retires_only_final_victim_cache() {
+fn writable_rename_replacement_preserves_open_ads_and_retires_only_final_victim_cache() {
     use ffs_core::vfs::ReleaseRequest;
     use ffs_core::{FsOps, RequestScope};
     use ffs_types::InodeNumber;
@@ -9347,36 +9347,6 @@ fn writable_rename_replacement_refuses_pinned_ads_and_retires_only_final_victim_
         let before = device.snapshot_durable_only();
         let writes = device.write_bytes_total();
         assert!(matches!(
-            fs.rename(
-                &cx,
-                &mut scope,
-                root,
-                OsStr::new("source"),
-                root,
-                OsStr::new("Streams.bin"),
-            ),
-            Err(FfsError::UnsupportedFeature(_))
-        ));
-        assert_eq!(device.write_bytes_total(), writes);
-        assert_eq!(device.snapshot_live(), before);
-        assert_eq!(device.snapshot_durable_only(), before);
-        assert_eq!(
-            fs.read(&cx, &mut scope, old_ads.ino, 0, 64).unwrap(),
-            b"original ADS"
-        );
-        fs.release(
-            &cx,
-            &mut scope,
-            ReleaseRequest {
-                ino: old_ads.ino,
-                fh: handle,
-                flags: libc::O_RDONLY,
-                lock_owner: None,
-                flush: false,
-            },
-        )
-        .unwrap();
-        assert!(matches!(
             fs.rename2(
                 &cx,
                 &mut scope,
@@ -9423,6 +9393,28 @@ fn writable_rename_replacement_refuses_pinned_ads_and_retires_only_final_victim_
             fs.read(&next, &mut scope, source_attr.ino, 0, 64).unwrap(),
             b"source unnamed"
         );
+        assert_eq!(
+            fs.read(&next, &mut scope, old_ads.ino, 0, 64).unwrap(),
+            b"original ADS"
+        );
+        assert_eq!(
+            fs.getattr(&next, &mut scope, victim_attr.ino)
+                .unwrap()
+                .nlink,
+            u32::from(keep_victim)
+        );
+        fs.release(
+            &next,
+            &mut scope,
+            ReleaseRequest {
+                ino: old_ads.ino,
+                fh: handle,
+                flags: libc::O_RDONLY,
+                lock_owner: None,
+                flush: false,
+            },
+        )
+        .unwrap();
         if keep_victim {
             assert_eq!(
                 fs.lookup(&next, &mut scope, root, OsStr::new("survivor"))

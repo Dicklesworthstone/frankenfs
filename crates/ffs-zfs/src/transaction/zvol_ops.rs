@@ -285,7 +285,7 @@ fn open_zvol_head_context(
             ds_row.guid
         };
         let wc = DatasetWriteCrypto {
-            nonces: ZfsNonceGenerator::new(ivset_guid, info.record.guid, new_txg, &[]),
+            nonces: ZfsNonceGenerator::new(cx, ivset_guid, info.record.guid, new_txg, &[])?,
             key,
             compression,
             zstd_level,
@@ -710,7 +710,7 @@ pub(super) fn stage_create_zvol(
         inherited_ivset_guid = Some(ivset_guid);
         inherited_crypto_key_obj = Some(p_info.crypto_key_obj);
         Some(DatasetWriteCrypto {
-            nonces: ZfsNonceGenerator::new(ivset_guid, p_info.record.guid, new_txg, &[]),
+            nonces: ZfsNonceGenerator::new(cx, ivset_guid, p_info.record.guid, new_txg, &[])?,
             key,
             compression,
             zstd_level,

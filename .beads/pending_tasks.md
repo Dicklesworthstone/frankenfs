@@ -32,18 +32,70 @@ existing pending ledger preserves work without rewriting the issue graph.
   is inferred. The four tests remain authored, not executed.
 - [x] Independently review the complete sidecar fix and all four tests; scoped
   pinned-toolchain rustfmt checking and git diff whitespace checks pass.
-- [~] Extend existing FAT retention to removed/overwritten pinned directories,
+- [x] Extend existing FAT retention to removed/overwritten pinned directories,
   preserving logical parent identity, delayed reclamation and namespace refusal.
-- [ ] Cover FAT16/FAT32 rmdir, directory replacement, parent cleanup, capacity,
-  read-only behavior and write/sync failures through the actual FsOps adapter.
-- [~] Remove Linux file capabilities atomically with admitted ZFS data changes
+- [x] Author five FsOps regression groups for FAT16/FAT32 rmdir and directory
+  replacement, original-parent cleanup, name/inode reuse, capacity/read-only/
+  cancellation refusals, ownership-scoped reopen/destroy and write/sync failures.
+  These are formatter-backed adapter tests, not executed kernel-mount evidence.
+- [x] Independently review FAT lifetime changes; fix the maximum-length parent
+  chain's terminal-probe boundary. Scoped rustfmt and diff whitespace checks pass.
+- [ ] Execute the FAT lifetime tests and required compiler/strict-Clippy gates;
+  retain the physical-parent recovery-slot and non-atomic interruption limits.
+- [x] Remove Linux file capabilities atomically with admitted ZFS data changes
   using native SA inline xattrs and the existing TXG publication path.
-- [ ] Keep set-ID-only editor policy distinct, preserve unrelated xattrs and
+- [x] Keep set-ID-only editor policy distinct, preserve unrelated xattrs and
   snapshot metadata, and retain refusal of external capability representations.
-- [ ] Exercise ZFS write/truncate/copy/range/compound-setattr and persistence
-  cuts, including no-op and prepublication refusal controls.
-- [ ] Publish each reviewed coherent increment directly to main using GitHub
-  with an expected-head lease; update this ledger without broad Bead closure.
+- [x] Wire full privilege clearing into ZFS write, O_TRUNC, size setattr,
+  range edits/copy and regular-file ownership requests, including unchanged IDs.
+  Support exact SA capability removal with ordinary xattr flag admission while
+  allowing authorized data append to clear privileges within its own transaction.
+- [x] Author seven ZFS regression groups for SA bonus/spill capability removal,
+  directory-shadow refusal, explicit native policies, no-op/unchanged-size cases,
+  compound attributes, owner requests and native flags. Extend the existing
+  set-ID persistence-cut driver to capability-bearing write/truncate/punch cases
+  without weakening its original assertions or external-capability refusal test.
+- [x] Independently review ZFS staging, native publication, flag admission,
+  owner requests, SA fixture layouts and API constructor updates. Fix the exact
+  capability removexattr flag-policy mismatch found during review.
+- [x] Recover all FAT blobs and seven of eight ZFS blobs exactly after workspace
+  expiry; reconstruct the external-shadow test with the same refusal contract.
+  Reconcile concurrent main `019f5545` without replacing its encryption/send-
+  receive work: preserve object IDs, crypto-aware COW and native deadlist fixtures.
+- [ ] Execute the ZFS adapter/native/persistence regressions and required
+  compiler/strict-Clippy gates. Scoped rustfmt and diff whitespace checks pass;
+  tests remain authored, with no runtime pass inferred from source review.
+- [x] Publish the independently reviewed sidecar increment directly to main via
+  GitHub expected-head lease as `000301d215e6a350d948624a7f7e049f8c2ab2e7`.
+  The documented gate exception was exercised with its commit trailer and
+  `FFS_PRE_PUSH_BYPASS=1`; compilation/runtime validation remains explicitly open.
+- [x] Publish FAT directory retention directly to main through GitHub as
+  `d2aff90bd942b097b9aec08923c3b2674887572b`, preserving the concurrent upstream
+  merge. Synchronize the legacy compatibility branch without a force update.
+- [x] Publish the integrated ZFS increment separately through GitHub as
+  `4a58f472b193abde2fc9be3c9a5a60bde5deacba`, using an expected-head lease and
+  synchronizing the legacy branch; retain validation limits and broad Bead status.
+- [x] Fix FAT cancellation arriving after successful native publication so it
+  cannot report a committed mutation as an ordinary failed/retryable operation.
+  Centralize final clean-state barriers and protection completion across native
+  mutation paths; mask only that finalization and mounted cache/reply publication.
+  Preserve precommit cancellation, native I/O failure fencing and cancellation
+  between separately durable stages of compound requests.
+- [x] Author FAT16/FAT32 late-cancellation controls for file growth, namespace,
+  metadata, truncation, allocation/copy/exchange, retention/reaping and sync.
+  Include real sidecar pending/sealed acknowledgments and cold reopen, original
+  cancellation remaining pending, dirty-stage interruption, genuine cache/sync
+  failure fencing and a compound setattr partial-operation control.
+- [x] Finish the mandatory FUSE O_SYNC/O_DSYNC flush after a successful write
+  even if cancellation is now pending. Add regressions for both flags covering
+  successful single publication/flush, real EIO and prepublication cancellation.
+- [x] Independently review FAT/FUSE finalization and all new regressions; correct
+  a test-only dirty-image reopen assumption without weakening dirty admission.
+  Final `cargo fmt --all --check` and whitespace checks pass; no runtime pass
+  is inferred.
+- [ ] Execute the FAT/FUSE cancellation regressions and required compiler and
+  strict-Clippy gates. Native mounted and hardware power-cut evidence remains
+  separate from these authored adapter/storage-model regressions.
 
 Validation environment: baseline workspace formatting passed before changes.
 The initial workspace check was interrupted during dependency compilation when
@@ -51,6 +103,23 @@ the shared disk filled (exit 130); no project-wide compiler pass was obtained.
 The executor then restarted and cleared temporary storage. Source changes were
 reconstructed in the persistent checkout; native mount/oracle evidence remains
 unavailable because this host has no `/dev/fuse`, dosfstools or mtools.
+
+Retry evidence: restored pinned tooling and real dependencies; fresh full
+formatting and `br --no-db ready --json` passed (37 rows). The single-job
+`cargo test --locked -p ffs-repair --lib durability_commit -- --nocapture
+--test-threads=1` attempt exited 101 when asupersync rustc was killed by SIGKILL
+under shared-host memory pressure, before any test binary ran. No source
+compiler diagnostic or runtime result was produced. Upstream merge `019f5545`
+separately reports RCH compiler/Clippy and 677 repair test passes for its exact
+tree; that report is not a fresh execution of these new FAT/ZFS changes.
+
+Two subsequent single-job, metadata-only `cargo check --locked -p ffs-zfs
+--all-targets` attempts also stopped during asupersync compilation. The resource
+guard interrupted each with exit 130 when available shared-host RAM fell below
+1.5 GiB, including a retry begun with roughly 6 GiB available. Neither produced
+a project source diagnostic or successful typecheck. No build process was left
+running. The installed environment has no UBS or RCH executable; those checks
+are not claimed. GitHub main workflows were queued when last inspected.
 
 ## Current execution — 2026-11-23, FAT protection, ZFS quotas and metadata order
 

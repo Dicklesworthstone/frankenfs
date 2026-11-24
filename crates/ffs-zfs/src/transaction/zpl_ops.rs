@@ -25,20 +25,20 @@ use crate::reader::dmu::{DatasetCryptoContext, Objects};
 
 use super::dmu_cow::{
     DMU_OT_DIRECTORY_CONTENTS, DMU_OT_PLAIN_FILE_CONTENTS, DMU_OT_SA, DMU_OT_ZNODE,
-    DatasetWriteCrypto, DnodeCowOutput, DnodeCowSpec, OwnerQuotaLimits, PoolSpaceAllocator,
-    QuotaDelta, SpaceDelta, StagedBlockWrite, WriteBucket, allocate_object_id,
-    allocated_leaf_blocks_in_range, apply_objectset_quota_deltas, collect_non_hole_bps_from,
-    cow_update_dnode_with_crypto, decode_compression_property, encode_zap_blocks_for_dnode,
-    enqueue_into_dataset_deadlist, load_owner_quota_limits, objectset_user_accounting_flags,
-    put_dnode_in_table, read_staged_or_committed_dnode, remove_dnode_from_table,
-    write_dataset_block, write_dataset_objset_block, zap_optional_u64, zap_required_u64,
+    DatasetFeatureUsage, DatasetWriteCrypto, DnodeCowOutput, DnodeCowSpec, MosFeatureState,
+    OwnerQuotaLimits, PoolSpaceAllocator, QuotaDelta, SpaceDelta, StagedBlockWrite, WriteBucket,
+    allocate_object_id, allocated_leaf_blocks_in_range, apply_objectset_quota_deltas,
+    collect_non_hole_bps_from, cow_update_dnode_with_crypto, decode_compression_property,
+    encode_zap_blocks_for_dnode, enqueue_into_dataset_deadlist, load_owner_quota_limits,
+    objectset_user_accounting_flags, put_dnode_in_table, read_staged_or_committed_dnode,
+    remove_dnode_from_table, write_dataset_block, write_dataset_objset_block, zap_optional_u64,
+    zap_required_u64,
 };
-use super::dsl_ops::DMU_OTN_ZAP_METADATA;
+use super::dsl_ops::{DMU_OTN_ZAP_METADATA, stage_activate_dataset_features};
 use super::{checkpoint, corrupt, parse_err, unsupported};
 
 const DMU_SPILL_BLKID: u64 = u64::MAX - 1;
 
-const DEFAULT_RECORDSIZE: usize = 131_072;
 const MAX_WRITE_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PATH_DEPTH: usize = 256;
 // One 512-byte dnode, minus its 64-byte header, one 128-byte data pointer,
@@ -69,7 +69,6 @@ pub struct ZfsObjectIdentity {
 
 // Native persistent ZPL flags (OpenZFS zfs-2.3.0, sys/zfs_znode.h).
 // Dataset `readonly` is a separate, inherited DSL property.
-#[allow(dead_code)]
 const ZFS_XATTR: u64 = 0x1;
 const ZFS_INHERIT_ACE: u64 = 0x2;
 const ZFS_ACL_TRIVIAL: u64 = 0x4;
@@ -161,9 +160,11 @@ fn clear_setid_bits_for_nonroot(mode: u64) -> u64 {
     next
 }
 
-/// Checksum algorithm used for newly written DMU data blocks (`ZIO_CHECKSUM_*`).
+/// Checksum selection for newly written DMU data blocks (`ZIO_CHECKSUM_*`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub enum ZfsDataChecksum {
+    /// Resolve the native dnode override and effective dataset property for ZPL writes.
+    Inherit,
     #[default]
     Fletcher4,
     Sha256,
@@ -173,6 +174,7 @@ impl ZfsDataChecksum {
     #[must_use]
     pub const fn code(self) -> u8 {
         match self {
+            Self::Inherit => 0,
             Self::Fletcher4 => 7,
             Self::Sha256 => 8,
         }
@@ -225,6 +227,9 @@ pub struct ZfsPosixSetAttr {
     /// Clear set-user-ID and executable set-group-ID after applying `mode`.
     /// Non-executable set-group-ID and directory permissions are preserved.
     pub clear_suid_sgid: bool,
+    /// Remove the exact native `security.capability` xattr from both stores in
+    /// this TXG. Private value objects require validated exclusive ownership.
+    pub clear_file_capabilities: bool,
 }
 
 impl From<&ZfsSetAttr> for ZfsPosixSetAttr {
@@ -247,6 +252,7 @@ impl ZfsPosixSetAttr {
             && self.uid.is_none()
             && self.gid.is_none()
             && !self.clear_suid_sgid
+            && !self.clear_file_capabilities
         {
             return Err(FfsError::Format("empty native ZPL attribute update".into()));
         }
@@ -296,6 +302,7 @@ pub(super) enum ZplMutation {
         offset: u64,
         data: Vec<u8>,
         clear_suid_sgid: bool,
+        clear_file_capabilities: bool,
         timestamp: Timestamp,
         checksum: ZfsDataChecksum,
     },
@@ -305,6 +312,7 @@ pub(super) enum ZplMutation {
         length: u64,
         operation: ZfsFileRangeOperation,
         clear_suid_sgid: bool,
+        clear_file_capabilities: bool,
         timestamp: Timestamp,
         checksum: ZfsDataChecksum,
     },
@@ -408,8 +416,35 @@ struct DatasetContext {
     sa_reg_dirty: bool,
     sa_lay_dirty: bool,
     recordsize: usize,
+    checksum: u8,
+    new_features: DatasetFeatureUsage,
     unlinked_set: Option<u64>,
     write_crypto: Option<DatasetWriteCrypto>,
+}
+
+impl DatasetContext {
+    fn data_checksum(&self, requested: ZfsDataChecksum, node: Option<&Dnode>) -> Result<u8> {
+        let native = node.map_or(0, Dnode::checksum_type);
+        let inherited = match native {
+            0 => self.checksum,
+            1 => ZfsDataChecksum::Fletcher4.code(),
+            6 | 7 => native,
+            // Explicit SHA256 retains its integrity policy on every data rewrite.
+            // Native dnode overrides contain only legacy checksum selectors;
+            // SHA512/256 is selected through the dataset property instead.
+            8 => return Ok(native),
+            _ => {
+                return Err(unsupported(format!(
+                    "native ZPL dnode checksum selector {native} is outside the writer profile"
+                )));
+            }
+        };
+        Ok(if requested == ZfsDataChecksum::Inherit {
+            inherited
+        } else {
+            requested.code()
+        })
+    }
 }
 
 fn validate_component(name: &[u8], utf8_only: bool) -> Result<()> {
@@ -426,6 +461,39 @@ fn validate_component(name: &[u8], utf8_only: bool) -> Result<()> {
         return Err(FfsError::Format(
             "non-UTF8 directory entry name on utf8only ZPL dataset".into(),
         ));
+    }
+    Ok(())
+}
+
+fn admit_sha512_feature(
+    cx: &Cx,
+    mos: &mut Objects,
+    head_object: u64,
+    head: &Dnode,
+    existing_use: bool,
+) -> Result<()> {
+    let owner = if head.object_type() == DMU_OTN_ZAP_METADATA {
+        zap_optional_u64(&mos.zap_values(cx, head_object)?, b"org.illumos:sha512")?
+    } else {
+        None
+    };
+    if owner.is_some_and(|value| value != 0) || (existing_use && owner.is_none()) {
+        return Err(unsupported(
+            "existing native SHA512 blocks require valid dataset feature ownership",
+        ));
+    }
+    let directory = mos.zap_values(cx, 1)?;
+    let features_object = zap_required_u64(&directory, b"features_for_read")?;
+    let features = mos.zap_values(cx, features_object)?;
+    for feature in [
+        b"org.illumos:sha512".as_slice(),
+        b"com.delphix:extensible_dataset".as_slice(),
+    ] {
+        if zap_optional_u64(&features, feature)?.is_none_or(|count| owner.is_some() && count == 0) {
+            return Err(unsupported(
+                "native SHA512 writes require enabled features and valid existing ownership counts",
+            ));
+        }
     }
     Ok(())
 }
@@ -447,14 +515,18 @@ fn open_head_dataset_context(
             "native ZFS ZPL writes require an initialized case-sensitive filesystem head",
         ));
     }
-    // Resolve the same local/received/inherited policy that a native import
-    // observes. Checking only this directory's property ZAP would permit writes
-    // under an inherited readonly=on and miss received/$inherit precedence.
+    // Resolve native local/received/inherited policy from one committed MOS.
+    // A raw local property lookup misses both ancestors and $inherit precedence.
     let properties = mos.properties(
         cx,
         dataset_components,
         None,
-        &["readonly".into(), "compression".into()],
+        &[
+            "readonly".into(),
+            "compression".into(),
+            "recordsize".into(),
+            "checksum".into(),
+        ],
     )?;
     match properties
         .values
@@ -535,20 +607,50 @@ fn open_head_dataset_context(
         os.zil_header = ffs_ondisk::zfs_dmu::ZilHeader::empty();
     }
 
-    // Read optional `recordsize` property on `dsl_dir` if explicitly set.
-    let mut recordsize = DEFAULT_RECORDSIZE;
-    let (dir_dn, _) = mos.object_with_ceiling(cx, ds_row.directory_object)?;
-    let props_zap = dir_dn
-        .order()
-        .u64(dir_dn.bonus(), 80)
-        .map_err(|e| parse_err(&e))?;
-    if props_zap != 0
-        && let Ok(props) = mos.zap_values(cx, props_zap)
-        && let Ok(Some(rs)) = zap_optional_u64(&props, b"recordsize")
-        && (512..=1_048_576).contains(&rs)
-        && rs.is_power_of_two()
+    let recordsize = match properties
+        .values
+        .get(2)
+        .and_then(|property| property.value.as_ref())
     {
-        recordsize = (rs as usize).min(DEFAULT_RECORDSIZE);
+        Some(PropertyValue::Number(size))
+            if (512..=1_048_576).contains(size) && size.is_power_of_two() =>
+        {
+            *size as usize
+        }
+        _ => {
+            return Err(corrupt(
+                "missing or invalid effective ZFS recordsize property",
+            ));
+        }
+    };
+    let checksum = match properties
+        .values
+        .get(3)
+        .and_then(|property| property.value.as_ref())
+    {
+        Some(PropertyValue::Number(1 | 7)) => 7,
+        Some(PropertyValue::Number(value @ (6 | 8 | 11))) => *value as u8,
+        Some(PropertyValue::Number(value)) => {
+            return Err(unsupported(format!(
+                "effective ZFS checksum selector {value} is outside the native writer profile"
+            )));
+        }
+        _ => {
+            return Err(corrupt(
+                "missing or invalid effective ZFS checksum property",
+            ));
+        }
+    };
+    if checksum == 11 || old_os_bp.checksum_type() == 11 {
+        // Finalization also rewrites the object-set root with its old algorithm,
+        // even when a caller requests Fletcher4 or changes only metadata.
+        admit_sha512_feature(
+            cx,
+            mos,
+            ds_row.head_object,
+            &head_dn,
+            old_os_bp.checksum_type() == 11,
+        )?;
     }
 
     let (write_crypto, view_crypto) = if let (Some(info), Some(key)) = (crypto_info, loaded_key) {
@@ -562,7 +664,7 @@ fn open_head_dataset_context(
             ds_row.guid
         };
         let wc = DatasetWriteCrypto {
-            nonces: ZfsNonceGenerator::new(ivset_guid, info.record.guid, new_txg, &[]),
+            nonces: ZfsNonceGenerator::new(cx, ivset_guid, info.record.guid, new_txg, &[])?,
             key,
             compression,
             zstd_level,
@@ -637,6 +739,8 @@ fn open_head_dataset_context(
             sa_reg_dirty: false,
             sa_lay_dirty: false,
             recordsize,
+            checksum,
+            new_features: DatasetFeatureUsage::default(),
             unlinked_set,
             write_crypto,
         },
@@ -800,6 +904,129 @@ fn decode_zpl_node(
         project_id,
         spill_bytes,
     })
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn file_capability_xattr_update(
+    cx: &Cx,
+    view: &mut Objects,
+    context: &mut DatasetContext,
+    meta: &Dnode,
+    ceiling: u64,
+    dirty: &mut BTreeMap<u64, Vec<u8>>,
+    file_obj: u64,
+    loaded: &LoadedZplNode,
+    timestamp: Timestamp,
+    alloc: &mut PoolSpaceAllocator,
+    acct_flags: u8,
+    order: Endian,
+    new_txg: u64,
+    staged_writes: &mut Vec<StagedBlockWrite>,
+    born: &mut SpaceDelta,
+    retired: &mut Vec<BlockPointer>,
+    quota_deltas: &mut Vec<QuotaDelta>,
+) -> Result<Option<BTreeMap<String, Vec<u8>>>> {
+    checkpoint(cx)?;
+    if loaded.metadata.kind != Kind::Regular {
+        return Err(unsupported(
+            "ZPL file capability removal requires a regular file",
+        ));
+    }
+    let mut source = match loaded.dnode.bonus_type() {
+        DMU_OT_ZNODE => XattrSources::legacy(loaded.dnode.bonus(), loaded.dnode.order()),
+        DMU_OT_SA => context
+            .sa_registry
+            .as_ref()
+            .ok_or_else(|| corrupt("missing SA registry"))?
+            .decode(loaded.dnode.bonus(), loaded.spill_bytes.as_deref())
+            .and_then(|attrs| attrs.xattrs()),
+        _ => return Err(unsupported("unsupported ZPL bonus representation")),
+    }
+    .map_err(|error| parse_err(&error))?;
+    if source.directory != 0 {
+        // Validate the entire committed ownership graph before staging either
+        // store. Aliases and extra hard links cannot authorize freeing a value.
+        let mut private = private_xattr_ownership(
+            cx,
+            view,
+            meta,
+            ceiling,
+            dirty,
+            context.sa_registry.as_ref(),
+            context.root_dir,
+            file_obj,
+            source.directory,
+            order,
+        )?;
+        let mut entries = view.zap_values(cx, source.directory)?;
+        if entries.len().saturating_add(source.inline.len()) > XATTR_COUNT {
+            return Err(unsupported("xattr catalog exceeds 4096 native names"));
+        }
+        if let Some(position) = entries
+            .iter()
+            .position(|entry| entry.name == b"security.capability")
+        {
+            let (directory, dir_loaded) = private
+                .pop()
+                .ok_or_else(|| corrupt("missing validated private xattr directory"))?;
+            let reference = entries
+                .remove(position)
+                .scalar()
+                .map_err(|error| parse_err(&error))?;
+            let (value_object, _) =
+                directory_reference(reference).map_err(|error| parse_err(&error))?;
+            let (_, value) = private
+                .into_iter()
+                .find(|(object, _)| *object == value_object)
+                .ok_or_else(|| {
+                    corrupt("capability value is outside its validated private graph")
+                })?;
+            let mut metadata = dir_loaded.metadata.clone();
+            metadata.size = entries.len() as u64 + 2;
+            metadata.times[1] = timestamp;
+            metadata.times[2] = timestamp;
+            // Keep the directory attached, including when it becomes empty.
+            // Final unlink reclaims it through the same native ownership path.
+            let node = flush_dir_node(
+                cx,
+                view,
+                alloc,
+                directory,
+                &dir_loaded,
+                &metadata,
+                &entries,
+                context.sa_registry.as_ref(),
+                acct_flags,
+                order,
+                new_txg,
+                context.write_crypto.as_mut(),
+                staged_writes,
+                born,
+                retired,
+                quota_deltas,
+            )?;
+            put_dnode_in_table(cx, view, meta, ceiling, dirty, directory, &node)?;
+            // Charge this object's actual owners and retain historical blocks
+            // through the dataset deadlist, exactly like final-link retirement.
+            retire_zpl_object(
+                cx,
+                view,
+                meta,
+                ceiling,
+                dirty,
+                value_object,
+                &value,
+                order,
+                retired,
+                quota_deltas,
+            )?;
+        }
+    }
+    Ok(source
+        .inline
+        .remove("security.capability")
+        .is_some()
+        .then_some(source.inline))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1024,6 +1251,7 @@ fn update_metadata_only_dnode(
     order: Endian,
 ) -> Result<DnodeCowOutput> {
     let mut born = SpaceDelta::default();
+    let mut feature_usage = DatasetFeatureUsage::default();
     let mut retired_bps = Vec::new();
     let mut retired_bytes = 0;
     if loaded.dnode.spill() != spill.as_ref() {
@@ -1033,6 +1261,7 @@ fn update_metadata_only_dnode(
         }
         if let Some(new_spill) = &spill {
             born = SpaceDelta::from_bp(new_spill)?;
+            feature_usage.observe(new_spill);
         }
     }
     let used_bytes = loaded
@@ -1063,6 +1292,7 @@ fn update_metadata_only_dnode(
         dnode,
         born,
         retired_bps,
+        feature_usage,
     })
 }
 
@@ -1308,7 +1538,7 @@ fn read_unlinked_set(
     Ok((object, node, ceiling, entries))
 }
 
-fn admit_unlinked_file(loaded: &LoadedZplNode, registry: Option<&SaRegistry>) -> Result<()> {
+fn admit_unlinked_file(loaded: &LoadedZplNode, registry: Option<&SaRegistry>) -> Result<u64> {
     if loaded.metadata.kind != Kind::Regular {
         return Err(unsupported(
             "native orphan reclamation currently requires a regular file",
@@ -1317,7 +1547,7 @@ fn admit_unlinked_file(loaded: &LoadedZplNode, registry: Option<&SaRegistry>) ->
     admit_zpl_reclamation(loaded, registry)
 }
 
-fn admit_zpl_reclamation(loaded: &LoadedZplNode, registry: Option<&SaRegistry>) -> Result<()> {
+fn admit_zpl_reclamation(loaded: &LoadedZplNode, registry: Option<&SaRegistry>) -> Result<u64> {
     let ownership = match loaded.dnode.bonus_type() {
         DMU_OT_ZNODE => ffs_ondisk::zfs_zpl::ReclamationOwnership::legacy(
             loaded.dnode.bonus(),
@@ -1331,11 +1561,6 @@ fn admit_zpl_reclamation(loaded: &LoadedZplNode, registry: Option<&SaRegistry>) 
             .map_err(|e| parse_err(&e))?,
         _ => return Err(unsupported("unsupported orphan bonus representation")),
     };
-    if ownership.xattr_directory != 0 {
-        return Err(unsupported(
-            "ZPL reclamation with a native xattr directory is unavailable",
-        ));
-    }
     if ownership.external_acl_object != 0 {
         return Err(unsupported(
             "ZPL reclamation with an external ACL object is unavailable",
@@ -1344,7 +1569,133 @@ fn admit_zpl_reclamation(loaded: &LoadedZplNode, registry: Option<&SaRegistry>) 
     // load_zpl_node validates the native project attribute and its presence
     // flag. Retention and final retirement charge their deltas to that loaded
     // owner, including nonzero project IDs.
-    Ok(())
+    Ok(ownership.xattr_directory)
+}
+
+/// Preflight the complete admitted private ownership graph before retaining or
+/// retiring its owner. Private values must be regular files, with no public hard
+/// links or recursive private directories. Parent, flag and link checks are
+/// ownership evidence; following a raw object number cannot authorize its free.
+#[allow(clippy::too_many_arguments)]
+fn private_xattr_reclamation(
+    cx: &Cx,
+    view: &mut Objects,
+    meta: &Dnode,
+    ceiling: u64,
+    dirty: &BTreeMap<u64, Vec<u8>>,
+    registry: Option<&SaRegistry>,
+    root: u64,
+    owner: u64,
+    loaded: &LoadedZplNode,
+    order: Endian,
+) -> Result<Vec<(u64, LoadedZplNode)>> {
+    let directory = admit_zpl_reclamation(loaded, registry)?;
+    private_xattr_ownership(
+        cx, view, meta, ceiling, dirty, registry, root, owner, directory, order,
+    )
+}
+
+/// Validate private values independently of retiring their owner. Killpriv
+/// preserves the owner's ACL and does not need to reclaim its external objects.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn private_xattr_ownership(
+    cx: &Cx,
+    view: &mut Objects,
+    meta: &Dnode,
+    ceiling: u64,
+    dirty: &BTreeMap<u64, Vec<u8>>,
+    registry: Option<&SaRegistry>,
+    root: u64,
+    owner: u64,
+    directory: u64,
+    order: Endian,
+) -> Result<Vec<(u64, LoadedZplNode)>> {
+    if directory == 0 {
+        return Ok(Vec::new());
+    }
+    if directory == owner || directory == root {
+        return Err(corrupt(
+            "private xattr directory aliases its owner or dataset root",
+        ));
+    }
+    let (node, node_ceiling) =
+        read_staged_or_committed_dnode(cx, view, meta, ceiling, dirty, directory, order)?;
+    let private_dir = decode_zpl_node(cx, view, node, node_ceiling, registry)?;
+    if private_dir.dnode.object_type() != DMU_OT_DIRECTORY_CONTENTS
+        || private_dir.metadata.kind != Kind::Directory
+        || private_dir.metadata.flags & ZFS_XATTR == 0
+        || private_dir.metadata.parent != owner
+        || private_dir.metadata.links != 2
+    {
+        return Err(corrupt(
+            "private xattr directory has ambiguous native ownership",
+        ));
+    }
+    if admit_zpl_reclamation(&private_dir, registry)? != 0 {
+        return Err(corrupt(
+            "private xattr directory owns another xattr directory",
+        ));
+    }
+    let entries = view.zap_values(cx, directory)?;
+    if entries.len() > XATTR_COUNT {
+        return Err(unsupported("xattr reclamation exceeds 4096 private values"));
+    }
+    if private_dir.metadata.size != entries.len() as u64 + 2 {
+        return Err(corrupt(
+            "private xattr directory size disagrees with its entries",
+        ));
+    }
+    let mut objects = BTreeSet::from([root, owner, directory]);
+    let mut names = BTreeSet::new();
+    let mut private = Vec::with_capacity(entries.len() + 1);
+    for entry in entries {
+        checkpoint(cx)?;
+        if entry.integer_bytes != 8
+            || entry.name.is_empty()
+            || entry.name.len() > XATTR_NAME_BYTES
+            || entry.name.contains(&0)
+            || entry.name.contains(&b'/')
+            || entry.name == b"."
+            || entry.name == b".."
+            || !names.insert(entry.name.clone())
+        {
+            return Err(corrupt("invalid or duplicate private xattr name"));
+        }
+        let (object, kind) =
+            directory_reference(entry.scalar().map_err(|error| parse_err(&error))?)
+                .map_err(|error| parse_err(&error))?;
+        if !objects.insert(object) || kind.is_some_and(|kind| kind != Kind::Regular) {
+            return Err(corrupt(
+                "private xattr value aliases another owner or has the wrong type",
+            ));
+        }
+        let (node, node_ceiling) =
+            read_staged_or_committed_dnode(cx, view, meta, ceiling, dirty, object, order)?;
+        let value = decode_zpl_node(cx, view, node, node_ceiling, registry)?;
+        if value.dnode.object_type() != DMU_OT_PLAIN_FILE_CONTENTS
+            || value.metadata.kind != Kind::Regular
+            || value.metadata.flags & ZFS_XATTR == 0
+            || value.metadata.parent != directory
+            || value.metadata.links != 1
+        {
+            return Err(corrupt(
+                "private xattr value has ambiguous native ownership",
+            ));
+        }
+        if value.metadata.size > XATTR_BYTES as u64 {
+            return Err(unsupported(
+                "private xattr value exceeds the 64 KiB reclamation profile",
+            ));
+        }
+        if admit_zpl_reclamation(&value, registry)? != 0 {
+            return Err(corrupt("private xattr value owns another xattr directory"));
+        }
+        private.push((object, value));
+    }
+    // Values retire before their private directory. Physical frees still pass
+    // through the dataset deadlist, so immutable snapshots retain their blocks.
+    private.push((directory, private_dir));
+    Ok(private)
 }
 
 fn retain_unlinked_target(
@@ -1400,6 +1751,18 @@ pub(super) fn pending_unlinks(
             return Err(corrupt("native unlinked set references a live ZPL object"));
         }
         admit_unlinked_file(&loaded, context.sa_registry.as_ref())?;
+        private_xattr_reclamation(
+            cx,
+            &mut view,
+            &context.os.meta,
+            context.old_os_bp.birth(),
+            &BTreeMap::new(),
+            context.sa_registry.as_ref(),
+            context.root_dir,
+            object,
+            &loaded,
+            context.os.meta.order(),
+        )?;
         pending.push(ZfsUnlinkedObject {
             object,
             generation: loaded.metadata.generation,
@@ -1488,6 +1851,7 @@ fn stage_unlinked_set_change(
         context.write_crypto.as_mut(),
         staged_writes,
     )?;
+    context.new_features.extend(out.feature_usage);
     born.add_assign(out.born)?;
     retired.extend(out.retired_bps);
     put_dnode_in_table(
@@ -1502,7 +1866,7 @@ fn stage_unlinked_set_change(
 }
 
 /// Stage a single ZPL mutation on `dataset_components` in memory, updating `mos_dirty_dnodes`,
-/// `write_features`, `alloc`, and `staged_writes`, and returning the operation's `u64` result
+/// `features`, `alloc`, and `staged_writes`, and returning the operation's `u64` result
 /// (`new_object_id`, `new_size`, `moved_object`, or `removed_object`).
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) fn stage_zpl_mutation(
@@ -1511,8 +1875,7 @@ pub(super) fn stage_zpl_mutation(
     dataset_components: &[Vec<u8>],
     mutation: &ZplMutation,
     mos_dirty_dnodes: &mut BTreeMap<u64, Vec<u8>>,
-    write_features: &mut BTreeMap<String, u64>,
-    write_features_dirty: &mut bool,
+    features: &mut MosFeatureState,
     empty_bpobj_id: Option<u64>,
     alloc: &mut PoolSpaceAllocator,
     order: Endian,
@@ -1564,7 +1927,7 @@ pub(super) fn stage_zpl_mutation(
             if parent_loaded.metadata.kind != Kind::Directory {
                 return Err(FfsError::NotDirectory);
             }
-            admit_directory_add(&parent_loaded, &ds_ctx, write_features)?;
+            admit_directory_add(&parent_loaded, &ds_ctx, &features.write_features)?;
             let mut entries = read_dir_entries(cx, &mut os_view, *parent_dir, &staged_dirs)?;
             if entries.iter().any(|e| e.name == *name) {
                 return Err(FfsError::Exists);
@@ -1624,7 +1987,7 @@ pub(super) fn stage_zpl_mutation(
                     existing: None,
                     object_type: DMU_OT_PLAIN_FILE_CONTENTS,
                     bonus_type,
-                    checksum_type: checksum.code(),
+                    checksum_type: ds_ctx.data_checksum(*checksum, None)?,
                     compress_type: 2,
                     user_flags: acct_flags,
                     indirect_shift: 17,
@@ -1644,6 +2007,7 @@ pub(super) fn stage_zpl_mutation(
                 ds_ctx.write_crypto.as_mut(),
                 staged_writes,
             )?;
+            ds_ctx.new_features.extend(file_out.feature_usage);
             zpl_born.add_assign(file_out.born)?;
             zpl_retired.extend(file_out.retired_bps);
             let mut file_dn = file_out.dnode;
@@ -1737,7 +2101,7 @@ pub(super) fn stage_zpl_mutation(
             if parent_loaded.metadata.kind != Kind::Directory {
                 return Err(FfsError::NotDirectory);
             }
-            admit_directory_add(&parent_loaded, &ds_ctx, write_features)?;
+            admit_directory_add(&parent_loaded, &ds_ctx, &features.write_features)?;
             let mut entries = read_dir_entries(cx, &mut os_view, *parent_dir, &staged_dirs)?;
             if entries.iter().any(|e| e.name == *name) {
                 return Err(FfsError::Exists);
@@ -1799,6 +2163,7 @@ pub(super) fn stage_zpl_mutation(
                 ds_ctx.write_crypto.as_mut(),
                 staged_writes,
             )?;
+            ds_ctx.new_features.extend(dir_out.feature_usage);
             zpl_born.add_assign(dir_out.born)?;
             quota_deltas.push(QuotaDelta {
                 uid: *uid,
@@ -1916,7 +2281,7 @@ pub(super) fn stage_zpl_mutation(
                 return Err(FfsError::NotDirectory);
             }
             reject_flags(&source.metadata, ZFS_IMMUTABLE | ZFS_APPENDONLY)?;
-            admit_directory_add(&parent, &ds_ctx, write_features)?;
+            admit_directory_add(&parent, &ds_ctx, &features.write_features)?;
             admit_project_entry(&parent, &source)?;
             let mut entries = read_dir_entries(cx, &mut os_view, *parent_dir, &staged_dirs)?;
             if entries.iter().any(|entry| entry.name == *name) {
@@ -1976,6 +2341,7 @@ pub(super) fn stage_zpl_mutation(
                 ds_ctx.write_crypto.as_mut(),
                 staged_writes,
             )?;
+            ds_ctx.new_features.extend(source_out.feature_usage);
             zpl_born.add_assign(source_out.born)?;
             zpl_retired.extend(source_out.retired_bps);
             let bytes_delta =
@@ -2042,6 +2408,7 @@ pub(super) fn stage_zpl_mutation(
             offset,
             data,
             clear_suid_sgid,
+            clear_file_capabilities,
             timestamp,
             checksum,
         } => {
@@ -2075,14 +2442,21 @@ pub(super) fn stage_zpl_mutation(
                 ZFS_IMMUTABLE
             };
             reject_flags(&loaded.metadata, prohibited)?;
-            let new_size = loaded.metadata.size.max(end_offset);
+            let empty_privilege_write = *clear_file_capabilities && data.is_empty();
+            let new_size = if empty_privilege_write {
+                loaded.metadata.size
+            } else {
+                loaded.metadata.size.max(end_offset)
+            };
             let mut new_meta = loaded.metadata.clone();
             if *clear_suid_sgid && !data.is_empty() {
                 new_meta.mode = clear_setid_bits_for_nonroot(new_meta.mode);
             }
             new_meta.size = new_size;
-            new_meta.times[1] = *timestamp;
-            new_meta.times[2] = *timestamp;
+            if !empty_privilege_write {
+                new_meta.times[1] = *timestamp;
+                new_meta.times[2] = *timestamp;
+            }
 
             if data.is_empty() {
                 let dirty_leaves = zero_allocated_range(
@@ -2111,7 +2485,7 @@ pub(super) fn stage_zpl_mutation(
                         existing: Some((&loaded.dnode, loaded.ceiling)),
                         object_type: DMU_OT_PLAIN_FILE_CONTENTS,
                         bonus_type: loaded.dnode.bonus_type(),
-                        checksum_type: checksum.code(),
+                        checksum_type: ds_ctx.data_checksum(*checksum, Some(&loaded.dnode))?,
                         compress_type: 2,
                         user_flags: acct_flags,
                         indirect_shift: loaded.dnode.indirect_shift(),
@@ -2131,6 +2505,7 @@ pub(super) fn stage_zpl_mutation(
                     ds_ctx.write_crypto.as_mut(),
                     staged_writes,
                 )?;
+                ds_ctx.new_features.extend(out.feature_usage);
                 zpl_born.add_assign(out.born)?;
                 zpl_retired.extend(out.retired_bps);
                 let bytes_delta =
@@ -2165,8 +2540,7 @@ pub(super) fn stage_zpl_mutation(
                     &zpl_retired,
                     &quota_deltas,
                     mos_dirty_dnodes,
-                    write_features,
-                    write_features_dirty,
+                    features,
                     empty_bpobj_id,
                     alloc,
                     order,
@@ -2253,20 +2627,40 @@ pub(super) fn stage_zpl_mutation(
                 dirty_leaves.insert(bid, Some(blk));
             }
 
-            let cksum_code = if loaded.dnode.checksum_type() == ZfsDataChecksum::Sha256.code() {
-                ZfsDataChecksum::Sha256.code()
+            let inline_xattrs = if *clear_file_capabilities {
+                file_capability_xattr_update(
+                    cx,
+                    &mut os_view,
+                    &mut ds_ctx,
+                    &zpl_meta_base,
+                    zpl_ceiling,
+                    &mut zpl_dirty_dnodes,
+                    *file_obj,
+                    &loaded,
+                    *timestamp,
+                    alloc,
+                    acct_flags,
+                    order,
+                    new_txg,
+                    staged_writes,
+                    &mut zpl_born,
+                    &mut zpl_retired,
+                    &mut quota_deltas,
+                )?
             } else {
-                checksum.code()
+                None
             };
-            let (bonus, spill) = encode_updated_zpl_bonus(
+            let cksum_code = ds_ctx.data_checksum(*checksum, Some(&loaded.dnode))?;
+            let (bonus, spill) = encode_updated_zpl_bonus_with_options(
                 &loaded,
                 *file_obj,
                 &new_meta,
-                ds_ctx.sa_registry.as_ref(),
+                &mut ds_ctx,
+                false,
+                inline_xattrs.as_ref(),
                 alloc,
                 order,
                 new_txg,
-                ds_ctx.write_crypto.as_mut(),
                 staged_writes,
             )?;
             let old_used = loaded.dnode.used_bytes();
@@ -2298,6 +2692,7 @@ pub(super) fn stage_zpl_mutation(
                 ds_ctx.write_crypto.as_mut(),
                 staged_writes,
             )?;
+            ds_ctx.new_features.extend(out.feature_usage);
             zpl_born.add_assign(out.born)?;
             zpl_retired.extend(out.retired_bps);
             let bytes_delta = signed_bytes_delta(out.dnode.used_bytes(), old_used)?;
@@ -2328,6 +2723,7 @@ pub(super) fn stage_zpl_mutation(
             length,
             operation,
             clear_suid_sgid,
+            clear_file_capabilities,
             timestamp,
             checksum,
         } => {
@@ -2361,6 +2757,29 @@ pub(super) fn stage_zpl_mutation(
             };
             let new_size = old_size.max(end);
             if *offset < end {
+                let inline_xattrs = if *clear_file_capabilities {
+                    file_capability_xattr_update(
+                        cx,
+                        &mut os_view,
+                        &mut ds_ctx,
+                        &zpl_meta_base,
+                        zpl_ceiling,
+                        &mut zpl_dirty_dnodes,
+                        *file_obj,
+                        &loaded,
+                        *timestamp,
+                        alloc,
+                        acct_flags,
+                        order,
+                        new_txg,
+                        staged_writes,
+                        &mut zpl_born,
+                        &mut zpl_retired,
+                        &mut quota_deltas,
+                    )?
+                } else {
+                    None
+                };
                 // Extending EOF also exposes the gap before `offset`; zero any
                 // allocated tail there rather than trusting bytes beyond old EOF.
                 let start = if new_size > old_size {
@@ -2377,15 +2796,16 @@ pub(super) fn stage_zpl_mutation(
                 new_meta.size = new_size;
                 new_meta.times[1] = *timestamp;
                 new_meta.times[2] = *timestamp;
-                let (bonus, spill) = encode_updated_zpl_bonus(
+                let (bonus, spill) = encode_updated_zpl_bonus_with_options(
                     &loaded,
                     *file_obj,
                     &new_meta,
-                    ds_ctx.sa_registry.as_ref(),
+                    &mut ds_ctx,
+                    false,
+                    inline_xattrs.as_ref(),
                     alloc,
                     order,
                     new_txg,
-                    ds_ctx.write_crypto.as_mut(),
                     staged_writes,
                 )?;
                 let out = cow_update_dnode_with_crypto(
@@ -2396,13 +2816,7 @@ pub(super) fn stage_zpl_mutation(
                         existing: Some((&loaded.dnode, loaded.ceiling)),
                         object_type: DMU_OT_PLAIN_FILE_CONTENTS,
                         bonus_type: loaded.dnode.bonus_type(),
-                        checksum_type: if loaded.dnode.checksum_type()
-                            == ZfsDataChecksum::Sha256.code()
-                        {
-                            ZfsDataChecksum::Sha256.code()
-                        } else {
-                            checksum.code()
-                        },
+                        checksum_type: ds_ctx.data_checksum(*checksum, Some(&loaded.dnode))?,
                         compress_type: loaded.dnode.compress_type(),
                         user_flags: acct_flags,
                         indirect_shift: loaded.dnode.indirect_shift(),
@@ -2422,6 +2836,7 @@ pub(super) fn stage_zpl_mutation(
                     ds_ctx.write_crypto.as_mut(),
                     staged_writes,
                 )?;
+                ds_ctx.new_features.extend(out.feature_usage);
                 zpl_born.add_assign(out.born)?;
                 zpl_retired.extend(out.retired_bps);
                 let bytes_delta =
@@ -2482,6 +2897,7 @@ pub(super) fn stage_zpl_mutation(
                 || attrs.uid.is_some()
                 || attrs.gid.is_some()
                 || attrs.clear_suid_sgid
+                || attrs.clear_file_capabilities
             {
                 reject_flags(&loaded.metadata, ZFS_IMMUTABLE)?;
             }
@@ -2563,13 +2979,36 @@ pub(super) fn stage_zpl_mutation(
                 new_meta.times[1] = *timestamp;
             }
             new_meta.times[2] = *timestamp;
+            let inline_xattrs = if attrs.clear_file_capabilities {
+                file_capability_xattr_update(
+                    cx,
+                    &mut os_view,
+                    &mut ds_ctx,
+                    &zpl_meta_base,
+                    zpl_ceiling,
+                    &mut zpl_dirty_dnodes,
+                    *file_obj,
+                    &loaded,
+                    *timestamp,
+                    alloc,
+                    acct_flags,
+                    order,
+                    new_txg,
+                    staged_writes,
+                    &mut zpl_born,
+                    &mut zpl_retired,
+                    &mut quota_deltas,
+                )?
+            } else {
+                None
+            };
             let (bonus, spill) = encode_updated_zpl_bonus_with_options(
                 &loaded,
                 *file_obj,
                 &new_meta,
                 &mut ds_ctx,
                 rebuild_trivial_acl,
-                None,
+                inline_xattrs.as_ref(),
                 alloc,
                 order,
                 new_txg,
@@ -2585,7 +3024,7 @@ pub(super) fn stage_zpl_mutation(
                         existing: Some((&loaded.dnode, loaded.ceiling)),
                         object_type: DMU_OT_PLAIN_FILE_CONTENTS,
                         bonus_type: loaded.dnode.bonus_type(),
-                        checksum_type: checksum.code(),
+                        checksum_type: ds_ctx.data_checksum(*checksum, Some(&loaded.dnode))?,
                         compress_type: loaded.dnode.compress_type(),
                         user_flags: acct_flags,
                         indirect_shift: loaded.dnode.indirect_shift(),
@@ -2608,6 +3047,7 @@ pub(super) fn stage_zpl_mutation(
             } else {
                 update_metadata_only_dnode(&loaded, bonus, spill, order)?
             };
+            ds_ctx.new_features.extend(out.feature_usage);
             zpl_born.add_assign(out.born)?;
             zpl_retired.extend(out.retired_bps);
             if owner_changed {
@@ -2776,7 +3216,7 @@ pub(super) fn stage_zpl_mutation(
             )?;
             let is_dir = src_obj_loaded.metadata.kind == Kind::Directory;
             admit_directory_remove(&src_parent.metadata, &src_obj_loaded.metadata)?;
-            admit_directory_add(&dst_parent, &ds_ctx, write_features)?;
+            admit_directory_add(&dst_parent, &ds_ctx, &features.write_features)?;
             admit_project_entry(&dst_parent, &src_obj_loaded)?;
 
             // Cycle check if moving a directory across parents.
@@ -2884,6 +3324,7 @@ pub(super) fn stage_zpl_mutation(
                     &target_loaded,
                     target_is_dir,
                     retain,
+                    ds_ctx.root_dir,
                     ds_ctx.sa_registry.as_ref(),
                     acct_flags,
                     alloc,
@@ -3084,6 +3525,7 @@ pub(super) fn stage_zpl_mutation(
                 ds_ctx.write_crypto.as_mut(),
                 staged_writes,
             )?;
+            ds_ctx.new_features.extend(m_out.feature_usage);
             zpl_born.add_assign(m_out.born)?;
             zpl_retired.extend(m_out.retired_bps);
             let moved_delta =
@@ -3194,7 +3636,7 @@ pub(super) fn stage_zpl_mutation(
                 // Both names are removed and replaced. In particular, an
                 // append-only parent cannot accept an exchange as an insertion.
                 admit_directory_remove(&parents[index].metadata, &loaded.metadata)?;
-                admit_directory_add(&parents[1 - index], &ds_ctx, write_features)?;
+                admit_directory_add(&parents[1 - index], &ds_ctx, &features.write_features)?;
                 // Preserve project-tree membership in both directions. This
                 // bounded profile also refuses the reverse mismatch that the
                 // pinned native implementation's one-sided check overlooks.
@@ -3351,6 +3793,7 @@ pub(super) fn stage_zpl_mutation(
                     ds_ctx.write_crypto.as_mut(),
                     staged_writes,
                 )?;
+                ds_ctx.new_features.extend(out.feature_usage);
                 zpl_born.add_assign(out.born)?;
                 zpl_retired.extend(out.retired_bps);
                 let bytes_delta =
@@ -3504,6 +3947,7 @@ pub(super) fn stage_zpl_mutation(
                 &target_loaded,
                 target_is_dir,
                 retain,
+                ds_ctx.root_dir,
                 ds_ctx.sa_registry.as_ref(),
                 acct_flags,
                 alloc,
@@ -3555,6 +3999,7 @@ pub(super) fn stage_zpl_mutation(
                 &loaded,
                 false,
                 false,
+                ds_ctx.root_dir,
                 ds_ctx.sa_registry.as_ref(),
                 acct_flags,
                 alloc,
@@ -3597,8 +4042,7 @@ pub(super) fn stage_zpl_mutation(
         &zpl_retired,
         &quota_deltas,
         mos_dirty_dnodes,
-        write_features,
-        write_features_dirty,
+        features,
         empty_bpobj_id,
         alloc,
         order,
@@ -3619,6 +4063,7 @@ fn retire_or_decrement_zpl_target(
     target_loaded: &LoadedZplNode,
     target_is_dir: bool,
     retain_unlinked: bool,
+    root: u64,
     sa_registry: Option<&SaRegistry>,
     acct_flags: u8,
     alloc: &mut PoolSpaceAllocator,
@@ -3635,6 +4080,22 @@ fn retire_or_decrement_zpl_target(
         0
     } else {
         target_loaded.metadata.links.saturating_sub(1)
+    };
+    let private = if rem_links == 0 {
+        private_xattr_reclamation(
+            cx,
+            os_view,
+            zpl_meta_base,
+            zpl_ceiling,
+            zpl_dirty_dnodes,
+            sa_registry,
+            root,
+            target_obj,
+            target_loaded,
+            order,
+        )?
+    } else {
+        Vec::new()
     };
     if rem_links > 0 || retain_unlinked {
         let mut next_meta = target_loaded.metadata.clone();
@@ -3703,12 +4164,50 @@ fn retire_or_decrement_zpl_target(
         );
     }
 
-    // The data tree and SA spill do not own private xattr directories or legacy
-    // external ACL objects. Require their cleanup support before final unlink,
-    // replacement, or reap. Nonfinal decrements above preserve these owners.
-    admit_zpl_reclamation(target_loaded, sa_registry)?;
+    for (object, loaded) in private {
+        retire_zpl_object(
+            cx,
+            os_view,
+            zpl_meta_base,
+            zpl_ceiling,
+            zpl_dirty_dnodes,
+            object,
+            &loaded,
+            order,
+            zpl_retired,
+            quota_deltas,
+        )?;
+    }
+    retire_zpl_object(
+        cx,
+        os_view,
+        zpl_meta_base,
+        zpl_ceiling,
+        zpl_dirty_dnodes,
+        target_obj,
+        target_loaded,
+        order,
+        zpl_retired,
+        quota_deltas,
+    )
+}
 
-    // Links == 0: retire all leaf, indirect, and spill blocks, update quota, and free dnode slot!
+/// Retire a validated native object through the normal dataset COW, deadlist
+/// and owner-accounting path. Each private object is charged to its own decoded
+/// owners rather than assuming that its uid, gid or project was inherited.
+#[allow(clippy::too_many_arguments)]
+fn retire_zpl_object(
+    cx: &Cx,
+    os_view: &mut Objects,
+    zpl_meta_base: &Dnode,
+    zpl_ceiling: u64,
+    zpl_dirty_dnodes: &mut BTreeMap<u64, Vec<u8>>,
+    target_obj: u64,
+    target_loaded: &LoadedZplNode,
+    order: Endian,
+    zpl_retired: &mut Vec<BlockPointer>,
+    quota_deltas: &mut Vec<QuotaDelta>,
+) -> Result<()> {
     collect_non_hole_bps_from(
         cx,
         os_view,
@@ -3883,6 +4382,7 @@ fn stage_sa_xattr_mutation(
     )?;
     let old_used = loaded.dnode.used_bytes();
     let out = update_metadata_only_dnode(&loaded, bonus, spill, order)?;
+    ds_ctx.new_features.extend(out.feature_usage);
     zpl_born.add_assign(out.born)?;
     zpl_retired.extend(out.retired_bps);
     let bytes_delta = signed_bytes_delta(out.dnode.used_bytes(), old_used)?;
@@ -4069,8 +4569,7 @@ fn finalize_dataset_to_mos(
     zpl_retired_initial: &[BlockPointer],
     quota_deltas: &[QuotaDelta],
     mos_dirty_dnodes: &mut BTreeMap<u64, Vec<u8>>,
-    write_features: &mut BTreeMap<String, u64>,
-    write_features_dirty: &mut bool,
+    features: &mut MosFeatureState,
     empty_bpobj_id: Option<u64>,
     alloc: &mut PoolSpaceAllocator,
     order: Endian,
@@ -4187,6 +4686,7 @@ fn finalize_dataset_to_mos(
         ds_ctx.write_crypto.as_mut(),
         staged_writes,
     )?;
+    ds_ctx.new_features.extend(meta_out.feature_usage);
     zpl_born.add_assign(meta_out.born)?;
     zpl_retired.extend(meta_out.retired_bps);
 
@@ -4205,6 +4705,7 @@ fn finalize_dataset_to_mos(
         ds_ctx.write_crypto.as_ref(),
         staged_writes,
     )?;
+    ds_ctx.new_features.observe(&new_os_bp);
     zpl_born.add_assign(SpaceDelta::from_bp(&new_os_bp)?)?;
     zpl_retired.push(ds_ctx.old_os_bp.clone());
 
@@ -4261,8 +4762,8 @@ fn finalize_dataset_to_mos(
             cx,
             mos,
             mos_dirty_dnodes,
-            write_features,
-            write_features_dirty,
+            &mut features.write_features,
+            &mut features.write_dirty,
             empty_bpobj_id,
             ds_ctx.deadlist_obj,
             &snap_bps,
@@ -4339,6 +4840,21 @@ fn finalize_dataset_to_mos(
         mos_dirty_dnodes,
         ds_ctx.head_object,
         &updated_head,
+    )?;
+
+    // Publish feature ownership with the first blocks that require it. The
+    // marker remains owned until this dataset (and each snapshot/clone) dies.
+    stage_activate_dataset_features(
+        cx,
+        mos,
+        ds_ctx.head_object,
+        &ds_ctx.new_features.required_features(),
+        mos_dirty_dnodes,
+        features,
+        alloc,
+        order,
+        new_txg,
+        staged_writes,
     )?;
 
     // Walk `dsl_dir` chain from `directory_object` up to root (`dd_parent_obj == 0`).

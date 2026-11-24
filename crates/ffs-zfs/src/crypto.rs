@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
+use asupersync::Cx;
 use ffs_error::{FfsError, Result};
 use ffs_ondisk::zfs::crypto::{
     DSL_CRYPTO_GUID, DSL_CRYPTO_HMAC_KEY_1, DSL_CRYPTO_IV, DSL_CRYPTO_KEY_VERSION_V0,
@@ -20,12 +21,42 @@ use ffs_ondisk::zfs::crypto::{
 };
 use ffs_ondisk::zfs_zap::Entry as ZapEntry;
 use serde::Serialize;
+use zeroize::{Zeroize, Zeroizing};
 
 fn corrupt(detail: impl Into<String>) -> FfsError {
     FfsError::Corruption {
         block: 0,
         detail: detail.into(),
     }
+}
+
+fn fill_crypto_entropy_with(
+    cx: &Cx,
+    bytes: &mut [u8],
+    fill: impl FnOnce(&mut [u8]) -> std::result::Result<(), getrandom::Error>,
+) -> Result<()> {
+    cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+    if !cx.capabilities().entropy {
+        return Err(FfsError::PermissionDenied);
+    }
+    if let Err(error) = fill(bytes) {
+        bytes.zeroize();
+        return Err(std::io::Error::from(error).into());
+    }
+    if cx.checkpoint().is_err() {
+        bytes.zeroize();
+        return Err(FfsError::Cancelled);
+    }
+    Ok(())
+}
+
+fn fresh_crypto_seed(cx: &Cx) -> Result<Zeroizing<[u8; 32]>> {
+    let mut entropy = Zeroizing::new([0_u8; 32]);
+    // Cx entropy providers may intentionally replay deterministic streams.
+    // Cryptographic material instead requires the OS CSPRNG, under the caller's
+    // explicit entropy authority, with every source failure propagated.
+    fill_crypto_entropy_with(cx, &mut *entropy, getrandom::fill)?;
+    Ok(entropy)
 }
 
 /// Runtime key availability for a dataset (`zfs get keystatus`).
@@ -402,31 +433,48 @@ pub fn encode_dsl_crypto_key_zap(record: &DslCryptoKeyRecord) -> Vec<ZapEntry> {
     entries
 }
 
-/// Strictly unique `(salt, iv)` generator bound to `(ivset_guid, txg, object_id, level, blkid, seq)`.
+/// Per-attempt `(salt, iv)` generator with a fresh OS-random cryptographic domain.
 ///
-/// Guarantees zero `(salt, iv)` reuse across every newly written block in a TXG and across TXGs
-/// without ambient randomness dependency, while deriving pseudorandom nonces via BLAKE3-keyed PRF.
-#[derive(Debug, Clone)]
+/// The native IV-set GUID, key GUID, TXG, object, block and sequence further separate
+/// nonce inputs. Retrying an unpublished TXG, including after reopening a pool,
+/// obtains independent entropy instead of reconstructing the failed attempt's domain.
 pub struct ZfsNonceGenerator {
-    seed: [u8; 32],
+    seed: Zeroizing<blake3::Hash>,
     txg: u64,
     counter: u64,
 }
 
+impl std::fmt::Debug for ZfsNonceGenerator {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ZfsNonceGenerator")
+            .field("seed", &"<redacted>")
+            .field("txg", &self.txg)
+            .field("counter", &self.counter)
+            .finish()
+    }
+}
+
 impl ZfsNonceGenerator {
-    #[must_use]
-    pub fn new(ivset_guid: u64, key_guid: u64, txg: u64, extra_entropy: &[u8]) -> Self {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"frankenfs.zfs.nonce.v1");
+    pub fn new(
+        cx: &Cx,
+        ivset_guid: u64,
+        key_guid: u64,
+        txg: u64,
+        extra_entropy: &[u8],
+    ) -> Result<Self> {
+        let entropy = fresh_crypto_seed(cx)?;
+        let mut hasher = Zeroizing::new(blake3::Hasher::new_keyed(&entropy));
+        hasher.update(b"frankenfs.zfs.nonce.v2");
         hasher.update(&ivset_guid.to_le_bytes());
         hasher.update(&key_guid.to_le_bytes());
         hasher.update(&txg.to_le_bytes());
         hasher.update(extra_entropy);
-        Self {
-            seed: *hasher.finalize().as_bytes(),
+        Ok(Self {
+            seed: Zeroizing::new(hasher.finalize()),
             txg,
             counter: 0,
-        }
+        })
     }
 
     pub fn next_salt_iv(
@@ -435,14 +483,17 @@ impl ZfsNonceGenerator {
         level: u8,
         block_id: u64,
     ) -> ([u8; ZIO_DATA_SALT_LEN], [u8; ZIO_DATA_IV_LEN]) {
-        self.counter = self.counter.wrapping_add(1);
-        let mut hasher = blake3::Hasher::new_keyed(&self.seed);
+        self.counter = self
+            .counter
+            .checked_add(1)
+            .expect("ZFS nonce sequence exhausted");
+        let mut hasher = Zeroizing::new(blake3::Hasher::new_keyed(self.seed.as_bytes()));
         hasher.update(&self.txg.to_le_bytes());
         hasher.update(&object_id.to_le_bytes());
         hasher.update(&[level]);
         hasher.update(&block_id.to_le_bytes());
         hasher.update(&self.counter.to_le_bytes());
-        let out = hasher.finalize();
+        let out = Zeroizing::new(hasher.finalize());
         let bytes = out.as_bytes();
         let mut salt = [0_u8; ZIO_DATA_SALT_LEN];
         salt.copy_from_slice(&bytes[0..ZIO_DATA_SALT_LEN]);
@@ -452,25 +503,31 @@ impl ZfsNonceGenerator {
     }
 }
 
-/// Derive deterministic or entropy-mixed key material for a newly created encrypted dataset.
+/// Generate fresh cryptographic dataset keys and a wrapping IV from OS entropy.
+///
+/// Public dataset identifiers and optional caller input provide domain separation;
+/// they never replace the mandatory random seed. Identical inputs produce independent
+/// material on each call. Requires entropy authority and propagates source failures.
 pub fn generate_new_dataset_keys(
+    cx: &Cx,
     pool_guid: u64,
     dataset_guid: u64,
     txg: u64,
     extra_entropy: &[u8],
-) -> (
+) -> Result<(
     [u8; ZFS_MAX_MASTER_KEY_LEN],
     [u8; ZFS_HMAC_KEY_LEN],
     [u8; ZIO_DATA_IV_LEN],
     u64,
-) {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"frankenfs.zfs.newkey.v1");
+)> {
+    let entropy = fresh_crypto_seed(cx)?;
+    let mut hasher = Zeroizing::new(blake3::Hasher::new_keyed(&entropy));
+    hasher.update(b"frankenfs.zfs.newkey.v2");
     hasher.update(&pool_guid.to_le_bytes());
     hasher.update(&dataset_guid.to_le_bytes());
     hasher.update(&txg.to_le_bytes());
     hasher.update(extra_entropy);
-    let mut xof = hasher.finalize_xof();
+    let mut xof = Zeroizing::new(hasher.finalize_xof());
     let mut master = [0_u8; ZFS_MAX_MASTER_KEY_LEN];
     let mut hmac = [0_u8; ZFS_HMAC_KEY_LEN];
     let mut iv = [0_u8; ZIO_DATA_IV_LEN];
@@ -480,7 +537,7 @@ pub fn generate_new_dataset_keys(
     xof.fill(&mut iv);
     xof.fill(&mut guid_bytes);
     let key_guid = u64::from_le_bytes(guid_bytes).max(1);
-    (master, hmac, iv, key_guid)
+    Ok((master, hmac, iv, key_guid))
 }
 
 #[cfg(test)]
@@ -489,9 +546,23 @@ mod tests {
     use ffs_ondisk::zfs::crypto::{DSL_CRYPTO_KEY_VERSION_V1, ZFS_PBKDF2_DEFAULT_ITERS};
 
     #[test]
+    fn entropy_source_failure_clears_partial_output_and_propagates_io_error() {
+        let cx = Cx::for_testing();
+        let mut bytes = [0_u8; 32];
+        let result = fill_crypto_entropy_with(&cx, &mut bytes, |output| {
+            output[..17].fill(0xA5);
+            Err(getrandom::Error::UNSUPPORTED)
+        });
+        assert!(matches!(result, Err(FfsError::Io(_))));
+        assert_eq!(bytes, [0; 32]);
+    }
+
+    #[test]
     fn zap_roundtrip_and_keyring_lifecycle() {
+        let cx = Cx::for_testing();
         let wrapping_bytes = [0x42_u8; ZFS_WRAPPING_KEY_LEN];
-        let (master, hmac, iv, key_guid) = generate_new_dataset_keys(7, 99, 10, b"test-seed");
+        let (master, hmac, iv, key_guid) =
+            generate_new_dataset_keys(&cx, 7, 99, 10, b"test-seed").unwrap();
         let record = DslCryptoKeyRecord::wrap(
             ZioEncrypt::Aes256Gcm,
             key_guid,
@@ -559,12 +630,14 @@ mod tests {
 
     #[test]
     fn passphrase_key_derivation_and_nonce_uniqueness() {
+        let cx = Cx::for_testing();
         let salt = 0x1122_3344_5566_7788_u64;
         let pass = ZfsKeyMaterial::Passphrase(b"correct horse battery staple".to_vec());
         let wk = pass
             .resolve_wrapping_key(ZfsKeyFormat::Passphrase, salt, ZFS_PBKDF2_MIN_ITERS)
             .unwrap();
-        let (master, hmac, iv, key_guid) = generate_new_dataset_keys(1, 2, 3, b"pass-seed");
+        let (master, hmac, iv, key_guid) =
+            generate_new_dataset_keys(&cx, 1, 2, 3, b"pass-seed").unwrap();
         let rec = DslCryptoKeyRecord::wrap(
             ZioEncrypt::Aes128Ccm,
             key_guid,
@@ -586,12 +659,13 @@ mod tests {
         assert_eq!(parsed.pbkdf2_iters, ZFS_PBKDF2_MIN_ITERS);
         let _ = ZFS_PBKDF2_DEFAULT_ITERS;
 
-        let mut nonce_gen = ZfsNonceGenerator::new(100, key_guid, 5, b"");
+        let mut nonce_gen = ZfsNonceGenerator::new(&cx, 100, key_guid, 5, b"").unwrap();
         let a = nonce_gen.next_salt_iv(1, 0, 0);
         let b = nonce_gen.next_salt_iv(1, 0, 0);
         let c = nonce_gen.next_salt_iv(1, 0, 1);
         assert_ne!(a, b);
         assert_ne!(b, c);
         assert_ne!(a, c);
+        assert!(format!("{nonce_gen:?}").contains("<redacted>"));
     }
 }

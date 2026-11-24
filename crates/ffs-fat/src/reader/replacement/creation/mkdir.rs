@@ -9,6 +9,7 @@ mod rename_in_place;
 mod spelling;
 
 use super::super::super::ImageArgs;
+use super::super::publication::EntryPublication;
 use super::super::{
     ImageFile, NativeMutation, change_fat, checkpoint, open_regular, reserve_clusters, set_dirty,
     set_hints, stable, validate_boot_state, write_volume,
@@ -244,6 +245,7 @@ impl DirectoryCreation {
         if table.entry(cx, self.directory_cluster)? != ffs_ondisk::fat::FatEntry::Free {
             bail!("reserved directory cluster is no longer free");
         }
+        let mut publication = EntryPublication::new(volume, self.namespace.entry.offset)?;
         let native = NativeMutation::begin(cx, volume)?;
         let mut phase = "publishing dirty state";
         let result = (|| -> Result<serde_json::Value> {
@@ -303,14 +305,7 @@ impl DirectoryCreation {
             } else {
                 deleted_slot()
             };
-            patch_slot(
-                cx,
-                volume,
-                self.namespace.entry.offset,
-                &expected,
-                &self.updated,
-            )?;
-            volume.device.sync(cx)?;
+            publication.publish_binding(cx, volume, &expected, &self.updated)?;
 
             phase = "verifying native directory readback";
             let entry = volume
@@ -372,8 +367,6 @@ impl DirectoryCreation {
             }
 
             phase = "synchronizing final clean state";
-            set_dirty(cx, volume, false)?;
-            volume.device.sync(cx)?;
             let mut report = self.report(volume, false);
             report["durability"] =
                 "directory_contents_allocation_namespace_and_clean_state_synced".into();
@@ -635,8 +628,6 @@ pub fn unlink_in_volume(
             serde_json::to_string(&verification)?
         );
     }
-    set_dirty(cx, volume, false)?;
-    volume.device.sync(cx)?;
     report["verification"] = serde_json::to_value(verification)?;
     native.finish(cx, report)
 }
@@ -733,8 +724,6 @@ pub fn rmdir_in_volume(
             serde_json::to_string(&verification)?
         );
     }
-    set_dirty(cx, volume, false)?;
-    volume.device.sync(cx)?;
     report["verification"] = serde_json::to_value(verification)?;
     native.finish(cx, report)
 }
@@ -1100,6 +1089,7 @@ fn rename_with_mode(
         return Ok(report);
     }
 
+    let mut publication = EntryPublication::new(volume, target.entry().offset)?;
     let native = NativeMutation::begin(cx, volume)?;
     let mut phase = "publishing dirty state";
     let result = (|| -> Result<serde_json::Value> {
@@ -1120,8 +1110,7 @@ fn rename_with_mode(
             }
         };
         phase = "publishing destination entry";
-        patch_slot(cx, volume, target.entry().offset, &expected, &updated)?;
-        volume.device.sync(cx)?;
+        publication.publish_binding(cx, volume, &expected, &updated)?;
 
         // Do not remove the source or reclaim the replaced object until the
         // ordinary native reader sees the exact published record and chain.
@@ -1183,8 +1172,6 @@ fn rename_with_mode(
             );
         }
         phase = "synchronizing final clean state";
-        set_dirty(cx, volume, false)?;
-        volume.device.sync(cx)?;
         report["durability"] = "namespace_allocation_and_clean_state_synced".into();
         report["verification"] = serde_json::to_value(verification)?;
         native.finish(cx, report)

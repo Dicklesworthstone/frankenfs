@@ -311,18 +311,6 @@ impl NtfsFs {
         Ok(own || oracle.is_some_and(|oracle| oracle(ino) != 0))
     }
 
-    pub(super) fn has_pinned_ads(&self, base: InodeNumber) -> Result<bool> {
-        let state = locked(&self.lifetime)?;
-        for (&stream, identity) in &state.ads {
-            if self.inode(identity.reference)? == base
-                && state.counts.get(&stream).copied().unwrap_or(0) != 0
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
     pub(super) fn rename_ads_identity(&self, ino: InodeNumber, new_name: &[u16]) -> Result<()> {
         if new_name.is_empty() || new_name.len() > 255 {
             return Err(FfsError::Format("invalid NTFS stream identity".into()));

@@ -121,8 +121,6 @@ pub fn set_attr_in_volume(
             bail!("metadata update changed allocation or namespace consistency");
         }
         phase = "synchronizing final clean state";
-        set_dirty(cx, volume, false)?;
-        volume.device.sync(cx)?;
         native.finish(cx, ())
     })();
     result.with_context(|| {

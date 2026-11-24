@@ -504,8 +504,6 @@ fn apply_update(
             );
         }
         phase = "synchronizing final clean state";
-        set_dirty(cx, volume, false)?;
-        volume.device.sync(cx)?;
         native.finish(cx, ())
     })();
     result.with_context(|| format!("FAT range update failed while {phase}; image retained and may be dirty, partially overwritten or partially changed; no rollback or atomicity is claimed"))

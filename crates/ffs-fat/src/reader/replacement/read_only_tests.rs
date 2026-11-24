@@ -293,6 +293,7 @@ struct BarrierTrace {
     barriers: Vec<([u8; 8], u64)>,
     fail_after: Option<(usize, Failure)>,
     fail_seal: Option<Failure>,
+    cancel_after: Option<usize>,
 }
 
 struct TracedProtection {
@@ -334,13 +335,19 @@ impl ByteDevice for TracedProtection {
         let state = archive_state(&self.archive);
         let mut trace = self.trace.lock().unwrap();
         trace.barriers.push(state);
+        if trace.cancel_after == Some(trace.barriers.len()) {
+            trace.cancel_after = None;
+            cx.set_cancel_requested(true);
+        }
         if let Some((cut, failure)) = trace.fail_after
             && cut == trace.barriers.len()
         {
             trace.fail_after = None;
             return Err(failure.error(cx));
         }
-        Ok(())
+        // Match the real file device's trailing checkpoint. This cooperative
+        // signal differs from an explicit returned I/O/Cancelled failure above.
+        checkpoint(cx)
     }
 
     fn begin_durability_commit(&self, cx: &Cx) -> ffs_error::Result<()> {
@@ -583,6 +590,107 @@ fn protected_native_barrier_errors_and_cancellation_never_seal_partial_mutations
                 SidecarImageDevice::open(&Cx::for_testing(), &fixture.image, &fixture.sidecar)
                     .unwrap_err();
             assert!(error.to_string().contains("unfinished"));
+        }
+    }
+}
+
+#[test]
+fn late_cancellation_preserves_native_and_mounted_protection_acknowledgments() {
+    const NOW: u64 = 1_700_000_000;
+    const REPLACEMENT: &[u8] = b"committed";
+    for fixture in [Fixture::new(), Fixture::fat32()] {
+        let pristine = fixture.snapshot();
+        let protected = ProtectedVolume::open(&fixture);
+        protected.committed(&fixture, |cx, volume| {
+            write_range_in_volume(cx, volume, "/PAYLOAD.BIN", 0, REPLACEMENT, NOW)
+        });
+        let count = protected.trace.lock().unwrap().barriers.len();
+        drop(protected);
+        let mut expected = PAYLOAD.to_vec();
+        expected[..REPLACEMENT.len()].copy_from_slice(REPLACEMENT);
+
+        // The final native clean barrier and the following protection barrier
+        // both have real trailing cancellation points. The mount keeps the
+        // outer hold through cache publication, then seals on a later fsync.
+        for cut in [count - 1, count] {
+            for mounted in [false, true] {
+                std::fs::write(&fixture.image, &pristine.0).unwrap();
+                std::fs::write(&fixture.sidecar, &pristine.1).unwrap();
+                {
+                    let ProtectedVolume {
+                        volume,
+                        protection,
+                        trace,
+                    } = ProtectedVolume::open(&fixture);
+                    trace.lock().unwrap().cancel_after = Some(cut);
+                    let cx = Cx::for_testing();
+                    if mounted {
+                        let fs =
+                            crate::filesystem::FatFs::new_with_mode(&cx, volume, 1000, 1000, true)
+                                .unwrap();
+                        let mut scope = RequestScope::empty();
+                        let ino = fs
+                            .lookup(&cx, &mut scope, InodeNumber(1), OsStr::new("PAYLOAD.BIN"))
+                            .unwrap()
+                            .ino;
+                        assert_eq!(
+                            fs.write(&cx, &mut scope, ino, 0, REPLACEMENT).unwrap() as usize,
+                            REPLACEMENT.len()
+                        );
+                        let status = protection.ack_status();
+                        assert!(status.native_durable && !status.protected_durable);
+                        assert_eq!(&archive_state(&fixture.sidecar).0, b"FFSRQPD2");
+                        let fresh = Cx::for_testing();
+                        assert_eq!(fs.read(&fresh, &mut scope, ino, 0, 8192).unwrap(), expected);
+                        let native = std::fs::read(&fixture.image).unwrap();
+                        fs.fsync(&fresh, &mut scope, ino, 0, false).unwrap();
+                        assert_eq!(
+                            std::fs::read(&fixture.image).unwrap(),
+                            native,
+                            "sealing must not replay native writes"
+                        );
+                    } else {
+                        assert_eq!(
+                            write_range_in_volume(
+                                &cx,
+                                &volume,
+                                "/PAYLOAD.BIN",
+                                0,
+                                REPLACEMENT,
+                                NOW
+                            )
+                            .unwrap(),
+                            REPLACEMENT.len()
+                        );
+                        assert_eq!(read_payload(&volume, "/PAYLOAD.BIN"), expected);
+                    }
+                    assert!(
+                        matches!(checkpoint(&cx), Err(FfsError::Cancelled)),
+                        "mask must preserve the pending signal"
+                    );
+                    let trace = trace.lock().unwrap();
+                    assert!(
+                        trace.cancel_after.is_none(),
+                        "the intended cancellation point was reached"
+                    );
+                    assert_eq!(trace.holds, 0);
+                    let (sealed, intermediate) = trace.barriers.split_last().unwrap();
+                    assert_eq!(&sealed.0, b"FFSRQSC2");
+                    assert!(intermediate.iter().all(|state| &state.0 == b"FFSRQPD2"));
+                    let status = protection.ack_status();
+                    assert!(status.native_durable && status.protected_durable);
+                }
+                let fresh = Cx::for_testing();
+                assert!(
+                    ffs_repair::sidecar::verify(&fresh, &fixture.image, &fixture.sidecar)
+                        .unwrap()
+                        .is_healthy()
+                );
+                let reopened = fixture.args().open(&fresh).unwrap();
+                assert_eq!(read_payload(&reopened, "/PAYLOAD.BIN"), expected);
+                let check = reopened.check(&fresh).unwrap();
+                assert!(check.clean && check.complete && check.namespace_complete);
+            }
         }
     }
 }

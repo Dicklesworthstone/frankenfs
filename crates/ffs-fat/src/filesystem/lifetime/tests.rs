@@ -108,6 +108,425 @@ fn expect_errno<T>(result: Result<T>, expected: i32) {
     assert_eq!(result.err().expect("expected refusal").to_errno(), expected);
 }
 
+fn mkdir(fs: &FatFs, parent: InodeNumber, name: &str) -> InodeNumber {
+    fs.mkdir(
+        &Cx::for_testing(),
+        &mut RequestScope::empty(),
+        parent,
+        OsStr::new(name),
+        0o755,
+        1000,
+        1000,
+    )
+    .unwrap()
+    .ino
+}
+
+fn pin_directory(fs: &FatFs, ino: InodeNumber) -> Arc<AtomicU64> {
+    // OPENDIR lifetime is represented by the transport's inode-reference
+    // oracle, not a regular-file backend open handle.
+    let pins = Arc::new(AtomicU64::new(1));
+    let live = Arc::clone(&pins);
+    fs.install_open_handle_oracle(Arc::new(move |which| {
+        if which == ino {
+            live.load(Ordering::SeqCst)
+        } else {
+            0
+        }
+    }));
+    pins
+}
+
+fn assert_held_directory(fs: &FatFs, ino: InodeNumber, parent: InodeNumber) {
+    let cx = Cx::for_testing();
+    let mut scope = RequestScope::empty();
+    let attr = fs.getattr(&cx, &mut scope, ino).unwrap();
+    assert_eq!(attr.ino, ino);
+    assert_eq!(attr.kind, ffs_core::FileType::Directory);
+    assert_eq!(attr.nlink, 0);
+    assert!(attr.blocks > 0);
+    for (name, expected) in [(".", ino), ("..", parent)] {
+        assert_eq!(
+            fs.lookup(&cx, &mut scope, ino, OsStr::new(name))
+                .unwrap()
+                .ino,
+            expected
+        );
+    }
+    let entries: Vec<_> = fs
+        .readdir(&cx, &mut scope, ino, 0)
+        .unwrap()
+        .iter()
+        .map(|entry| (entry.name.clone(), entry.ino))
+        .collect();
+    assert_eq!(entries, [(b".".to_vec(), ino), (b"..".to_vec(), parent)]);
+    assert!(fs.readdir(&cx, &mut scope, ino, 2).unwrap().is_empty());
+}
+
+#[test]
+fn removed_directory_keeps_identity_allocation_and_parent_until_last_transport_reference() {
+    for kind in ["fat16", "fat32"] {
+        let (_directory, args, fs) = fixture(kind);
+        let cx = Cx::for_testing();
+        let mut scope = RequestScope::empty();
+        let parent = mkdir(&fs, ROOT, "PARENT");
+        let held = mkdir(&fs, parent, "HELD");
+        let original = fs.node(&cx, held).unwrap().entry.unwrap();
+        let source = create(&fs, ROOT, "SOURCE.BIN", b"unchanged source");
+        let pins = pin_directory(&fs, held);
+        let free = clean(&fs);
+        fs.rmdir(&cx, &mut scope, parent, OsStr::new("HELD"))
+            .unwrap();
+        assert_held_directory(&fs, held, parent);
+        assert_eq!(clean(&fs), free);
+        assert_eq!(fs.getattr(&cx, &mut scope, parent).unwrap().nlink, 2);
+        expect_errno(
+            fs.lookup(&cx, &mut scope, parent, OsStr::new("HELD")),
+            libc::ENOENT,
+        );
+        let hidden = fs.node(&cx, held).unwrap().entry.unwrap().name().unwrap();
+        let before = std::fs::read(&args.image).unwrap();
+        expect_errno(
+            fs.rmdir(&cx, &mut scope, parent, OsStr::new(&hidden)),
+            libc::ENOENT,
+        );
+        expect_errno(
+            fs.create(&cx, &mut scope, held, OsStr::new("NEW"), 0o644, 1000, 1000),
+            libc::ENOENT,
+        );
+        expect_errno(
+            fs.mkdir(&cx, &mut scope, held, OsStr::new("NEW"), 0o755, 1000, 1000),
+            libc::ENOENT,
+        );
+        expect_errno(
+            fs.rename(
+                &cx,
+                &mut scope,
+                ROOT,
+                OsStr::new("SOURCE.BIN"),
+                held,
+                OsStr::new("NEW"),
+            ),
+            libc::ENOENT,
+        );
+        expect_errno(
+            fs.rename2(
+                &cx,
+                &mut scope,
+                held,
+                OsStr::new("NEW"),
+                ROOT,
+                OsStr::new("SOURCE.BIN"),
+                libc::RENAME_EXCHANGE,
+            ),
+            libc::ENOENT,
+        );
+        // FAT has no native hard/symbolic links; removed parents cannot
+        // acquire children through those unsupported entry points either.
+        assert!(
+            fs.link(&cx, &mut scope, source, held, OsStr::new("LINK"))
+                .is_err()
+        );
+        assert!(
+            fs.symlink(
+                &cx,
+                &mut scope,
+                held,
+                OsStr::new("LINK"),
+                std::path::Path::new("target"),
+                1000,
+                1000,
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&args.image).unwrap(), before);
+        assert_eq!(read(&fs, source), b"unchanged source");
+        let replacement = mkdir(&fs, parent, "HELD");
+        assert_ne!(replacement, held);
+        assert_ne!(
+            fs.node(&cx, replacement)
+                .unwrap()
+                .entry
+                .unwrap()
+                .native
+                .first_cluster,
+            original.native.first_cluster
+        );
+        fs.rename(
+            &cx,
+            &mut scope,
+            ROOT,
+            OsStr::new("PARENT"),
+            ROOT,
+            OsStr::new("MOVED"),
+        )
+        .unwrap();
+        assert_held_directory(&fs, held, parent);
+        fs.fsyncdir(&cx, &mut scope, held, 0, false).unwrap();
+        release(&fs, held, 0).unwrap();
+        assert!(!fs.finalize_unlinked_inode(&cx, &mut scope, held).unwrap());
+        // Metadata through an already-held inode remains supported. Final
+        // reclamation must not become a new user rmdir permission decision.
+        fs.setattr(
+            &cx,
+            &mut scope,
+            held,
+            &SetAttrRequest {
+                mode: Some(0o555),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let free = clean(&fs);
+        pins.store(0, Ordering::SeqCst);
+        assert!(fs.finalize_unlinked_inode(&cx, &mut scope, held).unwrap());
+        assert_eq!(clean(&fs), free + 1);
+        expect_errno(fs.getattr(&cx, &mut scope, held), libc::ENOENT);
+        assert!(!fs.finalize_unlinked_inode(&cx, &mut scope, held).unwrap());
+        assert_eq!(
+            fs.lookup(&cx, &mut scope, parent, OsStr::new("HELD"))
+                .unwrap()
+                .ino,
+            replacement
+        );
+    }
+}
+
+#[test]
+fn overwritten_directory_preserves_original_parent_and_reaps_implicit_parent_pins() {
+    for kind in ["fat16", "fat32"] {
+        let (_directory, _args, fs) = fixture(kind);
+        let cx = Cx::for_testing();
+        let mut scope = RequestScope::empty();
+        let from = mkdir(&fs, ROOT, "FROM");
+        let to = mkdir(&fs, ROOT, "TO");
+        let source = mkdir(&fs, from, "SOURCE");
+        let child = create(&fs, source, "CHILD.BIN", b"source child survives");
+        let held = mkdir(&fs, to, "Long destination directory");
+        let alias = fs
+            .node(&cx, held)
+            .unwrap()
+            .entry
+            .unwrap()
+            .short_alias()
+            .unwrap();
+        let pins = pin_directory(&fs, held);
+        let free = clean(&fs);
+        fs.rename(
+            &cx,
+            &mut scope,
+            from,
+            OsStr::new("SOURCE"),
+            to,
+            OsStr::new(&alias),
+        )
+        .unwrap();
+        assert_eq!(
+            fs.lookup(
+                &cx,
+                &mut scope,
+                to,
+                OsStr::new("Long destination directory")
+            )
+            .unwrap()
+            .ino,
+            source
+        );
+        assert_eq!(
+            fs.node(&cx, held).unwrap().parent,
+            from,
+            "native recovery location"
+        );
+        assert_held_directory(&fs, held, to);
+        assert_eq!(fs.getattr(&cx, &mut scope, from).unwrap().nlink, 2);
+        assert_eq!(fs.getattr(&cx, &mut scope, to).unwrap().nlink, 3);
+        assert_eq!(clean(&fs), free);
+        assert_eq!(read(&fs, child), b"source child survives");
+        fs.rename(
+            &cx,
+            &mut scope,
+            to,
+            OsStr::new("Long destination directory"),
+            ROOT,
+            OsStr::new("MOVED"),
+        )
+        .unwrap();
+        // TO is physically empty. Its only pin is the displaced directory's
+        // logical '..'; final FORGET for TO may precede HELD's final FORGET.
+        fs.rmdir(&cx, &mut scope, ROOT, OsStr::new("TO")).unwrap();
+        assert_held_directory(&fs, to, ROOT);
+        assert_held_directory(&fs, held, to);
+        assert!(!fs.finalize_unlinked_inode(&cx, &mut scope, to).unwrap());
+        assert_eq!(clean(&fs), free);
+        let replacement_parent = mkdir(&fs, ROOT, "TO");
+        assert_ne!(replacement_parent, to);
+        assert_held_directory(&fs, held, to);
+        let free = clean(&fs);
+        pins.store(0, Ordering::SeqCst);
+        assert!(fs.finalize_unlinked_inode(&cx, &mut scope, held).unwrap());
+        assert_eq!(clean(&fs), free + 2, "child and original parent reclaimed");
+        expect_errno(fs.getattr(&cx, &mut scope, held), libc::ENOENT);
+        expect_errno(fs.getattr(&cx, &mut scope, to), libc::ENOENT);
+        assert_eq!(read(&fs, child), b"source child survives");
+        fs.rmdir(&cx, &mut scope, ROOT, OsStr::new("FROM")).unwrap();
+        assert_eq!(
+            fs.lookup(&cx, &mut scope, ROOT, OsStr::new("TO"))
+                .unwrap()
+                .ino,
+            replacement_parent
+        );
+        clean(&fs);
+    }
+}
+
+#[test]
+fn directory_retention_preflight_refusals_preserve_the_native_namespace() {
+    let (_directory, args, fs) = fixture("fat16");
+    let cx = Cx::for_testing();
+    let mut scope = RequestScope::empty();
+    mkdir(&fs, ROOT, "SOURCE");
+    let held = mkdir(&fs, ROOT, "HELD");
+    create(&fs, held, "CHILD.BIN", b"do not remove this child");
+    create(&fs, ROOT, "FILE.BIN", b"not a directory");
+    let _pins = pin_directory(&fs, held);
+    let before = std::fs::read(&args.image).unwrap();
+    expect_errno(
+        fs.rmdir(&cx, &mut scope, ROOT, OsStr::new("HELD")),
+        libc::ENOTEMPTY,
+    );
+    for (source, destination, error) in [
+        ("SOURCE", "HELD", libc::ENOTEMPTY),
+        ("FILE.BIN", "HELD", libc::EISDIR),
+        ("HELD", "FILE.BIN", libc::ENOTDIR),
+    ] {
+        expect_errno(
+            fs.rename(
+                &cx,
+                &mut scope,
+                ROOT,
+                OsStr::new(source),
+                ROOT,
+                OsStr::new(destination),
+            ),
+            error,
+        );
+    }
+    let cancelled = Cx::for_testing();
+    cancelled.set_cancel_requested(true);
+    assert!(
+        fs.rmdir(&cancelled, &mut scope, ROOT, OsStr::new("HELD"))
+            .is_err()
+    );
+    assert_eq!(std::fs::read(&args.image).unwrap(), before);
+    assert!(locked(&fs.lifetime).unwrap().retained.is_empty());
+
+    fs.unlink(&cx, &mut scope, held, OsStr::new("CHILD.BIN"))
+        .unwrap();
+    let before = std::fs::read(&args.image).unwrap();
+    {
+        let mut state = locked(&fs.lifetime).unwrap();
+        for index in 0..MAX_RETAINED {
+            state.retained.insert(
+                InodeNumber(index as u64 + 10),
+                Retained {
+                    slot: u64::MAX - index as u64,
+                    visible_to_handles: false,
+                    directory_parent: None,
+                },
+            );
+        }
+    }
+    expect_errno(
+        fs.rmdir(&cx, &mut scope, ROOT, OsStr::new("HELD")),
+        libc::ENOSPC,
+    );
+    expect_errno(
+        fs.rename(
+            &cx,
+            &mut scope,
+            ROOT,
+            OsStr::new("SOURCE"),
+            ROOT,
+            OsStr::new("HELD"),
+        ),
+        libc::ENOSPC,
+    );
+    assert_eq!(std::fs::read(&args.image).unwrap(), before);
+    locked(&fs.lifetime).unwrap().retained.clear();
+    fs.setattr(
+        &cx,
+        &mut scope,
+        held,
+        &SetAttrRequest {
+            mode: Some(0o555),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let before = std::fs::read(&args.image).unwrap();
+    expect_errno(
+        fs.rmdir(&cx, &mut scope, ROOT, OsStr::new("HELD")),
+        libc::EACCES,
+    );
+    expect_errno(
+        fs.rename(
+            &cx,
+            &mut scope,
+            ROOT,
+            OsStr::new("SOURCE"),
+            ROOT,
+            OsStr::new("HELD"),
+        ),
+        libc::EACCES,
+    );
+    assert_eq!(std::fs::read(&args.image).unwrap(), before);
+    assert_eq!(fs.getattr(&cx, &mut scope, held).unwrap().nlink, 2);
+    clean(&fs);
+}
+
+#[test]
+fn directory_recovery_records_survive_reopen_and_destroy_uses_only_live_ownership() {
+    let (_directory, args, fs) = fixture("fat16");
+    let cx = Cx::for_testing();
+    let mut scope = RequestScope::empty();
+    let ordinary = mkdir(&fs, ROOT, "F0000000.DEL");
+    create(&fs, ordinary, "KEEP.BIN", b"ordinary user directory");
+    let held = mkdir(&fs, ROOT, "HELD");
+    let _pins = pin_directory(&fs, held);
+    fs.rmdir(&cx, &mut scope, ROOT, OsStr::new("HELD")).unwrap();
+    let recovery = fs.node(&cx, held).unwrap().entry.unwrap().name().unwrap();
+    assert_ne!(recovery, "F0000000.DEL");
+    clean(&fs);
+    // Successful native mutation followed by dropping the mount, not a
+    // storage-cut or live kernel-mount qualification claim.
+    drop(fs);
+    let fs = mount(&args);
+    let restored = fs
+        .lookup(&cx, &mut scope, ROOT, OsStr::new(&recovery))
+        .unwrap();
+    assert_eq!(restored.nlink, 2);
+    fs.flush_on_destroy(&cx).unwrap();
+    assert_eq!(fs.getattr(&cx, &mut scope, restored.ino).unwrap().nlink, 2);
+    let ordinary = fs
+        .lookup(&cx, &mut scope, ROOT, OsStr::new("F0000000.DEL"))
+        .unwrap()
+        .ino;
+    let child = fs
+        .lookup(&cx, &mut scope, ordinary, OsStr::new("KEEP.BIN"))
+        .unwrap()
+        .ino;
+    assert_eq!(read(&fs, child), b"ordinary user directory");
+    let _pins = pin_directory(&fs, restored.ino);
+    fs.rmdir(&cx, &mut scope, ROOT, OsStr::new(&recovery))
+        .unwrap();
+    let free = clean(&fs);
+    fs.flush_on_destroy(&cx).unwrap();
+    assert_eq!(clean(&fs), free + 1);
+    expect_errno(fs.getattr(&cx, &mut scope, restored.ino), libc::ENOENT);
+    assert_eq!(read(&fs, child), b"ordinary user directory");
+    assert!(locked(&fs.lifetime).unwrap().retained.is_empty());
+}
+
 #[test]
 fn unlinked_file_survives_two_handles_and_all_native_data_mutations_until_last_close() {
     for kind in ["fat16", "fat32"] {
@@ -591,6 +1010,7 @@ fn handle_and_retention_capacity_refuse_before_destructive_operations() {
                 Retained {
                     slot: u64::MAX - index as u64,
                     visible_to_handles: false,
+                    directory_parent: None,
                 },
             );
         }
@@ -650,7 +1070,7 @@ impl ByteDevice for FaultDevice {
     }
 }
 
-fn faulty(bytes: &[u8]) -> (FatFs, FaultDevice, InodeNumber, u64) {
+fn faulty_fs(bytes: &[u8]) -> (FatFs, FaultDevice) {
     let cx = Cx::for_testing();
     let device = FaultDevice(Arc::new(Mutex::new(FaultState {
         bytes: bytes.to_vec(),
@@ -660,6 +1080,12 @@ fn faulty(bytes: &[u8]) -> (FatFs, FaultDevice, InodeNumber, u64) {
     let volume =
         FatVolume::from_device(&cx, Box::new(device.clone()), 0, bytes.len() as u64).unwrap();
     let fs = FatFs::new_with_mode(&cx, volume, 1000, 1000, true).unwrap();
+    (fs, device)
+}
+
+fn faulty(bytes: &[u8]) -> (FatFs, FaultDevice, InodeNumber, u64) {
+    let (fs, device) = faulty_fs(bytes);
+    let cx = Cx::for_testing();
     let ino = fs
         .lookup(
             &cx,
@@ -671,6 +1097,92 @@ fn faulty(bytes: &[u8]) -> (FatFs, FaultDevice, InodeNumber, u64) {
         .ino;
     let handle = open(&fs, ino);
     (fs, device, ino, handle)
+}
+
+#[test]
+fn every_directory_retention_cut_fences_the_mount_and_keeps_initialized_clusters() {
+    let (_directory, args, fs) = fixture("fat16");
+    let cx = Cx::for_testing();
+    let held = mkdir(&fs, ROOT, "HELD");
+    let source = mkdir(&fs, ROOT, "SOURCE");
+    let spans: Vec<_> = [held, source]
+        .into_iter()
+        .map(|ino| {
+            let cluster = fs
+                .node(&cx, ino)
+                .unwrap()
+                .entry
+                .unwrap()
+                .native
+                .first_cluster;
+            let start = fs.volume.geometry.cluster_offset(cluster).unwrap() as usize;
+            start..start + fs.volume.geometry.cluster_bytes() as usize
+        })
+        .collect();
+    drop(fs);
+    let baseline = std::fs::read(&args.image).unwrap();
+    let prepare = || {
+        let (fs, device) = faulty_fs(&baseline);
+        let ino = fs
+            .lookup(&cx, &mut RequestScope::empty(), ROOT, OsStr::new("HELD"))
+            .unwrap()
+            .ino;
+        let pins = pin_directory(&fs, ino);
+        (fs, device, ino, pins)
+    };
+    for overwrite in [false, true] {
+        let remove = |fs: &FatFs| {
+            if overwrite {
+                fs.rename(
+                    &cx,
+                    &mut RequestScope::empty(),
+                    ROOT,
+                    OsStr::new("SOURCE"),
+                    ROOT,
+                    OsStr::new("HELD"),
+                )
+            } else {
+                fs.rmdir(&cx, &mut RequestScope::empty(), ROOT, OsStr::new("HELD"))
+            }
+        };
+        let (success, device, ino, _pins) = prepare();
+        remove(&success).unwrap();
+        assert_held_directory(&success, ino, ROOT);
+        clean(&success);
+        let total = device.0.lock().unwrap().attempts;
+        assert!(total > 4);
+        for cut in 1..=total {
+            let (fs, device, ino, _pins) = prepare();
+            device.0.lock().unwrap().fail_at = Some(cut);
+            assert!(remove(&fs).is_err(), "overwrite={overwrite}, cut={cut}");
+            expect_errno(fs.getattr(&cx, &mut RequestScope::empty(), ino), libc::EIO);
+            expect_errno(
+                fs.readdir(&cx, &mut RequestScope::empty(), ino, 0),
+                libc::EIO,
+            );
+            expect_errno(
+                fs.finalize_unlinked_inode(&cx, &mut RequestScope::empty(), ino),
+                libc::EIO,
+            );
+            let state = device.0.lock().unwrap();
+            assert_eq!(state.attempts, cut, "no implicit cleanup after failure");
+            for span in &spans {
+                assert_eq!(&state.bytes[span.clone()], &baseline[span.clone()]);
+            }
+        }
+        let (fs, device, ino, pins) = prepare();
+        remove(&fs).unwrap();
+        pins.store(0, Ordering::SeqCst);
+        {
+            let mut state = device.0.lock().unwrap();
+            state.fail_at = Some(state.attempts + 1);
+        }
+        assert!(
+            fs.finalize_unlinked_inode(&cx, &mut RequestScope::empty(), ino)
+                .is_err()
+        );
+        expect_errno(fs.flush_on_destroy(&cx), libc::EIO);
+    }
 }
 
 #[test]

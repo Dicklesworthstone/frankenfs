@@ -9,9 +9,9 @@
 use super::super::super::super::{Directory, FatVolume, check::FatCheckReport};
 use super::super::names::NativeName;
 use super::{
-    NativeMutation, Slot, checkpoint, delete_entry_slots, directory_offsets, patch_slot, read_slot,
-    rename_chain, retired_slot, set_dirty, validate_boot_state, validate_entry_slots,
-    verify_retired_slot,
+    EntryPublication, NativeMutation, Slot, checkpoint, delete_entry_slots, directory_offsets,
+    patch_slot, read_slot, rename_chain, retired_slot, set_dirty, validate_boot_state,
+    validate_entry_slots, verify_retired_slot,
 };
 use anyhow::{Context, Result, bail};
 use asupersync::Cx;
@@ -160,6 +160,7 @@ impl Rename<'_> {
             return Ok(report);
         }
 
+        let mut publication = EntryPublication::new(volume, self.short.offset)?;
         let native = NativeMutation::begin(cx, volume)?;
         let mut phase = "publishing dirty state";
         let result = (|| -> Result<serde_json::Value> {
@@ -184,17 +185,7 @@ impl Rename<'_> {
             verify_retired_slot(cx, volume, self.short)?;
 
             phase = "publishing the renamed short entry";
-            patch_slot(
-                cx,
-                volume,
-                self.short.offset,
-                &retired_slot(self.short),
-                &updated,
-            )?;
-            volume.device.sync(cx)?;
-            if read_slot(cx, volume, self.short.offset, false)?.bytes != updated {
-                bail!("in-place rename short-entry publication failed readback");
-            }
+            publication.publish_binding(cx, volume, &retired_slot(self.short), &updated)?;
             self.verify_names(cx, volume, &encoded)?;
 
             phase = "verifying native name and unchanged allocation";
@@ -229,8 +220,6 @@ impl Rename<'_> {
             // FSInfo is untouched: neither free allocation nor search hints
             // change. Directory contents (including . and ..) are also untouched.
             phase = "synchronizing final clean state";
-            set_dirty(cx, volume, false)?;
-            volume.device.sync(cx)?;
             report["durability"] = "namespace_allocation_and_clean_state_synced".into();
             report["verification"] = serde_json::to_value(verification)?;
             native.finish(cx, report)

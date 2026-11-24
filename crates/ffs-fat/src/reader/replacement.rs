@@ -54,15 +54,34 @@ impl<'a> NativeMutation<'a> {
         })
     }
 
-    /// Invoke only after verified native publication and its final clean-state
-    /// barrier. A protection error after this point cannot undo the native
-    /// mutation: retain the pending epoch and report that distinct outcome.
-    fn finish<T>(mut self, cx: &Cx, value: T) -> Result<T> {
-        self.deferral.complete();
-        self.volume.device.sync(cx).context(
-            "native FAT mutation committed; final protection synchronization failed; do not retry the mutation as if it were rolled back",
-        )?;
-        Ok(value)
+    /// Invoke only after native data, allocation and namespace verification.
+    /// Cancellation remains observable until the finalization decision; after
+    /// it, finish the clean markers and barriers under the caller's capability.
+    /// A device may checkpoint after a successful physical sync, so the mask
+    /// must cover that sync as well as the completion acknowledgment.
+    fn finish<T>(self, cx: &Cx, value: T) -> Result<T> {
+        self.finish_verified(cx, value, || Ok(()))
+    }
+
+    fn finish_verified<T>(
+        mut self,
+        cx: &Cx,
+        value: T,
+        verify_clean: impl FnOnce() -> Result<()>,
+    ) -> Result<T> {
+        checkpoint(cx)?;
+        cx.masked(|| {
+            set_dirty(cx, self.volume, false)?;
+            self.volume.device.sync(cx)?;
+            verify_clean()?;
+            self.deferral.complete();
+            // A real protection error cannot undo the committed native
+            // mutation. Retain the pending epoch and identify that outcome.
+            self.volume.device.sync(cx).context(
+                "native FAT mutation committed; final protection synchronization failed; do not retry the mutation as if it were rolled back",
+            )?;
+            Ok(value)
+        })
     }
 }
 
@@ -587,8 +606,6 @@ impl Replacement {
                 );
             }
             phase = "synchronizing final clean state";
-            set_dirty(cx, volume, false)?;
-            volume.device.sync(cx)?;
             let mut report = self.report(volume, false);
             report["durability"] = "all_data_metadata_and_clean_state_synced".into();
             report["payload_verification"] = "sha256_via_native_reader".into();
@@ -1025,7 +1042,11 @@ pub fn open_volume(cx: &Cx, args: &ImageArgs, writable: bool) -> Result<FatVolum
 }
 
 pub fn sync_volume(cx: &Cx, volume: &FatVolume) -> Result<()> {
-    volume.device.sync(cx)?;
+    checkpoint(cx)?;
+    // Once this barrier starts, a late cancellation cannot turn its successful
+    // physical completion into a retryable interruption. I/O errors still pass
+    // through to the caller and its mounted health fence.
+    cx.masked(|| volume.device.sync(cx))?;
     Ok(())
 }
 
