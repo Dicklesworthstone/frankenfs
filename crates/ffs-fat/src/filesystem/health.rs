@@ -76,6 +76,17 @@ impl<'a> OperationGuard<'a> {
         self.deferral = Some(deferral);
     }
 
+    /// Finish only the cache and reply work following a successful native
+    /// mutation. Cancellation cannot turn that committed result into EINTR;
+    /// real publication errors still drop this guard and fence the mount.
+    pub(super) fn publish_committed<T>(
+        self,
+        cx: &Cx,
+        publish: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        cx.masked(|| self.complete(publish()?))
+    }
+
     /// Call only after native durability, cache publication and fallible reply
     /// preparation have all succeeded. A later FUSE transport failure is not
     /// an unsuccessful native operation and cannot roll it back.

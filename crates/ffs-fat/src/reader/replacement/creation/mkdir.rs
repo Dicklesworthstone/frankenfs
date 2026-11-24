@@ -372,8 +372,6 @@ impl DirectoryCreation {
             }
 
             phase = "synchronizing final clean state";
-            set_dirty(cx, volume, false)?;
-            volume.device.sync(cx)?;
             let mut report = self.report(volume, false);
             report["durability"] =
                 "directory_contents_allocation_namespace_and_clean_state_synced".into();
@@ -635,8 +633,6 @@ pub fn unlink_in_volume(
             serde_json::to_string(&verification)?
         );
     }
-    set_dirty(cx, volume, false)?;
-    volume.device.sync(cx)?;
     report["verification"] = serde_json::to_value(verification)?;
     native.finish(cx, report)
 }
@@ -733,8 +729,6 @@ pub fn rmdir_in_volume(
             serde_json::to_string(&verification)?
         );
     }
-    set_dirty(cx, volume, false)?;
-    volume.device.sync(cx)?;
     report["verification"] = serde_json::to_value(verification)?;
     native.finish(cx, report)
 }
@@ -1183,8 +1177,6 @@ fn rename_with_mode(
             );
         }
         phase = "synchronizing final clean state";
-        set_dirty(cx, volume, false)?;
-        volume.device.sync(cx)?;
         report["durability"] = "namespace_allocation_and_clean_state_synced".into();
         report["verification"] = serde_json::to_value(verification)?;
         native.finish(cx, report)

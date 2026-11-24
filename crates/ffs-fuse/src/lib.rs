@@ -10136,6 +10136,8 @@ mod section22_corpus;
 #[cfg(test)]
 mod tests {
     mod copy_killpriv;
+    #[cfg(target_os = "linux")]
+    mod sync_write_cancellation;
 
     use super::*;
     use ffs_core::{

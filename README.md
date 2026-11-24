@@ -352,6 +352,21 @@ not make FAT namespace changes crash-atomic. Directory-lifetime regressions are
 authored in `crates/ffs-fat/src/filesystem/lifetime/tests.rs`; execution and native
 mounted qualification for this increment remain pending.
 
+Completed FAT mutations finish their final clean-state barriers, protection
+acknowledgment and mounted cache/reply publication with cancellation masked.
+A cancellation arriving during that finalization cannot turn a successful
+mutation into an interruption that invites an unsafe retry. Cancellation remains
+observable before finalization and between separately durable phases of compound
+requests; actual I/O, verification and cache-publication failures still fence
+the mount. Explicit sync barriers follow the same completion rule. FUSE also
+finishes the required `O_SYNC` / `O_DSYNC` flush after a successful write while
+retaining real flush errors and leaving cancellation pending afterward.
+
+Regressions cover both FAT dialects, native and mounted operations, real sidecar
+acknowledgments, subsequent access and cold reopen, plus synchronous FUSE write
+continuations. These tests are authored and source-reviewed; runtime execution
+and compiler/strict-Clippy qualification remain pending for this increment.
+
 ## FAT: create a file in an existing image
 
 The offline writer can create a new file with a native short or long name,

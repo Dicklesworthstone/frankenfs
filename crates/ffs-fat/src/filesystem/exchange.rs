@@ -31,36 +31,35 @@ impl FatFs {
         if source_ino == target_ino {
             return Ok(());
         }
-        let at_from = self.volume.lookup(cx, from_dir, &from_name)?;
-        let at_to = self.volume.lookup(cx, to_dir, &to_name)?;
-        if at_from.offset != source.offset || at_to.offset != target.offset {
-            return Err(FfsError::Corruption {
-                block: source.offset / 512,
-                detail: "exchange moved a native name slot during cache publication".into(),
-            });
-        }
-        let mut state = self.state()?;
-        Self::invalidate_cached_chain(&mut state, source_ino);
-        Self::invalidate_cached_chain(&mut state, target_ino);
-        state.free_clusters = None;
-        // Inodes follow objects, NOT names/slots. Cached descendants continue
-        // to refer to the same directory inode, whose own parent now changes.
-        let source_node = state
-            .nodes
-            .get_mut(&source_ino)
-            .ok_or_else(|| FfsError::NotFound(format!("FAT exchange inode {}", source_ino.0)))?;
-        source_node.parent = new_parent;
-        source_node.entry = Some(at_to);
-        let target_node = state
-            .nodes
-            .get_mut(&target_ino)
-            .ok_or_else(|| FfsError::NotFound(format!("FAT exchange inode {}", target_ino.0)))?;
-        target_node.parent = parent;
-        target_node.entry = Some(at_from);
-        state.slot_to_ino.insert(source.offset, target_ino);
-        state.slot_to_ino.insert(target.offset, source_ino);
-        drop(state);
-        checkpoint(cx)
+        cx.masked(|| {
+            let at_from = self.volume.lookup(cx, from_dir, &from_name)?;
+            let at_to = self.volume.lookup(cx, to_dir, &to_name)?;
+            if at_from.offset != source.offset || at_to.offset != target.offset {
+                return Err(FfsError::Corruption {
+                    block: source.offset / 512,
+                    detail: "exchange moved a native name slot during cache publication".into(),
+                });
+            }
+            let mut state = self.state()?;
+            Self::invalidate_cached_chain(&mut state, source_ino);
+            Self::invalidate_cached_chain(&mut state, target_ino);
+            state.free_clusters = None;
+            // Inodes follow objects, NOT names/slots. Cached descendants continue
+            // to refer to the same directory inode, whose own parent now changes.
+            let source_node = state.nodes.get_mut(&source_ino).ok_or_else(|| {
+                FfsError::NotFound(format!("FAT exchange inode {}", source_ino.0))
+            })?;
+            source_node.parent = new_parent;
+            source_node.entry = Some(at_to);
+            let target_node = state.nodes.get_mut(&target_ino).ok_or_else(|| {
+                FfsError::NotFound(format!("FAT exchange inode {}", target_ino.0))
+            })?;
+            target_node.parent = parent;
+            target_node.entry = Some(at_from);
+            state.slot_to_ino.insert(source.offset, target_ino);
+            state.slot_to_ino.insert(target.offset, source_ino);
+            Ok(())
+        })
     }
 }
 

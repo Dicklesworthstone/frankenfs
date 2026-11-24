@@ -260,8 +260,6 @@ pub(super) fn apply(
             );
         }
         phase = "synchronizing final clean state";
-        set_dirty(cx, volume, false)?;
-        volume.device.sync(cx)?;
         native.finish(cx, ())
     })();
     result.with_context(|| format!(

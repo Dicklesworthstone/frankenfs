@@ -229,8 +229,6 @@ impl Rename<'_> {
             // FSInfo is untouched: neither free allocation nor search hints
             // change. Directory contents (including . and ..) are also untouched.
             phase = "synchronizing final clean state";
-            set_dirty(cx, volume, false)?;
-            volume.device.sync(cx)?;
             report["durability"] = "namespace_allocation_and_clean_state_synced".into();
             report["verification"] = serde_json::to_value(verification)?;
             native.finish(cx, report)

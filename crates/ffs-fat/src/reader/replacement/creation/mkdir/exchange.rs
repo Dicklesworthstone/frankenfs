@@ -305,12 +305,9 @@ impl FatVolume {
                 bail!("exchange changed allocation or namespace consistency");
             }
             phase = "synchronizing and verifying clean state";
-            set_dirty(cx, self, false)?;
-            self.device.sync(cx)?;
-            verify_state(cx, self, false)?;
             report["durability"] = "metadata_and_clean_state_synced".into();
             report["verification"] = serde_json::to_value(after)?;
-            native.finish(cx, report)
+            native.finish_verified(cx, report, || verify_state(cx, self, false))
         })();
         result.with_context(|| format!(
             "FAT exchange failed while {phase}; image retained and may be dirty or partially changed; no rollback or crash atomicity is claimed"

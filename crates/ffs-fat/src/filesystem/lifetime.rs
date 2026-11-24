@@ -374,10 +374,11 @@ impl FatFs {
         rename_in_volume(cx, &self.volume, path, &recovery, true).map_err(map_mutation_error)?;
         let reservation = self.reserve_retention(cx, ino, entry.offset)?;
         rename_in_volume(cx, &self.volume, path, &recovery, false).map_err(map_mutation_error)?;
-        let node = self.refresh_node_from_path(cx, ino, &recovery)?;
-        let slot = node.entry.ok_or(FfsError::IsDirectory)?.offset;
-        reservation.publish(slot)?;
-        checkpoint(cx)
+        cx.masked(|| {
+            let node = self.refresh_node_from_path(cx, ino, &recovery)?;
+            let slot = node.entry.ok_or(FfsError::IsDirectory)?.offset;
+            reservation.publish(slot)
+        })
     }
 
     /// A pinned overwrite target must not be freed or disappear on a later
@@ -410,9 +411,10 @@ impl FatFs {
         // Do not recurse through public rename/unlink: this operation retains
         // one writer guard and has already reserved the displaced object's ID.
         rename_in_volume(cx, &self.volume, &from, &recovery, false).map_err(map_mutation_error)?;
-        let node = self.refresh_node_from_path(cx, target_ino, &recovery)?;
-        reservation.publish(node.entry.ok_or(FfsError::IsDirectory)?.offset)?;
-        checkpoint(cx)
+        cx.masked(|| {
+            let node = self.refresh_node_from_path(cx, target_ino, &recovery)?;
+            reservation.publish(node.entry.ok_or(FfsError::IsDirectory)?.offset)
+        })
     }
 
     /// Called under the operation writer gate by RELEASE, FORGET or destroy.
@@ -451,10 +453,13 @@ impl FatFs {
         ino: InodeNumber,
         destroying: bool,
     ) -> Result<(bool, Option<InodeNumber>)> {
-        checkpoint(cx)?;
+        // A completed child can leave cancellation pending. A final probe of
+        // its live/pinned parent performs no further native work and must not
+        // turn that completed reclamation into an interrupted mutation.
         if !self.retained(ino)? || (!destroying && self.pinned(ino)?) {
             return Ok((false, None));
         }
+        checkpoint(cx)?;
         self.ensure_writable()?;
         let path = self.path_for_inode(ino)?;
         let node = self.node(cx, ino)?;
@@ -483,7 +488,7 @@ impl FatFs {
         if actual.native.attributes & 1 != 0 {
             set_attr_in_volume(cx, &self.volume, &path, Some(false), None, None)
                 .map_err(map_mutation_error)?;
-            self.refresh_node_from_path(cx, ino, &path)?;
+            cx.masked(|| self.refresh_node_from_path(cx, ino, &path))?;
         }
         if actual.native.is_directory() {
             rmdir_in_volume(cx, &self.volume, &path, false).map_err(map_mutation_error)?;
@@ -504,7 +509,6 @@ impl FatFs {
             state.free_clusters = None;
         }
         locked(&self.lifetime)?.retained.remove(&ino);
-        checkpoint(cx)?;
         Ok((true, expected.directory_parent))
     }
 
@@ -515,7 +519,8 @@ impl FatFs {
             .filter_map(|(&ino, record)| record.visible_to_handles.then_some(ino))
             .collect();
         for ino in ids {
-            checkpoint(cx)?;
+            // The inner reaper checkpoints before each actual native removal.
+            // IDs reclaimed by an earlier parent cascade are now no-op probes.
             self.reap_retained_locked(cx, ino, true)?;
         }
         Ok(())
