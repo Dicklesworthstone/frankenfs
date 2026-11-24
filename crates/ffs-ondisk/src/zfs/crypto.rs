@@ -48,7 +48,7 @@ pub const DSL_CRYPTO_KEYFORMAT: &[u8] = b"keyformat";
 pub const DSL_CRYPTO_PBKDF2_SALT: &[u8] = b"pbkdf2salt";
 pub const DSL_CRYPTO_PBKDF2_ITERS: &[u8] = b"pbkdf2iters";
 
-fn invalid(reason: &'static str) -> ParseError {
+const fn invalid(reason: &'static str) -> ParseError {
     ParseError::InvalidField {
         field: "zfs.crypto",
         reason,
@@ -2248,13 +2248,7 @@ mod tests {
                 spill: None,
             })
             .unwrap();
-            let mut os = ObjectSet {
-                meta: meta_dnode,
-                zil_header: ZilHeader::default(),
-                kind: 2,
-                flags: 0,
-                tail_bytes: vec![0_u8; 4096 - 720],
-            };
+            let mut os = ObjectSet::new(2, 0, meta_dnode, ZilHeader::empty(), 4096).unwrap();
             os.stamp_encrypted_macs(order, &key.hmac_key, key.version)
                 .unwrap();
             let os_raw = os.encode(order).unwrap();

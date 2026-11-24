@@ -1159,7 +1159,8 @@ pub(super) fn write_dataset_objset_block(
     let fill = os.meta_fill();
     if let Some(wc) = crypto {
         if os.physical_bytes() < 2048 {
-            os.tail_bytes.resize(4096 - 720, 0);
+            os.ensure_min_physical_bytes(4096)
+                .map_err(|e| parse_err(&e))?;
         }
         os.stamp_encrypted_macs(order, &wc.key.hmac_key, wc.key.version)
             .map_err(|e| parse_err(&e))?;

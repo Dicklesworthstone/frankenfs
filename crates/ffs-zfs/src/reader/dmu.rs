@@ -167,7 +167,7 @@ impl Objects {
         &mut self,
         cx: &Cx,
         directory_object: u64,
-        all_datasets: &[datasets::DatasetInfo],
+        all_datasets: &[Dataset],
     ) -> Result<Option<ZfsDatasetCryptoInfo>> {
         let dir = self.load(cx, directory_object)?;
         if dir.node.object_type() != 196 {

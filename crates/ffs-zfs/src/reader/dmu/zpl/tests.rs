@@ -449,7 +449,7 @@ fn mos(leaf: &Leaf, meta: Dnode) -> Objects {
         txg: 61,
         root_birth: 60,
         meta,
-        cache: VecDeque::new(),
+        cache: std::collections::VecDeque::new(),
         cached_bytes: 0,
         keyring: crate::crypto::ZfsKeyRing::new(),
         crypto: None,

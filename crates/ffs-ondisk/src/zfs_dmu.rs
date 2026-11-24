@@ -1051,6 +1051,17 @@ impl ObjectSet {
         Some(out)
     }
 
+    /// Ensure `self.physical_bytes() >= min_bytes` (valid sizes: 1024, 2048, or 4096).
+    pub fn ensure_min_physical_bytes(&mut self, min_bytes: usize) -> Result<(), ParseError> {
+        if !matches!(min_bytes, 1024 | 2048 | 4096) {
+            return Err(invalid("unsupported object-set physical size"));
+        }
+        if self.physical_bytes() < min_bytes {
+            self.tail_bytes.resize(min_bytes - 720, 0);
+        }
+        Ok(())
+    }
+
     /// Write `(os_portable_mac, os_local_mac)` into `objset_phys_t` bytes `720..784`.
     pub fn set_macs(&mut self, portable: [u8; 32], local: [u8; 32]) -> Result<(), ParseError> {
         if self.physical_bytes() < 2048 || self.tail_bytes.len() < 64 {
