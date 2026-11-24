@@ -642,21 +642,16 @@ impl State {
             return Err(errno(libc::EOVERFLOW));
         }
         let writer = self.writer.as_mut().ok_or(FfsError::ReadOnly)?;
-        writer.engine.begin_durability_commit(cx)?;
+        checkpoint(cx)?;
         match operation(&mut writer.engine, &writer.dataset) {
             ZfsTxOutcome::Committed { value, token } => {
-                writer.engine.complete_durability_commit();
                 writer.last_token = Some(token);
                 writer.refresh_needed = true;
                 view.revision += 1;
                 Ok(value)
             }
-            ZfsTxOutcome::NotCommitted(error) => {
-                writer.engine.abort_durability_commit();
-                Err(error)
-            }
+            ZfsTxOutcome::NotCommitted(error) => Err(error),
             ZfsTxOutcome::Uncertain { reason, .. } => {
-                writer.engine.abort_durability_commit();
                 self.recovery_required = true;
                 Err(reason)
             }

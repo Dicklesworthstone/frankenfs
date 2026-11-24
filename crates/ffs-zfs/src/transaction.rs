@@ -773,6 +773,7 @@ impl ZfsTransactionEngine {
             let default_sw = if version == 5000 { 5000 } else { version };
             let selected_order = current_uberblock.order;
             current_uberblock.order = *expected_order;
+            let mut protection = pool.defer_protection(cx)?;
             for wave_labels in [[0_usize, 1], [2, 3]] {
                 for (m_idx, member) in members.iter().enumerate() {
                     for l_idx in wave_labels {
@@ -794,6 +795,9 @@ impl ZfsTransactionEngine {
                 for member in members {
                     member.sync_raw(cx)?;
                 }
+            }
+            for hold in &mut protection {
+                hold.complete();
             }
             // The native copies use label order; retain the selected in-memory
             // representation after reconciliation without cloning its root.
@@ -2528,7 +2532,14 @@ impl ZfsTransactionEngine {
         };
 
         // 2. Persist strictly child-before-parent across all members BEFORE touching Uberblocks!
-        let member_count = self.pool.leaves().len();
+        // Retain independent handles to the same admitted devices while updating
+        // engine state. Every early return drops all guards and aborts the epoch.
+        let pool = self.pool.clone();
+        let mut protection = match pool.defer_protection(cx) {
+            Ok(holds) => holds,
+            Err(error) => return ZfsTxOutcome::NotCommitted(error),
+        };
+        let member_count = pool.leaves().len();
         for bucket in [
             WriteBucket::ChildBlocks,
             WriteBucket::DatasetMetadata,
@@ -2708,6 +2719,9 @@ impl ZfsTransactionEngine {
         // and allocator before observing any further cancellation or reply fault.
         // A cancelled reply cannot make this durable TXG uncertain, poison the
         // owner, or leave subsequent requests using the predecessor allocator.
+        for hold in &mut protection {
+            hold.complete();
+        }
         let allow_v2 = converged_alloc.spacemap_v2_active;
         for ms in &mut converged_alloc.metaslabs {
             if ms.is_dirty() {

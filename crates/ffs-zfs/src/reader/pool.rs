@@ -199,6 +199,18 @@ impl Pool {
         &self.members
     }
 
+    /// Pin protection on every admitted leaf before the first write. If a
+    /// member refuses entry, the preceding guards abort without issuing I/O.
+    pub(crate) fn defer_protection(
+        &self,
+        cx: &Cx,
+    ) -> Result<Vec<ffs_block::DurabilityCommitDeferral<'_>>> {
+        self.members
+            .iter()
+            .map(|leaf| ffs_block::DurabilityCommitDeferral::enter(cx, leaf.device.as_ref()))
+            .collect()
+    }
+
     pub fn root(
         &self,
         cx: &Cx,

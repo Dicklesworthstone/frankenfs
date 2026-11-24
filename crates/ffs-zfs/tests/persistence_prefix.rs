@@ -2913,6 +2913,11 @@ struct MemberMediaState {
     write_calls: usize,
     sync_calls: usize,
     fault: DeviceFault,
+    protection_depth: usize,
+    protection_completed: usize,
+    protection_aborted: usize,
+    unprotected_io: usize,
+    refuse_protection: bool,
 }
 
 impl MemberMediaState {
@@ -2923,6 +2928,11 @@ impl MemberMediaState {
             write_calls: 0,
             sync_calls: 0,
             fault: DeviceFault::None,
+            protection_depth: 0,
+            protection_completed: 0,
+            protection_aborted: 0,
+            unprotected_io: 0,
+            refuse_protection: false,
         }
     }
 
@@ -3021,6 +3031,9 @@ impl ByteDevice for FaultableMemberDevice {
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         let mut st = self.state.lock().unwrap();
         let call = st.write_calls;
+        if st.protection_depth == 0 {
+            st.unprotected_io += 1;
+        }
         st.write_calls += 1;
         let start = usize::try_from(offset.0).unwrap();
         if start + buf.len() > st.durable.len() {
@@ -3063,6 +3076,9 @@ impl ByteDevice for FaultableMemberDevice {
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         let mut st = self.state.lock().unwrap();
         let idx = st.sync_calls;
+        if st.protection_depth == 0 {
+            st.unprotected_io += 1;
+        }
         st.sync_calls += 1;
         if let DeviceFault::FailSyncOnCall { sync_index } = st.fault
             && idx == sync_index
@@ -3076,6 +3092,28 @@ impl ByteDevice for FaultableMemberDevice {
             st.durable[start..start + pw.bytes.len()].copy_from_slice(&pw.bytes);
         }
         Ok(())
+    }
+
+    fn begin_durability_commit(&self, cx: &Cx) -> Result<()> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        let mut state = self.state.lock().unwrap();
+        if state.refuse_protection {
+            return Err(FfsError::ReadOnly);
+        }
+        state.protection_depth += 1;
+        Ok(())
+    }
+
+    fn complete_durability_commit(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.protection_depth -= 1;
+        state.protection_completed += 1;
+    }
+
+    fn abort_durability_commit(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.protection_depth -= 1;
+        state.protection_aborted += 1;
     }
 }
 
@@ -8248,6 +8286,100 @@ fn reconciliation_refuses_unadmitted_writers_without_rewriting_any_member() {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn direct_zfs_publication_defers_every_mirror_member_until_final_barrier() {
+    let cx = Cx::for_testing();
+    let built = build_clean_zfs_pool(&PoolFixtureSpec {
+        mirror_width: 2,
+        ..PoolFixtureSpec::default()
+    });
+    let members: Vec<_> = built
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let options = ZfsWriteOptions {
+        reconcile_torn_uberblocks: true,
+        ..default_write_opts(built.pool_guid, built.initial_slot)
+    };
+    let mut engine = open_engine_on_devices(&cx, &members, options).unwrap();
+    let protection =
+        |s: &MemberMediaState| (s.protection_depth, s.protection_completed, s.unprotected_io);
+    for member in &members {
+        let state = member.state.lock().unwrap();
+        assert_eq!((state.write_calls, state.sync_calls), (4, 2));
+        assert_eq!(protection(&state), (0, 1, 0));
+    }
+    let create = |engine: &mut ZfsTransactionEngine, name: &[u8]| {
+        engine.create_file(
+            &cx,
+            &[b"data".to_vec()],
+            2,
+            name,
+            0o644,
+            0,
+            0,
+            Timestamp {
+                seconds: 1_715_000_500,
+                nanos: 0,
+            },
+            ZfsDataChecksum::Fletcher4,
+        )
+    };
+
+    // Failure to admit the second member unwinds the first before any source write.
+    members[1].state.lock().unwrap().refuse_protection = true;
+    assert!(matches!(
+        create(&mut engine, b"refused"),
+        ZfsTxOutcome::NotCommitted(FfsError::ReadOnly)
+    ));
+    for (i, member) in members.iter().enumerate() {
+        let state = member.state.lock().unwrap();
+        assert_eq!((state.write_calls, state.sync_calls), (4, 2));
+        assert_eq!(
+            (state.protection_depth, state.protection_aborted),
+            (0, usize::from(i == 0))
+        );
+    }
+    members[1].state.lock().unwrap().refuse_protection = false;
+
+    engine.begin_durability_commit(&cx).unwrap();
+    let (_, token) = create(&mut engine, b"protected").into_result().unwrap();
+    engine.verify_token(&token).unwrap();
+    for member in &members {
+        let state = member.state.lock().unwrap();
+        assert!(state.sync_calls > 4);
+        assert_eq!(protection(&state), (1, 2, 0));
+    }
+    engine.complete_durability_commit();
+    engine.sync_devices(&cx).unwrap();
+    for member in &members {
+        let state = member.state.lock().unwrap();
+        assert_eq!(protection(&state), (0, 3, 1));
+    }
+
+    // A second-wave fault makes the native outcome uncertain. Neither member
+    // may report completion or run an unprotected barrier over that epoch.
+    engine.with_fault_hook(|event| {
+        if matches!(
+            event.stage,
+            ZfsPersistenceStage::UberblockBarrier { wave: 2, .. }
+        ) {
+            return Err(FfsError::Io(std::io::Error::other("cut final publication")));
+        }
+        Ok(())
+    });
+    assert!(matches!(
+        create(&mut engine, b"cut"),
+        ZfsTxOutcome::Uncertain { .. }
+    ));
+    for (i, member) in members.iter().enumerate() {
+        let state = member.state.lock().unwrap();
+        assert_eq!(protection(&state), (0, 3, 1));
+        assert_eq!(state.protection_aborted, 1 + usize::from(i == 0));
     }
 }
 
