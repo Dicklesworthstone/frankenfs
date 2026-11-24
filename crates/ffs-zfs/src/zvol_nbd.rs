@@ -7,6 +7,8 @@
 //! - Refusal of `zvol_destroy` while any session holds the volume (`EBUSY`).
 //! - Epoch invalidation on `zvol_resize` or `revoke_handles` so stale handles fail
 //!   closed with `ESTALE` (translated to `NBD_EIO` on the wire).
+//! - Encryption-key unload or replacement invalidates existing sessions, including
+//!   cached writeback reads. Loading a key again requires opening a fresh session.
 //! - Explicit durability semantics via [`ZvolSyncPolicy::Always`] (default: durable
 //!   4-label TXG + [`ZfsDurableToken`] before ack) or [`ZvolSyncPolicy::FlushBarrier`]
 //!   (explicit writeback staging committed atomically on `FUA` / `FLUSH`, dropped
@@ -17,13 +19,14 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::Duration;
 
 use asupersync::Cx;
 use ffs_block::ByteDevice;
 use ffs_error::{FfsError, Result};
+use ffs_ondisk::zfs::crypto::UnwrappedDslKey;
 use ffs_ondisk::zfs_zpl::Timestamp;
 use ffs_types::ByteOffset;
 use serde::Serialize;
@@ -368,6 +371,7 @@ impl ZfsVolumeManager {
         if info.readonly {
             return Err(FfsError::ReadOnly);
         }
+        let session_key = SessionKey::capture(cx, &guard.engine, dataset)?;
         if !guard.active_writable_leases.insert(info.dataset_guid) {
             return Err(reject_errno(
                 libc::EBUSY,
@@ -382,6 +386,7 @@ impl ZfsVolumeManager {
             snapshot: None,
             dataset_guid: info.dataset_guid,
             open_epoch,
+            session_key,
             volsize: info.volsize,
             volblocksize: info.volblocksize,
             read_only: false,
@@ -403,6 +408,7 @@ impl ZfsVolumeManager {
         checkpoint(cx)?;
         let mut guard = self.lock_state()?;
         let info = guard.engine.zvol_info(cx, dataset, snapshot)?;
+        let session_key = SessionKey::capture(cx, &guard.engine, dataset)?;
         let open_epoch = guard.current_epoch(info.dataset_guid);
         *guard
             .active_readonly_counts
@@ -415,6 +421,7 @@ impl ZfsVolumeManager {
             snapshot: snapshot.map(<[u8]>::to_vec),
             dataset_guid: info.dataset_guid,
             open_epoch,
+            session_key,
             volsize: info.volsize,
             volblocksize: info.volblocksize,
             read_only: true,
@@ -427,13 +434,60 @@ impl ZfsVolumeManager {
     }
 }
 
-/// Epoch-bound block I/O session opened from a [`ZfsVolumeManager`].
+/// Identity of the loaded key at session open. A weak reference lets unload scrub
+/// the key while preventing a later reload from reviving stale cached plaintext.
+struct SessionKey {
+    encryption_root_ddobj: u64,
+    loaded: Weak<UnwrappedDslKey>,
+}
+
+impl SessionKey {
+    fn capture(
+        cx: &Cx,
+        engine: &ZfsTransactionEngine,
+        dataset: &[Vec<u8>],
+    ) -> Result<Option<Self>> {
+        let Some(info) = engine.dataset_crypto_info(cx, dataset)? else {
+            return Ok(None);
+        };
+        let loaded = engine
+            .keyring()
+            .get(info.encryption_root_ddobj)
+            .ok_or(FfsError::PermissionDenied)?;
+        if loaded.guid != info.record.guid
+            || loaded.suite != info.record.suite
+            || loaded.version != info.record.version
+        {
+            return Err(FfsError::PermissionDenied);
+        }
+        Ok(Some(Self {
+            encryption_root_ddobj: info.encryption_root_ddobj,
+            loaded: Arc::downgrade(&loaded),
+        }))
+    }
+
+    fn verify(&self, engine: &ZfsTransactionEngine) -> Result<()> {
+        let current = engine
+            .keyring()
+            .get(self.encryption_root_ddobj)
+            .ok_or(FfsError::PermissionDenied)?;
+        let opened = self.loaded.upgrade().ok_or(FfsError::PermissionDenied)?;
+        if !Arc::ptr_eq(&opened, &current) {
+            return Err(FfsError::PermissionDenied);
+        }
+        Ok(())
+    }
+}
+
+/// Epoch-bound block I/O session opened from a [`ZfsVolumeManager`]. Encrypted
+/// sessions must be reopened after their encryption-root key is unloaded or replaced.
 pub struct ZfsZvolSession {
     state: Arc<Mutex<ManagerState>>,
     dataset: Vec<Vec<u8>>,
     snapshot: Option<Vec<u8>>,
     dataset_guid: u64,
     open_epoch: u64,
+    session_key: Option<SessionKey>,
     volsize: u64,
     volblocksize: usize,
     read_only: bool,
@@ -591,6 +645,9 @@ impl ZfsZvolSession {
                 libc::ESTALE,
                 "ZVOL session handle epoch invalidated by resize, destroy, or revocation",
             ));
+        }
+        if let Some(key) = &self.session_key {
+            key.verify(&guard.engine)?;
         }
         Ok(())
     }
