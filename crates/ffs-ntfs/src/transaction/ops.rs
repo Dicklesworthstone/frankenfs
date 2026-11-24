@@ -591,6 +591,14 @@ impl NtfsTransactionEngine {
         if let Err(err) = self.require_clean_writer() {
             return NtfsTxOutcome::NotCommitted(err);
         }
+        // The native writer owns every barrier, including initialization of an
+        // erased journal. Direct editor callers need the same protection hold
+        // as mounted mutations, and an outer caller may retain its own hold.
+        let device = std::sync::Arc::clone(&self.device);
+        let mut protection = match ffs_block::DurabilityCommitDeferral::enter(cx, device.as_ref()) {
+            Ok(protection) => protection,
+            Err(error) => return NtfsTxOutcome::NotCommitted(error),
+        };
         if let Err(err) = self.ensure_ring_initialized(cx, plan.operation) {
             return NtfsTxOutcome::NotCommitted(err);
         }
@@ -994,6 +1002,7 @@ impl NtfsTransactionEngine {
 
         match post_commit_step {
             Ok(ckpt_lsn) => {
+                protection.complete();
                 self.recovery_required = false;
                 let token =
                     self.make_token(tx_id, commit_lsn, Some(ckpt_lsn), plan.operation_digest);

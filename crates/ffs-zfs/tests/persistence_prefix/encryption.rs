@@ -12,8 +12,8 @@ use ffs_ondisk::zfs::crypto::{
 use ffs_zfs::reader::dmu::properties::PropertyValue;
 use ffs_zfs::{
     ZfsEncryptionCreateOptions, ZfsFs, ZfsKeyMaterial, ZfsKeyStatus, ZfsMountWriteOptions,
-    ZfsPropertySetValue, ZfsRecvRequest, ZfsSendFrom, ZfsSendRequest, ZfsXattrSetMode,
-    ZfsZvolCreateOptions, send_stream,
+    ZfsPropertySetValue, ZfsRecvRequest, ZfsSendFrom, ZfsSendRequest, ZfsVolumeManager,
+    ZfsXattrSetMode, ZfsZvolCreateOptions, ZvolAckKind, ZvolSyncPolicy, send_stream,
 };
 use std::collections::BTreeSet;
 use std::io::Cursor;
@@ -90,6 +90,208 @@ fn snapshot_ivset_guid(
         .value;
     assert_ne!(guid, 0);
     guid
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn encrypted_zvol_key_unload_revokes_writeback_and_reload_requires_fresh_sessions() {
+    let cx = Cx::for_testing();
+    let timestamp = Timestamp {
+        seconds: 1_736_500_001,
+        nanos: 0,
+    };
+    let built = build_clean_zfs_pool(&encryption_pool_spec(1));
+    let devices: Vec<_> = built
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut engine = open_engine_on_devices(
+        &cx,
+        &devices,
+        default_write_opts(built.pool_guid, built.initial_slot),
+    )
+    .unwrap();
+    let parent = vec![b"data".to_vec()];
+    let root = vec![b"data".to_vec(), b"vault".to_vec()];
+    let volume = vec![b"data".to_vec(), b"vault".to_vec(), b"disk0".to_vec()];
+    let material = ZfsKeyMaterial::Raw([0xC7; 32]);
+    engine
+        .create_encrypted_dataset(
+            &cx,
+            &parent,
+            b"vault",
+            &[],
+            &ZfsEncryptionCreateOptions {
+                suite: ZioEncrypt::Aes256Gcm,
+                key_material: Some(material.clone()),
+                keylocation: Some(b"prompt".to_vec()),
+                pbkdf2_iters: None,
+                extra_entropy: b"zvol-session-revocation".to_vec(),
+            },
+            timestamp,
+        )
+        .into_result()
+        .unwrap();
+    engine
+        .zvol_create(
+            &cx,
+            &root,
+            b"disk0",
+            &ZfsZvolCreateOptions {
+                volsize: 64 * 1024,
+                volblocksize: 4096,
+                sparse: true,
+                initial_props: Vec::new(),
+                timestamp,
+            },
+        )
+        .into_result()
+        .unwrap();
+    let committed = vec![0x31; 3 * 4096];
+    engine
+        .zvol_write_at(&cx, &volume, 0, &committed, ZfsDataChecksum::Sha256)
+        .into_result()
+        .unwrap();
+    engine
+        .zvol_snapshot(&cx, &volume, b"before", timestamp)
+        .into_result()
+        .unwrap();
+    let crypto = engine.dataset_crypto_info(&cx, &volume).unwrap().unwrap();
+    let keyring = engine.keyring().clone();
+    // Keep an external reference alive: revocation must check current keyring
+    // membership and identity, not merely whether the old allocation still exists.
+    let original_key = keyring.get(crypto.encryption_root_ddobj).unwrap();
+    let key_references = Arc::strong_count(&original_key);
+    let manager = ZfsVolumeManager::new(engine);
+    let mut session = manager
+        .open_writable_session(
+            &cx,
+            &volume,
+            ZvolSyncPolicy::FlushBarrier,
+            true,
+            ZfsDataChecksum::Sha256,
+        )
+        .unwrap();
+    let snapshot = manager
+        .open_readonly_session(&cx, &volume, Some(b"before"))
+        .unwrap();
+    assert_eq!(Arc::strong_count(&original_key), key_references);
+    let before_txg = manager.committed_txg().unwrap();
+    let before_writes: Vec<_> = devices
+        .iter()
+        .map(FaultableMemberDevice::write_calls)
+        .collect();
+    let staged = vec![0xA7; 4096];
+    assert_eq!(
+        session.write_at(&cx, 0, &staged, false).unwrap().0,
+        ZvolAckKind::StagedVolatile
+    );
+    session.discard(&cx, 4096, 4096).unwrap();
+    let mut visible = vec![0; 8192];
+    session.read_at(&cx, 0, &mut visible).unwrap();
+    assert_eq!(&visible[..4096], staged);
+    assert!(visible[4096..].iter().all(|byte| *byte == 0));
+
+    assert!(keyring.unload_key(crypto.encryption_root_ddobj).unwrap());
+    // Both cached plaintext and staged holes previously bypassed native reads.
+    for offset in [0, 4096, 8192] {
+        let mut out = vec![0xD9; 4096];
+        assert!(matches!(
+            session.read_at(&cx, offset, &mut out),
+            Err(FfsError::PermissionDenied)
+        ));
+        assert_eq!(out, vec![0xD9; 4096]);
+    }
+    for fua in [false, true] {
+        assert!(matches!(
+            session.write_at(&cx, 0, &staged, fua),
+            Err(FfsError::PermissionDenied)
+        ));
+        assert!(matches!(
+            session.discard_with_fua(&cx, 0, 4096, fua),
+            Err(FfsError::PermissionDenied)
+        ));
+    }
+    assert!(matches!(
+        session.flush(&cx),
+        Err(FfsError::PermissionDenied)
+    ));
+    let mut snapshot_bytes = vec![0xD9; 4096];
+    assert!(matches!(
+        snapshot.read_at(&cx, 0, &mut snapshot_bytes),
+        Err(FfsError::PermissionDenied)
+    ));
+    assert_eq!(snapshot_bytes, vec![0xD9; 4096]);
+
+    // Reloading identical key material does not resurrect revoked handles or
+    // permit their pre-unload writeback data to reach stable storage.
+    keyring.load_key(&crypto, &material).unwrap();
+    assert!(matches!(
+        session.flush(&cx),
+        Err(FfsError::PermissionDenied)
+    ));
+    assert!(matches!(
+        session.read_at(&cx, 0, &mut snapshot_bytes),
+        Err(FfsError::PermissionDenied)
+    ));
+    assert!(matches!(
+        snapshot.read_at(&cx, 0, &mut snapshot_bytes),
+        Err(FfsError::PermissionDenied)
+    ));
+    assert_eq!(snapshot_bytes, vec![0xD9; 4096]);
+    assert_eq!(manager.committed_txg().unwrap(), before_txg);
+    assert_eq!(
+        devices
+            .iter()
+            .map(FaultableMemberDevice::write_calls)
+            .collect::<Vec<_>>(),
+        before_writes
+    );
+    drop(session);
+    drop(snapshot);
+    drop(original_key);
+
+    let mut fresh = manager
+        .open_writable_session(
+            &cx,
+            &volume,
+            ZvolSyncPolicy::FlushBarrier,
+            true,
+            ZfsDataChecksum::Sha256,
+        )
+        .unwrap();
+    let mut visible = vec![0; committed.len()];
+    fresh.read_at(&cx, 0, &mut visible).unwrap();
+    assert_eq!(visible, committed);
+    let replacement = vec![0x53; 4096];
+    assert_eq!(
+        fresh.write_at(&cx, 0, &replacement, true).unwrap().0,
+        ZvolAckKind::DurableTxg
+    );
+    drop(fresh);
+    let slot = manager.committed_slot().unwrap();
+    drop(manager.into_engine().unwrap());
+    let recovered_devices: Vec<_> = devices
+        .iter()
+        .map(FaultableMemberDevice::fresh_from_durable)
+        .collect();
+    let recovered = open_engine_on_devices(
+        &cx,
+        &recovered_devices,
+        default_write_opts(built.pool_guid, slot),
+    )
+    .unwrap();
+    recovered.load_key(&cx, &root, &material).unwrap();
+    recovered
+        .zvol_read_at(&cx, &volume, None, 0, &mut visible)
+        .unwrap();
+    assert_eq!(&visible[..4096], replacement);
+    assert_eq!(&visible[4096..], &committed[4096..]);
+    recovered
+        .zvol_read_at(&cx, &volume, Some(b"before"), 0, &mut visible)
+        .unwrap();
+    assert_eq!(visible, committed);
 }
 
 #[test]

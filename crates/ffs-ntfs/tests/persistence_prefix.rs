@@ -1098,6 +1098,155 @@ fn writable_fsops_preserve_success_when_cancelled_after_native_commit() {
 }
 
 #[test]
+fn direct_native_transactions_defer_protection_through_journal_initialization_and_commit() {
+    let cx = Cx::for_testing();
+    let image = build_clean_ntfs_image(256, 50, 0xF12A_6E17_0000_0051);
+    let length = image.len() as u64 - SECTOR_BYTES as u64;
+    let device = FaultInjectingNtfsDevice::new(image);
+    let mut engine = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&device) as Arc<dyn ByteDevice>,
+        0,
+        length,
+        write_options_clean(),
+    )
+    .unwrap();
+
+    device.state.lock().unwrap().refuse_protection = true;
+    assert!(matches!(
+        engine.create_file(&cx, "/", "refused", b"data"),
+        NtfsTxOutcome::NotCommitted(FfsError::ReadOnly)
+    ));
+    assert_eq!(device.write_bytes_total(), 0);
+    assert_eq!(device.state.lock().unwrap().sync_calls, 0);
+    device.state.lock().unwrap().refuse_protection = false;
+    engine
+        .create_file(&cx, "/", "protected", &vec![0x37; 2 * CLUSTER_BYTES])
+        .into_result()
+        .unwrap();
+    {
+        let state = device.state.lock().unwrap();
+        assert!(
+            state.sync_calls > 3,
+            "initialization and transaction barriers"
+        );
+        assert_eq!(state.protection_depth, 0);
+        assert_eq!(state.protection_completed, 1);
+        assert_eq!(state.protection_aborted, 0);
+        assert_eq!(state.unprotected_writes, 0);
+        assert_eq!(state.unprotected_syncs, 0);
+    }
+
+    // A mounted or multi-operation caller retains its own protection hold.
+    device.begin_durability_commit(&cx).unwrap();
+    engine
+        .write_file_data(&cx, "/protected", &vec![0x51; 3 * CLUSTER_BYTES])
+        .into_result()
+        .unwrap();
+    {
+        let state = device.state.lock().unwrap();
+        assert_eq!(state.protection_depth, 1);
+        assert_eq!(state.protection_completed, 2);
+        assert_eq!(state.unprotected_syncs, 0);
+    }
+    device.complete_durability_commit();
+    engine.sync_device(&cx).unwrap();
+    {
+        let state = device.state.lock().unwrap();
+        assert_eq!(state.protection_depth, 0);
+        assert_eq!(state.protection_completed, 3);
+        assert_eq!(state.unprotected_writes, 0);
+        assert_eq!(state.unprotected_syncs, 1, "only the final seal barrier");
+    }
+    assert_eq!(
+        read_all_files_from_clean_volume(&device.snapshot_durable_only())["/protected"],
+        vec![0x51; 3 * CLUSTER_BYTES]
+    );
+}
+
+#[test]
+fn native_recovery_defers_protection_and_aborts_failed_epochs() {
+    for cut in [
+        NtfsPersistenceStage::DirtyRestartBarrier,
+        NtfsPersistenceStage::LogCommitBarrier,
+        NtfsPersistenceStage::TargetMetadataBarrier,
+    ] {
+        let cx = Cx::for_testing();
+        let image = build_clean_ntfs_image(256, 50, 0xF12A_6E17_0000_0052);
+        let length = image.len() as u64 - SECTOR_BYTES as u64;
+        let device = FaultInjectingNtfsDevice::new(image);
+        let mut engine = NtfsTransactionEngine::from_device(
+            &cx,
+            Arc::clone(&device) as Arc<dyn ByteDevice>,
+            0,
+            length,
+            write_options_clean(),
+        )
+        .unwrap();
+        engine
+            .create_file(&cx, "/", "saved", b"before")
+            .into_result()
+            .unwrap();
+        engine.set_stage_hook(Some(Box::new(move |event| {
+            if event.stage == cut {
+                return Err(FfsError::Io(std::io::Error::other(
+                    "native publication cut",
+                )));
+            }
+            Ok(())
+        })));
+        assert!(
+            engine
+                .write_file_data(&cx, "/saved", b"after")
+                .into_result()
+                .is_err()
+        );
+        {
+            let state = device.state.lock().unwrap();
+            assert_eq!(state.protection_depth, 0);
+            assert_eq!(state.protection_completed, 1);
+            assert_eq!(state.protection_aborted, 1);
+            assert_eq!(state.unprotected_writes, 0);
+            assert_eq!(state.unprotected_syncs, 0);
+        }
+        let crash = device.snapshot_durable_only();
+        for fail_barrier in [true, false] {
+            let recovered = FaultInjectingNtfsDevice::new(crash.clone());
+            if fail_barrier {
+                recovered.set_fail_sync_call(Some(1));
+            }
+            let result = NtfsTransactionEngine::from_device(
+                &cx,
+                Arc::clone(&recovered) as Arc<dyn ByteDevice>,
+                0,
+                length,
+                write_options_recover(),
+            );
+            assert_eq!(result.is_err(), fail_barrier, "{cut:?}");
+            {
+                let state = recovered.state.lock().unwrap();
+                assert_eq!(state.protection_depth, 0);
+                assert_eq!(state.protection_completed, usize::from(!fail_barrier));
+                assert_eq!(state.protection_aborted, usize::from(fail_barrier));
+                assert_eq!(state.unprotected_writes, 0);
+                assert_eq!(state.unprotected_syncs, 0);
+            }
+            if !fail_barrier {
+                let expected = if cut == NtfsPersistenceStage::DirtyRestartBarrier {
+                    b"before".as_slice()
+                } else {
+                    b"after".as_slice()
+                };
+                assert_eq!(
+                    read_all_files_from_clean_volume(&recovered.snapshot_durable_only())["/saved"],
+                    expected
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn failed_native_publication_cannot_reinitialize_the_log_before_recovery() {
     for stage in [
         NtfsPersistenceStage::DirtyRestartBarrier,
@@ -1923,6 +2072,12 @@ struct FaultState {
     sync_calls: usize,
     fail_sync_call: Option<usize>,
     write_bytes_total: u64,
+    protection_depth: usize,
+    protection_completed: usize,
+    protection_aborted: usize,
+    unprotected_writes: usize,
+    unprotected_syncs: usize,
+    refuse_protection: bool,
 }
 
 impl FaultInjectingNtfsDevice {
@@ -1935,6 +2090,12 @@ impl FaultInjectingNtfsDevice {
                 sync_calls: 0,
                 fail_sync_call: None,
                 write_bytes_total: 0,
+                protection_depth: 0,
+                protection_completed: 0,
+                protection_aborted: 0,
+                unprotected_writes: 0,
+                unprotected_syncs: 0,
+                refuse_protection: false,
             }),
         })
     }
@@ -1985,6 +2146,9 @@ impl ByteDevice for FaultInjectingNtfsDevice {
 
     fn write_all_at(&self, _cx: &Cx, offset: ByteOffset, buf: &[u8]) -> Result<()> {
         let mut st = self.state.lock().unwrap();
+        if st.protection_depth == 0 {
+            st.unprotected_writes += 1;
+        }
         let at = usize::try_from(offset.0).unwrap();
         st.live[at..at + buf.len()].copy_from_slice(buf);
         st.pending.push((offset.0, buf.to_vec()));
@@ -1994,6 +2158,9 @@ impl ByteDevice for FaultInjectingNtfsDevice {
 
     fn sync(&self, _cx: &Cx) -> Result<()> {
         let mut st = self.state.lock().unwrap();
+        if st.protection_depth == 0 {
+            st.unprotected_syncs += 1;
+        }
         st.sync_calls += 1;
         if st.fail_sync_call == Some(st.sync_calls) {
             return Err(FfsError::Io(std::io::Error::other(
@@ -2006,6 +2173,28 @@ impl ByteDevice for FaultInjectingNtfsDevice {
             st.durable[at..at + bytes.len()].copy_from_slice(&bytes);
         }
         Ok(())
+    }
+
+    fn begin_durability_commit(&self, cx: &Cx) -> Result<()> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        let mut state = self.state.lock().unwrap();
+        if state.refuse_protection {
+            return Err(FfsError::ReadOnly);
+        }
+        state.protection_depth += 1;
+        Ok(())
+    }
+
+    fn complete_durability_commit(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.protection_depth -= 1;
+        state.protection_completed += 1;
+    }
+
+    fn abort_durability_commit(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.protection_depth -= 1;
+        state.protection_aborted += 1;
     }
 }
 
