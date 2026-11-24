@@ -151,6 +151,8 @@ struct PoolFixtureSpec {
     zpl_flags: BTreeMap<u64, u64>,
     hello_size: Option<u64>,
     hello_mode: u16,
+    hello_compress_type: u8,
+    lz4_feature: Option<u64>,
     hello_sa_xattrs: BTreeMap<String, Vec<u8>>,
     hello_sa_xattrs_in_spill: bool,
     root_ids: (u64, u64),
@@ -200,6 +202,8 @@ impl Default for PoolFixtureSpec {
             zpl_flags: BTreeMap::new(),
             hello_size: None,
             hello_mode: 0o644,
+            hello_compress_type: 0,
+            lz4_feature: Some(1),
             hello_sa_xattrs: BTreeMap::new(),
             hello_sa_xattrs_in_spill: false,
             root_ids: (0, 0),
@@ -864,8 +868,10 @@ fn encode_zpl_bonus_for_fixture(
             if let SaSpillFixture::Project(project_id) = spill_profile {
                 sraw[56..64].copy_from_slice(&order.encode(project_id));
                 // Real LZJB: literal header/attributes followed by a zero run.
-                // Timestamp COW emits an uncompressed 8 KiB spill, which must
-                // charge its physical growth to this object's project owner.
+                // Pad this valid foreign compressed record so native metadata
+                // recompression has a nonzero physical accounting delta at both
+                // 512-byte and 4-KiB allocation sectors. Decoding stops at lsize;
+                // the trailing physical padding is not logical attribute data.
                 let mut compressed = Vec::new();
                 for literals in sraw[..72].as_chunks::<8>().0 {
                     compressed.push(0);
@@ -894,6 +900,8 @@ fn encode_zpl_bonus_for_fixture(
                     compressed.push(map);
                     compressed.extend_from_slice(&group);
                 }
+                assert!(compressed.len() < 512);
+                compressed.resize(4608, 0);
                 assert_eq!(
                     ffs_ondisk::zfs::decompress(&compressed, 3, sraw.len()).unwrap(),
                     sraw
@@ -1180,6 +1188,9 @@ fn build_zpl_objectset(
             order,
         );
         write_dnode_at(&mut table, 4, &hello_dn).expect("write hello dn");
+        // Native dn_compress is byte 6; model an imported per-object override
+        // independently of the dataset's inherited compression property.
+        table[4 * DNODE_BYTES + 6] = spec.hello_compress_type;
         root_entries.push((
             b"hello.txt",
             encode_directory_reference(4, Kind::Regular).unwrap(),
@@ -2331,13 +2342,15 @@ fn build_clean_zfs_pool(spec: &PoolFixtureSpec) -> BuiltPool {
 
     // Objects 10, 11, 12: MOS feature catalogs
     let mut rf_entries: Vec<(&[u8], u64)> = vec![
-        (b"org.illumos:lz4_compress", 1),
         (b"com.delphix:hole_birth", 1),
         (
             b"com.delphix:extensible_dataset",
             u64::from(!spec.data_head_features.is_empty()),
         ),
     ];
+    if let Some(count) = spec.lz4_feature {
+        rf_entries.push((b"org.illumos:lz4_compress", count));
+    }
     for &(name, count) in &spec.additional_read_features {
         rf_entries.push((name, count));
     }
@@ -3969,7 +3982,7 @@ fn native_accounting_snapshot(
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn project_owner_receives_spill_growth_truncate_and_final_unlink_accounting() {
+fn project_owner_receives_spill_recompression_truncate_and_final_unlink_accounting() {
     let cx = Cx::for_testing();
     let dataset = [b"data".to_vec()];
     let timestamp = Timestamp {
@@ -4006,9 +4019,10 @@ fn project_owner_receives_spill_growth_truncate_and_final_unlink_accounting() {
             (old_spill.compression(), old_spill.logical_bytes()),
             (3, 8192)
         );
-        let expected_growth = 8192 - bp_allocated_bytes(old_spill);
+        let expected_spill_bytes = 1_u64 << ashift;
+        let expected_reclaim = bp_allocated_bytes(old_spill) - expected_spill_bytes;
         assert!(
-            expected_growth > 0,
+            expected_reclaim > 0,
             "fixture must exercise a physical accounting delta"
         );
 
@@ -4029,6 +4043,10 @@ fn project_owner_receives_spill_growth_truncate_and_final_unlink_accounting() {
         let (updated_node, updated_counters) =
             native_accounting_snapshot(&cx, &engine, &devices[0]);
         let updated_node = updated_node.unwrap();
+        let new_spill = updated_node.spill().unwrap();
+        assert_eq!(new_spill.compression(), 15);
+        assert_eq!(new_spill.logical_bytes(), 8192);
+        assert_eq!(bp_allocated_bytes(new_spill), expected_spill_bytes);
         assert_eq!(
             updated_node.pointers(),
             original_node.pointers(),
@@ -4036,7 +4054,7 @@ fn project_owner_receives_spill_growth_truncate_and_final_unlink_accounting() {
         );
         assert_eq!(
             updated_node.used_bytes(),
-            original_node.used_bytes() + expected_growth
+            original_node.used_bytes() - expected_reclaim
         );
         for (index, owner) in [b"3e8".as_slice(), b"3e8".as_slice(), b"2a".as_slice()]
             .into_iter()
@@ -4044,10 +4062,10 @@ fn project_owner_receives_spill_growth_truncate_and_final_unlink_accounting() {
         {
             assert_eq!(
                 updated_counters[index][owner],
-                original_counters[index][owner] + expected_growth
+                original_counters[index][owner] - expected_reclaim
             );
             let mut expected = original_counters[index].clone();
-            *expected.get_mut(owner).unwrap() += expected_growth;
+            *expected.get_mut(owner).unwrap() -= expected_reclaim;
             assert_eq!(
                 updated_counters[index], expected,
                 "only the native accounting owner's bytes may change"
@@ -4065,8 +4083,11 @@ fn project_owner_receives_spill_growth_truncate_and_final_unlink_accounting() {
         let (truncated_node, truncated_counters) =
             native_accounting_snapshot(&cx, &engine, &devices[0]);
         let truncated_node = truncated_node.unwrap();
-        assert_eq!(truncated_node.used_bytes(), 8192);
-        assert_eq!(truncated_counters[2][b"2a".as_slice()], 8192 + 512);
+        assert_eq!(truncated_node.used_bytes(), expected_spill_bytes);
+        assert_eq!(
+            truncated_counters[2][b"2a".as_slice()],
+            expected_spill_bytes + 512
+        );
         assert_eq!(truncated_counters[2][b"obj-2a".as_slice()], 1);
         assert_eq!(
             truncated_counters[2][b"0".as_slice()],
@@ -4161,8 +4182,8 @@ fn project_owner_survives_unlink_replacement_restart_and_orphan_reclamation() {
             (old_spill.compression(), old_spill.logical_bytes()),
             (3, 8192)
         );
-        let expected_growth = 8192 - bp_allocated_bytes(old_spill);
-        assert!(expected_growth > 0);
+        let expected_spill_bytes = 1_u64 << ashift;
+        assert!(bp_allocated_bytes(old_spill) > expected_spill_bytes);
         let identity = {
             let mut mos = engine.open_read_objects(&cx).unwrap();
             let mut zpl = mos.zpl(&cx, &dataset).unwrap();
@@ -4193,7 +4214,7 @@ fn project_owner_survives_unlink_replacement_restart_and_orphan_reclamation() {
         // Unlink/replacement updates only `links` and `ctime` (both in `bonus`), so
         // `encode_updated_zpl_bonus` preserves the existing compressed spill block
         // intact (`used_bytes` unchanged) until `truncate_file` below updates `mtime`
-        // inside the spill block and charges spill growth to project `42` (`"2a"`).
+        // inside the spill block and credits recompression to project `42` (`"2a"`).
         assert_eq!(
             retained_node.unwrap().used_bytes(),
             original_node.used_bytes()
@@ -4250,8 +4271,12 @@ fn project_owner_survives_unlink_replacement_restart_and_orphan_reclamation() {
         let (truncated_node, truncated_counters) =
             native_accounting_snapshot(&cx, &reopened, &fresh[0]);
         let truncated_node = truncated_node.unwrap();
-        assert_eq!(truncated_node.used_bytes(), 8192);
-        assert_eq!(truncated_counters[2][b"2a".as_slice()], 8192 + 512);
+        assert_eq!(truncated_node.spill().unwrap().compression(), 15);
+        assert_eq!(truncated_node.used_bytes(), expected_spill_bytes);
+        assert_eq!(
+            truncated_counters[2][b"2a".as_slice()],
+            expected_spill_bytes + 512
+        );
         assert_eq!(truncated_counters[2][b"obj-2a".as_slice()], 1);
         assert_eq!(
             truncated_counters[2][b"0".as_slice()],
@@ -4786,6 +4811,916 @@ fn native_zpl_file_dnode(
     )
     .unwrap()
     .unwrap()
+}
+
+fn native_plain_leaf_pointers(device: &FaultableMemberDevice, node: &Dnode) -> Vec<BlockPointer> {
+    let image = device.durable_snapshot();
+    let mut pending: Vec<_> = node.pointers().iter().rev().cloned().collect();
+    let mut leaves = Vec::new();
+    while let Some(pointer) = pending.pop() {
+        if pointer.hole() {
+            continue;
+        }
+        if pointer.level() == 0 {
+            leaves.push(pointer);
+            continue;
+        }
+        let dva = pointer.regular_dvas().unwrap()[0];
+        let start = usize::try_from(DATA_OFFSET + dva.offset).unwrap();
+        let raw = ffs_ondisk::zfs::decompress(
+            &image[start..start + pointer.physical_bytes()],
+            pointer.compression(),
+            pointer.logical_bytes(),
+        )
+        .unwrap();
+        pending.extend(raw.chunks_exact(128).rev().map(|bytes| {
+            let child = BlockPointer::parse(bytes, pointer.payload_order()).unwrap();
+            assert!(child.hole() || child.level() + 1 == pointer.level());
+            child
+        }));
+    }
+    leaves
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn native_plain_compression_resolves_properties_and_preserves_object_overrides() {
+    const COMP: &[u8] = b"compression";
+    const RECEIVED: &[u8] = b"compression$recvd";
+    const INHERIT: &[u8] = b"compression$inherit";
+    let cases = [
+        ("default-off", vec![], vec![], 0, 2, Some(1)),
+        ("inherited-lz4", vec![(COMP, 15)], vec![], 0, 15, Some(1)),
+        ("received-gzip", vec![], vec![(RECEIVED, 6)], 0, 6, Some(1)),
+        (
+            "explicit-inherit",
+            vec![(COMP, 14)],
+            vec![(RECEIVED, 15), (INHERIT, 1)],
+            0,
+            14,
+            Some(1),
+        ),
+        (
+            "local-gzip",
+            vec![(COMP, 15)],
+            vec![(COMP, 13)],
+            0,
+            13,
+            Some(1),
+        ),
+        ("on-lz4", vec![], vec![(COMP, 1)], 0, 15, Some(1)),
+        ("on-lzjb", vec![], vec![(COMP, 1)], 0, 3, None),
+        ("explicit-lzjb", vec![], vec![(COMP, 3)], 0, 3, Some(1)),
+        ("object-off", vec![], vec![(COMP, 15)], 2, 2, Some(1)),
+        ("object-gzip", vec![], vec![(COMP, 15)], 5, 5, Some(1)),
+        ("object-on", vec![], vec![(COMP, 2)], 1, 15, Some(1)),
+        ("object-lz4", vec![], vec![(COMP, 2)], 15, 15, Some(1)),
+        ("object-empty", vec![], vec![(COMP, 15)], 4, 2, Some(1)),
+        (
+            "object-zstd-no-level",
+            vec![],
+            vec![(COMP, 2)],
+            16,
+            2,
+            Some(1),
+        ),
+        (
+            "object-zstd-default-level",
+            vec![],
+            vec![(COMP, 6)],
+            16,
+            16,
+            Some(1),
+        ),
+    ];
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    let timestamp = Timestamp {
+        seconds: 1_715_000_807,
+        nanos: 0,
+    };
+    let mut compressible = vec![0; 4096];
+    for index in (0..compressible.len()).step_by(256) {
+        compressible[index] = 0xA7;
+    }
+    // A deterministic high-entropy block exercises the physical-size fallback,
+    // independently of the encoder's choice of compression algorithm.
+    let mut state = 0xA26D_7C91_u32;
+    let incompressible: Vec<_> = (0..4096)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state.to_le_bytes()[0]
+        })
+        .collect();
+    for zpl_version in [4, 5] {
+        for (case, root_properties, data_properties, selector, expected, lz4_feature) in &cases {
+            let mut data_properties = data_properties.clone();
+            data_properties.push((b"recordsize", 4096));
+            let built = build_clean_zfs_pool(&PoolFixtureSpec {
+                zpl_version,
+                deadlist_mode: DeadlistMode::NativeDeadlist,
+                root_properties: root_properties.clone(),
+                data_properties,
+                hello_compress_type: *selector,
+                lz4_feature: *lz4_feature,
+                additional_read_features: if *selector == 16 {
+                    vec![(b"org.freebsd:zstd_compress", 0)]
+                } else {
+                    Vec::new()
+                },
+                ..PoolFixtureSpec::default()
+            });
+            let devices: Vec<_> = built
+                .members
+                .into_iter()
+                .map(FaultableMemberDevice::new)
+                .collect();
+            let mut engine = open_engine_on_devices(
+                &cx,
+                &devices,
+                default_write_opts(built.pool_guid, built.initial_slot),
+            )
+            .unwrap();
+            engine
+                .write_file_data(
+                    &cx,
+                    &dataset,
+                    4,
+                    0,
+                    &compressible,
+                    timestamp,
+                    ZfsDataChecksum::Inherit,
+                )
+                .into_result()
+                .unwrap_or_else(|error| panic!("{case}: {error}"));
+            let node = native_zpl_file_dnode(&cx, &engine, &devices[0], &dataset, 4);
+            assert_eq!(node.compress_type(), *selector, "{case}");
+            let leaves = native_plain_leaf_pointers(&devices[0], &node);
+            assert_eq!(leaves.len(), 1, "{case}");
+            assert_eq!(leaves[0].compression(), *expected, "{case}");
+            assert_eq!(leaves[0].logical_bytes(), 4096, "{case}");
+            if *expected == 2 {
+                assert_eq!(leaves[0].physical_bytes(), 4096, "{case}");
+            } else {
+                assert!(leaves[0].physical_bytes() < 4096, "{case}");
+            }
+            let mut mos = engine.open_read_objects(&cx).unwrap();
+            assert_eq!(
+                mos.zpl(&cx, &dataset)
+                    .unwrap()
+                    .read(&cx, 4, 0, 4096)
+                    .unwrap(),
+                compressible,
+                "{case}"
+            );
+            let head = mos.object(&cx, 18).unwrap();
+            let root = BlockPointer::parse(&head.bonus()[128..256], head.order()).unwrap();
+            let expected_metadata = if *lz4_feature == Some(1) { 15 } else { 3 };
+            assert_eq!(
+                root.compression(),
+                expected_metadata,
+                "ObjectSet metadata {case}"
+            );
+            let image = devices[0].durable_snapshot();
+            let root_offset =
+                usize::try_from(DATA_OFFSET + root.regular_dvas().unwrap()[0].offset).unwrap();
+            let raw = ffs_ondisk::zfs::decompress(
+                &image[root_offset..root_offset + root.physical_bytes()],
+                root.compression(),
+                root.logical_bytes(),
+            )
+            .unwrap();
+            let objectset = ObjectSet::parse(&raw, root.payload_order()).unwrap();
+            for pointer in objectset
+                .meta
+                .pointers()
+                .iter()
+                .filter(|pointer| !pointer.hole())
+            {
+                assert_eq!(
+                    pointer.compression(),
+                    expected_metadata,
+                    "DNODE metadata {case}"
+                );
+            }
+
+            // Time-only COW and namespace edits must not reset imported policy.
+            engine
+                .set_attributes(
+                    &cx,
+                    &dataset,
+                    4,
+                    &ffs_zfs::ZfsSetAttr {
+                        atime: Some(timestamp),
+                        ..ffs_zfs::ZfsSetAttr::default()
+                    },
+                    timestamp,
+                    ZfsDataChecksum::Inherit,
+                )
+                .into_result()
+                .unwrap();
+            engine
+                .rename_entry(
+                    &cx,
+                    &dataset,
+                    2,
+                    b"hello.txt",
+                    2,
+                    b"renamed",
+                    Some(4),
+                    timestamp,
+                )
+                .into_result()
+                .unwrap();
+            let metadata_node = native_zpl_file_dnode(&cx, &engine, &devices[0], &dataset, 4);
+            assert_eq!(metadata_node.compress_type(), *selector, "{case}");
+            assert_eq!(metadata_node.pointers(), node.pointers(), "{case}");
+
+            engine
+                .write_file_data(
+                    &cx,
+                    &dataset,
+                    4,
+                    0,
+                    &incompressible,
+                    timestamp,
+                    ZfsDataChecksum::Inherit,
+                )
+                .into_result()
+                .unwrap();
+            let slot = engine.committed_slot();
+            drop(engine);
+            let durable: Vec<_> = devices
+                .iter()
+                .map(FaultableMemberDevice::fresh_from_durable)
+                .collect();
+            let reopened =
+                open_engine_on_devices(&cx, &durable, default_write_opts(built.pool_guid, slot))
+                    .unwrap();
+            let node = native_zpl_file_dnode(&cx, &reopened, &durable[0], &dataset, 4);
+            assert_eq!(node.compress_type(), *selector, "{case}");
+            let leaves = native_plain_leaf_pointers(&durable[0], &node);
+            assert_eq!(leaves.len(), 1, "{case}");
+            assert_eq!(leaves[0].compression(), 2, "incompressible {case}");
+            assert_eq!(leaves[0].physical_bytes(), 4096, "incompressible {case}");
+            let mut mos = reopened.open_read_objects(&cx).unwrap();
+            let mut view = mos.zpl(&cx, &dataset).unwrap();
+            assert_eq!(view.resolve(&cx, b"/renamed").unwrap(), 4);
+            assert_eq!(
+                view.read(&cx, 4, 0, 4096).unwrap(),
+                incompressible,
+                "{case}"
+            );
+            assert_eq!(
+                mos.zpl_snapshot(&cx, &dataset, b"before")
+                    .unwrap()
+                    .read(&cx, 4, 0, 4096)
+                    .unwrap(),
+                built.snap_hello_expected,
+                "snapshot {case}"
+            );
+            assert_pool_scrub_and_allocation_clean(&cx, &durable, built.pool_guid, Some(slot));
+        }
+    }
+}
+
+#[test]
+fn native_compression_refuses_unavailable_or_invalid_policy_before_writes() {
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    let timestamp = Timestamp {
+        seconds: 1_715_000_808,
+        nanos: 0,
+    };
+    for (property, selector, lz4_feature) in [
+        (15, 0, None),
+        (15, 0, Some(0)),
+        (2, 15, None),
+        (16, 0, Some(1)),
+        (2, 255, Some(1)),
+    ] {
+        let built = build_clean_zfs_pool(&PoolFixtureSpec {
+            deadlist_mode: DeadlistMode::NativeDeadlist,
+            data_properties: vec![(b"compression", property)],
+            hello_compress_type: selector,
+            lz4_feature,
+            ..PoolFixtureSpec::default()
+        });
+        let devices: Vec<_> = built
+            .members
+            .into_iter()
+            .map(FaultableMemberDevice::new)
+            .collect();
+        let mut engine = open_engine_on_devices(
+            &cx,
+            &devices,
+            default_write_opts(built.pool_guid, built.initial_slot),
+        )
+        .unwrap();
+        assert_native_write_refused(&mut engine, &devices, libc::EOPNOTSUPP, |writer| {
+            writer.write_file_data(
+                &cx,
+                &dataset,
+                4,
+                0,
+                &[0xA9; 4096],
+                timestamp,
+                ZfsDataChecksum::Inherit,
+            )
+        });
+    }
+}
+
+#[test]
+fn native_zero_records_become_holes_except_with_explicit_compression_off() {
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    let timestamp = Timestamp {
+        seconds: 1_715_000_812,
+        nanos: 0,
+    };
+    for (property, selector, expect_hole) in [(2, 0, false), (15, 0, true), (2, 4, true)] {
+        let built = build_clean_zfs_pool(&PoolFixtureSpec {
+            deadlist_mode: DeadlistMode::NativeDeadlist,
+            data_properties: vec![(b"recordsize", 4096), (b"compression", property)],
+            hello_compress_type: selector,
+            ..PoolFixtureSpec::default()
+        });
+        let devices: Vec<_> = built
+            .members
+            .into_iter()
+            .map(FaultableMemberDevice::new)
+            .collect();
+        let mut engine = open_engine_on_devices(
+            &cx,
+            &devices,
+            default_write_opts(built.pool_guid, built.initial_slot),
+        )
+        .unwrap();
+        engine
+            .write_file_data(
+                &cx,
+                &dataset,
+                4,
+                0,
+                &[0; 4096],
+                timestamp,
+                ZfsDataChecksum::Inherit,
+            )
+            .into_result()
+            .unwrap();
+        let node = native_zpl_file_dnode(&cx, &engine, &devices[0], &dataset, 4);
+        assert_eq!(node.compress_type(), selector);
+        assert_eq!(
+            native_plain_leaf_pointers(&devices[0], &node).is_empty(),
+            expect_hole
+        );
+        assert_eq!(node.used_bytes(), if expect_hole { 0 } else { 4096 });
+        let slot = engine.committed_slot();
+        drop(engine);
+        let durable: Vec<_> = devices
+            .iter()
+            .map(FaultableMemberDevice::fresh_from_durable)
+            .collect();
+        let mut reopened =
+            open_engine_on_devices(&cx, &durable, default_write_opts(built.pool_guid, slot))
+                .unwrap();
+        let mut mos = reopened.open_read_objects(&cx).unwrap();
+        assert_eq!(
+            mos.zpl(&cx, &dataset)
+                .unwrap()
+                .read(&cx, 4, 0, 4096)
+                .unwrap(),
+            vec![0; 4096]
+        );
+        assert_eq!(
+            mos.zpl_snapshot(&cx, &dataset, b"before")
+                .unwrap()
+                .read(&cx, 4, 0, 4096)
+                .unwrap(),
+            built.snap_hello_expected
+        );
+        reopened
+            .write_file_data(
+                &cx,
+                &dataset,
+                4,
+                17,
+                b"initialized",
+                timestamp,
+                ZfsDataChecksum::Inherit,
+            )
+            .into_result()
+            .unwrap();
+        let mut expected = vec![0; 4096];
+        expected[17..28].copy_from_slice(b"initialized");
+        let mut mos = reopened.open_read_objects(&cx).unwrap();
+        assert_eq!(
+            mos.zpl(&cx, &dataset)
+                .unwrap()
+                .read(&cx, 4, 0, 4096)
+                .unwrap(),
+            expected
+        );
+        assert_pool_scrub_and_allocation_clean(
+            &cx,
+            &durable,
+            built.pool_guid,
+            Some(reopened.committed_slot()),
+        );
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn native_zstd_property_ownership_and_compressed_data_survive_shared_lifecycle() {
+    use ffs_zfs::ZfsPropertySetValue;
+
+    const ZSTD: &[u8] = b"org.freebsd:zstd_compress";
+    let cx = Cx::for_testing();
+    let parent = [b"data".to_vec()];
+    let dataset = vec![b"data".to_vec(), b"compressed".to_vec()];
+    let clone = vec![b"data".to_vec(), b"clone".to_vec()];
+    let timestamp = Timestamp {
+        seconds: 1_715_000_809,
+        nanos: 0,
+    };
+    let built = build_clean_zfs_pool(&PoolFixtureSpec {
+        additional_read_features: vec![(ZSTD, 0)],
+        ..PoolFixtureSpec::default()
+    });
+    let devices: Vec<_> = built
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut engine = open_engine_on_devices(
+        &cx,
+        &devices,
+        default_write_opts(built.pool_guid, built.initial_slot),
+    )
+    .unwrap();
+    engine
+        .create_dataset(&cx, &parent, b"compressed", &[], timestamp)
+        .into_result()
+        .unwrap();
+    assert_native_dataset_feature(&cx, &engine, &dataset, ZSTD, false, 0);
+    engine
+        .set_property(
+            &cx,
+            &dataset,
+            "compression",
+            ZfsPropertySetValue::Number(16 | (6 << 7)),
+        )
+        .into_result()
+        .unwrap();
+    // Native dsl_dataset_set_compression_sync activates this feature at an
+    // explicit property assignment, including an empty dataset with no BP16.
+    assert_native_dataset_feature(&cx, &engine, &dataset, ZSTD, true, 1);
+    engine
+        .set_property(
+            &cx,
+            &dataset,
+            "compression",
+            ZfsPropertySetValue::Number(16 | (6 << 7)),
+        )
+        .into_result()
+        .unwrap();
+    assert_native_dataset_feature(&cx, &engine, &dataset, ZSTD, true, 1);
+    let (file, _) = engine
+        .create_file(
+            &cx,
+            &dataset,
+            2,
+            b"payload",
+            0o600,
+            1000,
+            1000,
+            timestamp,
+            ZfsDataChecksum::Inherit,
+        )
+        .into_result()
+        .unwrap();
+    let payload = vec![0xD3; 8192];
+    engine
+        .write_file_data(
+            &cx,
+            &dataset,
+            file,
+            0,
+            &payload,
+            timestamp,
+            ZfsDataChecksum::Inherit,
+        )
+        .into_result()
+        .unwrap();
+    let node = native_zpl_file_dnode(&cx, &engine, &devices[0], &dataset, file);
+    assert_eq!(
+        node.compress_type(),
+        0,
+        "new files must retain native inheritance"
+    );
+    for pointer in native_plain_leaf_pointers(&devices[0], &node) {
+        assert_eq!(pointer.compression(), 16);
+        assert!(pointer.physical_bytes() < pointer.logical_bytes());
+        let media = devices[0].durable_snapshot();
+        let offset =
+            usize::try_from(DATA_OFFSET + pointer.regular_dvas().unwrap()[0].offset).unwrap();
+        assert_eq!(
+            media[offset + 7],
+            6,
+            "persist the requested native ZSTD level"
+        );
+    }
+    let (snapshot, _) = engine
+        .create_snapshot(&cx, &dataset, b"compressed", timestamp)
+        .into_result()
+        .unwrap();
+    assert_native_dataset_feature(&cx, &engine, &dataset, ZSTD, true, 2);
+    let (clone_head, _) = engine
+        .create_clone(
+            &cx,
+            &dataset,
+            b"compressed",
+            &parent,
+            b"clone",
+            &[],
+            timestamp,
+        )
+        .into_result()
+        .unwrap();
+    assert_native_dataset_feature(&cx, &engine, &clone, ZSTD, true, 3);
+    engine
+        .set_property(&cx, &dataset, "compression", ZfsPropertySetValue::Number(2))
+        .into_result()
+        .unwrap();
+    engine
+        .write_file_data(
+            &cx,
+            &dataset,
+            file,
+            0,
+            &[0xE4; 8192],
+            timestamp,
+            ZfsDataChecksum::Inherit,
+        )
+        .into_result()
+        .unwrap();
+    assert_native_dataset_feature(&cx, &engine, &dataset, ZSTD, true, 3);
+    let node = native_zpl_file_dnode(&cx, &engine, &devices[0], &dataset, file);
+    assert!(
+        native_plain_leaf_pointers(&devices[0], &node)
+            .iter()
+            .all(|pointer| pointer.compression() == 2)
+    );
+    let slot = engine.committed_slot();
+    drop(engine);
+    let durable: Vec<_> = devices
+        .iter()
+        .map(FaultableMemberDevice::fresh_from_durable)
+        .collect();
+    let mut reopened =
+        open_engine_on_devices(&cx, &durable, default_write_opts(built.pool_guid, slot)).unwrap();
+    let mut mos = reopened.open_read_objects(&cx).unwrap();
+    for object in [snapshot, clone_head] {
+        assert_eq!(
+            mos.zap(&cx, object)
+                .unwrap()
+                .iter()
+                .find(|entry| entry.name == ZSTD)
+                .unwrap()
+                .value,
+            0
+        );
+    }
+    assert_eq!(
+        mos.zpl_snapshot(&cx, &dataset, b"compressed")
+            .unwrap()
+            .read(&cx, file, 0, payload.len())
+            .unwrap(),
+        payload
+    );
+    assert_eq!(
+        mos.zpl(&cx, &clone)
+            .unwrap()
+            .read(&cx, file, 0, payload.len())
+            .unwrap(),
+        payload
+    );
+    reopened.destroy_dataset(&cx, &clone).into_result().unwrap();
+    assert_native_dataset_feature(&cx, &reopened, &dataset, ZSTD, true, 2);
+    reopened
+        .destroy_snapshot(&cx, &dataset, b"compressed", false)
+        .into_result()
+        .unwrap();
+    assert_native_dataset_feature(&cx, &reopened, &dataset, ZSTD, true, 1);
+    reopened
+        .destroy_dataset(&cx, &dataset)
+        .into_result()
+        .unwrap();
+    assert_native_dataset_feature(&cx, &reopened, &parent, ZSTD, false, 0);
+    assert_pool_scrub_and_allocation_clean(
+        &cx,
+        &durable,
+        built.pool_guid,
+        Some(reopened.committed_slot()),
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn inherited_zstd_first_data_crash_cuts_publish_compression_and_owner_together() {
+    use ffs_zfs::ZfsPropertySetValue;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const ZSTD: &[u8] = b"org.freebsd:zstd_compress";
+    let cx = Cx::for_testing();
+    let parent = [b"data".to_vec()];
+    let dataset = vec![b"data".to_vec(), b"inherited".to_vec()];
+    let timestamp = Timestamp {
+        seconds: 1_715_000_810,
+        nanos: 0,
+    };
+    let built = build_clean_zfs_pool(&PoolFixtureSpec {
+        data_properties: vec![(b"recordsize", 4096)],
+        additional_read_features: vec![(ZSTD, 0)],
+        ..PoolFixtureSpec::default()
+    });
+    let devices: Vec<_> = built
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut setup = open_engine_on_devices(
+        &cx,
+        &devices,
+        default_write_opts(built.pool_guid, built.initial_slot),
+    )
+    .unwrap();
+    setup
+        .set_property(&cx, &parent, "compression", ZfsPropertySetValue::Number(16))
+        .into_result()
+        .unwrap();
+    setup
+        .create_dataset(&cx, &parent, b"inherited", &[], timestamp)
+        .into_result()
+        .unwrap();
+    let (file, _) = setup
+        .create_file(
+            &cx,
+            &dataset,
+            2,
+            b"payload",
+            0o600,
+            1000,
+            1000,
+            timestamp,
+            ZfsDataChecksum::Inherit,
+        )
+        .into_result()
+        .unwrap();
+    setup
+        .create_snapshot(&cx, &dataset, b"empty", timestamp)
+        .into_result()
+        .unwrap();
+    // Inheritance and default-ON metadata do not themselves create a ZSTD owner.
+    assert_native_dataset_feature(&cx, &setup, &dataset, ZSTD, false, 1);
+    let base_txg = setup.committed_txg();
+    let base_slot = setup.committed_slot();
+    drop(setup);
+    let payload = vec![0xBD; 5 * 4096];
+    for stage in 0..6_u8 {
+        let cut_devices: Vec<_> = devices
+            .iter()
+            .map(FaultableMemberDevice::fresh_from_durable)
+            .collect();
+        let mut engine = open_engine_on_devices(
+            &cx,
+            &cut_devices,
+            default_write_opts(built.pool_guid, base_slot),
+        )
+        .unwrap();
+        let tripped = Arc::new(AtomicBool::new(false));
+        let hook_tripped = Arc::clone(&tripped);
+        engine.with_fault_hook(move |event| {
+            let cut = matches!(
+                (stage, event.stage),
+                (0, ZfsPersistenceStage::ChildBlocksWrite { .. })
+                    | (1, ZfsPersistenceStage::DatasetMetadataBarrier { .. })
+                    | (2, ZfsPersistenceStage::MosSpaceMapBarrier { .. })
+                    | (3, ZfsPersistenceStage::MosRootBarrier { .. })
+                    | (4, ZfsPersistenceStage::UberblockWrite { label: 2, .. })
+                    | (5, ZfsPersistenceStage::BeforeAcknowledge)
+            );
+            if cut {
+                hook_tripped.store(true, Ordering::SeqCst);
+                Err(FfsError::Cancelled)
+            } else {
+                Ok(())
+            }
+        });
+        let outcome = engine.write_file_data(
+            &cx,
+            &dataset,
+            file,
+            0,
+            &payload,
+            timestamp,
+            ZfsDataChecksum::Inherit,
+        );
+        assert!(tripped.load(Ordering::SeqCst), "missed ZSTD cut {stage}");
+        let published = stage >= 4;
+        let slot = match outcome {
+            ZfsTxOutcome::NotCommitted(FfsError::Cancelled) if !published => base_slot,
+            ZfsTxOutcome::Uncertain { target_slot, .. } if stage == 4 => {
+                assert!(engine.requires_recovery());
+                target_slot
+            }
+            ZfsTxOutcome::Committed { token, .. } if stage == 5 => token.published_slot(),
+            other => panic!("unexpected ZSTD cut {stage}: {other:?}"),
+        };
+        drop(engine);
+        let durable: Vec<_> = cut_devices
+            .iter()
+            .map(FaultableMemberDevice::fresh_from_durable)
+            .collect();
+        let mut options = default_write_opts(built.pool_guid, slot);
+        options.reconcile_torn_uberblocks = stage == 4;
+        let mut recovered = open_engine_on_devices(&cx, &durable, options).unwrap();
+        assert_eq!(recovered.committed_txg(), base_txg + u64::from(published));
+        assert_native_dataset_feature(
+            &cx,
+            &recovered,
+            &dataset,
+            ZSTD,
+            published,
+            1 + u64::from(published),
+        );
+        let mut mos = recovered.open_read_objects(&cx).unwrap();
+        assert_eq!(
+            mos.zpl(&cx, &dataset)
+                .unwrap()
+                .read(&cx, file, 0, payload.len())
+                .unwrap(),
+            if published { payload.as_slice() } else { &[] }
+        );
+        assert!(
+            mos.zpl_snapshot(&cx, &dataset, b"empty")
+                .unwrap()
+                .read(&cx, file, 0, payload.len())
+                .unwrap()
+                .is_empty()
+        );
+        assert_pool_scrub_and_allocation_clean(&cx, &durable, built.pool_guid, Some(slot));
+        recovered
+            .write_file_data(
+                &cx,
+                &dataset,
+                file,
+                0,
+                &payload,
+                timestamp,
+                ZfsDataChecksum::Inherit,
+            )
+            .into_result()
+            .unwrap();
+        assert_native_dataset_feature(&cx, &recovered, &dataset, ZSTD, true, 2);
+        let node = native_zpl_file_dnode(&cx, &recovered, &durable[0], &dataset, file);
+        let leaves = native_plain_leaf_pointers(&durable[0], &node);
+        assert_eq!(leaves.len(), 5);
+        assert!(leaves.iter().all(|pointer| pointer.compression() == 16));
+    }
+}
+
+#[test]
+fn native_plain_zvol_compression_survives_partial_discard_and_reopen() {
+    use ffs_zfs::{ZfsPropertySetValue, ZfsZvolCreateOptions};
+
+    const ZSTD: &[u8] = b"org.freebsd:zstd_compress";
+    let cx = Cx::for_testing();
+    let parent = [b"data".to_vec()];
+    let dataset = vec![b"data".to_vec(), b"compressed-volume".to_vec()];
+    let timestamp = Timestamp {
+        seconds: 1_715_000_811,
+        nanos: 0,
+    };
+    for compression in [15, 16 | (7 << 7)] {
+        let built = build_clean_zfs_pool(&PoolFixtureSpec {
+            additional_read_features: vec![(ZSTD, 0)],
+            ..PoolFixtureSpec::default()
+        });
+        let devices: Vec<_> = built
+            .members
+            .into_iter()
+            .map(FaultableMemberDevice::new)
+            .collect();
+        let mut engine = open_engine_on_devices(
+            &cx,
+            &devices,
+            default_write_opts(built.pool_guid, built.initial_slot),
+        )
+        .unwrap();
+        engine
+            .zvol_create(
+                &cx,
+                &parent,
+                b"compressed-volume",
+                &ZfsZvolCreateOptions {
+                    volsize: 64 * 1024,
+                    volblocksize: 4096,
+                    sparse: true,
+                    initial_props: vec![(
+                        "compression".to_owned(),
+                        ZfsPropertySetValue::Number(compression),
+                    )],
+                    timestamp,
+                },
+            )
+            .into_result()
+            .unwrap();
+        let original = vec![0xC5; 4 * 4096];
+        engine
+            .zvol_write_at(&cx, &dataset, 0, &original, ZfsDataChecksum::Fletcher4)
+            .into_result()
+            .unwrap();
+        let node = native_zpl_file_dnode(&cx, &engine, &devices[0], &dataset, 1);
+        assert_eq!(node.compress_type(), 0);
+        let leaves = native_plain_leaf_pointers(&devices[0], &node);
+        assert_eq!(leaves.len(), 4);
+        assert!(leaves.iter().all(
+            |pointer| u64::from(pointer.compression()) == compression & 127
+                && pointer.physical_bytes() < pointer.logical_bytes()
+        ));
+        engine
+            .create_snapshot(&cx, &dataset, b"original", timestamp)
+            .into_result()
+            .unwrap();
+        engine
+            .zvol_discard(&cx, &dataset, 512, 512, ZfsDataChecksum::Fletcher4)
+            .into_result()
+            .unwrap();
+        engine
+            .zvol_discard(&cx, &dataset, 4096, 4096, ZfsDataChecksum::Fletcher4)
+            .into_result()
+            .unwrap();
+        let mut expected = original.clone();
+        expected[512..1024].fill(0);
+        expected[4096..8192].fill(0);
+        let slot = engine.committed_slot();
+        drop(engine);
+        let durable: Vec<_> = devices
+            .iter()
+            .map(FaultableMemberDevice::fresh_from_durable)
+            .collect();
+        let mut reopened =
+            open_engine_on_devices(&cx, &durable, default_write_opts(built.pool_guid, slot))
+                .unwrap();
+        let mut mos = reopened.open_read_objects(&cx).unwrap();
+        assert_eq!(
+            mos.zvol(&cx, &dataset, None)
+                .unwrap()
+                .read(&cx, 0, original.len())
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            mos.zvol(&cx, &dataset, Some(b"original"))
+                .unwrap()
+                .read(&cx, 0, original.len())
+                .unwrap(),
+            original
+        );
+        let node = native_zpl_file_dnode(&cx, &reopened, &durable[0], &dataset, 1);
+        let leaves = native_plain_leaf_pointers(&durable[0], &node);
+        assert_eq!(leaves.len(), 3);
+        assert!(
+            leaves
+                .iter()
+                .all(|pointer| u64::from(pointer.compression()) == compression & 127)
+        );
+        assert_native_dataset_feature(
+            &cx,
+            &reopened,
+            &dataset,
+            ZSTD,
+            compression & 127 == 16,
+            if compression & 127 == 16 { 2 } else { 0 },
+        );
+        reopened
+            .destroy_snapshot(&cx, &dataset, b"original", false)
+            .into_result()
+            .unwrap();
+        reopened.zvol_destroy(&cx, &dataset).into_result().unwrap();
+        assert_native_dataset_feature(&cx, &reopened, &parent, ZSTD, false, 0);
+        assert_pool_scrub_and_allocation_clean(
+            &cx,
+            &durable,
+            built.pool_guid,
+            Some(reopened.committed_slot()),
+        );
+    }
 }
 
 #[test]

@@ -35,13 +35,14 @@ use crate::reader::dmu::{DatasetCryptoContext, Objects};
 
 use super::dmu_cow::{
     DMU_OT_BPOBJ, DMU_OT_BPOBJ_HDR, DMU_OT_DEADLIST, DMU_OT_DEADLIST_HDR,
-    DMU_OT_DIRECTORY_CONTENTS, DatasetWriteCrypto, DnodeCowSpec, FATZAP_BLOCK_BYTES,
-    MosFeatureState, PoolSpaceAllocator, SpaceDelta, StagedBlockWrite, WriteBucket,
-    allocate_object_id, append_bps_to_bpobj_inner, collect_non_hole_bps_from, cow_update_dnode,
-    cow_update_dnode_with_crypto, decode_compression_property, encode_zap_blocks_for_dnode,
-    encode_zap_blocks_for_dnode_with_normflags, objectset_user_accounting_flags,
-    put_dnode_in_table, read_dnode_prefix, read_staged_or_committed_dnode, remove_dnode_from_table,
-    write_dataset_objset_block, zap_optional_u64, zap_required_u64,
+    DMU_OT_DIRECTORY_CONTENTS, DatasetCompression, DatasetFeatureUsage, DatasetWriteCrypto,
+    DnodeCowSpec, FATZAP_BLOCK_BYTES, MosFeatureState, PoolSpaceAllocator, SpaceDelta,
+    StagedBlockWrite, WriteBucket, allocate_object_id, append_bps_to_bpobj_inner,
+    collect_non_hole_bps_from, cow_update_dnode, cow_update_dnode_with_crypto,
+    encode_zap_blocks_for_dnode, encode_zap_blocks_for_dnode_with_normflags,
+    objectset_user_accounting_flags, put_dnode_in_table, read_dnode_prefix,
+    read_staged_or_committed_dnode, remove_dnode_from_table, write_dataset_objset_block,
+    zap_optional_u64, zap_required_u64,
 };
 use super::{checkpoint, corrupt, parse_err, unsupported};
 
@@ -494,7 +495,11 @@ pub(super) fn effective_local_numeric_prop(
 }
 
 const EXTENSIBLE_DATASET_FEATURE: &str = "com.delphix:extensible_dataset";
-const DATASET_BLOCK_FEATURES: [&str; 2] = ["org.open-zfs:large_blocks", "org.illumos:sha512"];
+const DATASET_BLOCK_FEATURES: [&str; 3] = [
+    "org.open-zfs:large_blocks",
+    "org.illumos:sha512",
+    "org.freebsd:zstd_compress",
+];
 
 fn require_dataset_block_feature(features: &MosFeatureState, feature: &str) -> Result<()> {
     for required in [feature, EXTENSIBLE_DATASET_FEATURE] {
@@ -600,6 +605,33 @@ pub(super) fn activate_dataset_block_features(
         });
     }
     Ok(changed)
+}
+
+/// OpenZFS activates ZSTD when its property is explicitly set, even before a
+/// compressed block is born. Inherited compression activates on block birth.
+pub(super) fn activate_initial_compression_feature(
+    rows: &mut Vec<RawZapEntry>,
+    initial_props: &[(String, ZfsPropertySetValue)],
+    features: &mut MosFeatureState,
+    new_txg: u64,
+) -> Result<()> {
+    let mut requires_zstd = false;
+    for (name, value) in initial_props {
+        if name != "compression" {
+            continue;
+        }
+        let ZfsPropertySetValue::Number(raw) = value else {
+            return Err(reject_einval(
+                "ZFS compression requires a numeric property value",
+            ));
+        };
+        DatasetCompression::from_property(*raw, features)?;
+        requires_zstd |= raw & 127 == 16;
+    }
+    if requires_zstd {
+        activate_dataset_block_features(rows, &["org.freebsd:zstd_compress"], features, new_txg)?;
+    }
+    Ok(())
 }
 
 /// Release exactly one dataset's ownership of each feature it actually stores.
@@ -3842,19 +3874,20 @@ pub(super) fn adjust_dsl_crypto_key_refcount(
     Ok(next)
 }
 
-/// Resolve effective `(compression, zstd_level)` for a newly created child dataset from
+/// Resolve effective compression for a newly created child dataset from
 /// `initial_props` (falling back to inherited `parent_dataset` `compression` property).
 pub(super) fn effective_compression_for_new_dataset(
     cx: &Cx,
     mos: &mut Objects,
     parent_dataset: &[Vec<u8>],
     initial_props: &[(String, ZfsPropertySetValue)],
-) -> Result<(u8, Option<u8>)> {
+    features: &MosFeatureState,
+) -> Result<DatasetCompression> {
     for (k, v) in initial_props {
         if k == "compression"
             && let ZfsPropertySetValue::Number(raw) = v
         {
-            return Ok(decode_compression_property(*raw));
+            return DatasetCompression::from_property(*raw, features);
         }
     }
     let props = mos.properties(cx, parent_dataset, None, &["compression".into()])?;
@@ -3862,7 +3895,7 @@ pub(super) fn effective_compression_for_new_dataset(
         Some(PropertyValue::Number(n)) => *n,
         _ => 2,
     };
-    Ok(decode_compression_property(raw))
+    DatasetCompression::from_property(raw, features)
 }
 
 /// Build a fresh ZPL v4/v5 `ObjectSet` mirroring the SA schema and embedded quota
@@ -3873,6 +3906,7 @@ fn build_fresh_zpl_objectset(
     mos: &mut Objects,
     parent_head_obj: u64,
     parent_crypto: Option<&ZfsDatasetCryptoInfo>,
+    compression: DatasetCompression,
     mut write_crypto: Option<&mut DatasetWriteCrypto>,
     features: &mut MosFeatureState,
     alloc: &mut PoolSpaceAllocator,
@@ -3880,7 +3914,7 @@ fn build_fresh_zpl_objectset(
     order: Endian,
     new_txg: u64,
     staged_writes: &mut Vec<StagedBlockWrite>,
-) -> Result<(BlockPointer, SpaceDelta)> {
+) -> Result<(BlockPointer, SpaceDelta, DatasetFeatureUsage)> {
     let (p_dn, p_ceil) = mos.object_with_ceiling(cx, parent_head_obj)?;
     let p_os_bp =
         BlockPointer::parse(&p_dn.bonus()[128..256], p_dn.order()).map_err(|e| parse_err(&e))?;
@@ -3913,6 +3947,7 @@ fn build_fresh_zpl_objectset(
 
     let min_blk = (1_usize << alloc.ashift).max(512);
     let mut zpl_born = SpaceDelta::default();
+    let mut feature_usage = DatasetFeatureUsage::default();
     let mut zpl_dirty_dnodes: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
     let empty_meta = Dnode::from_spec(DnodeSpec {
         object_type: DMU_OT_DNODE,
@@ -3993,10 +4028,12 @@ fn build_fresh_zpl_objectset(
             },
             &dirty,
             obj_id,
+            compression,
             wc,
             staged_writes,
         )?;
         zpl_born.add_assign(out.born)?;
+        feature_usage.extend(out.feature_usage);
         let used = out.dnode.used_bytes();
         put_dnode_in_table(
             cx,
@@ -4258,10 +4295,12 @@ fn build_fresh_zpl_objectset(
                 },
                 &edirty,
                 emb_off as u64,
+                compression,
                 write_crypto.as_deref_mut(),
                 staged_writes,
             )?;
             zpl_born.add_assign(eout.born)?;
+            feature_usage.extend(eout.feature_usage);
             new_os
                 .set_embedded_dnode(emb_off, Some(&eout.dnode))
                 .map_err(|e| parse_err(&e))?;
@@ -4299,10 +4338,12 @@ fn build_fresh_zpl_objectset(
         },
         &meta_dirty,
         0,
+        compression,
         write_crypto.as_deref_mut(),
         staged_writes,
     )?;
     zpl_born.add_assign(meta_out.born)?;
+    feature_usage.extend(meta_out.feature_usage);
     new_os.meta = meta_out.dnode;
 
     let os_bp = write_dataset_objset_block(
@@ -4311,11 +4352,13 @@ fn build_fresh_zpl_objectset(
         7,
         order,
         new_txg,
+        compression,
         write_crypto.as_deref(),
         staged_writes,
     )?;
     zpl_born.add_assign(SpaceDelta::from_bp(&os_bp)?)?;
-    Ok((os_bp, zpl_born))
+    feature_usage.observe(&os_bp);
+    Ok((os_bp, zpl_born, feature_usage))
 }
 
 /// Resolve OpenZFS `dp->dp_origin_snap` (`$ORIGIN@$ORIGIN`) as `(origin_dd_obj, origin_head_obj, origin_snap_obj)`
@@ -4677,8 +4720,8 @@ fn stage_create_dataset(
 
     let ds_guid = derive_unique_guid(pool_guid, new_txg, new_head_obj, 2);
     let ds_fsid = derive_fsid_guid(ds_guid);
-    let (compression, zstd_level) =
-        effective_compression_for_new_dataset(cx, mos, parent_dataset, initial_props)?;
+    let compression =
+        effective_compression_for_new_dataset(cx, mos, parent_dataset, initial_props, features)?;
 
     // Resolve encryption creation mode:
     // - Explicit `Off`: forbidden under encrypted parent; unencrypted otherwise.
@@ -4796,8 +4839,6 @@ fn stage_create_dataset(
                     &opts.extra_entropy,
                 )?,
                 key: key_arc,
-                compression,
-                zstd_level,
             })
         }
         _ => {
@@ -4831,8 +4872,6 @@ fn stage_create_dataset(
                         &[],
                     )?,
                     key,
-                    compression,
-                    zstd_level,
                 })
             } else {
                 None
@@ -4841,11 +4880,12 @@ fn stage_create_dataset(
     };
 
     // Build fresh ZPL `ObjectSet` (`new_os_bp`, `os_space`).
-    let (new_os_bp, os_space) = build_fresh_zpl_objectset(
+    let (new_os_bp, os_space, feature_usage) = build_fresh_zpl_objectset(
         cx,
         mos,
         parent_head_obj,
         parent_crypto.as_ref(),
+        compression,
         write_crypto.as_mut(),
         features,
         alloc,
@@ -4965,14 +5005,24 @@ fn stage_create_dataset(
     head_bonus[120..128].copy_from_slice(&order.encode(inherited_flags | DS_FLAG_UNIQUE_ACCURATE));
     head_bonus[128..256].copy_from_slice(&new_os_bp.encode(order));
 
+    let mut head_zap = Vec::new();
+    activate_dataset_block_features(
+        &mut head_zap,
+        &feature_usage.required_features(),
+        features,
+        new_txg,
+    )?;
+    activate_initial_compression_feature(&mut head_zap, initial_props, features, new_txg)?;
     if let Some(ivset_guid) = ivset_guid_for_head {
-        features.increment_read("com.delphix:extensible_dataset", new_txg)?;
-        let head_zap = [RawZapEntry {
+        head_zap.push(RawZapEntry {
             name: DSL_DATASET_IVSET_GUID.to_vec(),
             integer_bytes: 8,
             values: vec![ivset_guid],
             collision: 0,
-        }];
+        });
+    }
+    if !head_zap.is_empty() {
+        features.increment_read("com.delphix:extensible_dataset", new_txg)?;
         write_zap_dnode_in_mos(
             cx,
             mos,
@@ -5366,6 +5416,7 @@ fn stage_create_clone(
         });
     }
     let mut clone_dd_extra_zap = Vec::new();
+    activate_initial_compression_feature(&mut clone_head_zap, initial_props, features, new_txg)?;
     if let Some(ref o_info) = origin_crypto {
         let _ = adjust_dsl_crypto_key_refcount(
             cx,
@@ -6622,6 +6673,22 @@ fn stage_set_property(
         new_txg,
         staged_writes,
     )?;
+    if name == "compression"
+        && matches!(value, Some(ZfsPropertySetValue::Number(raw)) if raw & 127 == 16)
+    {
+        stage_activate_dataset_features(
+            cx,
+            mos,
+            head_obj,
+            &["org.freebsd:zstd_compress"],
+            mos_dirty_dnodes,
+            features,
+            alloc,
+            order,
+            new_txg,
+            staged_writes,
+        )?;
+    }
     Ok(head_obj)
 }
 
@@ -6882,30 +6949,10 @@ pub(super) fn apply_properties_batch_on_ids(
                         }
                     }
                     "compression" => {
-                        let is_zstd = num & 127 == 16 && matches!(num >> 7, 0..=19);
-                        if !matches!(num, 0 | 1 | 2 | 5..=15) && !is_zstd {
-                            return Err(unsupported(format!(
-                                "unsupported ZFS compression property index {num}"
-                            )));
-                        }
-                        if matches!(num, 1 | 15)
-                            && features.read_features.get("org.illumos:lz4_compress") == Some(&0)
-                        {
-                            features.increment_read("org.illumos:lz4_compress", new_txg)?;
-                        }
-                        if is_zstd {
-                            if !features
-                                .read_features
-                                .contains_key("org.freebsd:zstd_compress")
-                            {
-                                return Err(unsupported(
-                                    "ZFS zstd compression requires org.freebsd:zstd_compress feature",
-                                ));
-                            }
-                            if features.read_features.get("org.freebsd:zstd_compress") == Some(&0) {
-                                features.increment_read("org.freebsd:zstd_compress", new_txg)?;
-                            }
-                        }
+                        // Pool capability is admission, not dataset ownership.
+                        // ZSTD ownership is staged on the head by the caller;
+                        // LZ4 must already be active from pool feature enablement.
+                        DatasetCompression::from_property(num, features)?;
                     }
                     _ => {
                         return Err(unsupported(format!(

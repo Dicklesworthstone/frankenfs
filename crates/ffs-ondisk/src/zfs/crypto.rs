@@ -1701,6 +1701,61 @@ pub fn verify_objset_macs(
 
 // ── Native ZFS Compression Encoder (for writable encrypted/plain blocks) ────
 
+/// LZJB wire groups contain one low-bit-first match bitmap and up to eight
+/// literal or two-byte match tokens. A match stores a 10-bit backward distance
+/// and a six-bit length biased by three; overlapping copies are permitted.
+/// The bounded dictionary is an encoder choice, not part of the wire format.
+fn compress_lzjb_payload(input: &[u8]) -> Vec<u8> {
+    const HASH_BITS: u32 = 12;
+    let mut latest = vec![usize::MAX; 1 << HASH_BITS];
+    let mut output = Vec::with_capacity(input.len() + input.len().div_ceil(8));
+    let mut position = 0;
+    while position < input.len() {
+        let map_index = output.len();
+        output.push(0);
+        for bit in 0..8 {
+            if position == input.len() {
+                break;
+            }
+            let mut matched = 0;
+            let mut distance = 0;
+            if input.len() - position >= 3 {
+                let prefix = u32::from_le_bytes([
+                    input[position],
+                    input[position + 1],
+                    input[position + 2],
+                    0,
+                ]);
+                let hash = (prefix.wrapping_mul(2_654_435_761) >> (32 - HASH_BITS)) as usize;
+                let candidate = latest[hash];
+                latest[hash] = position;
+                if candidate < position
+                    && position - candidate <= 1023
+                    && input[candidate..candidate + 3] == input[position..position + 3]
+                {
+                    distance = position - candidate;
+                    matched = 3;
+                    let limit = (input.len() - position).min(66);
+                    while matched < limit && input[candidate + matched] == input[position + matched]
+                    {
+                        matched += 1;
+                    }
+                }
+            }
+            if matched == 0 {
+                output.push(input[position]);
+                position += 1;
+            } else {
+                output[map_index] |= 1 << bit;
+                output.push((((matched - 3) << 2) | (distance >> 8)) as u8);
+                output.push((distance & 255) as u8);
+                position += matched;
+            }
+        }
+    }
+    output
+}
+
 fn compress_zle(input: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(input.len());
     let mut i = 0_usize;
@@ -1792,11 +1847,14 @@ fn compress_lz4_payload(input: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Compress a logical block using OpenZFS wire framing (`OFF=2`, `ZLE=14`, `LZ4=15`,
-/// `gzip-1..9 = 5..=13`, `zstd = 16`), zero-padded to `align_bytes` (e.g. `1 << ashift`).
+/// Compress a logical block using OpenZFS wire framing (`OFF=2`, `LZJB=3`,
+/// `EMPTY=4`, `ZLE=14`, `LZ4=15`, `gzip-1..9 = 5..=13`, `zstd = 16`), zero-padded
+/// to `align_bytes` (e.g. `1 << ashift`). Resolve `INHERIT` and `ON` using the
+/// dataset and active pool features before calling this codec-level function.
 ///
 /// Automatically falls back to uncompressed (`compression = 2`) when compression does not
-/// reduce the aligned physical size below `input.len()`.
+/// save the native minimum of one eighth of the logical size or does not reduce
+/// the aligned physical size below `input.len()`.
 pub fn compress_block(
     input: &[u8],
     requested_compression: u8,
@@ -1812,11 +1870,11 @@ pub fn compress_block(
         return Err(invalid("invalid ZFS compression block size or alignment"));
     }
     let effective = match requested_compression {
-        1 => 15, // ON -> LZ4
-        2 => return Ok((input.to_vec(), 2)),
+        2 | 4 => return Ok((input.to_vec(), 2)),
         other => other,
     };
     let raw_compressed: Vec<u8> = match effective {
+        3 => compress_lzjb_payload(input),
         14 => compress_zle(input),
         15 => {
             let body = compress_lz4_payload(input);
@@ -1862,6 +1920,18 @@ pub fn compress_block(
         _ => return Err(invalid("unsupported ZFS write compression algorithm")),
     };
 
+    let savings_limit = input.len() - (input.len() >> 3);
+    // Native ZLE uses the unrounded limit; the other codecs receive a limit
+    // rounded down to the pool allocation unit. A sub-sector result could be
+    // embedded natively, but this encoder's caller emits regular pointers.
+    let savings_limit = if effective == 14 {
+        savings_limit
+    } else {
+        (savings_limit - savings_limit % align_bytes).max(112)
+    };
+    if raw_compressed.len() > savings_limit {
+        return Ok((input.to_vec(), 2));
+    }
     let aligned_len = raw_compressed.len().next_multiple_of(align_bytes).max(512);
     if aligned_len >= input.len() {
         return Ok((input.to_vec(), 2));
@@ -2118,7 +2188,14 @@ mod tests {
         for (i, byte) in block.iter_mut().enumerate().take(512) {
             *byte = (i % 13) as u8;
         }
-        for (alg, lvl) in [(2, None), (14, None), (15, None), (6, None), (16, Some(3))] {
+        for (alg, lvl) in [
+            (2, None),
+            (3, None),
+            (14, None),
+            (15, None),
+            (6, None),
+            (16, Some(3)),
+        ] {
             let (phys, actual_alg) = compress_block(&block, alg, lvl, 512).unwrap();
             assert!(phys.len().is_multiple_of(512));
             let decoded = decompress(&phys, actual_alg, block.len()).unwrap();
@@ -2127,6 +2204,63 @@ mod tests {
                 assert_eq!(actual_alg, alg);
                 assert!(phys.len() < block.len());
             }
+        }
+    }
+
+    #[test]
+    fn lzjb_encoder_native_tokens_overlap_and_window_boundaries() {
+        assert_eq!(compress_lzjb_payload(b"abcdefgh"), b"\x00abcdefgh");
+        assert_eq!(
+            compress_lzjb_payload(b"abcabcabcabc"),
+            [8, b'a', b'b', b'c', 24, 3]
+        );
+        assert_eq!(compress_lzjb_payload(&[b'x'; 67]), [2, b'x', 252, 1]);
+        for period in [1, 2, 3, 7, 65, 66, 67, 255, 1023, 1024, 1025] {
+            let block: Vec<u8> = (0..8192).map(|i| (i % period % 251) as u8).collect();
+            let encoded = compress_lzjb_payload(&block);
+            assert_eq!(decompress(&encoded, 3, block.len()).unwrap(), block);
+        }
+    }
+
+    #[test]
+    fn compression_fallback_preserves_physical_alignment_and_requires_resolved_policy() {
+        let mut state = 0x1234_5678_u32;
+        let mut random = vec![0; 4096];
+        for byte in &mut random {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            *byte = (state & 255) as u8;
+        }
+        for algorithm in [3, 5, 14, 15, 16] {
+            let (physical, selected) = compress_block(&random, algorithm, Some(3), 512).unwrap();
+            assert_eq!(selected, 2);
+            assert_eq!(physical, random);
+
+            let zeros = vec![0; 4096];
+            let (physical, selected) = compress_block(&zeros, algorithm, Some(3), 4096).unwrap();
+            assert_eq!(selected, 2);
+            assert_eq!(physical, zeros);
+        }
+        for unresolved in [0, 1, 17, 255] {
+            assert!(compress_block(&random, unresolved, None, 512).is_err());
+        }
+        assert_eq!(compress_block(&random, 4, None, 512).unwrap(), (random, 2));
+
+        // Nine percent savings would occupy fewer sectors but does not meet
+        // the native one-eighth threshold. Keep the original bytes in that case.
+        let mut marginal = vec![0; 32_768];
+        for byte in marginal.iter_mut().take(29_696) {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            *byte = (state & 255) as u8;
+        }
+        for algorithm in [5, 15, 16] {
+            assert_eq!(
+                compress_block(&marginal, algorithm, Some(3), 512).unwrap(),
+                (marginal.clone(), 2)
+            );
         }
     }
 

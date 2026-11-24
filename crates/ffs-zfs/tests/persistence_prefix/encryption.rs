@@ -1954,18 +1954,25 @@ fn encrypted_failed_publication_reopen_retry_never_reuses_data_nonces() {
         // encrypted leaves prove the failed attempt already exposed ciphertext;
         // an in-memory RNG comparison would miss this storage-level failure.
         let events = &engine.persistence_events()[event_start..];
-        let indirect_writes: Vec<_> = events
+        let child_writes: Vec<_> = events
             .iter()
-            .filter(|event| {
-                matches!(event.stage, ZfsPersistenceStage::ChildBlocksWrite { .. })
-                    && event.bytes > 4096
-            })
+            .filter(|event| matches!(event.stage, ZfsPersistenceStage::ChildBlocksWrite { .. }))
             .collect();
-        assert_eq!(indirect_writes.len(), 1);
-        let indirect = indirect_writes[0];
+        assert_eq!(child_writes.len(), 6);
+        assert!(child_writes[..5].iter().all(|event| event.bytes == 4096));
+        let indirect = child_writes[5];
+        // Native metadata compression is ON even when file compression is OFF.
+        // This pool has active LZ4; inspect the actual compressed unpublished L1
+        // rather than assuming its physical size equals the logical 128 KiB.
+        assert!(indirect.bytes < 128 * 1024);
         let failed_media = devices[0].durable_snapshot();
         let indirect_offset = usize::try_from(indirect.offset).unwrap();
-        let indirect_bytes = &failed_media[indirect_offset..indirect_offset + indirect.bytes];
+        let indirect_bytes = ffs_ondisk::zfs::decompress(
+            &failed_media[indirect_offset..indirect_offset + indirect.bytes],
+            15,
+            128 * 1024,
+        )
+        .unwrap();
         let mut failed_pairs = BTreeSet::new();
         for (index, pointer_bytes) in indirect_bytes.chunks_exact(128).take(5).enumerate() {
             let pointer = BlockPointer::parse(pointer_bytes, order).unwrap();
