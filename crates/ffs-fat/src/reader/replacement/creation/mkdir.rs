@@ -10,8 +10,8 @@ mod spelling;
 
 use super::super::super::ImageArgs;
 use super::super::{
-    ImageFile, change_fat, checkpoint, open_regular, reserve_clusters, set_dirty, set_hints,
-    stable, validate_boot_state, write_volume,
+    ImageFile, NativeMutation, change_fat, checkpoint, open_regular, reserve_clusters, set_dirty,
+    set_hints, stable, validate_boot_state, write_volume,
 };
 use super::{
     Extension, Namespace, Slot, deleted_slot, directory_offsets, parent, patch_slot, read_slot,
@@ -244,6 +244,7 @@ impl DirectoryCreation {
         if table.entry(cx, self.directory_cluster)? != ffs_ondisk::fat::FatEntry::Free {
             bail!("reserved directory cluster is no longer free");
         }
+        let native = NativeMutation::begin(cx, volume)?;
         let mut phase = "publishing dirty state";
         let result = (|| -> Result<serde_json::Value> {
             set_dirty(cx, volume, true)?;
@@ -377,7 +378,7 @@ impl DirectoryCreation {
             report["durability"] =
                 "directory_contents_allocation_namespace_and_clean_state_synced".into();
             report["verification"] = serde_json::to_value(verification)?;
-            Ok(report)
+            native.finish(cx, report)
         })();
         result.with_context(|| {
             format!(
@@ -604,6 +605,7 @@ pub fn unlink_in_volume(
     if dry_run {
         return Ok(report);
     }
+    let native = NativeMutation::begin(cx, volume)?;
     set_dirty(cx, volume, true)?;
     set_hints(cx, volume, u32::MAX)?;
     volume.device.sync(cx)?;
@@ -636,7 +638,7 @@ pub fn unlink_in_volume(
     set_dirty(cx, volume, false)?;
     volume.device.sync(cx)?;
     report["verification"] = serde_json::to_value(verification)?;
-    Ok(report)
+    native.finish(cx, report)
 }
 
 pub fn rmdir_in_volume(
@@ -701,6 +703,7 @@ pub fn rmdir_in_volume(
     if dry_run {
         return Ok(report);
     }
+    let native = NativeMutation::begin(cx, volume)?;
     set_dirty(cx, volume, true)?;
     set_hints(cx, volume, u32::MAX)?;
     volume.device.sync(cx)?;
@@ -733,7 +736,7 @@ pub fn rmdir_in_volume(
     set_dirty(cx, volume, false)?;
     volume.device.sync(cx)?;
     report["verification"] = serde_json::to_value(verification)?;
-    Ok(report)
+    native.finish(cx, report)
 }
 
 /// An existing destination keeps its native name set and slot. In particular,
@@ -1097,6 +1100,7 @@ fn rename_with_mode(
         return Ok(report);
     }
 
+    let native = NativeMutation::begin(cx, volume)?;
     let mut phase = "publishing dirty state";
     let result = (|| -> Result<serde_json::Value> {
         set_dirty(cx, volume, true)?;
@@ -1183,7 +1187,7 @@ fn rename_with_mode(
         volume.device.sync(cx)?;
         report["durability"] = "namespace_allocation_and_clean_state_synced".into();
         report["verification"] = serde_json::to_value(verification)?;
-        Ok(report)
+        native.finish(cx, report)
     })();
     result.with_context(|| format!(
         "FAT rename failed while {phase}; image retained and may be dirty or partially changed; no rollback or atomicity is claimed"

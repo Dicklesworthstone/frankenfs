@@ -2,6 +2,61 @@
 
 Created by CC agent 2026-04-22. Import when bead database clears.
 
+## Current execution — 2026-11-23, native FAT protection and ZFS owner quotas
+
+Started at `f9ce14528328e8eb7f9a9bd1a0e21bf058b6ec86`. These are substantive
+increments toward `bd-tqrnc` and `bd-jdned`; their complete native-interchange,
+storage-set and lifecycle acceptance remains open. `br` is unavailable here,
+so this existing pending-work ledger records execution without rewriting the
+canonical issue graph or claiming closure of blocked broad milestones.
+
+- [x] Read the comprehensive native-format plan, porting priorities, repository
+  instructions, README and Beads; trace current code before choosing work.
+- [x] Run the source-aware tracker report: 37 ready rows, no foreign open rows
+  or permission-gated rows; preserve existing blocked/in-progress ownership.
+- [x] Verify that the earlier protected read-only FAT fix and its generation,
+  cancellation and zero-write regressions already exist on current main.
+- [x] Identify offline/public FAT mutation barriers that can seal an intermediate
+  native state into the repair sidecar, despite correct mounted-path deferral.
+- [x] Hold the existing native-commit deferral through every FAT dirty/clean
+  mutation boundary, preserving all native write-ordering barriers.
+- [x] Seal protection only after verified native completion; preserve pending
+  recovery authority on pre-commit failure and report post-commit seal failures.
+- [x] Independently review all 13 native writer boundaries and four real-sidecar
+  regressions spanning 18 operations, FAT16/FAT32, failure cuts and nested mounts.
+- [ ] Execute real-sidecar success, nested mounted-operation, source-failure,
+  cancellation and fresh-reopen regressions for FAT16/FAT32. The exact command
+  `cargo test --locked -p ffs-fat --lib protected_native_ -- --nocapture
+  --test-threads=1` was SIGKILLed while compiling `asupersync`, before FAT source
+  or tests ran, after earlier dependency kills and repeated executor resets.
+- [x] Identify the six owner byte/object quota tables currently refused by the
+  native ZFS writer and the existing per-TXG owner-accounting seam.
+- [ ] Correct owner byte usage to include native dnode allocation on object
+  creation, reclamation and owner transfer, with checked net arithmetic.
+- [ ] Enforce user/group/project byte/object limits before native publication;
+  permit reclamation, retain malformed-profile refusal and return EDQUOT.
+- [ ] Execute quota boundary, empty-file, owner-transfer, over-limit reclamation,
+  snapshot and cold-reopen controls through the actual transaction engine.
+- [x] Baseline workspace formatting passes. Initial workspace checks were
+  terminated by SIGKILL while compiling dependencies under shared-host pressure;
+  neither attempt establishes a source-code compiler result.
+- [x] Format the included FAT test file directly because the companion macro
+  is outside Cargo fmt traversal; all 11 FAT source files are hash-checkpointed.
+  Final current-source `cargo fmt --check` and direct included-test rustfmt
+  `--check` both pass, as does staged diff whitespace checking.
+- [x] UBS static fallback scan of all 13 changed production Rust files exits 0
+  with 0 critical findings; review the 3 added-line owner-key allocation warnings.
+  Cargo phases are disabled and ast-grep is unavailable. The 16-file scan is
+  partial (exit 2): the callable-escape detector limitation in the large ZFS
+  persistence fixture also reproduces on unchanged `f9ce145`; no full-scan pass
+  or runtime coverage is claimed.
+- [ ] Complete owning-package tests, workspace/all-target checking and strict
+  Clippy; retain exact commands and observed results below.
+- [ ] Review and publish meaningful increments directly to `main` through
+  GitHub with an expected-head lease; record commit IDs and verification.
+- [ ] Native OpenZFS and mounted-syscall qualification remain independent:
+  this environment has no native filesystem oracle tools or `/dev/fuse`.
+
 ## Current execution — 2026-11-23, ZFS project trees and initialized growth
 
 Started at `dada405ac8fa0b3d6acd4019c7e0360570d9cd89`; substantive increments

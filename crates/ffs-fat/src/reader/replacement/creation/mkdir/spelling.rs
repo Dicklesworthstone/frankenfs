@@ -8,9 +8,9 @@
 use super::super::super::super::{Directory, Entry, FatVolume};
 use super::super::names::NativeName;
 use super::{
-    Extension, Namespace, Slot, checkpoint, delete_entry_slots, deleted_slot, find_entry_slots,
-    parent, patch_slot, read_slot, rename_chain, reserve_clusters, reserve_slots, retired_slot,
-    set_dirty, set_hints, validate_boot_state, validate_entry_slots,
+    Extension, Namespace, NativeMutation, Slot, checkpoint, delete_entry_slots, deleted_slot,
+    find_entry_slots, parent, patch_slot, read_slot, rename_chain, reserve_clusters, reserve_slots,
+    retired_slot, set_dirty, set_hints, validate_boot_state, validate_entry_slots,
 };
 use anyhow::{Context, Result, bail};
 use asupersync::Cx;
@@ -201,6 +201,7 @@ pub(super) fn rename(
     if dry_run {
         return Ok(report);
     }
+    let native = NativeMutation::begin(cx, volume)?;
     let mut phase = "publishing dirty state";
     let result = (|| -> Result<serde_json::Value> {
         set_dirty(cx, volume, true)?;
@@ -292,7 +293,7 @@ pub(super) fn rename(
         volume.device.sync(cx)?;
         report["durability"] = "namespace_allocation_and_clean_state_synced".into();
         report["verification"] = serde_json::to_value(verification)?;
-        Ok(report)
+        native.finish(cx, report)
     })();
     result.with_context(|| format!(
         "FAT case-only rename failed while {phase}; image retained and may be dirty or partially changed; no rollback or atomicity is claimed"

@@ -3,8 +3,8 @@
 //! atomicity is not assumed; interrupted writes still require native recovery.
 
 use super::{
-    FatVolume, allocate, checkpoint, modified_timestamp, set_dirty, validate_boot_state,
-    write_volume,
+    FatVolume, NativeMutation, allocate, checkpoint, modified_timestamp, set_dirty,
+    validate_boot_state, write_volume,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use asupersync::Cx;
@@ -89,6 +89,7 @@ pub fn set_attr_in_volume(
     if sector[within..within + 32] != original {
         bail!("metadata target changed before dirty publication");
     }
+    let native = NativeMutation::begin(cx, volume)?;
     let mut phase = "publishing dirty state";
     let result = (|| -> Result<()> {
         set_dirty(cx, volume, true)?;
@@ -122,7 +123,7 @@ pub fn set_attr_in_volume(
         phase = "synchronizing final clean state";
         set_dirty(cx, volume, false)?;
         volume.device.sync(cx)?;
-        Ok(())
+        native.finish(cx, ())
     })();
     result.with_context(|| {
         format!(

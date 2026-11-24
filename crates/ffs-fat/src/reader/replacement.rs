@@ -37,6 +37,35 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const HASH_BYTES: usize = 64 * 1024;
 const EXPECT_END: u32 = u32::MAX;
 
+/// Keep intermediate native barriers from publishing protection for an
+/// unfinished FAT mutation. This boundary belongs to the native writer, so
+/// offline callers receive the same fencing as mounted operations. An outer
+/// mount deferral can still cover a compound request and cache publication.
+struct NativeMutation<'a> {
+    volume: &'a FatVolume,
+    deferral: ffs_block::DurabilityCommitDeferral<'a>,
+}
+
+impl<'a> NativeMutation<'a> {
+    fn begin(cx: &Cx, volume: &'a FatVolume) -> Result<Self> {
+        Ok(Self {
+            volume,
+            deferral: ffs_block::DurabilityCommitDeferral::enter(cx, volume.device.as_ref())?,
+        })
+    }
+
+    /// Invoke only after verified native publication and its final clean-state
+    /// barrier. A protection error after this point cannot undo the native
+    /// mutation: retain the pending epoch and report that distinct outcome.
+    fn finish<T>(mut self, cx: &Cx, value: T) -> Result<T> {
+        self.deferral.complete();
+        self.volume.device.sync(cx).context(
+            "native FAT mutation committed; final protection synchronization failed; do not retry the mutation as if it were rolled back",
+        )?;
+        Ok(value)
+    }
+}
+
 #[derive(Debug, Args)]
 pub struct ReplaceArgs {
     #[command(flatten)]
@@ -459,6 +488,7 @@ impl Replacement {
         // verifier reuses this cluster buffer, independent of file length.
         let mut buffer = allocate(volume.geometry.cluster_bytes() as usize)?;
         let mut publication = publication::EntryPublication::new(volume, self.entry_offset)?;
+        let native = NativeMutation::begin(cx, volume)?;
         let mut phase = "publishing dirty state";
         let result = (|| -> Result<serde_json::Value> {
             set_dirty(cx, volume, true)?;
@@ -563,7 +593,7 @@ impl Replacement {
             report["durability"] = "all_data_metadata_and_clean_state_synced".into();
             report["payload_verification"] = "sha256_via_native_reader".into();
             report["verification"] = serde_json::to_value(verification)?;
-            Ok(report)
+            native.finish(cx, report)
         })();
         result.with_context(|| format!("FAT file update failed while {phase}; image retained and may be dirty or partially changed; no rollback or atomicity is claimed"))
     }

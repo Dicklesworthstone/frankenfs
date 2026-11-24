@@ -218,6 +218,7 @@ pub(super) fn apply(
     } else {
         0x0FFF_FFFF
     };
+    let native = super::NativeMutation::begin(cx, volume)?;
     let mut phase = "publishing dirty state";
     let result = (|| -> Result<()> {
         set_dirty(cx, volume, true)?;
@@ -298,7 +299,7 @@ pub(super) fn apply(
         set_dirty(cx, volume, false)?;
         volume.device.sync(cx)?;
         checkpoint(cx)?;
-        Ok(())
+        native.finish(cx, ())
     })();
     result.with_context(|| format!(
         "FAT insertion failed while {phase}; image retained and may contain an empty or partially changed file and detached allocation; no rollback or atomicity is claimed"

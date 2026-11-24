@@ -13,8 +13,8 @@ mod zero;
 use super::super::super::{Entry, FatTable, FatVolume, FileChain, MAX_CHAIN_CLUSTERS};
 use super::super::publication::EntryPublication;
 use super::super::{
-    EXPECT_END, HASH_BYTES, allocate, change_fat, checkpoint, modified_timestamp, reserve_clusters,
-    set_dirty, set_hints, write_volume,
+    EXPECT_END, HASH_BYTES, NativeMutation, allocate, change_fat, checkpoint, modified_timestamp,
+    reserve_clusters, set_dirty, set_hints, write_volume,
 };
 use super::{EditSource, FileSource, validate_edit_state};
 use anyhow::{Context, Result, bail};
@@ -359,6 +359,7 @@ fn apply_update(
     let mut bytes = allocate(HASH_BYTES)?;
     let mut readback = allocate(HASH_BYTES)?;
     publication.verify_current(cx, volume, &original)?;
+    let native = NativeMutation::begin(cx, volume)?;
     let mut phase = "publishing dirty state";
     let result = (|| -> Result<()> {
         set_dirty(cx, volume, true)?;
@@ -505,7 +506,7 @@ fn apply_update(
         phase = "synchronizing final clean state";
         set_dirty(cx, volume, false)?;
         volume.device.sync(cx)?;
-        Ok(())
+        native.finish(cx, ())
     })();
     result.with_context(|| format!("FAT range update failed while {phase}; image retained and may be dirty, partially overwritten or partially changed; no rollback or atomicity is claimed"))
 }

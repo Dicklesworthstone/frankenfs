@@ -9,8 +9,9 @@
 use super::super::super::super::{Directory, FatVolume, check::FatCheckReport};
 use super::super::names::NativeName;
 use super::{
-    Slot, checkpoint, delete_entry_slots, directory_offsets, patch_slot, read_slot, rename_chain,
-    retired_slot, set_dirty, validate_boot_state, validate_entry_slots, verify_retired_slot,
+    NativeMutation, Slot, checkpoint, delete_entry_slots, directory_offsets, patch_slot, read_slot,
+    rename_chain, retired_slot, set_dirty, validate_boot_state, validate_entry_slots,
+    verify_retired_slot,
 };
 use anyhow::{Context, Result, bail};
 use asupersync::Cx;
@@ -159,6 +160,7 @@ impl Rename<'_> {
             return Ok(report);
         }
 
+        let native = NativeMutation::begin(cx, volume)?;
         let mut phase = "publishing dirty state";
         let result = (|| -> Result<serde_json::Value> {
             set_dirty(cx, volume, true)?;
@@ -231,7 +233,7 @@ impl Rename<'_> {
             volume.device.sync(cx)?;
             report["durability"] = "namespace_allocation_and_clean_state_synced".into();
             report["verification"] = serde_json::to_value(verification)?;
-            Ok(report)
+            native.finish(cx, report)
         })();
         result.with_context(|| format!(
             "FAT in-place rename failed while {phase}; image retained and may be dirty or partially changed; no rollback or atomicity is claimed"

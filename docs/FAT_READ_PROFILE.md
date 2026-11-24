@@ -172,6 +172,27 @@ The native update has explicit synchronization boundaries:
    Run the complete checker again and require the expected namespace/free counts.
 7. Clear the native dirty state and synchronize before reporting success.
 
+The shared native mutation boundary holds `DurabilityCommitDeferral` across
+these barriers when the backing device carries live RaptorQ protection.
+Intermediate synchronization flushes native bytes while the archive remains
+pending; it cannot publish a repair generation for unfinished allocation or
+namespace state. This also applies to directory, rename, metadata and range
+mutations reached directly through the library or offline CLI. A successful
+standalone mutation then performs one final protection synchronization. Mounted
+requests retain their outer deferral through compound operations and cache
+publication, with protection sealed at the filesystem synchronization boundary.
+
+An error or cancellation before native completion leaves the protection epoch
+pending and prevents a later sync from sealing escaped partial writes. If only
+the final protection synchronization fails after native completion, the error
+explicitly reports that the native mutation committed. A retained live owner can
+retry synchronization when the protection state permits it; replaying the
+mutation as though it rolled back is wrong. The regression injects errors before
+sealing begins and does not qualify every archive-publication failure as
+retryable. Fresh admission still refuses an unfinished protection epoch. These
+rules do not make native FAT mutation crash-atomic or eliminate offline
+reconciliation.
+
 Mirrored FAT copies are updated independently, retaining each FAT32 entry's
 reserved high nibble. A non-mirrored FAT32 volume changes only its selected active
 FAT; the inactive copy remains untouched. Allocation changes are coalesced into
@@ -190,10 +211,10 @@ verification, the final checker report and
 `durability: all_data_metadata_and_clean_state_synced`. A reporting failure occurs
 after the completed operation and does not undo it.
 
-Existing-file creation, unlink, rename, directory mutation, general writable
-mounts, crash replay and MVCC/RaptorQ integration remain incomplete. The offline
-replacement path does not complete the comprehensive plan's native-write or
-recovery milestones.
+File creation, unlink, rename, directory/range mutation and experimental writable
+mounts share this native writer. Their implementation and sidecar integration do
+not complete the comprehensive plan's independent native-interchange, mounted
+power-cut, general recovery or multi-format protection acceptance.
 
 ### Replacement validation status
 
