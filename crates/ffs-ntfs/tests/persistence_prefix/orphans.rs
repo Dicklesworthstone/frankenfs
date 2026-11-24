@@ -474,7 +474,7 @@ fn ntfs_orphan_open_handles_survive_and_writable_reopen_reaps() {
 
 #[test]
 fn ntfs_orphan_retention_and_replacement_recover_at_native_barriers() {
-    for replace in [false, true] {
+    for (replace, pin_stream) in [(false, false), (false, true), (true, false), (true, true)] {
         let cx = Cx::for_testing();
         let device = synthetic_device();
         let mut engine = engine_for(&cx, &device);
@@ -483,6 +483,16 @@ fn ntfs_orphan_retention_and_replacement_recover_at_native_barriers() {
             .into_result()
             .unwrap()
             .0;
+        engine
+            .create_stream_at(
+                &cx,
+                victim,
+                &utf16("content"),
+                b"old stream",
+                DEFAULT_NTFS_FILETIME,
+            )
+            .into_result()
+            .unwrap();
         let source = engine
             .create_file(&cx, "/", "source", b"new payload")
             .into_result()
@@ -511,7 +521,11 @@ fn ntfs_orphan_retention_and_replacement_recover_at_native_barriers() {
         let old = fs
             .lookup(&cx, &mut scope, ROOT, OsStr::new("victim"))
             .unwrap();
-        fs.open(&cx, &mut scope, old.ino, libc::O_RDWR).unwrap();
+        let ads = fs
+            .lookup(&cx, &mut scope, ROOT, OsStr::new("victim:content"))
+            .unwrap();
+        let pin = if pin_stream { ads.ino } else { old.ino };
+        fs.open(&cx, &mut scope, pin, libc::O_RDWR).unwrap();
         if replace {
             fs.rename(
                 &cx,
@@ -529,6 +543,10 @@ fn ntfs_orphan_retention_and_replacement_recover_at_native_barriers() {
         assert_eq!(
             fs.read(&cx, &mut scope, old.ino, 0, 64).unwrap(),
             b"old payload"
+        );
+        assert_eq!(
+            fs.read(&cx, &mut scope, ads.ino, 0, 64).unwrap(),
+            b"old stream"
         );
         assert_eq!(fs.getattr(&cx, &mut scope, old.ino).unwrap().nlink, 0);
         drop(fs);
@@ -559,6 +577,10 @@ fn ntfs_orphan_retention_and_replacement_recover_at_native_barriers() {
             let volume = engine.volume_view(&cx).unwrap();
             assert_eq!(native_stream(&cx, &volume, victim, ""), b"old payload");
             assert_eq!(native_stream(&cx, &volume, source, ""), b"new payload");
+            assert_eq!(
+                native_stream(&cx, &volume, victim, "content"),
+                b"old stream"
+            );
             let fs = NtfsFs::from_engine(&cx, engine, 1000, 1000).unwrap();
             let destination = fs.lookup(&cx, &mut scope, ROOT, OsStr::new("victim"));
             if committed && !replace {

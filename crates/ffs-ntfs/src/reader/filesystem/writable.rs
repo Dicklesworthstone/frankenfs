@@ -1232,11 +1232,8 @@ impl NtfsFs {
                 if no_replace {
                     return Err(FfsError::Exists);
                 }
-                if self.has_pinned_ads(ino)? {
-                    return Err(unsupported(
-                        "rename over an open NTFS destination requires atomic retention",
-                    ));
-                }
+                // A stream handle pins the entire destination FILE record, including
+                // all named DATA. Its remaining hard link or retained name owns it.
                 if dst_attr.nlink == 1 {
                     for _ in 0..16 {
                         let sequence = RETAINED_SEQUENCE
