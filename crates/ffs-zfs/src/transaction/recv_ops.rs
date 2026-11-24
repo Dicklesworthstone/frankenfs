@@ -3202,28 +3202,7 @@ impl ZfsTransactionEngine {
                     snap_bonus[120..128].copy_from_slice(&order.encode(clean_flags));
                     snap_bonus[128..256].copy_from_slice(&stage_head_dn.bonus()[128..256]);
 
-                    if !snapshot_entries.is_empty() {
-                        features.increment_read("com.delphix:extensible_dataset", new_txg)?;
-                        write_zap_dnode_in_mos(
-                            cx,
-                            mos,
-                            &mos_meta,
-                            mos_ceiling,
-                            mos_dirty_dnodes,
-                            alloc,
-                            snap_ds_obj,
-                            None,
-                            DMU_OTN_ZAP_METADATA,
-                            DMU_OT_DSL_DATASET,
-                            snap_bonus,
-                            &snapshot_entries,
-                            0,
-                            false,
-                            order,
-                            new_txg,
-                            staged_writes,
-                        )?;
-                    } else {
+                    if snapshot_entries.is_empty() {
                         let snap_dn = Dnode::from_spec(DnodeSpec {
                             object_type: DMU_OT_DSL_DATASET,
                             bonus_type: DMU_OT_DSL_DATASET,
@@ -3250,6 +3229,27 @@ impl ZfsTransactionEngine {
                             mos_dirty_dnodes,
                             snap_ds_obj,
                             &snap_dn,
+                        )?;
+                    } else {
+                        features.increment_read("com.delphix:extensible_dataset", new_txg)?;
+                        write_zap_dnode_in_mos(
+                            cx,
+                            mos,
+                            &mos_meta,
+                            mos_ceiling,
+                            mos_dirty_dnodes,
+                            alloc,
+                            snap_ds_obj,
+                            None,
+                            DMU_OTN_ZAP_METADATA,
+                            DMU_OT_DSL_DATASET,
+                            snap_bonus,
+                            &snapshot_entries,
+                            0,
+                            false,
+                            order,
+                            new_txg,
+                            staged_writes,
                         )?;
                     }
 
@@ -3640,28 +3640,7 @@ impl ZfsTransactionEngine {
                     snap_bonus[120..128].copy_from_slice(&order.encode(clean_flags));
                     snap_bonus[128..256].copy_from_slice(&stage_head_dn.bonus()[128..256]);
 
-                    if !snapshot_entries.is_empty() {
-                        features.increment_read("com.delphix:extensible_dataset", new_txg)?;
-                        write_zap_dnode_in_mos(
-                            cx,
-                            mos,
-                            &mos_meta,
-                            mos_ceiling,
-                            mos_dirty_dnodes,
-                            alloc,
-                            snap_ds_obj,
-                            None,
-                            DMU_OTN_ZAP_METADATA,
-                            DMU_OT_DSL_DATASET,
-                            snap_bonus,
-                            &snapshot_entries,
-                            0,
-                            false,
-                            order,
-                            new_txg,
-                            staged_writes,
-                        )?;
-                    } else {
+                    if snapshot_entries.is_empty() {
                         let snap_dn = Dnode::from_spec(DnodeSpec {
                             object_type: DMU_OT_DSL_DATASET,
                             bonus_type: DMU_OT_DSL_DATASET,
@@ -3688,6 +3667,27 @@ impl ZfsTransactionEngine {
                             mos_dirty_dnodes,
                             snap_ds_obj,
                             &snap_dn,
+                        )?;
+                    } else {
+                        features.increment_read("com.delphix:extensible_dataset", new_txg)?;
+                        write_zap_dnode_in_mos(
+                            cx,
+                            mos,
+                            &mos_meta,
+                            mos_ceiling,
+                            mos_dirty_dnodes,
+                            alloc,
+                            snap_ds_obj,
+                            None,
+                            DMU_OTN_ZAP_METADATA,
+                            DMU_OT_DSL_DATASET,
+                            snap_bonus,
+                            &snapshot_entries,
+                            0,
+                            false,
+                            order,
+                            new_txg,
+                            staged_writes,
                         )?;
                     }
 

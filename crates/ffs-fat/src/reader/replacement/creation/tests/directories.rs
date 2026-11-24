@@ -644,9 +644,9 @@ fn torn_live_binding_cannot_publish_mixed_directory_or_file_metadata() {
                 let mut stale = short_entry(b"STALE   BIN", 5, 4);
                 stale[0] = 0;
                 {
-                    let mut state = image.device.state.lock().unwrap();
-                    state.put(slot, &stale);
-                    state.persist();
+                    let mut dev_state = image.device.state.lock().unwrap();
+                    dev_state.put(slot, &stale);
+                    dev_state.persist();
                 }
                 let control = Image::new(kind, 512, false);
                 mkdir::mkdir_in_volume(&cx, &control.volume(), "/NEW", NOW, false).unwrap();

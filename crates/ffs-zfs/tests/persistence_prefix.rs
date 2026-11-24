@@ -733,7 +733,7 @@ fn build_sa_registry_objects(
         reg_entries.push(RawZapEntry {
             name: b"ZPL_DXATTR".to_vec(),
             integer_bytes: 8,
-            values: vec![(3_u64 << 16) | 20],
+            values: vec![(3_u64 << 16) | 0x0014],
             collision: 0,
         });
         for (layout, values) in [
@@ -1150,9 +1150,9 @@ fn build_zpl_objectset(
             }
         }
         if !spec.hello_sa_xattrs.is_empty()
-            && !spec
+            && spec
                 .auxiliary_ownership
-                .is_some_and(|(object, _)| object == 4)
+                .is_none_or(|(object, _)| object != 4)
         {
             assert_eq!(spec.zpl_version, 5);
             assert!(spill.is_none());

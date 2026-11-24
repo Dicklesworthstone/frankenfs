@@ -180,7 +180,7 @@ fn sync_write_preserves_real_fsync_failure_after_late_cancellation() {
         let state = state.lock().unwrap();
         assert_eq!(state.writes, 1);
         assert_eq!(state.published, b"accepted");
-        assert!(state.flushed.is_empty());
+        assert_eq!(state.flushed, b"");
         assert_eq!(state.flushes, [datasync]);
         assert_cancellation_remains_pending(&state);
     }
@@ -202,9 +202,9 @@ fn sync_write_still_observes_cancellation_before_native_publication() {
         ));
         let state = state.lock().unwrap();
         assert_eq!(state.writes, 0);
-        assert!(state.published.is_empty());
-        assert!(state.flushed.is_empty());
-        assert!(state.flushes.is_empty());
+        assert_eq!(state.published, b"");
+        assert_eq!(state.flushed, b"");
+        assert_eq!(state.flushes, [] as [bool; 0]);
         assert_cancellation_remains_pending(&state);
     }
 }

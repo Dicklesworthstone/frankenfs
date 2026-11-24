@@ -473,10 +473,10 @@ impl<'a> StagedEdit<'a> {
         let old = self.blocks.insert(id, block);
         let old_bytes = old.as_ref().and_then(Option::as_ref).map_or(0, Vec::len);
         *self.bytes = *self.bytes - old_bytes + new_bytes;
-        self.undo.push(match old {
-            Some(block) => ZvolCacheUndo::Restore(id, block),
-            None => ZvolCacheUndo::Remove(id),
-        });
+        self.undo
+            .push(old.map_or(ZvolCacheUndo::Remove(id), |block| {
+                ZvolCacheUndo::Restore(id, block)
+            }));
     }
 
     fn finish(

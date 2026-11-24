@@ -3896,12 +3896,12 @@ fn open_unlinked_private_xattrs_survive_until_release_or_restart_recovery() {
         let recovered_slot = recovered
             .last_durable_token()
             .unwrap()
-            .map_or(token.published_slot(), |next| next.published_slot());
+            .map_or_else(|| token.published_slot(), |next| next.published_slot());
         drop(recovered);
         let engine =
             open_engine_on_devices(&cx, &fresh, default_write_opts(POOL_GUID, recovered_slot))
                 .unwrap();
-        assert!(engine.pending_unlinks(&cx, &dataset).unwrap().is_empty());
+        assert_eq!(engine.pending_unlinks(&cx, &dataset).unwrap().len(), 0);
         let mut head = engine
             .open_read_objects(&cx)
             .unwrap()

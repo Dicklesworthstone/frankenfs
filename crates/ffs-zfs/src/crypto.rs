@@ -503,6 +503,14 @@ impl ZfsNonceGenerator {
     }
 }
 
+/// Newly generated per-dataset encryption material `(master_key, hmac_key, iv, salt_or_guid)`.
+pub type GeneratedDatasetKeys = (
+    [u8; ZFS_MAX_MASTER_KEY_LEN],
+    [u8; ZFS_HMAC_KEY_LEN],
+    [u8; ZIO_DATA_IV_LEN],
+    u64,
+);
+
 /// Generate fresh cryptographic dataset keys and a wrapping IV from OS entropy.
 ///
 /// Public dataset identifiers and optional caller input provide domain separation;
@@ -514,12 +522,7 @@ pub fn generate_new_dataset_keys(
     dataset_guid: u64,
     txg: u64,
     extra_entropy: &[u8],
-) -> Result<(
-    [u8; ZFS_MAX_MASTER_KEY_LEN],
-    [u8; ZFS_HMAC_KEY_LEN],
-    [u8; ZIO_DATA_IV_LEN],
-    u64,
-)> {
+) -> Result<GeneratedDatasetKeys> {
     let entropy = fresh_crypto_seed(cx)?;
     let mut hasher = Zeroizing::new(blake3::Hasher::new_keyed(&entropy));
     hasher.update(b"frankenfs.zfs.newkey.v2");

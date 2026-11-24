@@ -180,9 +180,8 @@ fn assert_mount_name_refusal_preserves_orphans(name: &[u16], expected_errno: i32
 
     // This namespace is valid NTFS, but its exact native name cannot pass the
     // mounted host projection. Refusal must precede all orphan-recovery writes.
-    let error = match NtfsFs::from_engine(&cx, engine, 1000, 1000) {
-        Ok(_) => panic!("unrepresentable native name was admitted for mounting"),
-        Err(error) => error,
+    let Err(error) = NtfsFs::from_engine(&cx, engine, 1000, 1000) else {
+        panic!("unrepresentable native name was admitted for mounting");
     };
     assert_eq!(error.to_errno(), expected_errno);
     assert_eq!(

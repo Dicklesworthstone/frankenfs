@@ -1726,6 +1726,7 @@ fn entropy_regression_options(
     }
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn assert_missing_entropy_authority<T>(outcome: ZfsTxOutcome<T>) {
     assert!(matches!(
         outcome,
@@ -1837,8 +1838,8 @@ fn encrypted_roots_and_rewraps_do_not_repeat_from_identical_public_inputs() {
             .record;
         assert_eq!(record.guid, records[0].guid);
         let rewrapped = record.unwrap(&[0xB3; 32]).unwrap();
-        assert!(rewrapped.active_master_key() == first_key.active_master_key());
-        assert!(rewrapped.hmac_key == first_key.hmac_key);
+        assert_eq!(rewrapped.active_master_key(), first_key.active_master_key());
+        assert_eq!(rewrapped.hmac_key, first_key.hmac_key);
         assert_ne!(record.iv, records[0].iv);
         wrapping_ivs.push(record.iv);
     }
@@ -1967,7 +1968,13 @@ fn encrypted_failed_publication_reopen_retry_never_reuses_data_nonces() {
         let indirect_offset = usize::try_from(indirect.offset).unwrap();
         let indirect_bytes = &failed_media[indirect_offset..indirect_offset + indirect.bytes];
         let mut failed_pairs = BTreeSet::new();
-        for (index, pointer_bytes) in indirect_bytes.chunks_exact(128).take(5).enumerate() {
+        for (index, pointer_bytes) in indirect_bytes
+            .as_chunks::<128>()
+            .0
+            .iter()
+            .take(5)
+            .enumerate()
+        {
             let pointer = BlockPointer::parse(pointer_bytes, order).unwrap();
             assert!(pointer.is_encrypted());
             assert_eq!(pointer.birth(), before_txg + 1);
@@ -2001,16 +2008,16 @@ fn encrypted_failed_publication_reopen_retry_never_reuses_data_nonces() {
         retry.load_key(&cx, &root, &material).unwrap();
         assert_eq!(retry.committed_txg(), before_txg);
         let mut recovered = retry.open_read_objects(&cx).unwrap();
-        assert!(
+        assert_eq!(
             recovered
                 .zpl(&cx, &child)
                 .unwrap()
                 .read(&cx, file, 0, attempted_plaintext.len())
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            b""
         );
         let crypto_recovered = recovered.dataset_crypto_info(&cx, &child).unwrap().unwrap();
-        assert!(crypto_recovered.record == crypto_before.record);
+        assert_eq!(crypto_recovered.record, crypto_before.record);
         assert_eq!(
             recovered
                 .zap(&cx, row.head_object)
