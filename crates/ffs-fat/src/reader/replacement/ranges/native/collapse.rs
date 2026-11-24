@@ -158,6 +158,7 @@ pub(super) fn apply(
         bail!("collapse directory record changed before mutation");
     }
 
+    let native = super::NativeMutation::begin(cx, volume)?;
     let mut phase = "publishing dirty state";
     let result = (|| -> Result<()> {
         set_dirty(cx, volume, true)?;
@@ -261,7 +262,7 @@ pub(super) fn apply(
         phase = "synchronizing final clean state";
         set_dirty(cx, volume, false)?;
         volume.device.sync(cx)?;
-        Ok(())
+        native.finish(cx, ())
     })();
     result.with_context(|| format!(
         "FAT collapse failed while {phase}; image retained and may contain a shorter or partially changed file and detached allocation; no rollback or atomicity is claimed"

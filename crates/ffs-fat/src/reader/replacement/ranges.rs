@@ -9,8 +9,8 @@ mod native;
 
 use super::super::{FatVolume, FileChain};
 use super::{
-    EXPECT_END, HASH_BYTES, Replacement, allocate, change_fat, checkpoint, hash_device,
-    modified_timestamp, set_dirty, set_hints, validate_boot_state, write_volume,
+    EXPECT_END, HASH_BYTES, NativeMutation, Replacement, allocate, change_fat, checkpoint,
+    hash_device, modified_timestamp, set_dirty, set_hints, validate_boot_state, write_volume,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use asupersync::Cx;
@@ -291,6 +291,7 @@ fn shrink_in_volume(cx: &Cx, volume: &FatVolume, path: &str, size: u32, now: u64
     if needs_guard {
         guarded[28..32].copy_from_slice(&guard_size.to_le_bytes());
     }
+    let native = NativeMutation::begin(cx, volume)?;
     let mut phase = "publishing dirty state";
     let result = (|| -> Result<()> {
         set_dirty(cx, volume, true)?;
@@ -378,7 +379,7 @@ fn shrink_in_volume(cx: &Cx, volume: &FatVolume, path: &str, size: u32, now: u64
         phase = "synchronizing final clean state";
         set_dirty(cx, volume, false)?;
         volume.device.sync(cx)?;
-        Ok(())
+        native.finish(cx, ())
     })();
     result.with_context(|| format!(
         "FAT shrink failed while {phase}; image retained and may be dirty or partially changed; no rollback or atomicity is claimed"

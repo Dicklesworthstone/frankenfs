@@ -6,7 +6,9 @@
 //! but this operation never frees allocation or writes either object's payload.
 
 use super::super::super::super::{Directory, Entry, FatVolume};
-use super::{parent, raw_cluster, read_slot, rename_chain, set_dirty, write_volume};
+use super::{
+    NativeMutation, parent, raw_cluster, read_slot, rename_chain, set_dirty, write_volume,
+};
 use anyhow::{Context, Result, bail};
 use asupersync::Cx;
 use ffs_error::FfsError;
@@ -262,6 +264,7 @@ impl FatVolume {
             return Ok(report);
         }
 
+        let native = NativeMutation::begin(cx, self)?;
         let mut phase = "persisting dirty state";
         let result = (|| -> Result<serde_json::Value> {
             set_dirty(cx, self, true)?;
@@ -307,7 +310,7 @@ impl FatVolume {
             verify_state(cx, self, false)?;
             report["durability"] = "metadata_and_clean_state_synced".into();
             report["verification"] = serde_json::to_value(after)?;
-            Ok(report)
+            native.finish(cx, report)
         })();
         result.with_context(|| format!(
             "FAT exchange failed while {phase}; image retained and may be dirty or partially changed; no rollback or crash atomicity is claimed"

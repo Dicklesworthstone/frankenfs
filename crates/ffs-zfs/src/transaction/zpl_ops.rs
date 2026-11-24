@@ -8,7 +8,7 @@ use ffs_error::{FfsError, Result};
 use ffs_ondisk::zfs::{BlockPointer, Endian, RegularBlockSpec};
 use ffs_ondisk::zfs_dmu::{
     DMU_OT_DNODE, DNODE_BLOCK_BYTES, DNODE_BYTES, Dnode, DnodeSpec, OBJSET_GROUPUSED_OFFSET,
-    OBJSET_PROJECTUSED_OFFSET, OBJSET_USERUSED_OFFSET, ObjectSet,
+    OBJSET_PROJECTUSED_OFFSET, OBJSET_USERUSED_OFFSET, ObjectSet, dnode_at,
 };
 use ffs_ondisk::zfs_zap::Entry as RawZapEntry;
 use ffs_ondisk::zfs_zpl::{
@@ -22,11 +22,12 @@ use crate::reader::dmu::properties::PropertyValue;
 
 use super::dmu_cow::{
     DMU_OT_DIRECTORY_CONTENTS, DMU_OT_OBJSET, DMU_OT_PLAIN_FILE_CONTENTS, DMU_OT_SA, DMU_OT_ZNODE,
-    DnodeCowOutput, DnodeCowSpec, PoolSpaceAllocator, QuotaDelta, SpaceDelta, StagedBlockWrite,
-    WriteBucket, allocate_object_id, allocated_leaf_blocks_in_range, apply_objectset_quota_deltas,
-    collect_non_hole_bps_from, cow_update_dnode, encode_zap_blocks_for_dnode,
-    enqueue_into_dataset_deadlist, objectset_user_accounting_flags, put_dnode_in_table,
-    read_staged_or_committed_dnode, remove_dnode_from_table, zap_optional_u64, zap_required_u64,
+    DnodeCowOutput, DnodeCowSpec, OwnerQuotaLimits, PoolSpaceAllocator, QuotaDelta, SpaceDelta,
+    StagedBlockWrite, WriteBucket, allocate_object_id, allocated_leaf_blocks_in_range,
+    apply_objectset_quota_deltas, collect_non_hole_bps_from, cow_update_dnode,
+    encode_zap_blocks_for_dnode, enqueue_into_dataset_deadlist, load_owner_quota_limits,
+    objectset_user_accounting_flags, put_dnode_in_table, read_staged_or_committed_dnode,
+    remove_dnode_from_table, zap_optional_u64, zap_required_u64,
 };
 use super::{checkpoint, corrupt, parse_err, unsupported};
 
@@ -388,6 +389,7 @@ struct DatasetContext {
     deadlist_obj: u64,
     old_os_bp: BlockPointer,
     os: ObjectSet,
+    owner_quota_limits: OwnerQuotaLimits,
     root_dir: u64,
     zpl_version: u64,
     utf8_only: bool,
@@ -519,24 +521,9 @@ fn open_head_dataset_context(
 
     let mut os_view = mos.open_objectset_view(os.meta.clone(), old_os_bp.birth(), mos.txg);
     let master = os_view.zap_values(cx, 1)?;
-    // OpenZFS stores per-owner byte and object limits in separate ZAPs
-    // referenced by these exact master-node keys. Updating the embedded *used
-    // counters does not enforce those limits. Keep the native writer closed
-    // to such datasets until it can enforce every applicable owner limit.
-    for key in [
-        b"userquota@".as_slice(),
-        b"groupquota@",
-        b"projectquota@",
-        b"userobjquota@",
-        b"groupobjquota@",
-        b"projectobjquota@",
-    ] {
-        if zap_optional_u64(&master, key)?.is_some_and(|object| object != 0) {
-            return Err(unsupported(
-                "native user, group, or project quota limits require owner-limit enforcement",
-            ));
-        }
-    }
+    // Limits are read from the selected committed object set and checked
+    // against the same net owner deltas that will be published with this TXG.
+    let owner_quota_limits = load_owner_quota_limits(cx, &mut os_view, &os, &master, os_order)?;
     let root_dir = zap_required_u64(&master, b"ROOT")?;
     let unlinked_set = zap_optional_u64(&master, b"DELETE_QUEUE")?.filter(|&object| object != 0);
     let zpl_version = zap_required_u64(&master, b"VERSION")?;
@@ -576,6 +563,7 @@ fn open_head_dataset_context(
             deadlist_obj,
             old_os_bp,
             os,
+            owner_quota_limits,
             root_dir,
             zpl_version,
             utf8_only,
@@ -682,6 +670,22 @@ fn load_zpl_node(
         object_id,
         order,
     )?;
+    let loaded = decode_zpl_node(cx, os_view, dnode, ceiling, sa_registry)?;
+    if loaded.metadata.flags & 1 != 0 {
+        return Err(unsupported(
+            "cannot directly mutate private ZPL xattr object",
+        ));
+    }
+    Ok(loaded)
+}
+
+fn decode_zpl_node(
+    cx: &Cx,
+    os_view: &mut Objects,
+    dnode: Dnode,
+    ceiling: u64,
+    sa_registry: Option<&SaRegistry>,
+) -> Result<LoadedZplNode> {
     if !matches!(
         dnode.object_type(),
         DMU_OT_PLAIN_FILE_CONTENTS | DMU_OT_DIRECTORY_CONTENTS
@@ -726,11 +730,6 @@ fn load_zpl_node(
         }
         _ => return Err(unsupported("unsupported ZPL bonus representation")),
     };
-    if metadata.flags & 1 != 0 {
-        return Err(unsupported(
-            "cannot directly mutate private ZPL xattr object",
-        ));
-    }
     Ok(LoadedZplNode {
         dnode,
         ceiling,
@@ -1458,6 +1457,12 @@ pub(super) fn stage_zpl_mutation(
 ) -> Result<u64> {
     checkpoint(cx)?;
     let (mut ds_ctx, mut os_view) = open_head_dataset_context(cx, mos, dataset_components)?;
+    // ObjectSet retains its embedded usage dnodes in the source byte order.
+    // Until that tail is converted as a unit, a quota-controlled transaction
+    // must not rewrite some counters and preserve others in a different order.
+    if ds_ctx.owner_quota_limits.active && ds_ctx.os.meta.order() != order {
+        return Err(unsupported("mixed-order native owner quota accounting"));
+    }
     let zpl_meta_base = ds_ctx.os.meta.clone();
     let zpl_ceiling = ds_ctx.old_os_bp.birth();
     let acct_flags = objectset_user_accounting_flags(&ds_ctx.os, order)?;
@@ -3862,6 +3867,71 @@ fn flush_sa_table_zap(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn validate_owner_quota_preimages(
+    cx: &Cx,
+    ds_ctx: &DatasetContext,
+    os_view: &mut Objects,
+    meta: &Dnode,
+    ceiling: u64,
+    dirty: &BTreeMap<u64, Vec<u8>>,
+    order: Endian,
+) -> Result<()> {
+    if !ds_ctx.owner_quota_limits.active {
+        return Ok(());
+    }
+    let mut existing = Vec::new();
+    for (&block, bytes) in dirty {
+        // Inspect each committed object once, including deletions and owners
+        // that cancel to zero in the transaction's aggregate usage change.
+        if let Some((old, old_order, old_ceiling)) =
+            os_view.object_data_block(cx, meta, ceiling, block)?
+        {
+            ds_ctx
+                .owner_quota_limits
+                .validate_dnode_table(&ds_ctx.os, &old, old_order)?;
+            let mut slot = 0;
+            while slot < old.len() / DNODE_BYTES {
+                checkpoint(cx)?;
+                let Some(node) =
+                    dnode_at(&old, slot, old_order).map_err(|error| parse_err(&error))?
+                else {
+                    slot += 1;
+                    continue;
+                };
+                slot += node.slots();
+                if matches!(
+                    node.object_type(),
+                    DMU_OT_PLAIN_FILE_CONTENTS | DMU_OT_DIRECTORY_CONTENTS
+                ) {
+                    let loaded = decode_zpl_node(
+                        cx,
+                        os_view,
+                        node,
+                        old_ceiling,
+                        ds_ctx.sa_registry.as_ref(),
+                    )?;
+                    existing.push(QuotaDelta {
+                        uid: loaded.metadata.uid,
+                        gid: loaded.metadata.gid,
+                        projid: Some(loaded.project_id),
+                        bytes_delta: i64::try_from(loaded.dnode.used_bytes()).map_err(|_| {
+                            corrupt("existing native owner usage exceeds supported range")
+                        })?,
+                        objs_delta: 1,
+                    });
+                }
+            }
+        }
+        ds_ctx
+            .owner_quota_limits
+            .validate_dnode_table(&ds_ctx.os, bytes, order)?;
+    }
+    ds_ctx
+        .owner_quota_limits
+        .validate_existing_usage(&existing, ds_ctx.os.flags & 2 != 0)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn finalize_dataset_to_mos(
     cx: &Cx,
     mos: &mut Objects,
@@ -3886,6 +3956,16 @@ fn finalize_dataset_to_mos(
     let mut zpl_born = *zpl_born_initial;
     let mut zpl_retired = zpl_retired_initial.to_vec();
     let mut all_zpl_dirty = zpl_dirty_dnodes.clone();
+
+    validate_owner_quota_preimages(
+        cx,
+        ds_ctx,
+        os_view,
+        zpl_meta_base,
+        zpl_ceiling,
+        zpl_dirty_dnodes,
+        order,
+    )?;
 
     if ds_ctx.sa_reg_dirty
         && let Some(reg_obj) = ds_ctx.sa_reg_obj
@@ -3935,6 +4015,7 @@ fn finalize_dataset_to_mos(
         &mut ds_ctx.os,
         alloc,
         quota_deltas,
+        &ds_ctx.owner_quota_limits,
         order,
         new_txg,
         staged_writes,

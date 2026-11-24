@@ -99,6 +99,7 @@ struct PoolFixtureSpec {
     ashift: u8,
     mirror_width: usize,
     zpl_version: u64,
+    zpl_order: Option<Endian>,
     with_sa_spill: bool,
     with_sa_spill_timestamps: bool,
     user_accounting: bool,
@@ -107,6 +108,8 @@ struct PoolFixtureSpec {
     malformed_project_id: bool,
     directory_projects: BTreeMap<u64, u64>,
     owner_quota_objects: Vec<(&'static [u8], u64)>,
+    owner_quota_entries: BTreeMap<u64, Vec<(&'static [u8], u64)>>,
+    owner_usage_overrides: Vec<(usize, &'static [u8], Option<u64>)>,
     deadlist_mode: DeadlistMode,
     preallocate_nearly_full: bool,
     pool_state: u64,
@@ -135,6 +138,7 @@ impl Default for PoolFixtureSpec {
             ashift: 9,
             mirror_width: 1,
             zpl_version: 5,
+            zpl_order: None,
             with_sa_spill: false,
             with_sa_spill_timestamps: false,
             user_accounting: false,
@@ -143,6 +147,8 @@ impl Default for PoolFixtureSpec {
             malformed_project_id: false,
             directory_projects: BTreeMap::new(),
             owner_quota_objects: Vec::new(),
+            owner_quota_entries: BTreeMap::new(),
+            owner_usage_overrides: Vec::new(),
             deadlist_mode: DeadlistMode::None,
             preallocate_nearly_full: false,
             pool_state: 1,
@@ -801,6 +807,7 @@ fn build_zpl_objectset(
     birth: u64,
     order: Endian,
 ) -> (BlockPointer, u64, Vec<u8>) {
+    let order = spec.zpl_order.unwrap_or(order);
     let mut table = vec![0_u8; DNODE_BLOCK_BYTES];
     let acct_flags = if spec.user_accounting || spec.project_accounting {
         DNODE_FLAG_USERUSED_ACCOUNTED | DNODE_FLAG_USEROBJUSED_ACCOUNTED
@@ -843,7 +850,12 @@ fn build_zpl_objectset(
                 .unwrap()
                 .is_none()
         );
-        let quota_raw = mzap(&[(b"0", 1), (b"2a", 1), (b"3e8", 1)], 0x5151, order);
+        let default_quota_entries = [(b"0".as_slice(), 1), (b"2a", 1), (b"3e8", 1)];
+        let quota_entries = spec
+            .owner_quota_entries
+            .get(&object)
+            .map_or(default_quota_entries.as_slice(), Vec::as_slice);
+        let quota_raw = mzap(quota_entries, 0x5151, order);
         let quota_bp = arena.alloc_block(&quota_raw, 40, 0, birth, order);
         let quota_dn = make_dnode(
             40,
@@ -1487,9 +1499,19 @@ fn build_zpl_objectset(
                 .iter_mut()
                 .zip([metadata.uid, metadata.gid, project])
             {
-                *map.entry(format!("{owner:x}").into_bytes()).or_default() += node.used_bytes();
+                // OpenZFS charges the 512-byte native dnode in addition to
+                // dn_used for every accounted object, including empty files.
+                *map.entry(format!("{owner:x}").into_bytes()).or_default() +=
+                    node.used_bytes() + 512;
                 *map.entry(format!("obj-{owner:x}").into_bytes())
                     .or_default() += 1;
+            }
+        }
+        for &(dimension, key, value) in &spec.owner_usage_overrides {
+            if let Some(value) = value {
+                counters[dimension].insert(key.to_vec(), value);
+            } else {
+                counters[dimension].remove(key);
             }
         }
         for (index, (offset, salt)) in [
@@ -3690,7 +3712,7 @@ fn project_owner_receives_spill_growth_truncate_and_final_unlink_accounting() {
             native_accounting_snapshot(&cx, &engine, &devices[0]);
         let truncated_node = truncated_node.unwrap();
         assert_eq!(truncated_node.used_bytes(), 8192);
-        assert_eq!(truncated_counters[2][b"2a".as_slice()], 8192);
+        assert_eq!(truncated_counters[2][b"2a".as_slice()], 8192 + 512);
         assert_eq!(truncated_counters[2][b"obj-2a".as_slice()], 1);
         assert_eq!(
             truncated_counters[2][b"0".as_slice()],
@@ -3875,7 +3897,7 @@ fn project_owner_survives_unlink_replacement_restart_and_orphan_reclamation() {
             native_accounting_snapshot(&cx, &reopened, &fresh[0]);
         let truncated_node = truncated_node.unwrap();
         assert_eq!(truncated_node.used_bytes(), 8192);
-        assert_eq!(truncated_counters[2][b"2a".as_slice()], 8192);
+        assert_eq!(truncated_counters[2][b"2a".as_slice()], 8192 + 512);
         assert_eq!(truncated_counters[2][b"obj-2a".as_slice()], 1);
         assert_eq!(
             truncated_counters[2][b"0".as_slice()],
@@ -3902,7 +3924,7 @@ fn project_owner_survives_unlink_replacement_restart_and_orphan_reclamation() {
         .enumerate()
         {
             let mut expected = truncated_counters[index].clone();
-            for (key, decrement) in [(owner, truncated_node.used_bytes()), (object_key, 1)] {
+            for (key, decrement) in [(owner, truncated_node.used_bytes() + 512), (object_key, 1)] {
                 let remaining = expected[key].checked_sub(decrement).unwrap();
                 if remaining == 0 {
                     expected.remove(key);

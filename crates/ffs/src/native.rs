@@ -1,6 +1,6 @@
 //! Bounded native filesystem access and explicitly authorized writable admission.
 
-pub(crate) mod writable;
+pub mod writable;
 
 use asupersync::Cx;
 use ffs_block::io_engine::{VolumeAccess, VolumeDevice};
@@ -773,6 +773,7 @@ pub struct ReadOnlyFs {
     tracker: Arc<ResourceTracker>,
 }
 
+#[derive(Clone, Copy)]
 struct BoundedReadRange {
     ino: InodeNumber,
     offset: u64,
@@ -1088,7 +1089,7 @@ impl ReadOnlyFs {
             frame.next_child = 0;
             self.tracker.charge_operation()?;
             // The page drops before its reservation, including on error.
-            let _page_memory;
+            let mut page_memory = self.tracker.acquire_retained_bytes(0)?;
             let page = self
                 .filesystem
                 .readdir(cx, scope, frame.ino, frame.cursor.offset)?;
@@ -1109,7 +1110,7 @@ impl ReadOnlyFs {
                         .ok_or_else(|| budget_error("retained_bytes", None, None))
                 },
             )?;
-            _page_memory = self.tracker.acquire_retained_bytes(page_bytes)?;
+            page_memory.resize(page_bytes)?;
             reserve_bounded_vec(
                 &self.tracker,
                 &mut frame.children,

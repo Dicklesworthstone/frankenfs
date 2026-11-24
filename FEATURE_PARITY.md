@@ -1,5 +1,40 @@
 # FEATURE_PARITY
 
+> **ZFS native owner quota enforcement (2026-11-23):**
+> Native COW mutations enforce byte and object limits for users, groups and
+> projects before backing writes or TXG publication. Per-owner net deltas
+> include the native 512-byte dnode charge, even for empty files, and correctly
+> transfer or reclaim both byte and object usage. Exact limits, net-zero changes
+> and reclamation remain valid; positive growth beyond a limit returns EDQUOT.
+> Empty limit tables are admitted with complete native accounting. Corrupt
+> keys/values, arithmetic overflow or underflow, incomplete or understated usage
+> for touched objects, and unsupported ObjectSet/commit byte order refuse
+> mutation. Eight integration regressions and three helper tests are authored.
+> Workspace formatting and the limited production UBS static scan pass.
+> Runtime tests and complete compiler/Clippy verification remain unverified:
+> the executor repeatedly SIGKILLed `asupersync`, including metadata-only
+> checking. The execution record is in `.beads/pending_tasks.md`.
+> Native OpenZFS interchange, mounted qualification, quota administration,
+> dataset limits and the broader `bd-jdned` acceptance remain open.
+
+> **FAT native mutation and sidecar publication (2026-11-23):**
+> Direct library and offline mutations now hold the existing native-commit
+> deferral across every dirty-state, allocation, namespace, verification and
+> clean-state barrier. Intermediate syncs cannot seal transient native state
+> as a trusted repair generation. Standalone completion seals once after native
+> durability; mounted outer guards retain compound-operation/cache boundaries.
+> Pre-commit failure keeps protection pending and refuses later sealing of
+> partial writes. A protection-only failure after native completion reports
+> committed native state. A retained live owner can retry synchronization when
+> protection state permits it; the regression covers a failure before sealing
+> begins. Four authored real-sidecar regressions cover 18 operation paths on
+> constructed FAT16/FAT32 images, intermediate archive identity, cancellation,
+> native and protection failure cuts, fresh admission and nested FsOps guards.
+> Workspace and direct included-test formatting pass. The runtime build was
+> SIGKILLed in `asupersync` before FAT source or tests ran; no runtime pass is
+> claimed. Native-system, mounted and hardware power-cut qualification and the
+> broad `bd-tqrnc` acceptance remain open.
+
 > **ZFS atomic set-ID removal during data mutation (2026-11-23):**
 > Writable FsOps writes, copies, truncation (including open-with-truncate),
 > hole punching and zero-range edits now remove S_ISUID and executable S_ISGID
@@ -3624,16 +3659,23 @@ Cross-project insertions return EXDEV before backing writes.
 Admission requires the active native project_quota feature, all three complete
 accounting flags and embedded user/group/project accounting objects. Newly
 created regular files/directories with inheritable parent ACEs remain refused.
-The central native writer also refuses any nonzero master-node reference to
-userquota@, groupquota@, projectquota@, userobjquota@, groupobjquota@ or
-projectobjquota@. Maintaining used counters does not enforce limits; even an
-empty referenced limit table remains outside this bounded profile. Ordinary
-dataset reads remain available. Project reassignment, ACL inheritance and
-complete quota enforcement remain roadmap work.
+The central native writer now enforces userquota@, groupquota@, projectquota@,
+userobjquota@, groupobjquota@ and projectobjquota@ against checked per-TXG net
+usage before backing writes. Byte accounting includes `512 + dn_used` for each
+native object, including empty files. Net growth above a limit returns EDQUOT;
+exact-boundary changes, changes with no per-owner increase and reclamation
+remain allowed.
+Absent references and missing owner keys impose no limit; a stored zero value
+is a hard zero. Empty referenced tables are admitted with complete native
+accounting. Malformed or incomplete accounting, understated usage for touched
+objects, arithmetic overflow/underflow and unsupported ObjectSet/commit byte
+order refuse mutation. Ordinary dataset reads remain available. Project
+reassignment, ACL inheritance, dataset quotas and quota administration remain
+roadmap work.
 
 Two codec regressions cover split-parent metadata, fresh independent layout
 registration, absent-project preservation and raw native quota-reader offsets
-in both byte orders. Nine persistence regression sources cover nested creation,
+in both byte orders. Persistence regression sources cover nested creation,
 owner counters through write/truncate/unlink, matching and mismatched namespace
 operations, symlink ownership, stale references, fresh durable reopen, snapshots,
 six native owner-limit profiles and mirrored publication cuts with dropped or

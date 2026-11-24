@@ -810,9 +810,15 @@ Hard links and moves into a project-inheriting directory require a matching
 project ID and return EXDEV on a mismatch. Links preserve the existing object's
 inheritance flag; moves acquire the destination's flag without changing the
 project owner. Exchange checks both destination boundaries. Project ownership
-reassignment remains unsupported. The native writer refuses datasets with
-nonzero user/group/project byte- or object-quota table references until those
-limits can be enforced; ordinary reads remain available.
+reassignment remains unsupported. The native writer enforces user, group and
+project byte and object quotas before publishing a mutation. An admitted quota
+profile requires complete native accounting and canonical limit tables in the
+writer's byte order. Empty files consume one object and the native 512-byte
+dnode charge; allocated data adds its native usage. Net growth past a limit
+returns EDQUOT, while exact-boundary changes and reclamation remain possible.
+Malformed limits, missing or understated accounting for touched objects, and
+unsupported mixed-order quota metadata refuse mutation; ordinary reads remain
+available.
 The writable FsOps adapter handles nonempty writes, file-range copies, truncation
 and supported sparse range edits by clearing native S_ISUID and executable
 S_ISGID bits in the same TXG as the data change. Non-executable S_ISGID is retained,
