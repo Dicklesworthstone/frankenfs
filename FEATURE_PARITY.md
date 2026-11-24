@@ -1,5 +1,21 @@
 # FEATURE_PARITY
 
+> **NTFS USN journal publication boundaries (2026-11-24):**
+> `$UsnJrnl:$J` append now COWs from the old logical EOF, preserving initialized
+> records while zeroing the padding exposed by a new USN page. Sparse-head
+> reclamation rounds to both whole clusters and whole 4 KiB USN pages, so
+> sub-page clusters and unaligned `$Max.allocation_delta` values cannot leave
+> the retained journal starting inside a record. An existing journal whose
+> initialized length is below EOF is explicitly refused before publication;
+> bounded initialization of arbitrary existing tails remains unsupported.
+> Three authored regressions cover five cluster geometries, poisoned physical
+> EOF padding, fresh-engine reopen and full consistency checks, and exact
+> unchanged-media/write-count refusal for a partially initialized journal.
+> Pinned rustfmt and `git diff --check` pass for the changed source and tests.
+> Runtime tests and workspace check/Clippy qualification remain unverified
+> after shared-host ENOSPC and executor loss. This advances `bd-h8n46` without
+> claiming its broader native-oracle or writable-transform acceptance.
+
 > **ZFS native compound replication framing (2026-11-24):**
 > Compound sends now emit the OpenZFS header END covering BEGIN plus its nvlist,
 > followed by ordinary substreams and the separate zero-checksum package END.
@@ -16,6 +32,11 @@
 > and `git diff --check`; full checking failed during dependency compilation
 > with ENOSPC, followed by executor disconnection. Native OpenZFS interchange,
 > runtime/Clippy qualification and the full `bd-jbo9q` acceptance remain open.
+> The existing receive outcome API also remains incomplete: failure after an
+> earlier compound substream or resumable staging checkpoint publishes can
+> still return `NotCommitted`. A receive-specific durable-prefix/checkpoint
+> outcome and interrupted-package reopen tests are required before callers can
+> distinguish every partial-receive state accurately.
 
 > **ZFS mixed-byte-order write admission (2026-11-23):**
 > Normal COW and final fixed-DVA replay refuse replacing an existing DNODE leaf

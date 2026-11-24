@@ -27,6 +27,9 @@ use ffs_ntfs::transaction::{
 };
 use ffs_ondisk::ntfs::NtfsReference;
 use ffs_ondisk::ntfs::reparse::{MOUNT_POINT_TAG, NtfsReparseData, NtfsReparsePoint};
+use ffs_ondisk::ntfs::usn::{
+    USN_PAGE_BYTES, UsnRecordV2, align_usn_offset, parse_usn_journal_slice,
+};
 use ffs_ondisk::ntfs_security::{
     ACE_FLAG_CONTAINER_INHERIT, ACE_FLAG_INHERIT_ONLY, ACE_FLAG_INHERITED, ACE_FLAG_OBJECT_INHERIT,
     ACE_TYPE_ACCESS_ALLOWED, ACE_TYPE_ACCESS_DENIED, ACE_TYPE_SYSTEM_AUDIT, FILE_ADD_FILE,
@@ -2854,6 +2857,340 @@ fn ntfs_secure_intern_dedup_multistripe_256k_inheritance_hardlink_dacl_sacl_and_
     )
     .unwrap();
     assert!(chk30.clean, "NTFS 3.0 check failed: {:?}", chk30.issues);
+}
+
+fn usn_publication_records(cx: &Cx, volume: &NtfsVolume) -> Vec<UsnRecordV2> {
+    let summary = volume.usn_summary(cx).unwrap().expect("active journal");
+    let record = volume.record(cx, u64::from(summary.record), None).unwrap();
+    let stream = volume.data_stream(cx, &record, &utf16("$J")).unwrap();
+    let bytes = volume
+        .read(
+            cx,
+            &stream,
+            summary.lowest_valid_usn,
+            usize::try_from(summary.next_usn - summary.lowest_valid_usn).unwrap(),
+        )
+        .unwrap();
+    parse_usn_journal_slice(summary.lowest_valid_usn, &bytes).unwrap()
+}
+
+#[test]
+fn usn_publication_trims_only_complete_pages_and_clusters() {
+    let cx = Cx::for_testing();
+    // $Max accepts byte-sized allocation deltas, including ones that do not
+    // align to either a USN page or an allocation cluster. Sub-page clusters
+    // must not turn such a delta into a retained head in the middle of a record.
+    for cluster_bytes in [512_u32, 1024, 2048, 4096, 8192] {
+        let (dev, vol_bytes) = format_to_fault_device(
+            &cx,
+            16,
+            cluster_bytes,
+            NtfsFormatVersion::V3_1,
+            0xBD84_0051_0000_0000 | u64::from(cluster_bytes),
+        );
+        let mut engine = open_clean_engine(&cx, &dev, vol_bytes);
+        let name = format!("{}.bin", "j".repeat(80));
+        let (file, _) = engine
+            .create_file(&cx, "/", &name, b"x")
+            .into_result()
+            .unwrap();
+        let allocation_delta = USN_PAGE_BYTES + u64::from(cluster_bytes) + 7;
+        engine
+            .enable_usn_journal(&cx, 4096, allocation_delta, DEFAULT_NTFS_FILETIME)
+            .into_result()
+            .unwrap();
+        let mut expected = Vec::new();
+        let mut previous_end = 0;
+        let mut trimmed = false;
+        for index in 0_u8..96 {
+            engine
+                .write_stream_range(&cx, file, &[], 0, &[index])
+                .into_result()
+                .unwrap();
+            // Reopen the engine from durable bytes; a warmed metadata view
+            // cannot hide a corrupt new $Max/$J pair.
+            drop(engine);
+            engine = open_clean_engine(&cx, &dev, vol_bytes);
+            let volume = engine.volume_view(&cx).unwrap();
+            let summary = volume.usn_summary(&cx).unwrap().expect("active journal");
+            assert_eq!(summary.allocation_delta, allocation_delta);
+            let records = usn_publication_records(&cx, &volume);
+            expected.extend(
+                records
+                    .iter()
+                    .filter(|record| record.usn >= previous_end)
+                    .cloned(),
+            );
+            previous_end = summary.next_usn;
+            assert_eq!(records.last().unwrap().file_ref, file);
+            assert_eq!(records.last().unwrap().name, utf16(&name));
+            assert_eq!(
+                read_file_by_path(&cx, &engine, &format!("/{name}")),
+                [index]
+            );
+            if summary.lowest_valid_usn != 0 {
+                assert!(summary.lowest_valid_usn.is_multiple_of(USN_PAGE_BYTES));
+                assert!(
+                    summary
+                        .lowest_valid_usn
+                        .is_multiple_of(u64::from(cluster_bytes))
+                );
+                let retained: Vec<_> = expected
+                    .into_iter()
+                    .filter(|record| record.usn >= summary.lowest_valid_usn)
+                    .collect();
+                assert_eq!(records, retained);
+                trimmed = true;
+                break;
+            }
+        }
+        assert!(trimmed, "must exercise head trimming for {cluster_bytes}");
+        engine.check_clean_consistency(&cx).unwrap();
+        let report = check_volume_device(
+            &cx,
+            Arc::clone(&dev) as Arc<dyn ByteDevice>,
+            0,
+            vol_bytes,
+            NtfsCheckLimits::default(),
+        )
+        .unwrap();
+        assert!(report.clean, "cluster {cluster_bytes}: {:?}", report.issues);
+    }
+}
+
+#[test]
+fn usn_publication_initializes_previous_page_padding_before_extending_journal() {
+    let cx = Cx::for_testing();
+    for cluster_bytes in [512_u32, 4096, 8192] {
+        let (dev, vol_bytes) = format_to_fault_device(
+            &cx,
+            16,
+            cluster_bytes,
+            NtfsFormatVersion::V3_1,
+            0xBD84_0052_0000_0000 | u64::from(cluster_bytes),
+        );
+        let mut engine = open_clean_engine(&cx, &dev, vol_bytes);
+        let name = format!("{}.bin", "p".repeat(80));
+        let (file, _) = engine
+            .create_file(&cx, "/", &name, b"old")
+            .into_result()
+            .unwrap();
+        engine
+            .enable_usn_journal(&cx, 65_536, 4096, DEFAULT_NTFS_FILETIME)
+            .into_result()
+            .unwrap();
+        let mut prepared = None;
+        for _ in 0..32 {
+            engine
+                .write_stream_range(&cx, file, &[], 0, b"old")
+                .into_result()
+                .unwrap();
+            let volume = engine.volume_view(&cx).unwrap();
+            let summary = volume.usn_summary(&cx).unwrap().expect("active journal");
+            let records = usn_publication_records(&cx, &volume);
+            let next_offset =
+                align_usn_offset(summary.next_usn, records.last().unwrap().encoded_len());
+            if next_offset > summary.next_usn {
+                prepared = Some((volume, summary, records, next_offset));
+                break;
+            }
+        }
+        let (volume, before, previous, next_offset) = prepared.expect("page-edge fixture");
+        let record = volume.record(&cx, u64::from(before.record), None).unwrap();
+        let catalog = volume.attributes(&cx, &record).unwrap();
+        let mut seed = dev.snapshot_durable_only();
+        let mut poisoned = 0;
+        // Bytes beyond the old logical EOF are not initialized file data.
+        // A native producer may leave any prior allocation contents there.
+        for attr in catalog.all().unwrap() {
+            if attr.kind != ffs_ondisk::ntfs::DATA || attr.name != utf16("$J") {
+                continue;
+            }
+            let ffs_ondisk::ntfs::NtfsValue::NonResident(nr) = attr.value else {
+                panic!("$J must be nonresident");
+            };
+            let runs = ffs_ondisk::ntfs::decode_mapping_pairs(
+                nr.mapping_pairs,
+                nr.first_vcn,
+                nr.last_vcn,
+                volume.geometry.cluster_count(),
+            )
+            .unwrap();
+            let cb = u64::from(cluster_bytes);
+            for run in runs {
+                let Some(lcn) = run.lcn else { continue };
+                let start = before.next_usn.max(run.vcn * cb);
+                let end = next_offset.min((run.vcn + run.clusters) * cb);
+                if start < end {
+                    let physical =
+                        volume.geometry.cluster_offset(lcn).unwrap() + start - run.vcn * cb;
+                    let at = usize::try_from(physical).unwrap();
+                    let len = usize::try_from(end - start).unwrap();
+                    seed[at..at + len].fill(0xA7);
+                    poisoned += len;
+                }
+            }
+        }
+        assert_eq!(poisoned as u64, next_offset - before.next_usn);
+        drop(engine);
+        let dev = FaultInjectingNtfsDevice::new(seed);
+        let mut engine = open_clean_engine(&cx, &dev, vol_bytes);
+        assert_eq!(
+            usn_publication_records(&cx, &engine.volume_view(&cx).unwrap()),
+            previous
+        );
+        engine
+            .write_stream_range(&cx, file, &[], 0, b"new")
+            .into_result()
+            .unwrap();
+        drop(engine);
+        let engine = open_clean_engine(&cx, &dev, vol_bytes);
+        let volume = engine.volume_view(&cx).unwrap();
+        let after = usn_publication_records(&cx, &volume);
+        assert_eq!(&after[..previous.len()], previous);
+        assert_eq!(after.len(), previous.len() + 1);
+        assert_eq!(after.last().unwrap().usn, next_offset);
+        assert_eq!(read_file_by_path(&cx, &engine, &format!("/{name}")), b"new");
+        let record = volume.record(&cx, u64::from(before.record), None).unwrap();
+        let journal = volume.data_stream(&cx, &record, &utf16("$J")).unwrap();
+        let padding = volume
+            .read(
+                &cx,
+                &journal,
+                before.next_usn,
+                usize::try_from(next_offset - before.next_usn).unwrap(),
+            )
+            .unwrap();
+        assert!(padding.iter().all(|&byte| byte == 0));
+        engine.check_clean_consistency(&cx).unwrap();
+        let report = check_volume_device(
+            &cx,
+            Arc::clone(&dev) as Arc<dyn ByteDevice>,
+            0,
+            vol_bytes,
+            NtfsCheckLimits::default(),
+        )
+        .unwrap();
+        assert!(report.clean, "cluster {cluster_bytes}: {:?}", report.issues);
+    }
+}
+
+#[test]
+fn usn_publication_refuses_uninitialized_existing_tail_without_writes() {
+    let cx = Cx::for_testing();
+    let (dev, vol_bytes) = format_to_fault_device(
+        &cx,
+        16,
+        4096,
+        NtfsFormatVersion::V3_1,
+        0xBD84_0053_0000_0001,
+    );
+    let mut engine = open_clean_engine(&cx, &dev, vol_bytes);
+    engine.grow_mft(&cx, 64).into_result().unwrap();
+    let (file, _) = engine
+        .create_file(&cx, "/", "uninitialized-journal.bin", b"old")
+        .into_result()
+        .unwrap();
+    engine
+        .enable_usn_journal(&cx, 65_536, 4096, DEFAULT_NTFS_FILETIME)
+        .into_result()
+        .unwrap();
+    engine
+        .write_stream_range(&cx, file, &[], 0, b"old")
+        .into_result()
+        .unwrap();
+    let volume = engine.volume_view(&cx).unwrap();
+    let summary = volume.usn_summary(&cx).unwrap().expect("active journal");
+    assert!(summary.next_usn > 0);
+    let record = volume.record(&cx, u64::from(summary.record), None).unwrap();
+    let record_bytes = volume.geometry.record_bytes() as usize;
+    let mut restored = record.used_bytes().to_vec();
+    restored.resize(record_bytes, 0);
+    let mut position = usize::from(u16::from_le_bytes(restored[20..22].try_into().unwrap()));
+    let mut patched = false;
+    loop {
+        let kind = u32::from_le_bytes(restored[position..position + 4].try_into().unwrap());
+        if kind == u32::MAX {
+            break;
+        }
+        let length =
+            u32::from_le_bytes(restored[position + 4..position + 8].try_into().unwrap()) as usize;
+        let name_len = usize::from(restored[position + 9]);
+        let name_at = position
+            + usize::from(u16::from_le_bytes(
+                restored[position + 10..position + 12].try_into().unwrap(),
+            ));
+        if kind == ffs_ondisk::ntfs::DATA
+            && name_len == 2
+            && restored[name_at..name_at + 4] == [b'$', 0, b'J', 0]
+        {
+            assert_eq!(restored[position + 8], 1);
+            // A valid nonresident stream can have initialized length below
+            // its logical EOF. Its physical tail must remain invisible.
+            restored[position + 56..position + 64].copy_from_slice(&0_u64.to_le_bytes());
+            patched = true;
+        }
+        position += length;
+    }
+    assert!(patched, "fixture has a base $J attribute");
+    let protected = ffs_ondisk::ntfs::protect_record(&restored).unwrap();
+    let mut seed = dev.snapshot_durable_only();
+    let logical_start = u64::from(summary.record) * record_bytes as u64;
+    let logical_end = logical_start + record_bytes as u64;
+    let cb = u64::from(volume.geometry.cluster_bytes());
+    let mft = volume.record(&cx, 0, None).unwrap();
+    let mft_attributes = volume.attributes(&cx, &mft).unwrap();
+    let mut replaced = 0;
+    for attr in mft_attributes.all().unwrap() {
+        if attr.kind != ffs_ondisk::ntfs::DATA || !attr.name.is_empty() {
+            continue;
+        }
+        let ffs_ondisk::ntfs::NtfsValue::NonResident(nr) = attr.value else {
+            panic!("$MFT must be nonresident");
+        };
+        for run in ffs_ondisk::ntfs::decode_mapping_pairs(
+            nr.mapping_pairs,
+            nr.first_vcn,
+            nr.last_vcn,
+            volume.geometry.cluster_count(),
+        )
+        .unwrap()
+        {
+            let start = logical_start.max(run.vcn * cb);
+            let end = logical_end.min((run.vcn + run.clusters) * cb);
+            if start < end {
+                let lcn = run.lcn.expect("allocated $MFT run");
+                let physical = volume.geometry.cluster_offset(lcn).unwrap() + start - run.vcn * cb;
+                let at = usize::try_from(physical).unwrap();
+                let from = usize::try_from(start - logical_start).unwrap();
+                let len = usize::try_from(end - start).unwrap();
+                seed[at..at + len].copy_from_slice(&protected[from..from + len]);
+                replaced += len;
+            }
+        }
+    }
+    assert_eq!(replaced, record_bytes);
+    drop(engine);
+    let dev = FaultInjectingNtfsDevice::new(seed);
+    let mut engine = open_clean_engine(&cx, &dev, vol_bytes);
+    let before = dev.snapshot_durable_only();
+    let writes = dev.write_bytes_total();
+    let outcome = engine.write_stream_range(&cx, file, &[], 0, b"new");
+    assert!(
+        matches!(
+            outcome,
+            NtfsTxOutcome::NotCommitted(FfsError::UnsupportedFeature(ref detail))
+                if detail.contains("fully initialized existing journal")
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(dev.write_bytes_total(), writes);
+    assert_eq!(dev.snapshot_live(), before);
+    assert_eq!(dev.snapshot_durable_only(), before);
+    assert_eq!(
+        read_file_by_path(&cx, &engine, "/uninitialized-journal.bin"),
+        b"old"
+    );
 }
 
 #[test]
