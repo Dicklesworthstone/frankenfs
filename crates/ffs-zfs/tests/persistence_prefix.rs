@@ -147,6 +147,7 @@ struct PoolFixtureSpec {
     hello_mode: u16,
     root_ids: (u64, u64),
     hello_ownership: Option<ffs_ondisk::zfs_zpl::ReclamationOwnership>,
+    hello_sa_xattrs: BTreeMap<String, Vec<u8>>,
     root_properties: Vec<(&'static [u8], u64)>,
     data_properties: Vec<(&'static [u8], u64)>,
     auxiliary_ownership: Option<(u64, AuxiliaryOwnership)>,
@@ -191,6 +192,7 @@ impl Default for PoolFixtureSpec {
             hello_mode: 0o644,
             root_ids: (0, 0),
             hello_ownership: None,
+            hello_sa_xattrs: BTreeMap::new(),
             root_properties: Vec::new(),
             data_properties: Vec::new(),
             auxiliary_ownership: None,
@@ -508,6 +510,7 @@ fn build_sa_registry_objects(
     order: Endian,
     malformed_project_id: bool,
     with_reclamation_ownership: bool,
+    with_sa_xattrs: bool,
 ) -> (SaRegistry, Dnode, Dnode, Dnode) {
     // Attribute IDs matching OpenZFS `SaRegistry::LEGACY` (0..16) + custom attr 18:
     // 0: ATIME(16,0), 1: MTIME(16,0), 2: CTIME(16,0), 3: CRTIME(16,0), 4: GEN(8,0),
@@ -669,6 +672,25 @@ fn build_sa_registry_objects(
             collision: 0,
         });
     }
+    if with_sa_xattrs {
+        reg_entries.push(RawZapEntry {
+            name: b"ZPL_DXATTR".to_vec(),
+            integer_bytes: 8,
+            values: vec![(3_u64 << 16) | 20],
+            collision: 0,
+        });
+        for (name, values) in [
+            (b"10".as_slice(), vec![20]),
+            (b"11".as_slice(), vec![9, 15, 19, 20]),
+        ] {
+            lay_entries.push(RawZapEntry {
+                name: name.to_vec(),
+                integer_bytes: 2,
+                values,
+                collision: 0,
+            });
+        }
+    }
     let registry = SaRegistry::from_zaps(&reg_entries, &lay_entries).expect("valid SaRegistry");
 
     let sa_master_raw = mzap(&[(b"REGISTRY", 9), (b"LAYOUTS", 10)], 0x1234, order);
@@ -701,6 +723,55 @@ fn build_sa_registry_objects(
     let lay_dn = make_dnode(47, 4096, lay_ptrs, 0, Vec::new(), None, 0, order);
 
     (registry, sa_master_dn, reg_dn, lay_dn)
+}
+
+/// Construct a native variable-length SA attribute independently of the
+/// production SA encoder. DXATTR contains an XDR nvlist of byte-array values;
+/// the optional fixed prefix retains XATTR, ZNODE_ACL and PROJID ownership.
+fn fixture_sa_xattr_spill(
+    xattrs: &BTreeMap<String, Vec<u8>>,
+    ownership: Option<&[u8]>,
+    order: Endian,
+) -> Vec<u8> {
+    assert!(!xattrs.is_empty());
+    let pairs: Vec<_> = xattrs
+        .iter()
+        .map(|(name, value)| {
+            let mut opaque = value.clone();
+            opaque.resize(opaque.len().next_multiple_of(4), 0);
+            nv_pair(
+                name,
+                10, // DATA_TYPE_BYTE_ARRAY
+                u32::try_from(value.len()).unwrap(),
+                &opaque,
+                value.len(),
+            )
+        })
+        .collect();
+    let packed = pack_xdr_nvlist(&pairs);
+    let length = u16::try_from(packed.len()).unwrap();
+    let layout = if ownership.is_some() { 11 } else { 10 };
+    let mut raw = vec![0_u8; 8];
+    let header = (1_u16 << 10) | layout;
+    match order {
+        Endian::Little => {
+            raw[..4].copy_from_slice(&[0x5a, 0x50, 0x2f, 0]);
+            raw[4..6].copy_from_slice(&header.to_le_bytes());
+            raw[6..8].copy_from_slice(&length.to_le_bytes());
+        }
+        Endian::Big => {
+            raw[..4].copy_from_slice(&[0, 0x2f, 0x50, 0x5a]);
+            raw[4..6].copy_from_slice(&header.to_be_bytes());
+            raw[6..8].copy_from_slice(&length.to_be_bytes());
+        }
+    }
+    if let Some(prefix) = ownership {
+        assert_eq!(prefix.len(), 104);
+        raw.extend_from_slice(prefix);
+    }
+    raw.extend_from_slice(&packed);
+    raw.resize(raw.len().max(512).next_power_of_two(), 0);
+    raw
 }
 
 fn encode_zpl_bonus_for_fixture(
@@ -837,6 +908,13 @@ fn build_zpl_objectset(
     birth: u64,
     order: Endian,
 ) -> (BlockPointer, u64, Vec<u8>) {
+    if !spec.hello_sa_xattrs.is_empty() {
+        assert_eq!(spec.zpl_version, 5, "SA xattrs require ZPL v5");
+        assert!(
+            spec.spill_profile() == SaSpillFixture::None,
+            "the explicit DXATTR fixture owns its complete SA spill layout"
+        );
+    }
     if head_object == 18
         && let Some((objectset_order, contents_order)) = spec.zvol_orders
     {
@@ -857,7 +935,8 @@ fn build_zpl_objectset(
             birth,
             order,
             spec.malformed_project_id,
-            spec.hello_ownership.is_some(),
+            spec.hello_ownership.is_some() || !spec.hello_sa_xattrs.is_empty(),
+            !spec.hello_sa_xattrs.is_empty(),
         );
         (Some(r), Some((m_dn, r_dn, l_dn)))
     } else {
@@ -1019,7 +1098,7 @@ fn build_zpl_objectset(
             &hello_meta,
             spec.zpl_version,
             sa_reg.as_ref(),
-            if spec.hello_ownership.is_some() {
+            if spec.hello_ownership.is_some() || !spec.hello_sa_xattrs.is_empty() {
                 SaSpillFixture::None
             } else {
                 spec.spill_profile()
@@ -1055,8 +1134,23 @@ fn build_zpl_objectset(
                 ] {
                     raw[offset..offset + 8].copy_from_slice(&order.encode(value));
                 }
-                spill = Some(arena.alloc_block(&raw, 44, 0, birth, order));
+                if spec.hello_sa_xattrs.is_empty() {
+                    spill = Some(arena.alloc_block(&raw, 44, 0, birth, order));
+                } else {
+                    let combined = fixture_sa_xattr_spill(
+                        &spec.hello_sa_xattrs,
+                        Some(&raw[8..112]),
+                        order,
+                    );
+                    spill = Some(arena.alloc_block(&combined, 44, 0, birth, order));
+                }
             }
+        } else if !spec.hello_sa_xattrs.is_empty()
+            && !spec.auxiliary_ownership.is_some_and(|(owner, _)| owner == 4)
+        {
+            assert_eq!(spec.zpl_version, 5, "SA xattrs require ZPL v5");
+            let raw = fixture_sa_xattr_spill(&spec.hello_sa_xattrs, None, order);
+            spill = Some(arena.alloc_block(&raw, 44, 0, birth, order));
         }
         let hello_dn = make_dnode(
             19,
@@ -1382,8 +1476,17 @@ fn build_zpl_objectset(
         };
         let mut bonus = owner_node.bonus().to_vec();
         let spill = if spec.zpl_version == 4 {
+            assert!(spec.hello_sa_xattrs.is_empty(), "SA xattrs require ZPL v5");
             bonus[attribute..attribute + payload.len()].copy_from_slice(&payload);
             None
+        } else if owner == 4 && !spec.hello_sa_xattrs.is_empty() {
+            // Combine ownership with DXATTR before allocating a spill, so the
+            // fixture does not leak an older private-ownership-only block.
+            let mut ownership = vec![0_u8; 104];
+            let offset = if attribute == 104 { 0 } else { 8 };
+            ownership[offset..offset + payload.len()].copy_from_slice(&payload);
+            let raw = fixture_sa_xattr_spill(&spec.hello_sa_xattrs, Some(&ownership), order);
+            Some(arena.alloc_block(&raw, 44, 0, birth, order))
         } else {
             let mut raw = vec![0_u8; (1_usize << spec.ashift).max(512)];
             raw[..4].copy_from_slice(&[0x5a, 0x50, 0x2f, 0]);

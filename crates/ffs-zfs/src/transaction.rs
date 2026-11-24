@@ -1102,12 +1102,13 @@ impl ZfsTransactionEngine {
         )
     }
 
-    /// Write data and clear set-user-ID and executable set-group-ID permissions
-    /// in the same TXG. A zero-length write does not clear either bit.
+    /// Write data and clear set-user-ID, executable set-group-ID, and SA file
+    /// capabilities in the same TXG. A zero-length write that does not grow the
+    /// file preserves those privileges.
     ///
     /// This is the data-mutation policy for callers without privilege to retain
-    /// set-ID permissions. File capabilities require separate admission; this
-    /// operation does not remove capability extended attributes.
+    /// set-ID permissions or file capabilities. Directory-backed capabilities
+    /// are rejected, including values shadowed by an SA capability.
     #[allow(clippy::too_many_arguments)]
     pub fn write_file_data_clearing_setid(
         &mut self,
@@ -1186,12 +1187,12 @@ impl ZfsTransactionEngine {
         )
     }
 
-    /// Edit a sparse range and clear set-user-ID and executable set-group-ID
-    /// permissions in the same TXG. A size-preserving range wholly beyond EOF
-    /// does not change the inode's permissions or timestamps.
+    /// Edit a sparse range and clear set-user-ID, executable set-group-ID, and
+    /// SA file capabilities in the same TXG. A size-preserving range wholly
+    /// beyond EOF does not change the inode's privileges or timestamps.
     ///
-    /// File capabilities require separate admission; this operation does not
-    /// remove capability extended attributes.
+    /// Directory-backed capabilities are rejected, including values shadowed
+    /// by an SA capability.
     #[allow(clippy::too_many_arguments)]
     pub fn edit_file_range_clearing_setid(
         &mut self,
@@ -1283,7 +1284,9 @@ impl ZfsTransactionEngine {
         )
     }
 
-    /// Remove a ZPL `user.*` extended attribute from SA (`ZPL_DXATTR`).
+    /// Remove a ZPL `user.*` extended attribute or `security.capability` from
+    /// SA (`ZPL_DXATTR`). Capability removal never falls back to a private
+    /// directory value; those objects require their own reclamation transaction.
     pub fn remove_xattr(
         &mut self,
         cx: &Cx,
@@ -1355,6 +1358,8 @@ impl ZfsTransactionEngine {
     /// Publish size, POSIX mode/uid/gid, set-ID clearing, and native timestamps
     /// atomically in one TXG, rebuilding trivial NFSv4 DACL on chmod and
     /// transferring embedded `userused`/`groupused` quota accounting on chown.
+    /// SA file capabilities are removed when ownership changes or
+    /// `clear_suid_sgid` is set; directory-backed capabilities are rejected.
     pub fn set_posix_attributes(
         &mut self,
         cx: &Cx,

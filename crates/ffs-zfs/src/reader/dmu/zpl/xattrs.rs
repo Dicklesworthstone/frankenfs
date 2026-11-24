@@ -250,14 +250,26 @@ impl Zpl {
     }
 
     /// Check both native stores for the capability key without exposing its
-    /// payload or projecting it into the user xattr namespace. Writable mounts
-    /// use this to distinguish an absent killpriv target from unsupported removal.
+    /// payload or projecting it into the user xattr namespace.
     pub(crate) fn has_file_capabilities(&mut self, cx: &Cx, owner: u64) -> Result<bool> {
         let catalog = self.xattr_catalog(cx, owner)?;
         Ok(catalog.inline.contains_key("security.capability")
             || catalog
                 .directory
                 .contains_key(b"security.capability".as_slice()))
+    }
+
+    /// Validate the complete native catalog before granting killpriv. An SA
+    /// capability can be removed in the owner's data TXG; a private value file
+    /// still requires a directory rewrite and independent object retirement.
+    pub(crate) fn admit_file_capability_removal(&mut self, cx: &Cx, owner: u64) -> Result<()> {
+        let catalog = self.xattr_catalog(cx, owner)?;
+        if catalog.directory.contains_key(b"security.capability".as_slice()) {
+            return Err(unsupported(
+                "removing directory-backed ZPL file capabilities is unavailable",
+            ));
+        }
+        Ok(())
     }
 
     /// Complete, sorted, unique host user names. Both native representations

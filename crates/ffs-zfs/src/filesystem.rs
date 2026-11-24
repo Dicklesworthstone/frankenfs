@@ -1083,6 +1083,10 @@ impl FsOps for ZfsFs {
             None
         };
 
+        // Chown drops file privileges even when the requested IDs are unchanged.
+        // Keep this request separate from the filtered owner updates above.
+        let owner_killpriv = metadata.kind != Kind::Directory
+            && (attrs.uid.is_some() || attrs.gid.is_some());
         let native_attrs = crate::ZfsPosixSetAttr {
             size: attrs.size,
             atime: attrs.atime.map(native_timestamp).transpose()?,
@@ -1090,9 +1094,9 @@ impl FsOps for ZfsFs {
             mode: mode_update,
             uid: uid_update,
             gid: gid_update,
-            // The permission change belongs to the same native transaction as
-            // the data mutation, including compound size/mode requests.
-            clear_suid_sgid: attrs.size.is_some(),
+            // Privilege removal belongs to the same native transaction as
+            // the data or owner request, including compound mode changes.
+            clear_suid_sgid: attrs.size.is_some() || owner_killpriv,
         };
         if attrs.size.is_some() {
             if metadata.kind == Kind::Directory {
@@ -1101,6 +1105,8 @@ impl FsOps for ZfsFs {
             if metadata.kind != Kind::Regular {
                 return Err(unsupported("ZPL truncate requires a regular file"));
             }
+        }
+        if native_attrs.clear_suid_sgid {
             state.admit_data_mutation(cx, ino)?;
         }
         if native_attrs.size.is_some()
@@ -1109,6 +1115,7 @@ impl FsOps for ZfsFs {
             || native_attrs.mode.is_some()
             || native_attrs.uid.is_some()
             || native_attrs.gid.is_some()
+            || native_attrs.clear_suid_sgid
         {
             let object = state.head.nodes[&ino].object;
             let timestamp = native_timestamp(SystemTime::now())?;
@@ -1365,16 +1372,11 @@ impl FsOps for ZfsFs {
         state.writable_metadata(cx, ino)?;
         let object = state.head.nodes[&ino].object;
         if name == "security.capability" {
-            if state.head.view.has_file_capabilities(cx, object)? {
-                return Err(unsupported(
-                    "native ZPL capability removal is not implemented",
-                ));
+            state.head.view.admit_file_capability_removal(cx, object)?;
+            if !state.head.view.has_file_capabilities(cx, object)? {
+                return Ok(false);
             }
-            // FUSE's killpriv path asks to drop capabilities before ordinary writes.
-            // A proven-absent attribute needs no mutation; a present one is refused.
-            return Ok(false);
-        }
-        if !name.starts_with("user.") {
+        } else if !name.starts_with("user.") {
             return Err(unsupported("only the ZPL user xattr namespace is exposed"));
         }
         let timestamp = native_timestamp(SystemTime::now())?;

@@ -958,6 +958,40 @@ fn encode_updated_zpl_bonus(
     }
 }
 
+/// Prepare native SA capability removal without publishing any metadata. A
+/// directory-backed copy must also be removed before the data can be exposed,
+/// even when an SA copy currently shadows it. That representation remains
+/// outside this operation until its private value object can be retired here.
+fn inline_xattrs_after_killpriv(
+    cx: &Cx,
+    objects: &mut Objects,
+    loaded: &LoadedZplNode,
+    registry: Option<&SaRegistry>,
+) -> Result<Option<BTreeMap<String, Vec<u8>>>> {
+    let mut sources = match loaded.dnode.bonus_type() {
+        DMU_OT_ZNODE => XattrSources::legacy(loaded.dnode.bonus(), loaded.dnode.order()),
+        DMU_OT_SA => registry
+            .ok_or_else(|| corrupt("missing SA registry"))?
+            .decode(loaded.dnode.bonus(), loaded.spill_bytes.as_deref())
+            .and_then(|attrs| attrs.xattrs()),
+        _ => return Err(unsupported("unsupported capability owner bonus representation")),
+    }
+    .map_err(|error| parse_err(&error))?;
+    if sources.directory != 0 {
+        let entries = objects.zap_values(cx, sources.directory)?;
+        if entries.len().saturating_add(sources.inline.len()) > XATTR_COUNT {
+            return Err(unsupported("xattr catalog exceeds 4096 native names"));
+        }
+        if entries.iter().any(|entry| entry.name == b"security.capability") {
+            return Err(unsupported(
+                "removing directory-backed ZPL file capabilities is unavailable",
+            ));
+        }
+    }
+    checkpoint(cx)?;
+    Ok(sources.inline.remove("security.capability").map(|_| sources.inline))
+}
+
 /// Replace only bonus/spill metadata. Unlike a data-tree COW, this retains the
 /// exact indirection and root pointers even when a sparse tree could be collapsed.
 /// Changed SA spills still enter the ordinary allocation and deadlist accounting.
@@ -2110,7 +2144,12 @@ pub(super) fn stage_zpl_mutation(
             reject_flags(&loaded.metadata, prohibited)?;
             let new_size = loaded.metadata.size.max(end_offset);
             let mut new_meta = loaded.metadata.clone();
-            if *clear_suid_sgid && !data.is_empty() {
+            // The direct writer also accepts an empty payload beyond EOF as
+            // extension. That exposes new file bytes and must clear privileges
+            // under the same policy as a nonempty write.
+            let killpriv = *clear_suid_sgid
+                && (!data.is_empty() || new_size != loaded.metadata.size);
+            if killpriv {
                 new_meta.mode = clear_setid_bits_for_nonroot(new_meta.mode);
             }
             new_meta.size = new_size;
@@ -2125,10 +2164,17 @@ pub(super) fn stage_zpl_mutation(
                     loaded.metadata.size,
                     new_size,
                 )?;
-                let (bonus, spill) = encode_updated_zpl_bonus(
+                let inline_xattrs = if killpriv {
+                    inline_xattrs_after_killpriv(cx, &mut os_view, &loaded, ds_ctx.sa_registry.as_ref())?
+                } else {
+                    None
+                };
+                let (bonus, spill) = encode_updated_zpl_bonus_with_options(
                     &loaded,
                     &new_meta,
-                    ds_ctx.sa_registry.as_ref(),
+                    &mut ds_ctx,
+                    false,
+                    inline_xattrs.as_ref(),
                     alloc,
                     order,
                     new_txg,
@@ -2287,10 +2333,17 @@ pub(super) fn stage_zpl_mutation(
             } else {
                 checksum.code()
             };
-            let (bonus, spill) = encode_updated_zpl_bonus(
+            let inline_xattrs = if killpriv {
+                inline_xattrs_after_killpriv(cx, &mut os_view, &loaded, ds_ctx.sa_registry.as_ref())?
+            } else {
+                None
+            };
+            let (bonus, spill) = encode_updated_zpl_bonus_with_options(
                 &loaded,
                 &new_meta,
-                ds_ctx.sa_registry.as_ref(),
+                &mut ds_ctx,
+                false,
+                inline_xattrs.as_ref(),
                 alloc,
                 order,
                 new_txg,
@@ -2402,10 +2455,17 @@ pub(super) fn stage_zpl_mutation(
                 new_meta.size = new_size;
                 new_meta.times[1] = *timestamp;
                 new_meta.times[2] = *timestamp;
-                let (bonus, spill) = encode_updated_zpl_bonus(
+                let inline_xattrs = if *clear_suid_sgid {
+                    inline_xattrs_after_killpriv(cx, &mut os_view, &loaded, ds_ctx.sa_registry.as_ref())?
+                } else {
+                    None
+                };
+                let (bonus, spill) = encode_updated_zpl_bonus_with_options(
                     &loaded,
                     &new_meta,
-                    ds_ctx.sa_registry.as_ref(),
+                    &mut ds_ctx,
+                    false,
+                    inline_xattrs.as_ref(),
                     alloc,
                     order,
                     new_txg,
@@ -2584,12 +2644,17 @@ pub(super) fn stage_zpl_mutation(
                 new_meta.times[1] = *timestamp;
             }
             new_meta.times[2] = *timestamp;
+            let inline_xattrs = if attrs.clear_suid_sgid || owner_changed {
+                inline_xattrs_after_killpriv(cx, &mut os_view, &loaded, ds_ctx.sa_registry.as_ref())?
+            } else {
+                None
+            };
             let (bonus, spill) = encode_updated_zpl_bonus_with_options(
                 &loaded,
                 &new_meta,
                 &mut ds_ctx,
                 rebuild_trivial_acl,
-                None,
+                inline_xattrs.as_ref(),
                 alloc,
                 order,
                 new_txg,
@@ -3822,12 +3887,19 @@ fn stage_sa_xattr_mutation(
     if name.len() > XATTR_NAME_BYTES {
         return Err(FfsError::NameTooLong);
     }
-    let Some(suffix) = name.strip_prefix("user.") else {
+    // The only admitted security operation is removal of the exact native
+    // capability key. No capability setter or user-namespace alias is exposed.
+    let removing_capability = set_op.is_none() && name == "security.capability";
+    let suffix = if removing_capability {
+        name
+    } else if let Some(suffix) = name.strip_prefix("user.") {
+        suffix
+    } else {
         return Err(unsupported("only the ZPL user xattr namespace is exposed"));
     };
     if suffix.is_empty()
         || suffix.as_bytes().contains(&0)
-        || is_reserved_xattr_prefix(suffix.as_bytes())
+        || (!removing_capability && is_reserved_xattr_prefix(suffix.as_bytes()))
     {
         return Err(FfsError::Format("invalid user xattr suffix".into()));
     }

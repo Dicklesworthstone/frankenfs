@@ -76,7 +76,8 @@ impl ZfsFs {
     /// Without caller credentials, data mutations conservatively clear SUID and
     /// group-executable SGID atomically with the data. Non-executable SGID remains;
     /// frontends may remove it through a clearing-only `setattr` for other callers.
-    /// Files with native capabilities remain outside the data-mutation profile.
+    /// Native SA file capabilities are removed in that same transaction.
+    /// Directory-backed capabilities remain outside the data-mutation profile.
     /// Open regular files survive final unlink in the native unlinked set. A
     /// fresh owner drains pending regular-file reclamation before exposing the
     /// mount. Snapshot and control-directory operations remain read-only.
@@ -597,15 +598,10 @@ impl State {
     pub(super) fn admit_data_mutation(&mut self, cx: &Cx, ino: InodeNumber) -> Result<()> {
         // Set-ID removal is part of each native data transaction, including
         // streaming copies that reach WRITE without a preceding SETATTR.
-        // Native capabilities still require atomic xattr removal, so refuse
-        // those files before staging any data or permission changes.
+        // SA capabilities are also removed atomically. Validate both native
+        // stores so a shadowed directory value cannot regain privileges.
         let object = self.head.nodes[&ino].object;
-        if self.head.view.has_file_capabilities(cx, object)? {
-            return Err(unsupported(
-                "native ZPL data mutation cannot clear file capabilities",
-            ));
-        }
-        Ok(())
+        self.head.view.admit_file_capability_removal(cx, object)
     }
 
     pub(super) fn child(

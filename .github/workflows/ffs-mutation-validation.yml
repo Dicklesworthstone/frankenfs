@@ -1,11 +1,11 @@
-name: Inline directory mutation validation
+name: Native capability removal validation
 on:
   push:
-    branches: [validation/ffs-inline-20261124]
+    branches: [validation/ffs-killpriv-20261124]
 permissions:
   contents: read
 concurrency:
-  group: ffs-inline-20261124
+  group: ffs-killpriv-20261124
   cancel-in-progress: true
 env:
   CARGO_TERM_COLOR: never
@@ -21,6 +21,10 @@ env:
     crates/ffs-zfs/tests/persistence_prefix.rs
     crates/ffs-zfs/tests/persistence_prefix/writable_fs.rs
     crates/ffs-zfs/tests/persistence_prefix/setid.rs
+    crates/ffs-zfs/src/filesystem.rs
+    crates/ffs-zfs/src/filesystem/writable.rs
+    crates/ffs-zfs/src/reader/dmu/zpl/xattrs.rs
+    crates/ffs-zfs/src/transaction.rs
     crates/ffs-core/src/lib.rs
   FFS_VALIDATION_WORKFLOW: .github/workflows/ffs-mutation-validation.yml
 jobs:
@@ -154,10 +158,8 @@ jobs:
         run: cargo check --locked --workspace --all-targets
       - name: Workspace strict Clippy gate
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
-      - name: Inline directory and native ext4 regressions
-        run: cargo test --locked -p ffs-core --lib ext4_inline_ -- --nocapture --test-threads=1
-      - name: Sharded allocator inline directory regressions
-        run: cargo test --locked -p ffs-core --features bhh0i_sharded_alloc --lib ext4_inline_ -- --nocapture --test-threads=1
+      - name: ZFS library, capability, native zdb and persistence regressions
+        run: cargo test --locked -p ffs-zfs -- --test-threads=1
       - name: Confirm tested source stayed unchanged
         run: |
           set -euo pipefail
