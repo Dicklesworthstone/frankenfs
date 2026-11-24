@@ -1097,6 +1097,123 @@ fn zvol_failed_fua_requests_restore_prior_writeback_data_and_holes() {
 
 #[test]
 #[allow(clippy::too_many_lines)]
+fn zvol_oversized_trim_preserves_writeback_and_nbd_framing() {
+    let cx = Cx::for_testing();
+    let built = build_clean_zfs_pool(&PoolFixtureSpec {
+        image_bytes: 20 * 1024 * 1024,
+        ashift: 9,
+        ..PoolFixtureSpec::default()
+    });
+    let device = FaultableMemberDevice::new(built.members[0].clone());
+    let engine = open_engine_on_devices(
+        &cx,
+        std::slice::from_ref(&device),
+        default_write_opts(built.pool_guid, built.initial_slot),
+    )
+    .unwrap();
+    let manager = ZfsVolumeManager::new(engine);
+    let dataset = [b"data".to_vec(), b"bounded-trim".to_vec()];
+    manager
+        .zvol_create(
+            &cx,
+            &dataset[..1],
+            b"bounded-trim",
+            &ZfsZvolCreateOptions {
+                volsize: 64 * 1024 * 1024,
+                volblocksize: 4096,
+                sparse: true,
+                initial_props: Vec::new(),
+                timestamp: Timestamp {
+                    seconds: 1_736_500_002,
+                    nanos: 0,
+                },
+            },
+        )
+        .into_result()
+        .unwrap();
+    let mut session = manager
+        .open_writable_session(
+            &cx,
+            &dataset,
+            ZvolSyncPolicy::FlushBarrier,
+            true,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .unwrap();
+    session.write_at(&cx, 0, &[0x65; 4096], false).unwrap();
+    session.discard(&cx, 4096, 4096).unwrap();
+    let before_txg = manager.committed_txg().unwrap();
+    let before_writes = device.write_calls();
+    let oversized = 16 * 1024 * 1024 + 512;
+    for fua in [false, true] {
+        assert!(matches!(
+            session.discard_with_fua(&cx, 0, oversized, fua),
+            Err(FfsError::RequestRejected {
+                errno: libc::EINVAL,
+                ..
+            })
+        ));
+    }
+    let mut expected = vec![0; 8192];
+    expected[..4096].fill(0x65);
+    let mut visible = vec![0; expected.len()];
+    session.read_at(&cx, 0, &mut visible).unwrap();
+    assert_eq!(visible, expected);
+    assert_eq!(manager.committed_txg().unwrap(), before_txg);
+    assert_eq!(device.write_calls(), before_writes);
+
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("bounded-trim.sock");
+    let mut server = ZfsZvolNbdServer::bind_session_unix(
+        &socket,
+        session,
+        NbdServerConfig {
+            export_name: "bounded-trim".to_owned(),
+            once: true,
+        },
+    )
+    .unwrap();
+    let worker = thread::spawn(move || server.serve(&Cx::for_testing()));
+    let client = ZfsZvolNbdClient::connect_unix(&cx, &socket, "bounded-trim").unwrap();
+    for fua in [false, true] {
+        assert!(matches!(
+            client.trim_with_fua(&cx, 0, oversized, fua),
+            Err(FfsError::RequestRejected {
+                errno: libc::EINVAL,
+                ..
+            })
+        ));
+        client.read_at(&cx, 0, &mut visible).unwrap();
+        assert_eq!(visible, expected);
+    }
+    assert_eq!(manager.committed_txg().unwrap(), before_txg);
+    assert_eq!(device.write_calls(), before_writes);
+    client.flush(&cx).unwrap();
+    client.disconnect(&cx).unwrap();
+    let audit = worker.join().unwrap().unwrap();
+    assert_eq!(
+        audit
+            .iter()
+            .filter(|entry| { entry.cmd == "TRIM" && entry.ack_kind == ZvolAckKind::Rejected })
+            .count(),
+        2
+    );
+
+    let fresh = device.fresh_from_durable();
+    let recovered = open_engine_on_devices(
+        &cx,
+        std::slice::from_ref(&fresh),
+        default_write_opts(built.pool_guid, manager.committed_slot().unwrap()),
+    )
+    .unwrap();
+    recovered
+        .zvol_read_at(&cx, &dataset, None, 0, &mut visible)
+        .unwrap();
+    assert_eq!(visible, expected);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
 fn zvol_nbd_unix_tcp_always_readonly_flush_barrier_and_revocation() {
     let cx = Cx::for_testing();
     let ts = Timestamp {
