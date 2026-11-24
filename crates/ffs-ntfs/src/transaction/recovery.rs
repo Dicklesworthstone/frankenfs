@@ -1308,6 +1308,10 @@ impl NtfsTransactionEngine {
         drop(staged);
 
         // Phase 2: Persist recovery in strict barrier order.
+        // Replayed metadata and repaired restart pages form one protection
+        // epoch. Never seal parity at an intermediate recovery barrier.
+        let device = Arc::clone(&self.device);
+        let mut protection = ffs_block::DurabilityCommitDeferral::enter(cx, device.as_ref())?;
         // If one RSTR slot was torn, heal that slot first with the validated dirty state!
         if let Some(torn_slot) = healed_slot {
             let heal_cfg = NtfsRestartConfig {
@@ -1405,6 +1409,7 @@ impl NtfsTransactionEngine {
         self.ring = Some(ring);
         let final_ckpt_lsn = self.publish_clean_checkpoint_and_rstr(cx, "recover_in_place", 24)?;
         self.check_clean_consistency(cx)?;
+        protection.complete();
         self.recovery_required = false;
 
         Ok(NtfsRecoverySummary {
