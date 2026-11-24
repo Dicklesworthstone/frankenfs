@@ -172,6 +172,7 @@ fn open_zvol_head_context(
     cx: &Cx,
     mos: &mut Objects,
     dataset: &[Vec<u8>],
+    commit_order: Endian,
 ) -> Result<(ZvolContext, Objects)> {
     checkpoint(cx)?;
     let ds_row = mos
@@ -210,6 +211,13 @@ fn open_zvol_head_context(
     let mut os = ObjectSet::parse(&os_raw, os_order).map_err(|e| parse_err(&e))?;
     if os.kind != OBJSET_TYPE_ZVOL {
         return Err(corrupt("selected dataset is not a ZVOL object set"));
+    }
+    // ObjectSet::encode retains raw tail bytes; native mutation cannot convert
+    // their byte order by merely replacing the meta-dnode and outer header.
+    if os_order != commit_order {
+        return Err(unsupported(
+            "rewriting a mixed-order native ZVOL object set",
+        ));
     }
     if mos.dataset_has_pending_zil_work(
         cx,
@@ -1227,7 +1235,7 @@ pub(super) fn stage_resize_zvol(
     new_txg: u64,
     staged_writes: &mut Vec<StagedBlockWrite>,
 ) -> Result<u64> {
-    let (mut ctx, mut os_view) = open_zvol_head_context(cx, mos, dataset)?;
+    let (mut ctx, mut os_view) = open_zvol_head_context(cx, mos, dataset, order)?;
     let bs = ctx.volblocksize as u64;
     if new_volsize == 0 || i64::try_from(new_volsize).is_err() || !new_volsize.is_multiple_of(bs) {
         return Err(reject_einval(
@@ -1392,7 +1400,7 @@ pub(super) fn stage_zvol_write_at(
     new_txg: u64,
     staged_writes: &mut Vec<StagedBlockWrite>,
 ) -> Result<u64> {
-    let (mut ctx, mut os_view) = open_zvol_head_context(cx, mos, dataset)?;
+    let (mut ctx, mut os_view) = open_zvol_head_context(cx, mos, dataset, order)?;
     validate_sector_span(offset, data.len() as u64, ctx.volsize, MAX_ZVOL_IO_BYTES)?;
 
     let zvol_meta_base = ctx.os.meta.clone();
@@ -1513,7 +1521,7 @@ pub(super) fn stage_zvol_discard(
     new_txg: u64,
     staged_writes: &mut Vec<StagedBlockWrite>,
 ) -> Result<u64> {
-    let (mut ctx, mut os_view) = open_zvol_head_context(cx, mos, dataset)?;
+    let (mut ctx, mut os_view) = open_zvol_head_context(cx, mos, dataset, order)?;
     if !offset.is_multiple_of(ZVOL_LOGICAL_SECTOR_BYTES as u64)
         || !len.is_multiple_of(ZVOL_LOGICAL_SECTOR_BYTES as u64)
         || offset.checked_add(len).is_none_or(|end| end > ctx.volsize)
@@ -1642,7 +1650,7 @@ pub(super) fn stage_zvol_batch_apply(
     new_txg: u64,
     staged_writes: &mut Vec<StagedBlockWrite>,
 ) -> Result<u64> {
-    let (mut ctx, mut os_view) = open_zvol_head_context(cx, mos, dataset)?;
+    let (mut ctx, mut os_view) = open_zvol_head_context(cx, mos, dataset, order)?;
     let bs = ctx.volblocksize as u64;
     let total_blocks = ctx.volsize / bs;
     let mut filtered: BTreeMap<u64, Option<Vec<u8>>> = BTreeMap::new();

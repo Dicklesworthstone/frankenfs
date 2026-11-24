@@ -1458,10 +1458,10 @@ pub(super) fn stage_zpl_mutation(
     checkpoint(cx)?;
     let (mut ds_ctx, mut os_view) = open_head_dataset_context(cx, mos, dataset_components)?;
     // ObjectSet retains its embedded usage dnodes in the source byte order.
-    // Until that tail is converted as a unit, a quota-controlled transaction
-    // must not rewrite some counters and preserve others in a different order.
-    if ds_ctx.owner_quota_limits.active && ds_ctx.os.meta.order() != order {
-        return Err(unsupported("mixed-order native owner quota accounting"));
+    // Until that tail is converted as a unit, a transaction must not rewrite
+    // selected fields and retain the remaining counters in a different order.
+    if ds_ctx.os.meta.order() != order {
+        return Err(unsupported("rewriting a mixed-order native ZPL object set"));
     }
     let zpl_meta_base = ds_ctx.os.meta.clone();
     let zpl_ceiling = ds_ctx.old_os_bp.birth();
