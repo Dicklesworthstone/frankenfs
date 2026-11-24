@@ -151,6 +151,167 @@ fn retain_files(
     references
 }
 
+fn assert_mount_name_refusal_preserves_orphans(name: &[u16], expected_errno: i32) {
+    let cx = Cx::for_testing();
+    let device = synthetic_device();
+    let retained = retain_files(&cx, &device, 1)[0];
+    let mut engine = engine_for(&cx, &device);
+    let root = engine.resolve_path_reference(&cx, "/").unwrap();
+    let ordinary = engine
+        .create_entry_at(
+            &cx,
+            root,
+            name,
+            false,
+            false,
+            b"ordinary data",
+            DEFAULT_NTFS_FILETIME,
+        )
+        .into_result()
+        .unwrap()
+        .0;
+    engine.check_clean_consistency(&cx).unwrap();
+    let ownership = owned_files(&cx, &engine);
+    assert_eq!(ownership.len(), 1);
+    assert_eq!(ownership[0].0, retained);
+    let retained_name = String::from_utf16(&ownership[0].1).unwrap();
+    let before = device.snapshot_durable_only();
+    let writes = device.write_bytes_total();
+
+    // This namespace is valid NTFS, but its exact native name cannot pass the
+    // mounted host projection. Refusal must precede all orphan-recovery writes.
+    let error = match NtfsFs::from_engine(&cx, engine, 1000, 1000) {
+        Ok(_) => panic!("unrepresentable native name was admitted for mounting"),
+        Err(error) => error,
+    };
+    assert_eq!(error.to_errno(), expected_errno);
+    assert_eq!(
+        device.write_bytes_total(),
+        writes,
+        "rejected mount reclaimed a file before validating its namespace"
+    );
+    assert_eq!(device.snapshot_live(), before);
+    assert_eq!(device.snapshot_durable_only(), before);
+
+    let mut engine = engine_for(&cx, &device);
+    engine.check_clean_consistency(&cx).unwrap();
+    assert_eq!(owned_files(&cx, &engine), ownership);
+    let volume = engine.volume_view(&cx).unwrap();
+    assert_eq!(native_stream(&cx, &volume, retained, ""), [0x61; 9000]);
+    assert_eq!(native_stream(&cx, &volume, ordinary, ""), b"ordinary data");
+
+    // A native rename removes the host-projection blocker. Admission can then
+    // reap the orphan and must expose a fresh, writable view of the survivor.
+    engine
+        .rename_at(&cx, root, name, root, &utf16("ordinary"), ordinary, true)
+        .into_result()
+        .unwrap();
+    let fs = NtfsFs::from_engine(&cx, engine, 1000, 1000).unwrap();
+    assert!(fs.last_durable_token().unwrap().is_some());
+    let mut scope = RequestScope::empty();
+    assert!(matches!(
+        fs.lookup(&cx, &mut scope, ROOT, OsStr::new(&retained_name)),
+        Err(FfsError::NotFound(_))
+    ));
+    let survivor = fs
+        .lookup(&cx, &mut scope, ROOT, OsStr::new("ordinary"))
+        .unwrap();
+    assert_eq!(survivor.perm, 0o644);
+    assert_eq!(
+        fs.read(&cx, &mut scope, survivor.ino, 0, 32).unwrap(),
+        b"ordinary data"
+    );
+    assert_eq!(
+        fs.write(&cx, &mut scope, survivor.ino, 0, b"updated")
+            .unwrap(),
+        7
+    );
+    drop(fs);
+    let reopened = engine_for(&cx, &device);
+    reopened.check_clean_consistency(&cx).unwrap();
+    assert_eq!(
+        owned_files(&cx, &reopened),
+        [] as [(NtfsReference, Vec<u16>); 0]
+    );
+    assert_eq!(
+        native_stream(&cx, &reopened.volume_view(&cx).unwrap(), ordinary, ""),
+        b"updatedy data"
+    );
+}
+
+#[test]
+fn ntfs_mount_utf8_name_length_refusal_preserves_retained_files() {
+    // 128 UTF-16 code units are native-valid, but their 256 UTF-8 bytes exceed
+    // the mounted name limit. Do not shorten or normalize the native name.
+    assert_mount_name_refusal_preserves_orphans(&[0x00E9; 128], libc::ENAMETOOLONG);
+}
+
+#[test]
+fn ntfs_mount_unpaired_utf16_refusal_preserves_retained_files() {
+    assert_mount_name_refusal_preserves_orphans(&[0xD800], libc::EOPNOTSUPP);
+}
+
+#[test]
+fn ntfs_mount_finishes_recovery_after_committed_cancellation() {
+    for stage in [
+        NtfsPersistenceStage::LogCommitBarrier,
+        NtfsPersistenceStage::TargetMetadataBarrier,
+        NtfsPersistenceStage::AckPublished,
+    ] {
+        let cx = Cx::for_testing();
+        let device = synthetic_device();
+        retain_files(&cx, &device, 1);
+        let mut engine = engine_for(&cx, &device);
+        let retained_name = String::from_utf16(&owned_files(&cx, &engine)[0].1).unwrap();
+        let cancellation = cx.clone();
+        engine.set_stage_hook(Some(Box::new(move |event| {
+            if event.stage == stage {
+                cancellation.set_cancel_requested(true);
+            }
+            Ok(())
+        })));
+        let fs = NtfsFs::from_engine(&cx, engine, 1000, 1000).unwrap_or_else(|error| {
+            panic!("committed cleanup must finish admission at {stage:?}: {error}")
+        });
+        assert!(cx.checkpoint().is_err(), "cancellation remains requested");
+        assert!(fs.last_durable_token().unwrap().is_some());
+
+        let next = Cx::for_testing();
+        let mut scope = RequestScope::empty();
+        assert!(matches!(
+            fs.lookup(&next, &mut scope, ROOT, OsStr::new(&retained_name)),
+            Err(FfsError::NotFound(_))
+        ));
+        let created = fs
+            .create(
+                &next,
+                &mut scope,
+                ROOT,
+                OsStr::new("after-recovery"),
+                0o644,
+                1000,
+                1000,
+            )
+            .unwrap();
+        assert_eq!(
+            fs.write(&next, &mut scope, created.ino, 0, b"live")
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            fs.read(&next, &mut scope, created.ino, 0, 16).unwrap(),
+            b"live"
+        );
+        drop(fs);
+        let reopened = engine_for(&next, &device);
+        reopened.check_clean_consistency(&next).unwrap();
+        assert_eq!(
+            owned_files(&next, &reopened),
+            [] as [(NtfsReference, Vec<u16>); 0]
+        );
+    }
+}
+
 #[test]
 fn ntfs_orphan_open_handles_survive_and_writable_reopen_reaps() {
     for version in [NtfsFormatVersion::V3_0, NtfsFormatVersion::V3_1] {
