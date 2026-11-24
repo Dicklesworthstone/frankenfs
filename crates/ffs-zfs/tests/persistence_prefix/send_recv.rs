@@ -443,13 +443,32 @@ fn receive_feature_owners_survive_checkpoints_resume_abort_and_destruction() {
     send_stream(&cx, &mut source_mos, &request, &mut incremental).unwrap();
     request.large_blocks = false;
     let mut downconverted_incremental = Vec::new();
-    send_stream(
-        &cx,
-        &mut source_mos,
-        &request,
-        &mut downconverted_incremental,
-    )
-    .unwrap();
+    assert!(matches!(
+        send_stream(
+            &cx,
+            &mut source_mos,
+            &request,
+            &mut downconverted_incremental
+        ),
+        Err(FfsError::UnsupportedFeature(_))
+    ));
+    // The sender refuses unsupported splitting. A separately checksummed hostile
+    // stream still exercises receiver admission when the native flag is removed.
+    let downconverted_incremental =
+        restamp_substream(&incremental, false, |mut record, payload| {
+            if let DrrRecord::Begin(begin) = &mut record {
+                assert!(
+                    begin
+                        .features
+                        .contains(ffs_ondisk::zfs::send_stream::DMU_BACKUP_FEATURE_LARGE_BLOCKS)
+                );
+                begin.features = ffs_ondisk::zfs::send_stream::SendFeatureFlags::from_bits(
+                    begin.features.bits()
+                        & !ffs_ondisk::zfs::send_stream::DMU_BACKUP_FEATURE_LARGE_BLOCKS,
+                );
+            }
+            Some((record, payload))
+        });
 
     {
         let missing = b"org.open-zfs:large_blocks".as_slice();
@@ -864,6 +883,508 @@ fn stream_with_object_checksum(stream: &[u8], object: u64, checksum: u8) -> Vec<
     output
 }
 
+fn checked_substream_records(stream: &[u8], raw: bool) -> Vec<(usize, DrrRecord, Vec<u8>)> {
+    let mut records = Vec::new();
+    let mut rolling = Fletcher4Stream::new(Endian::Little);
+    let mut offset = 0;
+    while offset < stream.len() {
+        let start = offset;
+        let header = stream[offset..offset + DMU_REPLAY_RECORD_BYTES]
+            .try_into()
+            .unwrap();
+        let (record, _) = DrrRecord::parse_header(header, Endian::Little).unwrap();
+        offset += DMU_REPLAY_RECORD_BYTES;
+        let length = record.expected_payload_len(raw).unwrap();
+        let payload = stream[offset..offset + length].to_vec();
+        offset += length;
+        rolling
+            .verify_record(header, &payload, record.record_type(), true)
+            .unwrap();
+        records.push((start, record, payload));
+    }
+    assert_eq!(offset, stream.len());
+    records
+}
+
+fn restamp_substream(
+    stream: &[u8],
+    raw: bool,
+    mut edit: impl FnMut(DrrRecord, Vec<u8>) -> Option<(DrrRecord, Vec<u8>)>,
+) -> Vec<u8> {
+    let mut output = Vec::new();
+    let mut rolling = Fletcher4Stream::new(Endian::Little);
+    for (_, record, payload) in checked_substream_records(stream, raw) {
+        let Some((record, payload)) = edit(record, payload) else {
+            continue;
+        };
+        assert_eq!(record.expected_payload_len(raw).unwrap(), payload.len());
+        let mut header = record.encode_header(Endian::Little).unwrap();
+        rolling
+            .stamp_record(&mut header, &payload, record.record_type())
+            .unwrap();
+        output.extend_from_slice(&header);
+        output.extend_from_slice(&payload);
+    }
+    // These adversarial streams retain correct per-record and final checksums.
+    // A checksum rejection must not accidentally stand in for payload checks.
+    checked_substream_records(&output, raw);
+    output
+}
+
+fn restamp_raw_keydata(
+    stream: &[u8],
+    mut edit: impl FnMut(&mut ffs_ondisk::zfs::nvlist::NvList),
+) -> Vec<u8> {
+    let mut changed = 0;
+    let output = restamp_substream(stream, true, |mut record, mut payload| {
+        if let DrrRecord::Begin(begin) = &mut record {
+            let mut keydata = ffs_ondisk::zfs::nvlist::NvList::parse_exact(&payload).unwrap();
+            edit(&mut keydata);
+            payload = keydata.encode_xdr().unwrap();
+            begin.payload_len = u32::try_from(payload.len()).unwrap();
+            changed += 1;
+        }
+        Some((record, payload))
+    });
+    assert_eq!(changed, 1);
+    output
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn malformed_plain_compressed_records_preserve_the_last_durable_checkpoint() {
+    use ffs_ondisk::zfs::send_stream::DrrWriteEmbedded;
+
+    let cx = Cx::for_testing();
+    let timestamp = Timestamp {
+        seconds: 1_730_000_710,
+        nanos: 0,
+    };
+    let source = vec![b"data".to_vec()];
+    let destination = vec![b"data".to_vec(), b"validated".to_vec()];
+    let spec = PoolFixtureSpec {
+        ashift: 9,
+        ..send_recv_pool_spec(32 * 1024 * 1024)
+    };
+    let built = build_clean_zfs_pool(&spec);
+    let source_devices: Vec<_> = built
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut sender = open_engine_on_devices(
+        &cx,
+        &source_devices,
+        default_write_opts(built.pool_guid, built.initial_slot),
+    )
+    .unwrap();
+    for (name, value) in [("recordsize", 4096), ("compression", 15)] {
+        sender
+            .set_property(&cx, &source, name, ZfsPropertySetValue::Number(value))
+            .into_result()
+            .unwrap();
+    }
+    let content = vec![0xA6; 3 * 4096];
+    sender
+        .write_file_data(
+            &cx,
+            &source,
+            4,
+            0,
+            &content,
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    sender
+        .create_snapshot(&cx, &source, b"validated", timestamp)
+        .into_result()
+        .unwrap();
+    let mut source_mos = sender.open_read_objects(&cx).unwrap();
+    let mut request = ZfsSendRequest::full(source.clone(), b"validated".to_vec());
+    request.compressed = true;
+    request.embedded = true;
+    let mut stream = Vec::new();
+    send_stream(&cx, &mut source_mos, &request, &mut stream).unwrap();
+    stream = restamp_substream(&stream, false, |mut record, payload| {
+        if let DrrRecord::Begin(begin) = &mut record {
+            begin.features = begin
+                .features
+                .with(ffs_ondisk::zfs::send_stream::DMU_BACKUP_FEATURE_ZSTD);
+        }
+        Some((record, payload))
+    });
+    let second_record = checked_substream_records(&stream, false).into_iter().find(|(_, record, _)| {
+        matches!(record, DrrRecord::Write(write) if write.object == 4 && write.offset == 4096)
+    }).unwrap().0;
+    let target = build_clean_zfs_pool(&spec);
+    let mut receive = ZfsRecvRequest::new(destination.clone());
+    receive.resumable = true;
+    receive.checkpoint_bytes = 1;
+    let baseline_devices: Vec<_> = target
+        .members
+        .iter()
+        .cloned()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut baseline = open_engine_on_devices(
+        &cx,
+        &baseline_devices,
+        default_write_opts(target.pool_guid, target.initial_slot),
+    )
+    .unwrap();
+    assert!(matches!(
+        baseline.receive_stream(&cx, &receive, &mut Cursor::new(&stream[..second_record])),
+        ZfsTxOutcome::NotCommitted(_)
+    ));
+    let expected_state = baseline
+        .inspect_receive_resume_state(&cx, &destination)
+        .unwrap()
+        .unwrap();
+    let expected_txg = baseline.committed_txg();
+    assert_eq!(expected_state.object, 4);
+    assert_eq!(expected_state.offset, 4096);
+    for case in 0..8 {
+        let mut changed = 0;
+        let malformed = restamp_substream(&stream, false, |mut record, mut payload| {
+            if let DrrRecord::Write(write) = &mut record
+                && write.object == 4
+                && write.offset == 4096
+            {
+                changed += 1;
+                match case {
+                    0..=2 => {
+                        write.compressiontype = [15, 5, 16][case];
+                        payload.fill(0);
+                        if case == 0 {
+                            payload[..4].copy_from_slice(&u32::MAX.to_be_bytes());
+                        }
+                    }
+                    3 => write.logical_size = 8192,
+                    4 => write.logical_size = ffs_ondisk::zfs::MAX_BLOCK_BYTES as u64 + 512,
+                    5 => write.offset = u64::MAX - 4095,
+                    6 | 7 => {
+                        let embedded = DrrWriteEmbedded {
+                            object: write.object,
+                            offset: write.offset,
+                            length: write.logical_size,
+                            toguid: write.toguid,
+                            compression: 15,
+                            etype: 0,
+                            lsize: if case == 6 { 4096 } else { 8192 },
+                            psize: 8,
+                        };
+                        payload = vec![0xFF; 8];
+                        record = DrrRecord::WriteEmbedded(embedded);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            if let DrrRecord::Begin(begin) = &mut record {
+                begin.features = begin
+                    .features
+                    .with(ffs_ondisk::zfs::send_stream::DMU_BACKUP_FEATURE_ZSTD);
+            }
+            Some((record, payload))
+        });
+        assert_eq!(changed, 1);
+        let devices: Vec<_> = target
+            .members
+            .iter()
+            .cloned()
+            .map(FaultableMemberDevice::new)
+            .collect();
+        let mut receiver = open_engine_on_devices(
+            &cx,
+            &devices,
+            default_write_opts(target.pool_guid, target.initial_slot),
+        )
+        .unwrap();
+        match receiver.receive_stream(&cx, &receive, &mut Cursor::new(&malformed)) {
+            ZfsTxOutcome::NotCommitted(error) => assert!(
+                !error.to_string().contains("Fletcher4"),
+                "case {case}: {error}"
+            ),
+            other => panic!("malformed compressed record {case} was accepted: {other:?}"),
+        }
+        assert_eq!(
+            receiver.committed_txg(),
+            expected_txg,
+            "case {case} advanced durability"
+        );
+        let state = receiver
+            .inspect_receive_resume_state(&cx, &destination)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state, expected_state,
+            "case {case} advanced resume position"
+        );
+        let slot = receiver.committed_slot();
+        drop(receiver);
+        let durable: Vec<_> = devices
+            .iter()
+            .map(FaultableMemberDevice::fresh_from_durable)
+            .collect();
+        let mut reopened =
+            open_engine_on_devices(&cx, &durable, default_write_opts(target.pool_guid, slot))
+                .unwrap();
+        assert_eq!(
+            reopened
+                .inspect_receive_resume_state(&cx, &destination)
+                .unwrap(),
+            Some(expected_state.clone())
+        );
+        if case % 2 == 0 {
+            let mut resume = ZfsSendRequest::full(source.clone(), Vec::new());
+            resume.resume_token = Some(state.token);
+            resume.compressed = true;
+            resume.embedded = true;
+            let mut remaining = Vec::new();
+            send_stream(&cx, &mut source_mos, &resume, &mut remaining).unwrap();
+            reopened
+                .receive_stream(&cx, &receive, &mut Cursor::new(remaining))
+                .into_result()
+                .unwrap();
+            let mut mos = reopened.open_read_objects(&cx).unwrap();
+            assert_eq!(
+                mos.zpl(&cx, &destination)
+                    .unwrap()
+                    .read(&cx, 4, 0, content.len())
+                    .unwrap(),
+                content
+            );
+        } else {
+            reopened
+                .abort_receive(&cx, &destination)
+                .into_result()
+                .unwrap();
+            assert!(
+                reopened
+                    .inspect_receive_resume_state(&cx, &destination)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                !reopened
+                    .open_read_objects(&cx)
+                    .unwrap()
+                    .datasets(&cx)
+                    .unwrap()
+                    .iter()
+                    .any(|row| row.components == destination)
+            );
+        }
+        assert_pool_scrub_and_allocation_clean(
+            &cx,
+            &durable,
+            target.pool_guid,
+            Some(reopened.committed_slot()),
+        );
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn compressed_send_exports_logical_metadata_and_native_untyped_sa_spills() {
+    let cx = Cx::for_testing();
+    let timestamp = Timestamp {
+        seconds: 1_730_000_711,
+        nanos: 0,
+    };
+    let source = vec![b"data".to_vec()];
+    let destination = vec![b"data".to_vec(), b"native-spill".to_vec()];
+    let spec = PoolFixtureSpec {
+        ashift: 9,
+        ..send_recv_pool_spec(32 * 1024 * 1024)
+    };
+    let built = build_clean_zfs_pool(&spec);
+    let source_devices: Vec<_> = built
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut sender = open_engine_on_devices(
+        &cx,
+        &source_devices,
+        default_write_opts(built.pool_guid, built.initial_slot),
+    )
+    .unwrap();
+    let xattr = vec![0x6A; 12 * 1024];
+    sender
+        .set_xattr(
+            &cx,
+            &source,
+            4,
+            "user.native-spill",
+            &xattr,
+            ZfsXattrSetMode::Create,
+            timestamp,
+        )
+        .into_result()
+        .unwrap();
+    sender
+        .rename_entry(
+            &cx,
+            &source,
+            2,
+            b"hello.txt",
+            2,
+            b"renamed",
+            Some(4),
+            timestamp,
+        )
+        .into_result()
+        .unwrap();
+    sender
+        .create_snapshot(&cx, &source, b"wire", timestamp)
+        .into_result()
+        .unwrap();
+    let node = native_zpl_file_dnode(&cx, &sender, &source_devices[0], &source, 4);
+    let spill = node.spill().unwrap();
+    assert_eq!(node.bonus_type(), 44);
+    assert_eq!(spill.compression(), 15);
+    assert!(spill.physical_bytes() < spill.logical_bytes());
+    let directory = native_zpl_file_dnode(&cx, &sender, &source_devices[0], &source, 2);
+    assert!(
+        native_plain_leaf_pointers(&source_devices[0], &directory)
+            .iter()
+            .any(|pointer| pointer.compression() == 15)
+    );
+    let source_media = source_devices[0].durable_snapshot();
+    let physical_offset =
+        usize::try_from(DATA_OFFSET + spill.regular_dvas().unwrap()[0].offset).unwrap();
+    let compressed_spill =
+        source_media[physical_offset..physical_offset + spill.physical_bytes()].to_vec();
+    let logical_spill =
+        ffs_ondisk::zfs::decompress(&compressed_spill, 15, spill.logical_bytes()).unwrap();
+    let mut source_mos = sender.open_read_objects(&cx).unwrap();
+    let mut request = ZfsSendRequest::full(source.clone(), b"wire".to_vec());
+    request.compressed = true;
+    let mut stream = Vec::new();
+    send_stream(&cx, &mut source_mos, &request, &mut stream).unwrap();
+    let mut saw_directory = false;
+    let mut saw_spill = false;
+    for (_, record, payload) in checked_substream_records(&stream, false) {
+        match record {
+            DrrRecord::Write(write) if write.object == 2 => {
+                saw_directory = true;
+                assert_eq!(write.compressiontype, 0);
+                assert_eq!(write.compressed_size, 0);
+                assert_eq!(payload.len() as u64, write.logical_size);
+            }
+            DrrRecord::Spill(record) if record.object == 4 => {
+                saw_spill = true;
+                assert_eq!(
+                    record.object_type, 0,
+                    "native DRR_SPILL leaves this field unused"
+                );
+                assert_eq!(
+                    record.compressiontype, 0,
+                    "-c does not compress nonraw spills"
+                );
+                assert_eq!(record.compressed_size, 0);
+                assert_eq!(record.salt, [0; 8]);
+                assert_eq!(record.iv, [0; 12]);
+                assert_eq!(record.mac, [0; 16]);
+                assert_eq!(payload, logical_spill);
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_directory && saw_spill);
+    let target = build_clean_zfs_pool(&spec);
+    let devices: Vec<_> = target
+        .members
+        .iter()
+        .cloned()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut receiver = open_engine_on_devices(
+        &cx,
+        &devices,
+        default_write_opts(target.pool_guid, target.initial_slot),
+    )
+    .unwrap();
+    receiver
+        .receive_stream(
+            &cx,
+            &ZfsRecvRequest::new(destination.clone()),
+            &mut Cursor::new(&stream),
+        )
+        .into_result()
+        .unwrap();
+    let slot = receiver.committed_slot();
+    drop(receiver);
+    let durable: Vec<_> = devices
+        .iter()
+        .map(FaultableMemberDevice::fresh_from_durable)
+        .collect();
+    let reopened =
+        open_engine_on_devices(&cx, &durable, default_write_opts(target.pool_guid, slot)).unwrap();
+    let mut mos = reopened.open_read_objects(&cx).unwrap();
+    let mut view = mos.zpl(&cx, &destination).unwrap();
+    assert_eq!(view.resolve(&cx, b"/renamed").unwrap(), 4);
+    assert_eq!(
+        view.getxattr(&cx, 4, "user.native-spill").unwrap(),
+        Some(xattr)
+    );
+    assert_eq!(
+        view.read(&cx, 4, 0, 4096).unwrap(),
+        built.snap_hello_expected
+    );
+    assert_pool_scrub_and_allocation_clean(&cx, &durable, target.pool_guid, Some(slot));
+
+    let mut changed = 0;
+    let malformed = restamp_substream(&stream, false, |mut record, mut payload| {
+        if let DrrRecord::Spill(spill) = &mut record
+            && spill.object == 4
+        {
+            changed += 1;
+            spill.compressiontype = 15;
+            spill.compressed_size = compressed_spill.len() as u64;
+            payload = compressed_spill.clone();
+        }
+        Some((record, payload))
+    });
+    assert_eq!(changed, 1);
+    let rejected_devices: Vec<_> = target
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut rejected = open_engine_on_devices(
+        &cx,
+        &rejected_devices,
+        default_write_opts(target.pool_guid, target.initial_slot),
+    )
+    .unwrap();
+    assert!(matches!(
+        rejected.receive_stream(
+            &cx,
+            &ZfsRecvRequest::new(destination.clone()),
+            &mut Cursor::new(malformed)
+        ),
+        ZfsTxOutcome::NotCommitted(_)
+    ));
+    assert!(
+        !rejected
+            .open_read_objects(&cx)
+            .unwrap()
+            .datasets(&cx)
+            .unwrap()
+            .iter()
+            .any(|row| row.components == destination)
+    );
+    assert_pool_scrub_and_allocation_clean(
+        &cx,
+        &rejected_devices,
+        target.pool_guid,
+        Some(rejected.committed_slot()),
+    );
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn receive_preserves_native_checksum_policy_across_incremental_updates_and_rewrites() {
@@ -963,6 +1484,24 @@ fn receive_preserves_native_checksum_policy_across_incremental_updates_and_rewri
     )
     .unwrap();
     let receive = ZfsRecvRequest::new(destination.clone());
+    let invalid_compression = restamp_substream(&full, false, |mut record, payload| {
+        if let DrrRecord::Object(node) = &mut record
+            && node.object == object
+        {
+            node.compress = 255;
+        }
+        Some((record, payload))
+    });
+    assert!(matches!(
+        receiver.receive_stream(&cx, &receive, &mut Cursor::new(invalid_compression)),
+        ZfsTxOutcome::NotCommitted(FfsError::Format(message)) if message.contains("compression selector")
+    ));
+    assert!(
+        receiver
+            .inspect_receive_resume_state(&cx, &destination)
+            .unwrap()
+            .is_none()
+    );
     for invalid_checksum in [9, 11, 255] {
         let invalid = stream_with_object_checksum(&full, object, invalid_checksum);
         assert!(matches!(
@@ -993,6 +1532,94 @@ fn receive_preserves_native_checksum_policy_across_incremental_updates_and_rewri
         .unwrap();
     let node = native_zpl_file_dnode(&cx, &receiver, &target_devices[0], &destination, object);
     assert_eq!(node.checksum_type(), 7);
+    // Incremental streams may omit DRR_OBJECT for an existing object. Validate
+    // writes against the actual staging dnode, not only objects seen on the wire.
+    let mut removed = 0;
+    let without_object = restamp_substream(&incremental, false, |record, payload| {
+        if matches!(&record, DrrRecord::Object(node) if node.object == object) {
+            removed += 1;
+            None
+        } else {
+            Some((record, payload))
+        }
+    });
+    assert_eq!(removed, 1);
+    let write_start = checked_substream_records(&without_object, false)
+        .into_iter()
+        .find(|(_, record, _)| matches!(record, DrrRecord::Write(write) if write.object == object))
+        .unwrap()
+        .0;
+    let mut resumable = ZfsRecvRequest::new(destination.clone());
+    resumable.resumable = true;
+    resumable.checkpoint_bytes = 1;
+    let control_txg = receiver.committed_txg();
+    assert!(matches!(
+        receiver.receive_stream(
+            &cx,
+            &resumable,
+            &mut Cursor::new(&without_object[..write_start])
+        ),
+        ZfsTxOutcome::NotCommitted(_)
+    ));
+    let expected_commits = receiver.committed_txg() - control_txg;
+    let expected_state = receiver
+        .inspect_receive_resume_state(&cx, &destination)
+        .unwrap()
+        .unwrap();
+    receiver
+        .abort_receive(&cx, &destination)
+        .into_result()
+        .unwrap();
+    for case in 0..3 {
+        let mut changed = 0;
+        let invalid = restamp_substream(&without_object, false, |mut record, mut payload| {
+            if let DrrRecord::Write(write) = &mut record
+                && write.object == object
+            {
+                changed += 1;
+                match case {
+                    0 => {
+                        write.logical_size /= 2;
+                        payload.truncate(usize::try_from(write.logical_size).unwrap());
+                    }
+                    1 => write.offset = 512,
+                    2 => write.object_type = 23,
+                    _ => unreachable!(),
+                }
+            }
+            Some((record, payload))
+        });
+        assert_eq!(changed, 1);
+        let before = receiver.committed_txg();
+        assert!(
+            matches!(
+                receiver.receive_stream(&cx, &resumable, &mut Cursor::new(invalid)),
+                ZfsTxOutcome::NotCommitted(_)
+            ),
+            "existing-object geometry case {case}"
+        );
+        assert_eq!(
+            receiver.committed_txg() - before,
+            expected_commits,
+            "invalid existing-object write reached a checkpoint"
+        );
+        assert_eq!(
+            receiver
+                .inspect_receive_resume_state(&cx, &destination)
+                .unwrap(),
+            Some(expected_state.clone())
+        );
+        let mut view = receiver
+            .open_read_objects(&cx)
+            .unwrap()
+            .zpl(&cx, &destination)
+            .unwrap();
+        assert_eq!(view.read(&cx, object, 0, initial.len()).unwrap(), initial);
+        receiver
+            .abort_receive(&cx, &destination)
+            .into_result()
+            .unwrap();
+    }
     receiver
         .receive_stream(&cx, &receive, &mut Cursor::new(&incremental))
         .into_result()
@@ -1071,7 +1698,7 @@ fn receive_preserves_native_checksum_policy_across_incremental_updates_and_rewri
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn zpl_full_incremental_bookmark_intermediary_properties_and_big_endian_roundtrip() {
+fn zpl_full_incremental_bookmark_intermediary_properties_and_foreign_order_refusal() {
     let cx = Cx::for_testing();
     let ts = Timestamp {
         seconds: 1_730_000_000,
@@ -1355,7 +1982,7 @@ fn zpl_full_incremental_bookmark_intermediary_properties_and_big_endian_roundtri
     expected_blob_s2[4096..4096 + blob_s2_patch.len()].copy_from_slice(blob_s2_patch);
 
     // 2. Emit full stream @s1 with -c -e -L -p, incremental bookmark stream #bm1 -> @s2,
-    //    intermediary compound stream -I @s1 @s3, and a big-endian full stream @s1.
+    //    intermediary compound stream -I @s1 @s3, and refuse unconverted foreign-order metadata.
     let mut src_mos = open_mos(
         &cx,
         &src_devs,
@@ -1393,8 +2020,10 @@ fn zpl_full_incremental_bookmark_intermediary_properties_and_big_endian_roundtri
     let mut be_full_bytes = Vec::new();
     let mut be_req = ZfsSendRequest::full(src_ds.clone(), b"s1".to_vec());
     be_req.stream_order = Endian::Big;
-    let be_report = send_stream(&cx, &mut src_mos, &be_req, &mut be_full_bytes).unwrap();
-    assert_eq!(be_report.to_guid, full_report.to_guid);
+    assert!(matches!(
+        send_stream(&cx, &mut src_mos, &be_req, &mut be_full_bytes),
+        Err(FfsError::UnsupportedFeature(_))
+    ));
 
     // 3. Build completely independent destination pool and receive full + bookmark-incremental!
     let dst_built = build_clean_zfs_pool(&send_recv_pool_spec(32 * 1024 * 1024));
@@ -1514,16 +2143,16 @@ fn zpl_full_incremental_bookmark_intermediary_properties_and_big_endian_roundtri
         assert_eq!(zpl_head.read(&cx, a2, 0, 32).unwrap(), b"created-in-s2");
     }
 
-    // 4. Receive big-endian full @s1 into `data/dst_inter` then `-I @s1 @s3` intermediary compound!
+    // 4. Receive native-order full @s1 into `data/dst_inter` then `-I @s1 @s3` intermediary compound.
     let dst_inter = vec![b"data".to_vec(), b"dst_inter".to_vec()];
     dst_engine
         .receive_stream(
             &cx,
             &ZfsRecvRequest::new(dst_inter.clone()),
-            &mut Cursor::new(&be_full_bytes),
+            &mut Cursor::new(&full_s1_bytes),
         )
         .into_result()
-        .expect("receive big-endian full @s1");
+        .expect("receive native-order full @s1");
     let (rec_inter, tok_inter) = dst_engine
         .receive_stream(
             &cx,
@@ -1806,6 +2435,19 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
         )
         .into_result()
         .unwrap();
+    let secret_xattr = vec![0xD8; 12 * 1024];
+    src_engine
+        .set_xattr(
+            &cx,
+            &vault_src,
+            sec_obj,
+            "user.raw-spill",
+            &secret_xattr,
+            ZfsXattrSetMode::Create,
+            ts,
+        )
+        .into_result()
+        .unwrap();
     src_engine
         .create_snapshot(&cx, &vault_src, b"e1", ts)
         .into_result()
@@ -1860,6 +2502,21 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
     req_e1.large_blocks = true;
     let report_e1 = send_stream(&cx, &mut keyless_src_mos, &req_e1, &mut raw_e1).unwrap();
     assert!(report_e1.raw);
+    let mut raw_spills = 0;
+    for (_, record, _) in checked_substream_records(&raw_e1, true) {
+        if let DrrRecord::Spill(spill) = record
+            && spill.object == sec_obj
+        {
+            assert_eq!(
+                spill.object_type, 0,
+                "native raw SPILL also leaves its type field unused"
+            );
+            assert_eq!(spill.compressiontype, 15);
+            assert!(spill.compressed_size < spill.length);
+            raw_spills += 1;
+        }
+    }
+    assert_eq!(raw_spills, 1);
 
     let mut raw_e2 = Vec::new();
     let mut req_e2 = ZfsSendRequest::full(vault_src.clone(), b"e2".to_vec());
@@ -1939,6 +2596,71 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
     let mut receive = ZfsRecvRequest::new(vault_dst.clone());
     receive.resumable = true;
     receive.checkpoint_bytes = 1;
+    let before_missing_keydata = snapshot_media_bytes(&dst_devs);
+    let missing_keydata = restamp_substream(&raw_e1, true, |mut record, mut payload| {
+        if let DrrRecord::Begin(begin) = &mut record {
+            begin.payload_len = 0;
+            payload.clear();
+        }
+        Some((record, payload))
+    });
+    assert!(matches!(
+        dst_engine.receive_stream(&cx, &receive, &mut Cursor::new(missing_keydata)),
+        ZfsTxOutcome::NotCommitted(_)
+    ));
+    assert_media_unchanged(&dst_devs, &before_missing_keydata);
+    assert!(
+        dst_engine
+            .inspect_receive_resume_state(&cx, &vault_dst)
+            .unwrap()
+            .is_none()
+    );
+    for malformed_slots in [false, true] {
+        let mut changed = false;
+        let malformed = restamp_substream(&raw_e1, true, |mut record, payload| {
+            if let DrrRecord::ObjectRange(range) = &mut record
+                && !changed
+            {
+                if malformed_slots {
+                    range.numslots = u64::MAX;
+                } else {
+                    range.firstobj = 1;
+                }
+                changed = true;
+            }
+            Some((record, payload))
+        });
+        assert!(changed);
+        assert!(matches!(
+            dst_engine.receive_stream(
+                &cx,
+                &ZfsRecvRequest::new(vault_dst.clone()),
+                &mut Cursor::new(malformed)
+            ),
+            ZfsTxOutcome::NotCommitted(_)
+        ));
+        assert!(
+            dst_engine
+                .inspect_receive_resume_state(&cx, &vault_dst)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !dst_engine
+                .open_read_objects(&cx)
+                .unwrap()
+                .datasets(&cx)
+                .unwrap()
+                .iter()
+                .any(|row| row.components == vault_dst)
+        );
+        assert_pool_scrub_and_allocation_clean(
+            &cx,
+            &dst_devs,
+            dst_built.pool_guid,
+            Some(dst_engine.committed_slot()),
+        );
+    }
     assert!(matches!(
         dst_engine.receive_stream(
             &cx,
@@ -1953,17 +2675,107 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
         .unwrap()
         .expect("raw feature-bearing checkpoint");
     let mut resume = ZfsSendRequest::full(vault_src.clone(), Vec::new());
-    resume.resume_token = Some(state.token);
+    resume.resume_token = Some(state.token.clone());
     resume.raw = true;
     resume.large_blocks = true;
     let mut resumed_e1 = Vec::new();
     send_stream(&cx, &mut keyless_src_mos, &resume, &mut resumed_e1).unwrap();
+    let downgraded = restamp_substream(&resumed_e1, true, |mut record, payload| {
+        if let DrrRecord::Begin(begin) = &mut record {
+            begin.features = ffs_ondisk::zfs::send_stream::SendFeatureFlags::from_bits(
+                begin.features.bits() & !ffs_ondisk::zfs::send_stream::DMU_BACKUP_FEATURE_RAW,
+            );
+        }
+        Some((record, payload))
+    });
+    let checkpoint_media = snapshot_media_bytes(&dst_devs);
+    assert!(matches!(
+        dst_engine.receive_stream(&cx, &receive, &mut Cursor::new(downgraded)),
+        ZfsTxOutcome::NotCommitted(_)
+    ));
+    assert_media_unchanged(&dst_devs, &checkpoint_media);
+    assert_eq!(
+        dst_engine
+            .inspect_receive_resume_state(&cx, &vault_dst)
+            .unwrap(),
+        Some(state)
+    );
     let (r_e1, _) = dst_engine
         .receive_stream(&cx, &receive, &mut Cursor::new(&resumed_e1))
         .into_result()
         .expect("keyless raw recv @e1");
     assert!(r_e1.raw && r_e1.final_snapshot == "e1");
     assert_eq!(&dsl_block_feature_counts(&cx, &dst_engine)[..2], &[2, 2]);
+
+    for case in 0..4 {
+        let invalid = restamp_raw_keydata(&raw_e2, |keydata| {
+            use ffs_ondisk::zfs::nvlist::Value;
+            match case {
+                0 => {
+                    let Some(Value::List(crypto)) = keydata.fields.get_mut("crypt_keydata") else {
+                        panic!("missing source keydata")
+                    };
+                    let guid = crypto.unsigned("DSL_CRYPTO_GUID").unwrap();
+                    crypto
+                        .fields
+                        .insert("DSL_CRYPTO_GUID".to_owned(), Value::Unsigned(guid ^ 1));
+                }
+                1 => {
+                    assert!(keydata.fields.remove("from_ivset_guid").is_some());
+                }
+                2 => {
+                    keydata
+                        .fields
+                        .insert("from_ivset_guid".to_owned(), Value::Unsigned(0));
+                }
+                3 => {
+                    let ivset = keydata.unsigned("from_ivset_guid").unwrap();
+                    keydata
+                        .fields
+                        .insert("from_ivset_guid".to_owned(), Value::Unsigned(ivset ^ 1));
+                }
+                _ => unreachable!(),
+            }
+        });
+        let before = snapshot_media_bytes(&dst_devs);
+        assert!(
+            matches!(
+                dst_engine.receive_stream(
+                    &cx,
+                    &ZfsRecvRequest::new(vault_dst.clone()),
+                    &mut Cursor::new(invalid)
+                ),
+                ZfsTxOutcome::NotCommitted(_)
+            ),
+            "raw identity case {case}"
+        );
+        assert_media_unchanged(&dst_devs, &before);
+    }
+    let mut plain_source = src_engine.open_read_objects(&cx).unwrap();
+    plain_source
+        .load_key(&cx, &vault_src, &wrapping_key)
+        .unwrap();
+    let mut plain_request = ZfsSendRequest::full(vault_src.clone(), b"e2".to_vec());
+    plain_request.from = Some(ZfsSendFrom::Snapshot(b"e1".to_vec()));
+    plain_request.large_blocks = true;
+    let mut plain_incremental = Vec::new();
+    send_stream(
+        &cx,
+        &mut plain_source,
+        &plain_request,
+        &mut plain_incremental,
+    )
+    .unwrap();
+    let before_plain = snapshot_media_bytes(&dst_devs);
+    assert!(matches!(
+        dst_engine.receive_stream(
+            &cx,
+            &ZfsRecvRequest::new(vault_dst.clone()),
+            &mut Cursor::new(plain_incremental)
+        ),
+        ZfsTxOutcome::NotCommitted(_)
+    ));
+    assert_media_unchanged(&dst_devs, &before_plain);
 
     let (r_e2, tok_e2) = dst_engine
         .receive_stream(
@@ -1999,6 +2811,14 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
     assert_eq!(
         dst_mos.key_status(&cx, &vault_dst).unwrap(),
         ZfsKeyStatus::Available
+    );
+    assert_eq!(
+        dst_mos
+            .zpl(&cx, &vault_dst)
+            .unwrap()
+            .getxattr(&cx, sec_obj, "user.raw-spill")
+            .unwrap(),
+        Some(secret_xattr)
     );
     {
         let ds_row = dst_mos

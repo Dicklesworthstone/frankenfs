@@ -8,10 +8,10 @@
 use super::dmu_cow::{
     DatasetCompression, DatasetFeatureUsage, DnodeCowSpec, MosFeatureState, PoolSpaceAllocator,
     SpaceDelta, StagedBlockWrite, StagedLeafUpdate, WriteBucket, allocate_object_id,
-    collect_non_hole_bps_from, cow_update_dnode_with_staged_leaves, enqueue_into_dataset_deadlist,
-    ensure_dnode_table_block_loaded, put_dnode_in_table, read_staged_or_committed_dnode,
-    remove_dnode_from_table, write_dataset_objset_block, write_dataset_objset_block_raw_protected,
-    zap_optional_u64,
+    collect_non_hole_bps_from, cow_update_dnode_with_staged_leaves, dmu_ot_is_byte_array,
+    enqueue_into_dataset_deadlist, ensure_dnode_table_block_loaded, put_dnode_in_table,
+    read_staged_or_committed_dnode, remove_dnode_from_table, write_dataset_objset_block,
+    write_dataset_objset_block_raw_protected, zap_optional_u64,
 };
 use super::dsl_ops::{
     DMU_OT_DSL_DATASET, DMU_OT_DSL_DIR_CHILD_MAP, DMU_OT_DSL_DS_SNAP_MAP, DMU_OT_DSL_PROPS,
@@ -55,7 +55,7 @@ use ffs_ondisk::zfs::send_stream::{
     detect_stream_endian, validate_toname_snapshot,
 };
 use ffs_ondisk::zfs::{
-    BlockPointer, Endian, MAX_BLOCK_BYTES, ProtectedBlockSpec, RegularBlockSpec,
+    BlockPointer, Endian, MAX_BLOCK_BYTES, ProtectedBlockSpec, RegularBlockSpec, decompress,
 };
 use ffs_ondisk::zfs_dmu::{
     DMU_OT_DNODE, DNODE_BLOCK_BYTES, DNODE_FLAG_USED_BYTES, Dnode, DnodeSpec, ObjectSet, ZilHeader,
@@ -300,6 +300,142 @@ fn admit_received_compression(compression: u8, features: &MosFeatureState) -> Re
         )));
     }
     DatasetCompression::from_property(u64::from(compression), features).map(|_| ())
+}
+
+/// A stream checksum covers the transmitted bytes, not the validity of the
+/// compressed frame. Validate bounded plaintext transforms before enqueueing a
+/// record, so neither a checkpoint nor promotion can publish an unreadable BP.
+/// Raw encrypted streams deliberately retain their ciphertext without decoding.
+fn validate_received_block_payload(
+    cx: &Cx,
+    logical_size: u64,
+    compression: u8,
+    payload: &[u8],
+    raw_encrypted: bool,
+) -> Result<()> {
+    if !(512..=MAX_BLOCK_BYTES as u64).contains(&logical_size)
+        || !logical_size.is_multiple_of(512)
+        || payload.len() < 512
+        || !payload.len().is_multiple_of(512)
+        || payload.len() as u64 > logical_size
+    {
+        return Err(FfsError::Format(
+            "invalid receive block logical or physical size".into(),
+        ));
+    }
+    let codec = if compression == 0 { 2 } else { compression };
+    if codec == 2 {
+        if payload.len() as u64 != logical_size {
+            return Err(FfsError::Format(
+                "uncompressed receive block length mismatch".into(),
+            ));
+        }
+    } else if !raw_encrypted {
+        checkpoint(cx)?;
+        let logical_bytes =
+            usize::try_from(logical_size).map_err(|_| corrupt("receive logical size overflow"))?;
+        let decoded = decompress(payload, codec, logical_bytes).map_err(|e| parse_err(&e))?;
+        drop(decoded);
+        checkpoint(cx)?;
+    }
+    Ok(())
+}
+
+fn validate_received_embedded_payload(
+    cx: &Cx,
+    rec: &DrrWriteEmbedded,
+    payload: &[u8],
+) -> Result<()> {
+    if !(512..=MAX_BLOCK_BYTES as u64).contains(&rec.length)
+        || !rec.length.is_multiple_of(512)
+        || rec.offset.checked_add(rec.length).is_none()
+        || u64::from(rec.lsize) != rec.length
+        || !(1..=112).contains(&rec.psize)
+        || rec.psize > rec.lsize
+        || !matches!(rec.compression, 2 | 3 | 5..=16)
+    {
+        return Err(FfsError::Format(
+            "invalid DRR_WRITE_EMBEDDED geometry or compression".into(),
+        ));
+    }
+    let packed =
+        usize::try_from(rec.psize).map_err(|_| corrupt("embedded physical size overflow"))?;
+    if payload.len() != packed.next_multiple_of(8) {
+        return Err(FfsError::Format(
+            "DRR_WRITE_EMBEDDED payload length mismatch".into(),
+        ));
+    }
+    checkpoint(cx)?;
+    let logical =
+        usize::try_from(rec.lsize).map_err(|_| corrupt("embedded logical size overflow"))?;
+    let decoded =
+        decompress(&payload[..packed], rec.compression, logical).map_err(|e| parse_err(&e))?;
+    drop(decoded);
+    checkpoint(cx)
+}
+
+fn validate_received_geometry(offset: u64, logical: u64, block_bytes: usize) -> Result<()> {
+    let block_bytes = block_bytes as u64;
+    if block_bytes == 0
+        || !offset.is_multiple_of(block_bytes)
+        || logical != block_bytes
+        || offset.checked_add(logical).is_none()
+    {
+        return Err(FfsError::Format(
+            "receive record geometry disagrees with its dnode".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_received_plain_order(
+    object_type: u8,
+    stream_order: Endian,
+    pool_order: Endian,
+) -> Result<()> {
+    if stream_order != pool_order && !dmu_ot_is_byte_array(object_type) {
+        return Err(unsupported(
+            "cross-endian receive of structured DMU payloads requires byte-swap conversion",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_received_crypto_identity(
+    incoming: &StreamCryptoKeydata,
+    existing: &DslCryptoKeyRecord,
+) -> Result<()> {
+    // Wrapping material may change independently of the underlying dataset key.
+    // Its native key GUID, cipher and encryption format must remain compatible.
+    if incoming.guid != existing.guid
+        || incoming.suite != existing.suite
+        || incoming.version != existing.version
+    {
+        return Err(FfsError::Format(
+            "raw receive crypto identity disagrees with its destination".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_received_base_ivset(
+    cx: &Cx,
+    mos: &mut Objects,
+    keydata: &StreamCryptoKeydata,
+    base_snapshot: u64,
+) -> Result<()> {
+    let expected = keydata
+        .from_ivset_guid
+        .filter(|&guid| guid != 0)
+        .ok_or_else(|| {
+            FfsError::Format("raw incremental receive requires a nonzero from_ivset_guid".into())
+        })?;
+    if mos.dataset_ivset_guid(cx, base_snapshot)? != Some(expected) {
+        return Err(FfsError::Format(
+            "raw incremental from_ivset_guid disagrees with target base snapshot".into(),
+        ));
+    }
+    Ok(())
 }
 
 // ── ZAP Helpers for Resume State ────────────────────────────────────────────
@@ -891,6 +1027,12 @@ impl ZfsTransactionEngine {
             None
         };
 
+        if is_raw && keydata.is_none() {
+            return ZfsTxOutcome::NotCommitted(FfsError::Format(
+                "raw encrypted receive requires DRR_BEGIN crypt_keydata".into(),
+            ));
+        }
+
         if keydata.is_some()
             && (!self
                 .mos_features
@@ -1024,13 +1166,34 @@ impl ZfsTransactionEngine {
                     );
                 }
                 DrrRecord::ObjectRange(r) => {
+                    if !is_raw {
+                        return cleanup_on_abort(
+                            self,
+                            FfsError::Format(
+                                "DRR_OBJECT_RANGE requires a raw encrypted stream".into(),
+                            ),
+                        );
+                    }
+                    // This receiver's metadnode uses 16 KiB blocks (32 slots).
+                    // Reject incompatible ranges before expanding any state.
+                    if r.numslots != 32 || !r.firstobj.is_multiple_of(32) {
+                        return cleanup_on_abort(
+                            self,
+                            unsupported(
+                                "DRR_OBJECT_RANGE requires one aligned 32-slot dnode block",
+                            ),
+                        );
+                    }
                     if r.toguid != 0 && r.toguid != begin.toguid {
                         return cleanup_on_abort(
                             self,
                             corrupt("DRR_OBJECT_RANGE toguid disagrees with DRR_BEGIN"),
                         );
                     }
-                    if r.firstobj + r.numslots < last_obj {
+                    if r.firstobj
+                        .checked_add(r.numslots)
+                        .is_none_or(|end| end < last_obj)
+                    {
                         return cleanup_on_abort(
                             self,
                             FfsError::Format("out-of-order DRR_OBJECT_RANGE".into()),
@@ -1063,6 +1226,36 @@ impl ZfsTransactionEngine {
                             self,
                             FfsError::Format("DRR_OBJECT cannot target object 0".into()),
                         );
+                    }
+                    let bonus_type = match u8::try_from(o.bonus_type) {
+                        Ok(kind) => kind,
+                        Err(_) => {
+                            return cleanup_on_abort(
+                                self,
+                                corrupt("DRR_OBJECT bonus type overflow"),
+                            );
+                        }
+                    };
+                    if u8::try_from(o.object_type).is_err() || o.object_type == 0 {
+                        return cleanup_on_abort(self, corrupt("invalid DRR_OBJECT type"));
+                    }
+                    if o.compress > 16 {
+                        return cleanup_on_abort(
+                            self,
+                            FfsError::Format("invalid DRR_OBJECT compression selector".into()),
+                        );
+                    }
+                    if let Err(error) =
+                        DatasetCompression::from_property(u64::from(o.compress), &self.mos_features)
+                    {
+                        return cleanup_on_abort(self, error);
+                    }
+                    if !is_raw && o.bonuslen != 0 {
+                        if let Err(error) =
+                            validate_received_plain_order(bonus_type, stream_order, self.order)
+                        {
+                            return cleanup_on_abort(self, error);
+                        }
                     }
                     // Native dnode overrides are limited to legacy checksums.
                     // Newer algorithms remain valid on individual DRR_WRITE BPs.
@@ -1190,13 +1383,50 @@ impl ZfsTransactionEngine {
                     {
                         return cleanup_on_abort(self, error);
                     }
+                    let object_type = match u8::try_from(w.object_type) {
+                        Ok(kind) if kind != 0 => kind,
+                        _ => return cleanup_on_abort(self, corrupt("invalid DRR_WRITE type")),
+                    };
+                    let Some(end_offset) = w.offset.checked_add(w.logical_size) else {
+                        return cleanup_on_abort(self, corrupt("DRR_WRITE offset overflow"));
+                    };
+                    if !is_raw {
+                        if w.flags & DRR_RAW_BYTESWAP != 0 {
+                            return cleanup_on_abort(
+                                self,
+                                corrupt("non-raw DRR_WRITE carries raw byte order"),
+                            );
+                        }
+                        if let Err(error) =
+                            validate_received_plain_order(object_type, stream_order, self.order)
+                        {
+                            return cleanup_on_abort(self, error);
+                        }
+                    }
+                    if let Err(error) = validate_received_block_payload(
+                        cx,
+                        w.logical_size,
+                        w.compressiontype,
+                        &payload,
+                        is_raw,
+                    ) {
+                        return cleanup_on_abort(self, error);
+                    }
                     last_obj = w.object;
-                    last_offset = w.offset.saturating_add(w.logical_size);
+                    last_offset = end_offset;
                     blocks_received += 1;
                     pending_bytes = pending_bytes.saturating_add(payload.len() as u64);
                     pending_ops.push(RecvOp::Write { rec: w, payload });
                 }
                 DrrRecord::WriteEmbedded(e) => {
+                    if is_raw {
+                        return cleanup_on_abort(
+                            self,
+                            FfsError::Format(
+                                "DRR_WRITE_EMBEDDED is forbidden in raw encrypted streams".into(),
+                            ),
+                        );
+                    }
                     if let Err(error) =
                         admit_received_compression(e.compression, &self.mos_features)
                     {
@@ -1236,8 +1466,21 @@ impl ZfsTransactionEngine {
                             unsupported("non-DATA DRR_WRITE_EMBEDDED subtype is unsupported"),
                         );
                     }
+                    if let Some(&blksz) = obj_blksz_map.get(&e.object)
+                        && (!e.offset.is_multiple_of(blksz) || e.length != blksz)
+                    {
+                        return cleanup_on_abort(
+                            self,
+                            FfsError::Format(
+                                "misaligned or mismatched DRR_WRITE_EMBEDDED block size".into(),
+                            ),
+                        );
+                    }
+                    if let Err(error) = validate_received_embedded_payload(cx, &e, &payload) {
+                        return cleanup_on_abort(self, error);
+                    }
                     last_obj = e.object;
-                    last_offset = e.offset.saturating_add(e.length);
+                    last_offset = e.offset + e.length;
                     blocks_received += 1;
                     pending_bytes = pending_bytes.saturating_add(payload.len() as u64 + 128);
                     pending_ops.push(RecvOp::WriteEmbedded { rec: e, payload });
@@ -1279,6 +1522,23 @@ impl ZfsTransactionEngine {
                             self,
                             FfsError::Format("reordered DRR_SPILL object".into()),
                         );
+                    }
+                    // Native non-raw SPILL records always carry logical bytes,
+                    // even when the stream permits compressed WRITE records.
+                    if !is_raw && (s.compressiontype != 0 || s.flags & DRR_RAW_BYTESWAP != 0) {
+                        return cleanup_on_abort(
+                            self,
+                            FfsError::Format("non-raw DRR_SPILL must contain logical bytes".into()),
+                        );
+                    }
+                    if let Err(error) = validate_received_block_payload(
+                        cx,
+                        s.length,
+                        s.compressiontype,
+                        &payload,
+                        is_raw,
+                    ) {
+                        return cleanup_on_abort(self, error);
                     }
                     last_obj = s.object;
                     blocks_received += 1;
@@ -1413,16 +1673,30 @@ impl ZfsTransactionEngine {
         )?;
         let owners = dataset_block_feature_owners(&staging_entries, &self.mos_features)?;
         require_receive_large_blocks(&owners, begin)?;
+        let is_raw = begin.features.contains(DMU_BACKUP_FEATURE_RAW);
+        if state.rawok != is_raw || is_raw != keydata.is_some() {
+            return Err(FfsError::Format(
+                "resuming stream raw mode disagrees with persisted receive state".into(),
+            ));
+        }
+        let staging_crypto = resolve_staging_crypto_info(cx, &mut mos, staging.directory_object)?;
+        if staging_crypto.is_some() != is_raw {
+            return Err(FfsError::Format(
+                "resuming stream encryption disagrees with its staging dataset".into(),
+            ));
+        }
         if let Some(kd) = keydata {
-            if !state.rawok {
-                return Err(FfsError::Format(
-                    "raw resuming stream cannot target a non-raw staging receive".into(),
-                ));
-            }
+            let crypto = staging_crypto
+                .as_ref()
+                .ok_or_else(|| corrupt("raw receive staging dataset lacks crypto identity"))?;
+            validate_received_crypto_identity(kd, &crypto.record)?;
             if state.ivsetguid.unwrap_or(0) != kd.to_ivset_guid {
                 return Err(FfsError::Format(
                     "resuming raw stream ivset_guid disagrees with persisted receive state".into(),
                 ));
+            }
+            if begin.fromguid != 0 {
+                validate_received_base_ivset(cx, &mut mos, kd, staging.prev_snap_obj)?;
             }
         }
         let (target_dd_obj, target_head_obj) = if staging.is_pct_recv_child {
@@ -1431,7 +1705,7 @@ impl ZfsTransactionEngine {
         } else {
             (staging.directory_object, None)
         };
-        let is_raw_encrypted = state.rawok || keydata.is_some();
+        let is_raw_encrypted = is_raw;
         let (crypto_version, portable_mac, to_ivset_guid) = if let Some(kd) = keydata {
             (kd.version, kd.portable_mac, Some(kd.to_ivset_guid))
         } else {
@@ -1962,16 +2236,12 @@ impl ZfsTransactionEngine {
                                 "raw encrypted incremental cannot target unencrypted dataset".into(),
                             ));
                         };
-                        let _ = tc;
-                        if let Some(expected_from_ivset) = kd.from_ivset_guid {
-                            let actual_from_ivset = mos.dataset_ivset_guid(cx, prev_snap_obj)?;
-                            if actual_from_ivset != Some(expected_from_ivset) {
-                                return Err(FfsError::Format(
-                                    "raw incremental from_ivset_guid disagrees with target base snapshot"
-                                        .into(),
-                                ));
-                            }
-                        }
+                        validate_received_crypto_identity(kd, &tc.record)?;
+                        validate_received_base_ivset(cx, mos, kd, prev_snap_obj)?;
+                    } else if target_crypto.is_some() {
+                        return Err(unsupported(
+                            "non-raw incremental receive into an encrypted dataset requires re-encryption",
+                        ));
                     }
 
                     let (target_dd_dn, _) = read_staged_or_committed_dnode(
@@ -2181,7 +2451,7 @@ impl ZfsTransactionEngine {
                         target_head_obj: Some(target_head_obj),
                         prev_snap_obj,
                         prev_snap_txg,
-                        is_raw_encrypted: kd_cloned.is_some() || target_crypto.is_some(),
+                        is_raw_encrypted: kd_cloned.is_some(),
                         crypto_version: kd_cloned.as_ref().map_or(1, |k| k.version),
                         portable_mac: kd_cloned.as_ref().map_or([0_u8; 32], |k| k.portable_mac),
                         to_ivset_guid: kd_cloned.as_ref().map(|k| k.to_ivset_guid),
@@ -2485,6 +2755,15 @@ impl ZfsTransactionEngine {
                                 &mut os_view,
                             )?;
                             let d = drafts.get_mut(&rec.object).expect("loaded");
+                            // Incremental and resumed streams may omit OBJECT;
+                            // admission must use the actual preserved dnode too.
+                            validate_received_geometry(rec.offset, rec.logical_size, d.data_bytes)?;
+                            if rec.object_type != u32::from(d.object_type) {
+                                return Err(corrupt("DRR_WRITE type disagrees with its dnode"));
+                            }
+                            if !stage_cloned.is_raw_encrypted {
+                                validate_received_plain_order(d.object_type, stream_order, order)?;
+                            }
                             let blksz = d.data_bytes as u64;
                             let bid = rec.offset / blksz;
                             d.max_block = d.max_block.max(bid);
@@ -2493,6 +2772,8 @@ impl ZfsTransactionEngine {
                                     Endian::Little => Endian::Big,
                                     Endian::Big => Endian::Little,
                                 }
+                            } else if stage_cloned.is_raw_encrypted {
+                                stream_order
                             } else {
                                 order
                             };
@@ -2593,6 +2874,8 @@ impl ZfsTransactionEngine {
                                 &mut os_view,
                             )?;
                             let d = drafts.get_mut(&rec.object).expect("loaded");
+                            validate_received_geometry(rec.offset, rec.length, d.data_bytes)?;
+                            validate_received_plain_order(d.object_type, stream_order, order)?;
                             let blksz = d.data_bytes as u64;
                             let bid = rec.offset / blksz;
                             d.max_block = d.max_block.max(bid);
@@ -2645,13 +2928,23 @@ impl ZfsTransactionEngine {
                                 &mut os_view,
                             )?;
                             let d = drafts.get_mut(&rec.object).expect("loaded");
-                            let obj_type = u8::try_from(rec.object_type)
-                                .map_err(|_| corrupt("DRR_SPILL object_type overflow"))?;
+                            // OpenZFS leaves drr_type zero: spill blocks inherit
+                            // their DMU type (and encryption policy) from the
+                            // owning dnode's bonus type, not its data object type.
+                            let obj_type = d.bonus_type;
+                            if obj_type == 0 || (rec.object_type != 0 && rec.object_type != u32::from(obj_type)) {
+                                return Err(corrupt("DRR_SPILL type disagrees with its dnode bonus type"));
+                            }
+                            if !stage_cloned.is_raw_encrypted {
+                                validate_received_plain_order(obj_type, stream_order, order)?;
+                            }
                             let block_order = if rec.flags & DRR_RAW_BYTESWAP != 0 {
                                 match stream_order {
                                     Endian::Little => Endian::Big,
                                     Endian::Big => Endian::Little,
                                 }
+                            } else if stage_cloned.is_raw_encrypted {
+                                stream_order
                             } else {
                                 order
                             };

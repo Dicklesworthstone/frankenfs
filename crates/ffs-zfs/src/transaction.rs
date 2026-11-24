@@ -38,6 +38,7 @@ use self::dmu_cow::{
     MosFeatureState, PoolSpaceAllocator, StagedBlockWrite, WriteBucket,
     finalize_mos_and_space_maps_to_convergence, zap_optional_u64, zap_required_u64,
 };
+pub(crate) use self::dmu_cow::{dmu_ot_is_byte_array, dmu_ot_is_metadata};
 pub(crate) use self::dsl_ops::dataset_statfs_quota_space;
 use self::dsl_ops::{DslMutation, stage_dsl_mutation};
 pub use self::dsl_ops::{
