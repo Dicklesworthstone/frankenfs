@@ -15,7 +15,7 @@ env:
   CARGO_PROFILE_TEST_DEBUG: "0"
   RUSTFLAGS: "-Z threads=1"
   CARGO_HTTP_USER_AGENT: "frankenfs-agent (+https://github.com/Dicklesworthstone/frankenfs)"
-  FFS_BASE_COMMIT: ddd6d94374a69c5e70b3b498d5ba2ffcb8583b4f
+  FFS_BASE_COMMIT: 000301d215e6a350d948624a7f7e049f8c2ab2e7
   FFS_SOURCE_PATHS: |
     crates/ffs-zfs/src/transaction/zpl_ops.rs
     crates/ffs-zfs/tests/persistence_prefix.rs
@@ -23,7 +23,7 @@ env:
   FFS_VALIDATION_WORKFLOW: .github/workflows/ffs-mutation-validation.yml
 jobs:
   prepare:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
     permissions:
       contents: write
@@ -95,7 +95,7 @@ jobs:
           PY
   validate:
     needs: prepare
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 120
     env:
       FFS_EXPECTED_TREE: ${{ needs.prepare.outputs.tree }}

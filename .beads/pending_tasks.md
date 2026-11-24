@@ -2,6 +2,56 @@
 
 Created by CC agent 2026-04-22. Import when bead database clears.
 
+## Current execution — 2026-11-24, native lifetime and protection integrity
+
+Started at `ddd6d94374a69c5e70b3b498d5ba2ffcb8583b4f`. Prioritize concrete
+native operation gaps within FAT lifetime, ZFS privilege handling and shared
+protection. Broad `bd-tqrnc` / `bd-jdned` acceptance remains open. The existing
+FAT milestones are historical completion receipts, not permission to disregard
+new lifetime defects. `br --no-db ready --json` returned 37 rows; an attempted
+issue creation still failed with `DATABASE_ERROR: database is busy`, so this
+existing pending ledger preserves work without rewriting the issue graph.
+
+- [x] Read comprehensive format plan, porting priorities, repository rules,
+  README and current Beads before selecting work; verify earlier FAT read-only
+  protection, ordinary mutations, production SSI and inode merging already exist.
+- [x] Identify nested sidecar abort losing its failure at outer completion;
+  independently review the shared physical epoch and no-savepoint invariant.
+- [x] Author four real-sidecar regressions: nested abort/outer completion,
+  write-free abort continuation, completed-inner/aborted-outer, and successful
+  nesting with fresh-generation repair. These are not yet execution evidence.
+- [x] Make escaped-write abort poison the complete deferred epoch immediately;
+  preserve its pending archive, invalidate native acknowledgment time and explain
+  aborted-commit poisoning in the device diagnostic.
+- [ ] Execute the planted-red regression, fixed sidecar controls, owning-package
+  tests and required check/strict-Clippy gates. The real dependency build for
+  `cargo test -p ffs-repair --lib
+  nested_aborted_durability_commit_cannot_be_sealed_by_outer_completion --
+  --nocapture --test-threads=1` was interrupted with exit 130 under shared-host
+  pressure before a test binary ran. No baseline failure or fixed runtime pass
+  is inferred. The four tests remain authored, not executed.
+- [x] Independently review the complete sidecar fix and all four tests; scoped
+  pinned-toolchain rustfmt checking and git diff whitespace checks pass.
+- [~] Extend existing FAT retention to removed/overwritten pinned directories,
+  preserving logical parent identity, delayed reclamation and namespace refusal.
+- [ ] Cover FAT16/FAT32 rmdir, directory replacement, parent cleanup, capacity,
+  read-only behavior and write/sync failures through the actual FsOps adapter.
+- [~] Remove Linux file capabilities atomically with admitted ZFS data changes
+  using native SA inline xattrs and the existing TXG publication path.
+- [ ] Keep set-ID-only editor policy distinct, preserve unrelated xattrs and
+  snapshot metadata, and retain refusal of external capability representations.
+- [ ] Exercise ZFS write/truncate/copy/range/compound-setattr and persistence
+  cuts, including no-op and prepublication refusal controls.
+- [ ] Publish each reviewed coherent increment directly to main using GitHub
+  with an expected-head lease; update this ledger without broad Bead closure.
+
+Validation environment: baseline workspace formatting passed before changes.
+The initial workspace check was interrupted during dependency compilation when
+the shared disk filled (exit 130); no project-wide compiler pass was obtained.
+The executor then restarted and cleared temporary storage. Source changes were
+reconstructed in the persistent checkout; native mount/oracle evidence remains
+unavailable because this host has no `/dev/fuse`, dosfstools or mtools.
+
 ## Current execution — 2026-11-23, FAT protection, ZFS quotas and metadata order
 
 Started at `f9ce14528328e8eb7f9a9bd1a0e21bf058b6ec86`. These are substantive
