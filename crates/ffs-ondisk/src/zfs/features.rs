@@ -412,7 +412,7 @@ pub const OPENZFS_2_4_FEATURES: &[FeaturePolicy] = &[
         for_write: true,
         mos: false,
         read_supported: true,
-        write_supported: true,
+        write_supported: false,
         dependencies: &[],
     },
     FeaturePolicy {
@@ -653,7 +653,6 @@ mod tests {
             "com.delphix:zpool_checkpoint",
             "com.delphix:obsolete_counts",
             "com.datto:resilver_defer",
-            "org.openzfs:device_rebuild",
             "org.openzfs:zilsaxattr",
         ] {
             assert!(
@@ -662,6 +661,7 @@ mod tests {
             );
         }
         for ro_only in [
+            "org.openzfs:device_rebuild",
             "com.delphix:log_spacemap",
             "com.fudosecurity:block_cloning",
             "com.truenas:block_cloning_endian",

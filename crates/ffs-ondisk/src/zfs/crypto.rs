@@ -2215,8 +2215,10 @@ mod tests {
             [8, b'a', b'b', b'c', 24, 3]
         );
         assert_eq!(compress_lzjb_payload(&[b'x'; 67]), [2, b'x', 252, 1]);
-        for period in [1, 2, 3, 7, 65, 66, 67, 255, 1023, 1024, 1025] {
-            let block: Vec<u8> = (0..8192).map(|i| (i % period % 251) as u8).collect();
+        for period in [1_u32, 2, 3, 7, 65, 66, 67, 255, 1023, 1024, 1025] {
+            let block: Vec<u8> = (0_u32..8192)
+                .map(|i| u8::try_from((i % period) % 251).unwrap())
+                .collect();
             let encoded = compress_lzjb_payload(&block);
             assert_eq!(decompress(&encoded, 3, block.len()).unwrap(), block);
         }

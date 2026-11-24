@@ -919,6 +919,69 @@ fn encode_zpl_bonus_for_fixture(
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct DatasetSpaceTotals {
+    dsize: u64,
+    comp: u64,
+    uncomp: u64,
+}
+
+impl DatasetSpaceTotals {
+    fn from_bp(bp: &BlockPointer) -> Self {
+        if bp.hole() || bp.embedded() {
+            return Self::default();
+        }
+        let dsize = bp_allocated_bytes(bp);
+        let comp = bp.physical_bytes() as u64;
+        let ot = bp.object_type();
+        let is_meta = bp.level() > 0
+            || if ot & 0x80 != 0 {
+                ot & 0x40 != 0
+            } else {
+                !matches!(ot, 19 | 23 | 25 | 26 | 49 | 54 | 55)
+            };
+        let uncomp = if is_meta {
+            comp
+        } else {
+            bp.logical_bytes() as u64
+        };
+        Self {
+            dsize,
+            comp,
+            uncomp,
+        }
+    }
+
+    fn add_assign(&mut self, rhs: Self) {
+        self.dsize += rhs.dsize;
+        self.comp += rhs.comp;
+        self.uncomp += rhs.uncomp;
+    }
+
+    fn sum(self, rhs: Self) -> Self {
+        Self {
+            dsize: self.dsize + rhs.dsize,
+            comp: self.comp + rhs.comp,
+            uncomp: self.uncomp + rhs.uncomp,
+        }
+    }
+
+    fn add_dnode_table(&mut self, table: &[u8], order: Endian) {
+        for raw in table.as_chunks::<DNODE_BYTES>().0 {
+            if raw[0] == 0 {
+                continue;
+            }
+            let dn = Dnode::parse(raw, order).expect("parse fixture dnode for space totals");
+            for bp in dn.pointers() {
+                self.add_assign(Self::from_bp(bp));
+            }
+            if let Some(spill) = dn.spill() {
+                self.add_assign(Self::from_bp(spill));
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn build_zpl_objectset(
     arena: &mut RawArena,
@@ -927,7 +990,7 @@ fn build_zpl_objectset(
     populate_snapshot_files: bool,
     birth: u64,
     order: Endian,
-) -> (BlockPointer, u64, Vec<u8>) {
+) -> (BlockPointer, DatasetSpaceTotals, Vec<u8>) {
     if head_object == 18
         && let Some((objectset_order, contents_order)) = spec.zvol_orders
     {
@@ -1668,8 +1731,11 @@ fn build_zpl_objectset(
     );
     write_dnode_at(&mut table, 2, &root_dn).expect("write root dn");
 
+    let mut space_totals = DatasetSpaceTotals::default();
+    space_totals.add_dnode_table(&table, order);
     let mut table_pointers = vec![arena.alloc_block(&table, DMU_OT_DNODE, 0, birth, order)];
     if let Some((extra, leaf_order)) = extra_table {
+        space_totals.add_dnode_table(&extra, leaf_order);
         table_pointers.push(arena.alloc_block(&extra, DMU_OT_DNODE, 0, birth, leaf_order));
     }
     let meta_dn = make_dnode(
@@ -1830,6 +1896,7 @@ fn build_zpl_objectset(
                 .collect();
             let raw = mzap(&entries, salt, order);
             let pointer = arena.alloc_block(&raw, 39, 0, birth, order);
+            space_totals.add_assign(DatasetSpaceTotals::from_bp(&pointer));
             let node = make_dnode(
                 39,
                 pointer.logical_bytes(),
@@ -1864,8 +1931,11 @@ fn build_zpl_objectset(
     } else {
         arena.alloc_block(&encoded_os, DMU_OT_OBJSET, 0, birth, objectset_order)
     };
-    let referenced = os_obj.meta.used_bytes() + bp_allocated_bytes(&os_bp);
-    (os_bp, referenced, snap_hello_bytes)
+    for bp in os_obj.meta.pointers() {
+        space_totals.add_assign(DatasetSpaceTotals::from_bp(bp));
+    }
+    space_totals.add_assign(DatasetSpaceTotals::from_bp(&os_bp));
+    (os_bp, space_totals, snap_hello_bytes)
 }
 
 fn encode_dsl_dir_bonus(
@@ -1874,7 +1944,7 @@ fn encode_dsl_dir_bonus(
     origin_obj: u64,
     child_dir_zapobj: u64,
     props_zapobj: u64,
-    used_bytes: u64,
+    space: DatasetSpaceTotals,
     order: Endian,
 ) -> Vec<u8> {
     let mut raw = vec![0_u8; 256];
@@ -1884,9 +1954,9 @@ fn encode_dsl_dir_bonus(
         (16, parent_dir_obj),
         (24, origin_obj),
         (32, child_dir_zapobj),
-        (40, used_bytes),
-        (48, used_bytes),
-        (56, used_bytes),
+        (40, space.dsize),
+        (48, space.comp),
+        (56, space.uncomp),
         (80, props_zapobj),
     ] {
         raw[at..at + 8].copy_from_slice(&order.encode(val));
@@ -1904,7 +1974,7 @@ fn encode_dsl_dataset_bonus(
     num_children: u64,
     creation_txg: u64,
     deadlist_obj: u64,
-    referenced_bytes: u64,
+    space: DatasetSpaceTotals,
     guid: u64,
     next_clones_obj: u64,
     os_bp: &BlockPointer,
@@ -1921,10 +1991,10 @@ fn encode_dsl_dataset_bonus(
         (48, 1_700_000_000 + creation_txg),
         (56, creation_txg),
         (64, deadlist_obj),
-        (72, referenced_bytes),
-        (80, referenced_bytes),
-        (88, referenced_bytes),
-        (96, referenced_bytes),
+        (72, space.dsize),
+        (80, space.comp),
+        (88, space.uncomp),
+        (96, space.dsize),
         (104, guid ^ 0x55AA),
         (112, guid),
         (120, 0),
@@ -2083,14 +2153,23 @@ fn build_clean_zfs_pool(spec: &PoolFixtureSpec) -> BuiltPool {
 
     // Special MOS DSL directories: Object 9 (`$MOS`), Object 14 (`$FREE`), Object 24 (`$ORIGIN`)
     for (special_dir_id, child_id, props_id) in [(9_usize, 33_u64, 30_u64), (14, 34, 31)] {
-        let special_bonus = encode_dsl_dir_bonus(0, 2, 0, child_id, props_id, 0, order);
+        let special_bonus = encode_dsl_dir_bonus(
+            0,
+            2,
+            0,
+            child_id,
+            props_id,
+            DatasetSpaceTotals::default(),
+            order,
+        );
         set_mos(
             &mut mos_tables,
             special_dir_id,
             &make_dnode(12, 512, Vec::new(), 12, special_bonus, None, 0, order),
         );
     }
-    let origin_dir_bonus = encode_dsl_dir_bonus(25, 2, 0, 35, 32, 0, order);
+    let origin_dir_bonus =
+        encode_dsl_dir_bonus(25, 2, 0, 35, 32, DatasetSpaceTotals::default(), order);
     set_mos(
         &mut mos_tables,
         24,
@@ -2122,7 +2201,7 @@ fn build_clean_zfs_pool(spec: &PoolFixtureSpec) -> BuiltPool {
         0,
         1,
         36,
-        0,
+        DatasetSpaceTotals::default(),
         0xABCD_0025,
         0,
         &origin_hole_bp,
@@ -2168,7 +2247,7 @@ fn build_clean_zfs_pool(spec: &PoolFixtureSpec) -> BuiltPool {
         3,
         1,
         13,
-        0,
+        DatasetSpaceTotals::default(),
         0xABCD_0026,
         28,
         &origin_hole_bp,
@@ -2337,7 +2416,7 @@ fn build_clean_zfs_pool(spec: &PoolFixtureSpec) -> BuiltPool {
         &make_dnode(12, 512, Vec::new(), 12, data_dir_bonus, None, 0, order),
     );
     let root_dir_bonus =
-        encode_dsl_dir_bonus(3, 0, 26, 15, 16, root_ref_bytes + data_ref_bytes, order);
+        encode_dsl_dir_bonus(3, 0, 26, 15, 16, root_ref_bytes.sum(data_ref_bytes), order);
     set_mos(
         &mut mos_tables,
         2,
@@ -4855,7 +4934,9 @@ fn native_plain_compression_resolves_properties_and_preserves_object_overrides()
     const RECEIVED: &[u8] = b"compression$recvd";
     const INHERIT: &[u8] = b"compression$inherit";
     let cases = [
-        ("default-off", vec![], vec![], 0, 2, Some(1)),
+        ("default-on-lz4", vec![], vec![], 0, 15, Some(1)),
+        ("default-on-lzjb", vec![], vec![], 0, 3, None),
+        ("explicit-off", vec![], vec![(COMP, 2)], 0, 2, Some(1)),
         ("inherited-lz4", vec![(COMP, 15)], vec![], 0, 15, Some(1)),
         ("received-gzip", vec![], vec![(RECEIVED, 6)], 0, 6, Some(1)),
         (
@@ -5295,11 +5376,18 @@ fn native_zstd_property_ownership_and_compressed_data_survive_shared_lifecycle()
         .into_result()
         .unwrap();
     assert_native_dataset_feature(&cx, &engine, &dataset, ZSTD, true, 1);
+    let root_obj = engine
+        .open_read_objects(&cx)
+        .unwrap()
+        .zpl(&cx, &dataset)
+        .unwrap()
+        .resolve(&cx, b"/")
+        .unwrap();
     let (file, _) = engine
         .create_file(
             &cx,
             &dataset,
-            2,
+            root_obj,
             b"payload",
             0o600,
             1000,
@@ -5473,11 +5561,18 @@ fn inherited_zstd_first_data_crash_cuts_publish_compression_and_owner_together()
         .create_dataset(&cx, &parent, b"inherited", &[], timestamp)
         .into_result()
         .unwrap();
+    let root_obj = setup
+        .open_read_objects(&cx)
+        .unwrap()
+        .zpl(&cx, &dataset)
+        .unwrap()
+        .resolve(&cx, b"/")
+        .unwrap();
     let (file, _) = setup
         .create_file(
             &cx,
             &dataset,
-            2,
+            root_obj,
             b"payload",
             0o600,
             1000,
@@ -6272,6 +6367,7 @@ fn native_zpl_checksum_policy_refuses_unadmitted_algorithms_before_writes() {
     };
     for value in [0, 2, 9, 11, u64::MAX] {
         let built = build_clean_zfs_pool(&PoolFixtureSpec {
+            deadlist_mode: DeadlistMode::NativeDeadlist,
             root_properties: vec![(b"checksum", value)],
             ..PoolFixtureSpec::default()
         });
@@ -10787,7 +10883,16 @@ fn dsl_quota_refquota_reservation_and_inherit_enforcement() {
         .expect("create within refquota");
 
     // Exceeding `refquota` must fail closed with `EDQUOT` and zero writes!
-    let big_buf = vec![0xAB_u8; 96 * 1024];
+    // Use deterministic incompressible bytes so default `compression=on` still allocates 96 KiB > 32 KiB.
+    let mut prng = 0x5EED_CAFE_u32;
+    let big_buf: Vec<u8> = (0..96 * 1024)
+        .map(|_| {
+            prng ^= prng << 13;
+            prng ^= prng >> 17;
+            prng ^= prng << 5;
+            prng.to_le_bytes()[0]
+        })
+        .collect();
     assert_native_write_refused(
         &mut engine,
         std::slice::from_ref(&device),
