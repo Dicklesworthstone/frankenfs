@@ -816,8 +816,9 @@ final removal of inline-only metadata.
 Cached lookups alone do not prevent a closed file from being removed. Directory
 continuation cookies become stale after a committed mutation, and
 removed-directory references cannot alias a reused object.
-Changing mode or ownership and creating/deleting datasets or snapshots remain
-outside this mount profile. Existing native project IDs are retained and charged
+Authorized writable mounts support native mode and ownership updates;
+creating/deleting datasets or snapshots remain outside this mount profile.
+Existing native project IDs are retained and charged
 to their own usage records through mutation and final reclamation. Regular files
 and directories created under an admitted project-inheriting directory inherit
 its project ID and inheritance flag; other new children and symlinks use project
@@ -850,9 +851,17 @@ The writable FsOps adapter handles nonempty writes, file-range copies, truncatio
 and supported sparse range edits by clearing native S_ISUID and executable
 S_ISGID bits in the same TXG as the data change. Non-executable S_ISGID is retained,
 empty writes leave metadata unchanged, and snapshots retain their original data
-and permissions. Files with Linux file
-capabilities are still refused before data mutation because atomic capability
-xattr removal is not implemented.
+and permissions. Native SA `security.capability` attributes are removed in that
+same TXG, including attributes stored in SA spill blocks. Unrelated xattrs are
+preserved. Regular-file ownership requests also clear privileges atomically,
+including requests that specify the current owner IDs. Exact capability removal
+is available to the kernel's killpriv path; other security xattrs remain opaque.
+Directory-backed capability values, including values shadowed by an SA copy,
+still refuse the complete mutation before publication. Explicit native editor
+APIs retain their separate set-ID-only and full privilege-clearing policies.
+Capability regressions cover cold reopen, snapshots, native flag admission,
+compound requests and modeled persistence cuts; their runtime execution and
+native mounted qualification remain pending for this increment.
 
 Write and truncate growth initialize newly visible bytes even when an existing
 checksummed, compressed record contains nonzero bytes beyond the old logical

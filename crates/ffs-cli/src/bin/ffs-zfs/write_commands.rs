@@ -1405,6 +1405,7 @@ impl WriteCommand {
                     uid,
                     gid,
                     clear_suid_sgid,
+                    clear_file_capabilities: false,
                 };
                 let (mut engine, components) = pool.open_engine(cx)?;
                 let target_obj = resolve_target_object(cx, &engine, &components, path.as_os_str())?;

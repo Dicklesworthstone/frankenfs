@@ -798,7 +798,6 @@ impl FsOps for ZfsFs {
         }
         let handle = state.next_open_handle()?;
         if flags & libc::O_TRUNC != 0 {
-            state.admit_data_mutation(cx, ino)?;
             let object = state.head.nodes[&ino].object;
             let timestamp = native_timestamp(SystemTime::now())?;
             state.mutate(cx, |engine, dataset| {
@@ -809,6 +808,7 @@ impl FsOps for ZfsFs {
                     &crate::ZfsPosixSetAttr {
                         size: Some(0),
                         clear_suid_sgid: true,
+                        clear_file_capabilities: true,
                         ..crate::ZfsPosixSetAttr::default()
                     },
                     timestamp,
@@ -944,11 +944,10 @@ impl FsOps for ZfsFs {
         if data.is_empty() {
             return Ok(0);
         }
-        state.admit_data_mutation(cx, ino)?;
         let object = state.head.nodes[&ino].object;
         let timestamp = native_timestamp(SystemTime::now())?;
         state.mutate(cx, |engine, dataset| {
-            engine.write_file_data_clearing_setid(
+            engine.write_file_data_clearing_privileges(
                 cx,
                 dataset,
                 object,
@@ -989,11 +988,10 @@ impl FsOps for ZfsFs {
         if metadata.kind != Kind::Regular {
             return Err(unsupported("ZPL range mutation requires a regular file"));
         }
-        state.admit_data_mutation(cx, ino)?;
         let object = state.head.nodes[&ino].object;
         let timestamp = native_timestamp(SystemTime::now())?;
         state.mutate(cx, |engine, dataset| {
-            engine.edit_file_range_clearing_setid(
+            engine.edit_file_range_clearing_privileges(
                 cx,
                 dataset,
                 object,
@@ -1083,6 +1081,11 @@ impl FsOps for ZfsFs {
             None
         };
 
+        // Linux chown requests kill file privileges even when the supplied
+        // owner IDs equal the current IDs. Keep that policy in the same TXG
+        // rather than filtering the request into a metadata no-op.
+        let clear_privileges = attrs.size.is_some()
+            || (metadata.kind == Kind::Regular && (attrs.uid.is_some() || attrs.gid.is_some()));
         let native_attrs = crate::ZfsPosixSetAttr {
             size: attrs.size,
             atime: attrs.atime.map(native_timestamp).transpose()?,
@@ -1092,7 +1095,8 @@ impl FsOps for ZfsFs {
             gid: gid_update,
             // The permission change belongs to the same native transaction as
             // the data mutation, including compound size/mode requests.
-            clear_suid_sgid: attrs.size.is_some(),
+            clear_suid_sgid: clear_privileges,
+            clear_file_capabilities: clear_privileges,
         };
         if attrs.size.is_some() {
             if metadata.kind == Kind::Directory {
@@ -1101,7 +1105,6 @@ impl FsOps for ZfsFs {
             if metadata.kind != Kind::Regular {
                 return Err(unsupported("ZPL truncate requires a regular file"));
             }
-            state.admit_data_mutation(cx, ino)?;
         }
         if native_attrs.size.is_some()
             || native_attrs.atime.is_some()
@@ -1109,6 +1112,7 @@ impl FsOps for ZfsFs {
             || native_attrs.mode.is_some()
             || native_attrs.uid.is_some()
             || native_attrs.gid.is_some()
+            || native_attrs.clear_file_capabilities
         {
             let object = state.head.nodes[&ino].object;
             let timestamp = native_timestamp(SystemTime::now())?;
@@ -1362,17 +1366,39 @@ impl FsOps for ZfsFs {
         name: &str,
     ) -> Result<bool> {
         let mut state = self.state(cx)?;
-        state.writable_metadata(cx, ino)?;
+        let metadata = state.writable_metadata(cx, ino)?;
         let object = state.head.nodes[&ino].object;
         if name == "security.capability" {
-            if state.head.view.has_file_capabilities(cx, object)? {
-                return Err(unsupported(
-                    "native ZPL capability removal is not implemented",
-                ));
+            if !state.head.view.has_file_capabilities(cx, object)? {
+                return Ok(false);
             }
-            // FUSE's killpriv path asks to drop capabilities before ordinary writes.
-            // A proven-absent attribute needs no mutation; a present one is refused.
-            return Ok(false);
+            // Explicit xattr removal has the same native flag admission as
+            // user-xattr mutation. An authorized data append instead removes
+            // capabilities inside WRITE, where APPENDONLY remains admissible.
+            if metadata.flags
+                & (0x0000_0001_0000_0000 | 0x0000_0010_0000_0000 | 0x0000_0040_0000_0000)
+                != 0
+            {
+                return Err(errno(libc::EPERM));
+            }
+            // The kernel killpriv path may remove this exact key independently
+            // of WRITE. Other security attributes remain outside the host API.
+            let timestamp = native_timestamp(SystemTime::now())?;
+            state.mutate(cx, |engine, dataset| {
+                engine.set_posix_attributes(
+                    cx,
+                    dataset,
+                    object,
+                    &crate::ZfsPosixSetAttr {
+                        clear_file_capabilities: true,
+                        ..crate::ZfsPosixSetAttr::default()
+                    },
+                    timestamp,
+                    crate::ZfsDataChecksum::default(),
+                )
+            })?;
+            state.publish_committed(|state| state.refresh_head(cx))?;
+            return Ok(true);
         }
         if !name.starts_with("user.") {
             return Err(unsupported("only the ZPL user xattr namespace is exposed"));

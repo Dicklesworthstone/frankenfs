@@ -1146,7 +1146,7 @@ impl ZfsTransactionEngine {
         timestamp: Timestamp,
         checksum: ZfsDataChecksum,
     ) -> ZfsTxOutcome<u64> {
-        self.write_file_data_with_setid_policy(
+        self.write_file_data_with_privilege_policy(
             cx,
             dataset_components,
             file_obj,
@@ -1154,6 +1154,7 @@ impl ZfsTransactionEngine {
             data,
             timestamp,
             checksum,
+            false,
             false,
         )
     }
@@ -1175,7 +1176,7 @@ impl ZfsTransactionEngine {
         timestamp: Timestamp,
         checksum: ZfsDataChecksum,
     ) -> ZfsTxOutcome<u64> {
-        self.write_file_data_with_setid_policy(
+        self.write_file_data_with_privilege_policy(
             cx,
             dataset_components,
             file_obj,
@@ -1184,11 +1185,40 @@ impl ZfsTransactionEngine {
             timestamp,
             checksum,
             true,
+            false,
+        )
+    }
+
+    /// Write data, clear set-user-ID and executable set-group-ID permissions, and
+    /// remove native SA file capabilities in the same TXG. Empty writes preserve
+    /// size, timestamps, and privileges. Directory-backed capability values refuse
+    /// the whole mutation before publication.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_file_data_clearing_privileges(
+        &mut self,
+        cx: &Cx,
+        dataset_components: &[Vec<u8>],
+        file_obj: u64,
+        offset: u64,
+        data: &[u8],
+        timestamp: Timestamp,
+        checksum: ZfsDataChecksum,
+    ) -> ZfsTxOutcome<u64> {
+        self.write_file_data_with_privilege_policy(
+            cx,
+            dataset_components,
+            file_obj,
+            offset,
+            data,
+            timestamp,
+            checksum,
+            true,
+            true,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn write_file_data_with_setid_policy(
+    fn write_file_data_with_privilege_policy(
         &mut self,
         cx: &Cx,
         dataset_components: &[Vec<u8>],
@@ -1198,6 +1228,7 @@ impl ZfsTransactionEngine {
         timestamp: Timestamp,
         checksum: ZfsDataChecksum,
         clear_suid_sgid: bool,
+        clear_file_capabilities: bool,
     ) -> ZfsTxOutcome<u64> {
         self.execute_zpl_txg(
             cx,
@@ -1207,6 +1238,7 @@ impl ZfsTransactionEngine {
                 offset,
                 data: data.to_vec(),
                 clear_suid_sgid,
+                clear_file_capabilities,
                 timestamp,
                 checksum,
             },
@@ -1229,7 +1261,7 @@ impl ZfsTransactionEngine {
         timestamp: Timestamp,
         checksum: ZfsDataChecksum,
     ) -> ZfsTxOutcome<u64> {
-        self.edit_file_range_with_setid_policy(
+        self.edit_file_range_with_privilege_policy(
             cx,
             dataset_components,
             file_obj,
@@ -1238,6 +1270,7 @@ impl ZfsTransactionEngine {
             operation,
             timestamp,
             checksum,
+            false,
             false,
         )
     }
@@ -1260,7 +1293,7 @@ impl ZfsTransactionEngine {
         timestamp: Timestamp,
         checksum: ZfsDataChecksum,
     ) -> ZfsTxOutcome<u64> {
-        self.edit_file_range_with_setid_policy(
+        self.edit_file_range_with_privilege_policy(
             cx,
             dataset_components,
             file_obj,
@@ -1270,11 +1303,41 @@ impl ZfsTransactionEngine {
             timestamp,
             checksum,
             true,
+            false,
+        )
+    }
+
+    /// Edit a sparse range while clearing set-ID permissions and native SA file
+    /// capabilities atomically. A size-preserving range wholly beyond EOF retains
+    /// all privileges. Directory-backed capabilities refuse the whole mutation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn edit_file_range_clearing_privileges(
+        &mut self,
+        cx: &Cx,
+        dataset_components: &[Vec<u8>],
+        file_obj: u64,
+        offset: u64,
+        length: u64,
+        operation: ZfsFileRangeOperation,
+        timestamp: Timestamp,
+        checksum: ZfsDataChecksum,
+    ) -> ZfsTxOutcome<u64> {
+        self.edit_file_range_with_privilege_policy(
+            cx,
+            dataset_components,
+            file_obj,
+            offset,
+            length,
+            operation,
+            timestamp,
+            checksum,
+            true,
+            true,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn edit_file_range_with_setid_policy(
+    fn edit_file_range_with_privilege_policy(
         &mut self,
         cx: &Cx,
         dataset_components: &[Vec<u8>],
@@ -1285,6 +1348,7 @@ impl ZfsTransactionEngine {
         timestamp: Timestamp,
         checksum: ZfsDataChecksum,
         clear_suid_sgid: bool,
+        clear_file_capabilities: bool,
     ) -> ZfsTxOutcome<u64> {
         if length == 0
             || offset
@@ -1308,6 +1372,7 @@ impl ZfsTransactionEngine {
                 length,
                 operation,
                 clear_suid_sgid,
+                clear_file_capabilities,
                 timestamp,
                 checksum,
             },
@@ -1408,7 +1473,7 @@ impl ZfsTransactionEngine {
         )
     }
 
-    /// Publish size, POSIX mode/uid/gid, set-ID clearing, and native timestamps
+    /// Publish size, POSIX mode/uid/gid, privilege clearing, and native timestamps
     /// atomically in one TXG, rebuilding trivial NFSv4 DACL on chmod and
     /// transferring embedded `userused`/`groupused` quota accounting on chown.
     pub fn set_posix_attributes(

@@ -131,6 +131,8 @@ struct PoolFixtureSpec {
     zpl_flags: BTreeMap<u64, u64>,
     hello_size: Option<u64>,
     hello_mode: u16,
+    hello_sa_xattrs: BTreeMap<String, Vec<u8>>,
+    hello_sa_xattrs_in_spill: bool,
     root_ids: (u64, u64),
     hello_ownership: Option<ffs_ondisk::zfs_zpl::ReclamationOwnership>,
     root_properties: Vec<(&'static [u8], u64)>,
@@ -173,6 +175,8 @@ impl Default for PoolFixtureSpec {
             zpl_flags: BTreeMap::new(),
             hello_size: None,
             hello_mode: 0o644,
+            hello_sa_xattrs: BTreeMap::new(),
+            hello_sa_xattrs_in_spill: false,
             root_ids: (0, 0),
             hello_ownership: None,
             root_properties: Vec::new(),
@@ -274,6 +278,45 @@ fn pack_xdr_nvlist(pairs: &[Vec<u8>]) -> Vec<u8> {
     let mut out = vec![1, 1, 0, 0]; // NV_ENCODE_XDR (1), big-endian XDR stream (1)
     out.extend_from_slice(&nv_list_body(pairs));
     out
+}
+
+// Independent XDR byte-array encoding, rather than the production SA writer,
+// so capability-removal tests start from externally representable attributes.
+fn fixture_sa_xattrs(values: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
+    let pairs: Vec<_> = values
+        .iter()
+        .map(|(name, value)| {
+            let mut padded = value.clone();
+            padded.resize(padded.len().next_multiple_of(4), 0);
+            nv_pair(
+                name,
+                10,
+                u32::try_from(value.len()).unwrap(),
+                &padded,
+                value.len(),
+            )
+        })
+        .collect();
+    pack_xdr_nvlist(&pairs)
+}
+
+fn fixture_sa_xattr_header(layout: u16, length: usize, order: Endian) -> Vec<u8> {
+    let mut header = vec![0_u8; 8];
+    let layout = (1_u16 << 10) | layout;
+    let length = u16::try_from(length).unwrap();
+    match order {
+        Endian::Little => {
+            header[..4].copy_from_slice(&[0x5a, 0x50, 0x2f, 0]);
+            header[4..6].copy_from_slice(&layout.to_le_bytes());
+            header[6..8].copy_from_slice(&length.to_le_bytes());
+        }
+        Endian::Big => {
+            header[..4].copy_from_slice(&[0, 0x2f, 0x50, 0x5a]);
+            header[4..6].copy_from_slice(&layout.to_be_bytes());
+            header[6..8].copy_from_slice(&length.to_be_bytes());
+        }
+    }
+    header
 }
 
 // ---------------------------------------------------------------------------
@@ -490,6 +533,7 @@ fn build_sa_registry_objects(
     order: Endian,
     malformed_project_id: bool,
     with_reclamation_ownership: bool,
+    with_sa_xattrs: bool,
 ) -> (SaRegistry, Dnode, Dnode, Dnode) {
     // Attribute IDs matching OpenZFS `SaRegistry::LEGACY` (0..16) + custom attr 18:
     // 0: ATIME(16,0), 1: MTIME(16,0), 2: CTIME(16,0), 3: CRTIME(16,0), 4: GEN(8,0),
@@ -650,6 +694,29 @@ fn build_sa_registry_objects(
             values: vec![9, 15, 19],
             collision: 0,
         });
+    }
+    if with_sa_xattrs {
+        reg_entries.push(RawZapEntry {
+            name: b"ZPL_DXATTR".to_vec(),
+            integer_bytes: 8,
+            values: vec![(3_u64 << 16) | 20],
+            collision: 0,
+        });
+        for (layout, values) in [
+            (
+                b"10".as_slice(),
+                vec![5, 6, 4, 12, 13, 7, 11, 0, 1, 2, 3, 8, 20],
+            ),
+            (b"11", vec![20]),
+            (b"12", vec![9, 20]),
+        ] {
+            lay_entries.push(RawZapEntry {
+                name: layout.to_vec(),
+                integer_bytes: 2,
+                values,
+                collision: 0,
+            });
+        }
     }
     let registry = SaRegistry::from_zaps(&reg_entries, &lay_entries).expect("valid SaRegistry");
 
@@ -840,6 +907,7 @@ fn build_zpl_objectset(
             order,
             spec.malformed_project_id,
             spec.hello_ownership.is_some(),
+            !spec.hello_sa_xattrs.is_empty(),
         );
         (Some(r), Some((m_dn, r_dn, l_dn)))
     } else {
@@ -1038,6 +1106,30 @@ fn build_zpl_objectset(
                     raw[offset..offset + 8].copy_from_slice(&order.encode(value));
                 }
                 spill = Some(arena.alloc_block(&raw, 44, 0, birth, order));
+            }
+        }
+        if !spec.hello_sa_xattrs.is_empty()
+            && !spec
+                .auxiliary_ownership
+                .is_some_and(|(object, _)| object == 4)
+        {
+            assert_eq!(spec.zpl_version, 5);
+            assert!(spill.is_none());
+            let packed = fixture_sa_xattrs(&spec.hello_sa_xattrs);
+            if spec.hello_sa_xattrs_in_spill {
+                let mut raw = fixture_sa_xattr_header(11, packed.len(), order);
+                raw.extend_from_slice(&packed);
+                raw.resize(
+                    raw.len()
+                        .next_power_of_two()
+                        .max(1_usize << spec.ashift)
+                        .max(512),
+                    0,
+                );
+                spill = Some(arena.alloc_block(&raw, 44, 0, birth, order));
+            } else {
+                bbytes[..8].copy_from_slice(&fixture_sa_xattr_header(10, packed.len(), order));
+                bbytes.extend_from_slice(&packed);
             }
         }
         let hello_dn = make_dnode(
@@ -1322,7 +1414,25 @@ fn build_zpl_objectset(
             }
         };
         let mut bonus = owner_node.bonus().to_vec();
-        let spill = if spec.zpl_version == 4 {
+        let spill = if owner == 4 && !spec.hello_sa_xattrs.is_empty() {
+            assert_eq!(spec.zpl_version, 5);
+            assert!(matches!(
+                auxiliary,
+                AuxiliaryOwnership::XattrDirectory | AuxiliaryOwnership::CapabilityXattr
+            ));
+            let packed = fixture_sa_xattrs(&spec.hello_sa_xattrs);
+            let mut raw = fixture_sa_xattr_header(12, packed.len(), order);
+            raw.extend_from_slice(&payload);
+            raw.extend_from_slice(&packed);
+            raw.resize(
+                raw.len()
+                    .next_power_of_two()
+                    .max(1_usize << spec.ashift)
+                    .max(512),
+                0,
+            );
+            Some(arena.alloc_block(&raw, 44, 0, birth, order))
+        } else if spec.zpl_version == 4 {
             bonus[attribute..attribute + payload.len()].copy_from_slice(&payload);
             None
         } else {

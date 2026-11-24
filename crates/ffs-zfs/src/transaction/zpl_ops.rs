@@ -225,6 +225,9 @@ pub struct ZfsPosixSetAttr {
     /// Clear set-user-ID and executable set-group-ID after applying `mode`.
     /// Non-executable set-group-ID and directory permissions are preserved.
     pub clear_suid_sgid: bool,
+    /// Remove the exact native `security.capability` SA xattr in this TXG.
+    /// Directory-backed capability values refuse the whole mutation.
+    pub clear_file_capabilities: bool,
 }
 
 impl From<&ZfsSetAttr> for ZfsPosixSetAttr {
@@ -247,6 +250,7 @@ impl ZfsPosixSetAttr {
             && self.uid.is_none()
             && self.gid.is_none()
             && !self.clear_suid_sgid
+            && !self.clear_file_capabilities
         {
             return Err(FfsError::Format("empty native ZPL attribute update".into()));
         }
@@ -296,6 +300,7 @@ pub(super) enum ZplMutation {
         offset: u64,
         data: Vec<u8>,
         clear_suid_sgid: bool,
+        clear_file_capabilities: bool,
         timestamp: Timestamp,
         checksum: ZfsDataChecksum,
     },
@@ -305,6 +310,7 @@ pub(super) enum ZplMutation {
         length: u64,
         operation: ZfsFileRangeOperation,
         clear_suid_sgid: bool,
+        clear_file_capabilities: bool,
         timestamp: Timestamp,
         checksum: ZfsDataChecksum,
     },
@@ -800,6 +806,43 @@ fn decode_zpl_node(
         project_id,
         spill_bytes,
     })
+}
+
+fn file_capability_xattr_update(
+    cx: &Cx,
+    mos: &mut Objects,
+    dataset_components: &[Vec<u8>],
+    file_obj: u64,
+    loaded: &LoadedZplNode,
+    sa_registry: Option<&SaRegistry>,
+) -> Result<Option<BTreeMap<String, Vec<u8>>>> {
+    checkpoint(cx)?;
+    if loaded.metadata.kind != Kind::Regular {
+        return Err(unsupported(
+            "ZPL file capability removal requires a regular file",
+        ));
+    }
+    let mut source = match loaded.dnode.bonus_type() {
+        DMU_OT_ZNODE => XattrSources::legacy(loaded.dnode.bonus(), loaded.dnode.order()),
+        DMU_OT_SA => sa_registry
+            .ok_or_else(|| corrupt("missing SA registry"))?
+            .decode(loaded.dnode.bonus(), loaded.spill_bytes.as_deref())
+            .and_then(|attrs| attrs.xattrs()),
+        _ => return Err(unsupported("unsupported ZPL bonus representation")),
+    }
+    .map_err(|error| parse_err(&error))?;
+    if source.directory != 0 {
+        // Reuse the reader's bounded catalog and private-object ownership
+        // checks. A directory shadow cannot survive an SA capability removal.
+        return mos
+            .zpl(cx, dataset_components)?
+            .file_capability_removal_xattrs(cx, file_obj);
+    }
+    Ok(source
+        .inline
+        .remove("security.capability")
+        .is_some()
+        .then_some(source.inline))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2042,6 +2085,7 @@ pub(super) fn stage_zpl_mutation(
             offset,
             data,
             clear_suid_sgid,
+            clear_file_capabilities,
             timestamp,
             checksum,
         } => {
@@ -2075,14 +2119,21 @@ pub(super) fn stage_zpl_mutation(
                 ZFS_IMMUTABLE
             };
             reject_flags(&loaded.metadata, prohibited)?;
-            let new_size = loaded.metadata.size.max(end_offset);
+            let empty_privilege_write = *clear_file_capabilities && data.is_empty();
+            let new_size = if empty_privilege_write {
+                loaded.metadata.size
+            } else {
+                loaded.metadata.size.max(end_offset)
+            };
             let mut new_meta = loaded.metadata.clone();
             if *clear_suid_sgid && !data.is_empty() {
                 new_meta.mode = clear_setid_bits_for_nonroot(new_meta.mode);
             }
             new_meta.size = new_size;
-            new_meta.times[1] = *timestamp;
-            new_meta.times[2] = *timestamp;
+            if !empty_privilege_write {
+                new_meta.times[1] = *timestamp;
+                new_meta.times[2] = *timestamp;
+            }
 
             if data.is_empty() {
                 let dirty_leaves = zero_allocated_range(
@@ -2253,20 +2304,33 @@ pub(super) fn stage_zpl_mutation(
                 dirty_leaves.insert(bid, Some(blk));
             }
 
+            let inline_xattrs = if *clear_file_capabilities {
+                file_capability_xattr_update(
+                    cx,
+                    mos,
+                    dataset_components,
+                    *file_obj,
+                    &loaded,
+                    ds_ctx.sa_registry.as_ref(),
+                )?
+            } else {
+                None
+            };
             let cksum_code = if loaded.dnode.checksum_type() == ZfsDataChecksum::Sha256.code() {
                 ZfsDataChecksum::Sha256.code()
             } else {
                 checksum.code()
             };
-            let (bonus, spill) = encode_updated_zpl_bonus(
+            let (bonus, spill) = encode_updated_zpl_bonus_with_options(
                 &loaded,
                 *file_obj,
                 &new_meta,
-                ds_ctx.sa_registry.as_ref(),
+                &mut ds_ctx,
+                false,
+                inline_xattrs.as_ref(),
                 alloc,
                 order,
                 new_txg,
-                ds_ctx.write_crypto.as_mut(),
                 staged_writes,
             )?;
             let old_used = loaded.dnode.used_bytes();
@@ -2328,6 +2392,7 @@ pub(super) fn stage_zpl_mutation(
             length,
             operation,
             clear_suid_sgid,
+            clear_file_capabilities,
             timestamp,
             checksum,
         } => {
@@ -2361,6 +2426,18 @@ pub(super) fn stage_zpl_mutation(
             };
             let new_size = old_size.max(end);
             if *offset < end {
+                let inline_xattrs = if *clear_file_capabilities {
+                    file_capability_xattr_update(
+                        cx,
+                        mos,
+                        dataset_components,
+                        *file_obj,
+                        &loaded,
+                        ds_ctx.sa_registry.as_ref(),
+                    )?
+                } else {
+                    None
+                };
                 // Extending EOF also exposes the gap before `offset`; zero any
                 // allocated tail there rather than trusting bytes beyond old EOF.
                 let start = if new_size > old_size {
@@ -2377,15 +2454,16 @@ pub(super) fn stage_zpl_mutation(
                 new_meta.size = new_size;
                 new_meta.times[1] = *timestamp;
                 new_meta.times[2] = *timestamp;
-                let (bonus, spill) = encode_updated_zpl_bonus(
+                let (bonus, spill) = encode_updated_zpl_bonus_with_options(
                     &loaded,
                     *file_obj,
                     &new_meta,
-                    ds_ctx.sa_registry.as_ref(),
+                    &mut ds_ctx,
+                    false,
+                    inline_xattrs.as_ref(),
                     alloc,
                     order,
                     new_txg,
-                    ds_ctx.write_crypto.as_mut(),
                     staged_writes,
                 )?;
                 let out = cow_update_dnode_with_crypto(
@@ -2482,6 +2560,7 @@ pub(super) fn stage_zpl_mutation(
                 || attrs.uid.is_some()
                 || attrs.gid.is_some()
                 || attrs.clear_suid_sgid
+                || attrs.clear_file_capabilities
             {
                 reject_flags(&loaded.metadata, ZFS_IMMUTABLE)?;
             }
@@ -2563,13 +2642,25 @@ pub(super) fn stage_zpl_mutation(
                 new_meta.times[1] = *timestamp;
             }
             new_meta.times[2] = *timestamp;
+            let inline_xattrs = if attrs.clear_file_capabilities {
+                file_capability_xattr_update(
+                    cx,
+                    mos,
+                    dataset_components,
+                    *file_obj,
+                    &loaded,
+                    ds_ctx.sa_registry.as_ref(),
+                )?
+            } else {
+                None
+            };
             let (bonus, spill) = encode_updated_zpl_bonus_with_options(
                 &loaded,
                 *file_obj,
                 &new_meta,
                 &mut ds_ctx,
                 rebuild_trivial_acl,
-                None,
+                inline_xattrs.as_ref(),
                 alloc,
                 order,
                 new_txg,

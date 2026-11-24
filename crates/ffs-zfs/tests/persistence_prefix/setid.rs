@@ -115,6 +115,567 @@ fn durable_head(cx: &Cx, devices: &[FaultableMemberDevice]) -> ffs_zfs::Zpl {
     objects.zpl(cx, &[b"data".to_vec()]).unwrap()
 }
 
+fn capability_xattrs() -> BTreeMap<String, Vec<u8>> {
+    // Linux VFS_CAP_REVISION_2 | VFS_CAP_FLAGS_EFFECTIVE, permitted
+    // CAP_NET_BIND_SERVICE. The native writer treats the payload as opaque.
+    let mut capability = vec![0_u8; 20];
+    capability[..4].copy_from_slice(&0x0200_0001_u32.to_le_bytes());
+    capability[4..8].copy_from_slice(&0x400_u32.to_le_bytes());
+    BTreeMap::from([
+        ("security.capability".to_owned(), capability),
+        ("user.keep".to_owned(), b"retained".to_vec()),
+        ("security.keep".to_owned(), b"opaque".to_vec()),
+    ])
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn mounted_sa_capabilities_removed_atomically_with_each_data_mutation() {
+    let cx = Cx::for_testing();
+    for (in_spill, auxiliary) in [
+        (false, None),
+        (true, None),
+        (true, Some((4, AuxiliaryOwnership::XattrDirectory))),
+    ] {
+        let built = build_clean_zfs_pool(&PoolFixtureSpec {
+            mirror_width: 2,
+            hello_mode: 0o6755,
+            hello_sa_xattrs: capability_xattrs(),
+            hello_sa_xattrs_in_spill: in_spill,
+            auxiliary_ownership: auxiliary,
+            deadlist_mode: DeadlistMode::NativeDeadlist,
+            ..PoolFixtureSpec::default()
+        });
+        for operation in DATA_MUTATIONS {
+            let devices: Vec<_> = built
+                .members
+                .iter()
+                .cloned()
+                .map(FaultableMemberDevice::new)
+                .collect();
+            let engine = open_engine_on_devices(
+                &cx,
+                &devices,
+                default_write_opts(POOL_GUID, built.initial_slot),
+            )
+            .unwrap();
+            assert!(
+                durable_head(&cx, &devices)
+                    .has_file_capabilities(&cx, 4)
+                    .unwrap()
+            );
+            let fs = ZfsFs::with_writer(&cx, engine, vec![b"data".to_vec()]).unwrap();
+            let file = lookup(&fs, &cx, ROOT, "hello.txt");
+            let source = lookup(&fs, &cx, ROOT, "keep.bin");
+            let mut scope = RequestScope::empty();
+            let before = io_counts(&devices);
+            assert_eq!(
+                fs.write(&cx, &mut scope, file.ino, file.size + 32, b"")
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                fs.copy_file_range(&cx, &mut scope, source.ino, 0, file.ino, 0, 0)
+                    .unwrap(),
+                0
+            );
+            assert_eq!(io_counts(&devices), before);
+            // KEEP_SIZE entirely beyond EOF changes no bytes and retains capabilities.
+            fs.fallocate(
+                &cx,
+                &mut scope,
+                file.ino,
+                file.size + 32,
+                16,
+                libc::FALLOC_FL_ZERO_RANGE | libc::FALLOC_FL_KEEP_SIZE,
+            )
+            .unwrap();
+            assert!(
+                durable_head(&cx, &devices)
+                    .has_file_capabilities(&cx, 4)
+                    .unwrap()
+            );
+            assert_eq!(read(&fs, &cx, file.ino), built.snap_hello_expected);
+            let prior_txg = fs
+                .last_durable_token()
+                .unwrap()
+                .map_or(INITIAL_TXG, |token| token.committed_txg());
+            operation.apply(&fs, &cx, file.ino, source.ino).unwrap();
+            let token = fs.last_durable_token().unwrap().unwrap();
+            assert_eq!(token.committed_txg(), prior_txg + 1, "{operation:?}");
+            let current = lookup(&fs, &cx, ROOT, "hello.txt");
+            let expected = operation.expected(&built.snap_hello_expected);
+            assert_eq!((current.perm, current.size), (0o755, expected.len() as u64));
+            assert_eq!(
+                (current.uid, current.gid, current.generation),
+                (file.uid, file.gid, file.generation)
+            );
+            assert_eq!(read(&fs, &cx, file.ino), expected);
+            drop(fs);
+            let mut reopened = durable_head(&cx, &devices);
+            assert!(!reopened.has_file_capabilities(&cx, 4).unwrap());
+            assert_eq!(
+                reopened.getxattr(&cx, 4, "user.keep").unwrap().as_deref(),
+                Some(b"retained".as_slice())
+            );
+            assert_eq!(reopened.read(&cx, 4, 0, 8192).unwrap(), expected);
+            if auxiliary.is_some() {
+                assert_eq!(
+                    reopened
+                        .getxattr(&cx, 4, "user.retained")
+                        .unwrap()
+                        .as_deref(),
+                    Some(b"private value survives namespace changes".as_slice())
+                );
+            }
+            let mut snapshot = reopened.open_snapshot(&cx, b"before").unwrap();
+            assert!(snapshot.has_file_capabilities(&cx, 4).unwrap());
+            assert_eq!(snapshot.stat(&cx, 4).unwrap().0.mode & 0o7777, 0o6755);
+            assert_eq!(
+                snapshot.read(&cx, 4, 0, 8192).unwrap(),
+                built.snap_hello_expected
+            );
+            assert_pool_scrub_and_allocation_clean(
+                &cx,
+                &devices,
+                POOL_GUID,
+                Some(token.published_slot()),
+            );
+        }
+    }
+}
+
+#[test]
+fn sa_capability_kernel_removal_and_unchanged_size_truncate() {
+    let cx = Cx::for_testing();
+    for in_spill in [false, true] {
+        for explicit_removal in [false, true] {
+            // A capability-only map exercises removal of the complete DXATTR
+            // attribute, including retirement of a now-unneeded SA spill.
+            let mut xattrs = capability_xattrs();
+            xattrs.retain(|name, _| name == "security.capability");
+            let (engine, devices) = writer_fixture(
+                &cx,
+                &PoolFixtureSpec {
+                    hello_mode: 0o6755,
+                    hello_sa_xattrs: xattrs,
+                    hello_sa_xattrs_in_spill: in_spill,
+                    deadlist_mode: DeadlistMode::NativeDeadlist,
+                    ..PoolFixtureSpec::default()
+                },
+            );
+            let fs = ZfsFs::with_writer(&cx, engine, vec![b"data".to_vec()]).unwrap();
+            let file = lookup(&fs, &cx, ROOT, "hello.txt");
+            let original = read(&fs, &cx, file.ino);
+            let mut scope = RequestScope::empty();
+            let before = io_counts(&devices);
+            assert!(
+                fs.setattr(
+                    &cx,
+                    &mut scope,
+                    file.ino,
+                    &SetAttrRequest {
+                        size: Some(0),
+                        uid: Some(2000),
+                        ..SetAttrRequest::default()
+                    }
+                )
+                .is_err()
+            );
+            assert!(
+                fs.fallocate(
+                    &cx,
+                    &mut scope,
+                    file.ino,
+                    u64::MAX,
+                    8,
+                    libc::FALLOC_FL_ZERO_RANGE
+                )
+                .is_err()
+            );
+            assert_eq!(io_counts(&devices), before);
+            assert!(
+                durable_head(&cx, &devices)
+                    .has_file_capabilities(&cx, 4)
+                    .unwrap()
+            );
+            fs.setattr(
+                &cx,
+                &mut scope,
+                file.ino,
+                &SetAttrRequest {
+                    mtime: Some(UNIX_EPOCH + Duration::from_secs(1_715_000_000)),
+                    ..SetAttrRequest::default()
+                },
+            )
+            .unwrap();
+            assert!(
+                durable_head(&cx, &devices)
+                    .has_file_capabilities(&cx, 4)
+                    .unwrap()
+            );
+            if explicit_removal {
+                assert!(
+                    fs.removexattr(&cx, &mut scope, file.ino, "security.capability")
+                        .unwrap()
+                );
+                assert_eq!(lookup(&fs, &cx, ROOT, "hello.txt").perm, 0o6755);
+            } else {
+                let updated = fs
+                    .setattr(
+                        &cx,
+                        &mut scope,
+                        file.ino,
+                        &SetAttrRequest {
+                            size: Some(file.size),
+                            ..SetAttrRequest::default()
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(updated.perm, 0o755);
+            }
+            let token = fs.last_durable_token().unwrap().unwrap();
+            let after = io_counts(&devices);
+            assert!(
+                !fs.removexattr(&cx, &mut scope, file.ino, "security.capability")
+                    .unwrap()
+            );
+            assert_eq!(io_counts(&devices), after);
+            assert_eq!(fs.last_durable_token().unwrap().unwrap(), token);
+            assert_eq!(read(&fs, &cx, file.ino), original);
+            let mut reopened = durable_head(&cx, &devices);
+            assert!(!reopened.has_file_capabilities(&cx, 4).unwrap());
+            assert!(
+                reopened
+                    .open_snapshot(&cx, b"before")
+                    .unwrap()
+                    .has_file_capabilities(&cx, 4)
+                    .unwrap()
+            );
+            assert_pool_scrub_and_allocation_clean(
+                &cx,
+                &devices,
+                POOL_GUID,
+                Some(token.published_slot()),
+            );
+        }
+    }
+}
+
+#[test]
+fn native_sa_capability_policies_and_compound_setattr_are_explicit() {
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    let timestamp = Timestamp {
+        seconds: 1_715_000_000,
+        nanos: 0,
+    };
+    let (mut engine, devices) = writer_fixture(
+        &cx,
+        &PoolFixtureSpec {
+            hello_mode: 0o6755,
+            hello_sa_xattrs: capability_xattrs(),
+            deadlist_mode: DeadlistMode::NativeDeadlist,
+            ..PoolFixtureSpec::default()
+        },
+    );
+    let original = durable_head(&cx, &devices).stat(&cx, 4).unwrap().0;
+    engine
+        .write_file_data_clearing_privileges(
+            &cx,
+            &dataset,
+            4,
+            original.size + 100,
+            b"",
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    let unchanged = durable_head(&cx, &devices).stat(&cx, 4).unwrap().0;
+    assert_eq!(
+        (unchanged.size, unchanged.mode, unchanged.times),
+        (original.size, original.mode, original.times)
+    );
+    assert!(
+        durable_head(&cx, &devices)
+            .has_file_capabilities(&cx, 4)
+            .unwrap()
+    );
+    engine
+        .write_file_data_clearing_setid(
+            &cx,
+            &dataset,
+            4,
+            0,
+            b"native",
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    assert!(
+        durable_head(&cx, &devices)
+            .has_file_capabilities(&cx, 4)
+            .unwrap()
+    );
+    assert_eq!(
+        durable_head(&cx, &devices).stat(&cx, 4).unwrap().0.mode & 0o7777,
+        0o755
+    );
+    engine
+        .set_posix_attributes(
+            &cx,
+            &dataset,
+            4,
+            &ffs_zfs::ZfsPosixSetAttr {
+                size: Some(5),
+                mode: Some(0o6755),
+                uid: Some(2000),
+                gid: Some(2001),
+                clear_suid_sgid: true,
+                clear_file_capabilities: true,
+                ..ffs_zfs::ZfsPosixSetAttr::default()
+            },
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    let mut head = durable_head(&cx, &devices);
+    let metadata = head.stat(&cx, 4).unwrap().0;
+    assert_eq!(
+        (
+            metadata.size,
+            metadata.mode & 0o7777,
+            metadata.uid,
+            metadata.gid
+        ),
+        (5, 0o755, 2000, 2001)
+    );
+    assert_eq!(head.read(&cx, 4, 0, 8192).unwrap(), b"nativ");
+    assert!(!head.has_file_capabilities(&cx, 4).unwrap());
+    assert_eq!(
+        head.getxattr(&cx, 4, "user.keep").unwrap().as_deref(),
+        Some(b"retained".as_slice())
+    );
+}
+
+#[test]
+fn sa_capability_directory_shadow_refuses_all_mutations_without_partial_changes() {
+    let cx = Cx::for_testing();
+    let (engine, devices) = writer_fixture(
+        &cx,
+        &PoolFixtureSpec {
+            hello_mode: 0o6755,
+            hello_sa_xattrs: capability_xattrs(),
+            auxiliary_ownership: Some((4, AuxiliaryOwnership::CapabilityXattr)),
+            deadlist_mode: DeadlistMode::NativeDeadlist,
+            ..PoolFixtureSpec::default()
+        },
+    );
+    let fs = ZfsFs::with_writer_options(
+        &cx,
+        engine,
+        vec![b"data".to_vec()],
+        ffs_zfs::ZfsMountWriteOptions {
+            allow_mode_and_owner_setattr: true,
+        },
+    )
+    .unwrap();
+    let file = lookup(&fs, &cx, ROOT, "hello.txt");
+    let source = lookup(&fs, &cx, ROOT, "keep.bin");
+    let original = read(&fs, &cx, file.ino);
+    let before = io_counts(&devices);
+    for operation in DATA_MUTATIONS {
+        assert_eq!(
+            operation
+                .apply(&fs, &cx, file.ino, source.ino)
+                .unwrap_err()
+                .to_errno(),
+            libc::EOPNOTSUPP,
+            "{operation:?}"
+        );
+    }
+    let mut scope = RequestScope::empty();
+    assert_eq!(
+        fs.removexattr(&cx, &mut scope, file.ino, "security.capability")
+            .unwrap_err()
+            .to_errno(),
+        libc::EOPNOTSUPP
+    );
+    assert_eq!(
+        fs.setattr(
+            &cx,
+            &mut scope,
+            file.ino,
+            &SetAttrRequest {
+                size: Some(0),
+                mode: Some(0o600),
+                uid: Some(2000),
+                gid: Some(2001),
+                ..SetAttrRequest::default()
+            }
+        )
+        .unwrap_err()
+        .to_errno(),
+        libc::EOPNOTSUPP
+    );
+    assert_eq!(io_counts(&devices), before);
+    assert_eq!(lookup(&fs, &cx, ROOT, "hello.txt"), file);
+    assert_eq!(read(&fs, &cx, file.ino), original);
+    assert!(fs.last_durable_token().unwrap().is_none());
+    assert!(
+        durable_head(&cx, &devices)
+            .has_file_capabilities(&cx, 4)
+            .unwrap()
+    );
+}
+
+#[test]
+fn sa_capability_owner_requests_clear_privileges_even_for_unchanged_ids() {
+    let cx = Cx::for_testing();
+    for directory_shadow in [false, true] {
+        for (uid, gid) in [
+            (Some(1000), None),
+            (None, Some(1000)),
+            (Some(2000), Some(2001)),
+        ] {
+            let (engine, devices) = writer_fixture(
+                &cx,
+                &PoolFixtureSpec {
+                    hello_mode: 0o6755,
+                    hello_sa_xattrs: capability_xattrs(),
+                    auxiliary_ownership: directory_shadow
+                        .then_some((4, AuxiliaryOwnership::CapabilityXattr)),
+                    deadlist_mode: DeadlistMode::NativeDeadlist,
+                    ..PoolFixtureSpec::default()
+                },
+            );
+            let fs = ZfsFs::with_writer_options(
+                &cx,
+                engine,
+                vec![b"data".to_vec()],
+                ffs_zfs::ZfsMountWriteOptions {
+                    allow_mode_and_owner_setattr: true,
+                },
+            )
+            .unwrap();
+            let file = lookup(&fs, &cx, ROOT, "hello.txt");
+            let original = read(&fs, &cx, file.ino);
+            let before = io_counts(&devices);
+            let result = fs.setattr(
+                &cx,
+                &mut RequestScope::empty(),
+                file.ino,
+                &SetAttrRequest {
+                    uid,
+                    gid,
+                    // A rejected shadow must not partially apply an authorized
+                    // chmod or chown even without a size/data change.
+                    mode: directory_shadow.then_some(0o600),
+                    ..SetAttrRequest::default()
+                },
+            );
+            if directory_shadow {
+                assert_eq!(result.unwrap_err().to_errno(), libc::EOPNOTSUPP);
+                assert_eq!(io_counts(&devices), before);
+                assert_eq!(lookup(&fs, &cx, ROOT, "hello.txt"), file);
+                assert!(fs.last_durable_token().unwrap().is_none());
+            } else {
+                let attr = result.unwrap();
+                assert_eq!(
+                    (attr.perm, attr.uid, attr.gid),
+                    (0o755, uid.unwrap_or(file.uid), gid.unwrap_or(file.gid))
+                );
+                assert_eq!(
+                    fs.last_durable_token().unwrap().unwrap().committed_txg(),
+                    INITIAL_TXG + 1
+                );
+            }
+            assert_eq!(read(&fs, &cx, file.ino), original);
+            let mut head = durable_head(&cx, &devices);
+            assert_eq!(
+                head.has_file_capabilities(&cx, 4).unwrap(),
+                directory_shadow
+            );
+            assert!(
+                head.open_snapshot(&cx, b"before")
+                    .unwrap()
+                    .has_file_capabilities(&cx, 4)
+                    .unwrap()
+            );
+        }
+    }
+}
+
+#[test]
+fn sa_capability_clearing_preserves_native_flag_admission() {
+    let cx = Cx::for_testing();
+    for flag in [
+        0x0000_0001_0000_0000,
+        0x0000_0010_0000_0000,
+        0x0000_0040_0000_0000,
+    ] {
+        let (engine, devices) = writer_fixture(
+            &cx,
+            &PoolFixtureSpec {
+                hello_mode: 0o6755,
+                hello_sa_xattrs: capability_xattrs(),
+                zpl_flags: BTreeMap::from([(4, flag)]),
+                deadlist_mode: DeadlistMode::NativeDeadlist,
+                ..PoolFixtureSpec::default()
+            },
+        );
+        let fs = ZfsFs::with_writer(&cx, engine, vec![b"data".to_vec()]).unwrap();
+        let file = lookup(&fs, &cx, ROOT, "hello.txt");
+        let source = lookup(&fs, &cx, ROOT, "keep.bin");
+        let original = read(&fs, &cx, file.ino);
+        let before = io_counts(&devices);
+        for operation in DATA_MUTATIONS {
+            assert!(
+                operation.apply(&fs, &cx, file.ino, source.ino).is_err(),
+                "{operation:?}, {flag:x}"
+            );
+        }
+        assert_eq!(
+            fs.removexattr(
+                &cx,
+                &mut RequestScope::empty(),
+                file.ino,
+                "security.capability"
+            )
+            .unwrap_err()
+            .to_errno(),
+            libc::EPERM
+        );
+        assert_eq!(io_counts(&devices), before);
+        assert_eq!(lookup(&fs, &cx, ROOT, "hello.txt"), file);
+        assert_eq!(read(&fs, &cx, file.ino), original);
+        assert!(
+            durable_head(&cx, &devices)
+                .has_file_capabilities(&cx, 4)
+                .unwrap()
+        );
+        if flag == 0x0000_0040_0000_0000 {
+            // APPENDONLY authorizes extending data; capability removal must not
+            // accidentally import the ordinary xattr setter's stricter denial.
+            fs.write(
+                &cx,
+                &mut RequestScope::empty(),
+                file.ino,
+                file.size,
+                b"appended",
+            )
+            .unwrap();
+            let mut head = durable_head(&cx, &devices);
+            assert!(!head.has_file_capabilities(&cx, 4).unwrap());
+            assert_eq!(head.read(&cx, 4, file.size, 8).unwrap(), b"appended");
+            assert_eq!(head.stat(&cx, 4).unwrap().0.mode & 0o7777, 0o755);
+        }
+    }
+}
+
 fn native_acl_snapshot(cx: &Cx, devices: &[FaultableMemberDevice]) -> (Vec<u8>, Option<Vec<u8>>) {
     let device = devices[0].fresh_from_durable();
     let len = device.len_bytes();
@@ -526,13 +1087,28 @@ fn explicit_native_editors_preserve_setid_and_compound_truncate_honors_clear_req
 }
 
 #[test]
-#[allow(clippy::too_many_lines)]
 fn mounted_setid_persistence_cuts_never_publish_changed_data_with_old_privileges() {
+    data_privilege_persistence_cuts(false);
+}
+
+#[test]
+fn mounted_sa_capability_persistence_cuts_keep_data_and_privileges_atomic() {
+    data_privilege_persistence_cuts(true);
+}
+
+#[allow(clippy::too_many_lines)]
+fn data_privilege_persistence_cuts(capabilities: bool) {
     let cx = Cx::for_testing();
     let built = build_clean_zfs_pool(&PoolFixtureSpec {
         mirror_width: 2,
         hello_mode: 0o6755,
-        with_sa_spill: true,
+        with_sa_spill: !capabilities,
+        hello_sa_xattrs: if capabilities {
+            capability_xattrs()
+        } else {
+            BTreeMap::new()
+        },
+        hello_sa_xattrs_in_spill: capabilities,
         deadlist_mode: DeadlistMode::NativeDeadlist,
         ..PoolFixtureSpec::default()
     });
@@ -620,6 +1196,18 @@ fn mounted_setid_persistence_cuts_never_publish_changed_data_with_old_privileges
                 let metadata = reopened.stat(&cx, 4).unwrap().0;
                 let bytes = reopened.read(&cx, 4, 0, 8192).unwrap();
                 let committed = metadata.mode & 0o7777 == 0o755;
+                if capabilities {
+                    assert_eq!(
+                        reopened.has_file_capabilities(&cx, 4).unwrap(),
+                        !committed,
+                        "{operation:?}: {:?}",
+                        cut.stage
+                    );
+                    assert_eq!(
+                        reopened.getxattr(&cx, 4, "user.keep").unwrap().as_deref(),
+                        Some(b"retained".as_slice())
+                    );
+                }
                 if committed {
                     assert_eq!(bytes, expected, "{operation:?}: {:?}", cut.stage);
                     assert_eq!(metadata.size, expected.len() as u64);
@@ -639,6 +1227,9 @@ fn mounted_setid_persistence_cuts_never_publish_changed_data_with_old_privileges
                     assert!(committed);
                 }
                 let mut snapshot = reopened.open_snapshot(&cx, b"before").unwrap();
+                if capabilities {
+                    assert!(snapshot.has_file_capabilities(&cx, 4).unwrap());
+                }
                 assert_eq!(snapshot.stat(&cx, 4).unwrap().0.mode & 0o7777, 0o6755);
                 assert_eq!(
                     snapshot.read(&cx, 4, 0, 8192).unwrap(),
