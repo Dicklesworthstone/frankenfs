@@ -4580,6 +4580,217 @@ fn partition_slice_open_files_at_preserves_prefix_and_suffix_canaries() {
 // 3. Snapshotted dataset COW + Deadlist (`DMU_OT_BPOBJ` & `DMU_OT_DEADLIST`)
 // ---------------------------------------------------------------------------
 
+fn native_zpl_file_dnode(
+    cx: &Cx,
+    engine: &ZfsTransactionEngine,
+    device: &FaultableMemberDevice,
+    dataset: &[Vec<u8>],
+    object: u64,
+) -> Dnode {
+    let mut mos = engine.open_read_objects(cx).unwrap();
+    let dataset = mos
+        .datasets(cx)
+        .unwrap()
+        .into_iter()
+        .find(|row| row.components == dataset)
+        .unwrap();
+    let head = mos.object(cx, dataset.head_object).unwrap();
+    let root = BlockPointer::parse(&head.bonus()[128..256], head.order()).unwrap();
+    let image = device.durable_snapshot();
+    let read = |pointer: &BlockPointer| {
+        let dva = pointer.regular_dvas().unwrap()[0];
+        let start = usize::try_from(DATA_OFFSET + dva.offset).unwrap();
+        ffs_ondisk::zfs::decompress(
+            &image[start..start + pointer.physical_bytes()],
+            pointer.compression(),
+            pointer.logical_bytes(),
+        )
+        .unwrap()
+    };
+    let objectset = ObjectSet::parse(&read(&root), root.payload_order()).unwrap();
+    assert_eq!(objectset.meta.levels(), 1);
+    let slot = usize::try_from(object).unwrap();
+    let slots_per_block = DNODE_BLOCK_BYTES / DNODE_BYTES;
+    let table_pointer = &objectset.meta.pointers()[slot / slots_per_block];
+    ffs_ondisk::zfs_dmu::dnode_at(
+        &read(table_pointer),
+        slot % slots_per_block,
+        table_pointer.payload_order(),
+    )
+    .unwrap()
+    .unwrap()
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn native_writes_resolve_effective_recordsize_before_choosing_file_geometry() {
+    const RECORDSIZE: &[u8] = b"recordsize";
+    const RECEIVED: &[u8] = b"recordsize$recvd";
+    const INHERIT: &[u8] = b"recordsize$inherit";
+    let cases = [
+        ("default", vec![], vec![], 131_072_usize),
+        ("inherited", vec![(RECORDSIZE, 4096)], vec![], 4096),
+        (
+            "local-override",
+            vec![(RECORDSIZE, 512)],
+            vec![(RECORDSIZE, 8192)],
+            8192,
+        ),
+        (
+            "received",
+            vec![(RECORDSIZE, 4096)],
+            vec![(RECEIVED, 8192)],
+            8192,
+        ),
+        (
+            "inherit-suppresses-received",
+            vec![(RECORDSIZE, 4096)],
+            vec![(RECEIVED, 8192), (INHERIT, 1)],
+            4096,
+        ),
+        (
+            "local-precedes-inherit",
+            vec![(RECORDSIZE, 8192)],
+            vec![(RECORDSIZE, 2048), (RECEIVED, 512), (INHERIT, 1)],
+            2048,
+        ),
+        ("inherited-received", vec![(RECEIVED, 1024)], vec![], 1024),
+    ];
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    let timestamp = Timestamp {
+        seconds: 1_715_000_198,
+        nanos: 19,
+    };
+    for zpl_version in [4, 5] {
+        for (case, root_properties, data_properties, recordsize) in &cases {
+            let built = build_clean_zfs_pool(&PoolFixtureSpec {
+                zpl_version,
+                deadlist_mode: DeadlistMode::NativeDeadlist,
+                root_properties: root_properties.clone(),
+                data_properties: data_properties.clone(),
+                ..PoolFixtureSpec::default()
+            });
+            let devices: Vec<_> = built
+                .members
+                .into_iter()
+                .map(FaultableMemberDevice::new)
+                .collect();
+            let mut engine = open_engine_on_devices(
+                &cx,
+                &devices,
+                default_write_opts(built.pool_guid, built.initial_slot),
+            )
+            .unwrap();
+            let (object, _) = engine
+                .create_file(
+                    &cx,
+                    &dataset,
+                    2,
+                    b"geometry.bin",
+                    0o644,
+                    1000,
+                    1000,
+                    timestamp,
+                    ZfsDataChecksum::Fletcher4,
+                )
+                .into_result()
+                .unwrap_or_else(|error| panic!("{case}: {error}"));
+            let payload: Vec<_> = (0..recordsize * 2 + 17)
+                .map(|index| u8::try_from(index % 251).unwrap())
+                .collect();
+            let (_, token) = engine
+                .write_file_data(
+                    &cx,
+                    &dataset,
+                    object,
+                    0,
+                    &payload,
+                    timestamp,
+                    ZfsDataChecksum::Fletcher4,
+                )
+                .into_result()
+                .unwrap_or_else(|error| panic!("{case}: {error}"));
+            engine.verify_token(&token).unwrap();
+            let slot = engine.committed_slot();
+            drop(engine);
+
+            let durable: Vec<_> = devices
+                .iter()
+                .map(FaultableMemberDevice::fresh_from_durable)
+                .collect();
+            let reopened =
+                open_engine_on_devices(&cx, &durable, default_write_opts(built.pool_guid, slot))
+                    .unwrap();
+            let node = native_zpl_file_dnode(&cx, &reopened, &durable[0], &dataset, object);
+            assert_eq!(node.data_bytes(), *recordsize, "{case}");
+            let mut mos = reopened.open_read_objects(&cx).unwrap();
+            let mut zpl = mos.zpl(&cx, &dataset).unwrap();
+            assert_eq!(
+                zpl.resolve(&cx, b"/geometry.bin").unwrap(),
+                object,
+                "{case}"
+            );
+            assert_eq!(
+                zpl.read(&cx, object, 0, payload.len() + 1).unwrap(),
+                payload,
+                "{case}"
+            );
+            let mut snapshot = mos.zpl_snapshot(&cx, &dataset, b"before").unwrap();
+            assert!(matches!(
+                snapshot.resolve(&cx, b"/geometry.bin"),
+                Err(FfsError::NotFound(_))
+            ));
+            assert_pool_scrub_and_allocation_clean(&cx, &durable, built.pool_guid, Some(slot));
+        }
+    }
+}
+
+#[test]
+fn native_writes_reject_invalid_effective_recordsize_without_backing_writes() {
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    let timestamp = Timestamp {
+        seconds: 1_715_000_198,
+        nanos: 0,
+    };
+    for invalid in [0, 511, 513, 1_048_577, u64::MAX] {
+        for (root_properties, data_properties) in [
+            (vec![(b"recordsize".as_slice(), invalid)], vec![]),
+            (vec![], vec![(b"recordsize".as_slice(), invalid)]),
+            (vec![], vec![(b"recordsize$recvd".as_slice(), invalid)]),
+        ] {
+            let built = build_clean_zfs_pool(&PoolFixtureSpec {
+                root_properties,
+                data_properties,
+                ..PoolFixtureSpec::default()
+            });
+            let devices: Vec<_> = built
+                .members
+                .into_iter()
+                .map(FaultableMemberDevice::new)
+                .collect();
+            let mut engine = open_engine_on_devices(
+                &cx,
+                &devices,
+                default_write_opts(built.pool_guid, built.initial_slot),
+            )
+            .unwrap();
+            assert_native_write_refused(&mut engine, &devices, libc::EIO, |writer| {
+                writer.write_file_data(
+                    &cx,
+                    &dataset,
+                    4,
+                    0,
+                    b"must not be published",
+                    timestamp,
+                    ZfsDataChecksum::Fletcher4,
+                )
+            });
+        }
+    }
+}
+
 #[test]
 fn writes_preserve_existing_blocks_after_recordsize_reduction() {
     let cx = Cx::for_testing();

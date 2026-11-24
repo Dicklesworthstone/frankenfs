@@ -460,7 +460,7 @@ fn open_head_dataset_context(
         cx,
         dataset_components,
         None,
-        &["readonly".into(), "compression".into()],
+        &["readonly".into(), "compression".into(), "recordsize".into()],
     )?;
     match properties
         .values
@@ -541,21 +541,24 @@ fn open_head_dataset_context(
         os.zil_header = ffs_ondisk::zfs_dmu::ZilHeader::empty();
     }
 
-    // Read optional `recordsize` property on `dsl_dir` if explicitly set.
-    let mut recordsize = DEFAULT_RECORDSIZE;
-    let (dir_dn, _) = mos.object_with_ceiling(cx, ds_row.directory_object)?;
-    let props_zap = dir_dn
-        .order()
-        .u64(dir_dn.bonus(), 80)
-        .map_err(|e| parse_err(&e))?;
-    if props_zap != 0
-        && let Ok(props) = mos.zap_values(cx, props_zap)
-        && let Ok(Some(rs)) = zap_optional_u64(&props, b"recordsize")
-        && (512..=1_048_576).contains(&rs)
-        && rs.is_power_of_two()
+    let recordsize = match properties
+        .values
+        .get(2)
+        .and_then(|property| property.value.as_ref())
     {
-        recordsize = (rs as usize).min(DEFAULT_RECORDSIZE);
-    }
+        Some(PropertyValue::Number(size))
+            if (512..=1_048_576).contains(size) && size.is_power_of_two() =>
+        {
+            // recordsize is a maximum. Keep the existing 128 KiB writer ceiling
+            // until large-block dataset feature ownership is supported.
+            (*size as usize).min(DEFAULT_RECORDSIZE)
+        }
+        _ => {
+            return Err(corrupt(
+                "missing or invalid effective ZFS recordsize property",
+            ));
+        }
+    };
 
     let (write_crypto, view_crypto) = if let (Some(info), Some(key)) = (crypto_info, loaded_key) {
         let ivset_guid = if head_dn.object_type() == DMU_OTN_ZAP_METADATA {
