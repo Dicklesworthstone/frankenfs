@@ -458,7 +458,7 @@ fn owner_quota_mixed_objectset_order_preserves_reads_and_refuses_mutations() {
         &PoolFixtureSpec {
             zpl_order: Some(Endian::Big),
             owner_quota_objects: vec![(b"userquota@", 11)],
-            owner_quota_entries: BTreeMap::from([(11, vec![(b"3e8", u64::MAX)])]),
+            owner_quota_entries: BTreeMap::from([(11, vec![(b"3e8".as_slice(), u64::MAX)])]),
             ..accounted_spec()
         },
     );

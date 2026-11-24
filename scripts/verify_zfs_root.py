@@ -521,7 +521,10 @@ def main() -> None:
                         "-o", "feature@async_destroy=enabled",
                         "-o", "feature@empty_bpobj=enabled",
                         "-o", "feature@enabled_txg=enabled",
+                        "-o", "feature@encryption=enabled",
+                        "-o", "feature@extensible_dataset=enabled",
                         "-o", "feature@hole_birth=enabled",
+                        "-o", "feature@lz4_compress=enabled",
                         "-o", "feature@spacemap_histogram=enabled",
                         "-o", "feature@spacemap_v2=enabled",
                         "-m", "none", "-o", "cachefile=none",
@@ -621,6 +624,46 @@ def main() -> None:
                 adv_root_tx("tx-rename-dataset", writable_img, "data/tx_renamed", "--dataset", "data/tx_child")
                 adv_root_tx("tx-create-dataset", writable_img, "ephemeral", "--dataset", "data")
                 adv_root_tx("tx-destroy-dataset", writable_img, "--dataset", "data/ephemeral")
+                # Native encrypted dataset root creation, key-status, keyless scrub, and keyless locked destroy.
+                # Ephemeral key lives outside `root` so zero key material enters retained proof artifacts.
+                with tempfile.TemporaryDirectory(prefix="ffs-zfs-root-keys-") as root_key_dir:
+                    os.chmod(root_key_dir, 0o700)
+                    root_enc_key = Path(root_key_dir) / "enc.key"
+                    root_enc_key.write_bytes(secrets.token_bytes(32))
+                    os.chmod(root_enc_key, 0o600)
+                    adv_root_tx(
+                        "tx-create-dataset", writable_img, "tx_enc", "--dataset", "data",
+                        "--encryption", "aes-256-gcm",
+                        "--keylocation", "prompt",
+                        "--new-key-file", root_enc_key,
+                        "--prop", "compression=lz4",
+                    )
+                    enc_opts = [
+                        "--offline-image", "--pool-guid", tx_guid, "--label", "0",
+                        "--slot", str(cur_slot), "--dataset", "data/tx_enc",
+                    ]
+                    ks_doc = json.loads(command(binary, "key-status", writable_img, *enc_opts))
+                    require(
+                        ks_doc["encrypted"] is True
+                        and ks_doc["encryption"] == "aes-256-gcm"
+                        and ks_doc["keyformat"] == "raw"
+                        and ks_doc["keystatus"] == "unavailable",
+                        f"unexpected root encrypted key-status: {ks_doc}",
+                    )
+                    enc_scrub = json.loads(command(binary, "scrub", writable_img, *enc_opts))
+                    require(
+                        enc_scrub["clean"] is True and enc_scrub["key_status"] == "unavailable",
+                        f"keyless scrub failed on root encrypted dataset: {enc_scrub}",
+                    )
+                    lk_doc = json.loads(
+                        command(binary, "load-key", writable_img, *enc_opts, "--key-file", root_enc_key)
+                    )
+                    require(
+                        lk_doc["keystatus"] == "available",
+                        f"load-key failed on root encrypted dataset: {lk_doc}",
+                    )
+                    # Keyless locked destroy must reclaim all encrypted blocks and com.datto:encryption refcount!
+                    adv_root_tx("tx-destroy-dataset", writable_img, "--dataset", "data/tx_enc")
                 adv_root_tx(
                     "tx-zvol-create",
                     writable_img,

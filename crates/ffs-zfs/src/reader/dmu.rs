@@ -399,7 +399,7 @@ impl Objects {
     /// When `verify_key` is `None` and `allow_protected_keyless` is `true` (e.g.,
     /// keyless `datasets`/`snapshots`/`raw_scrub` inspection), protected objset
     /// blocks are physically checksummed and decompressed without needing the key.
-    pub(super) fn read_dataset_objset_block(
+    fn read_dataset_objset_block(
         &mut self,
         cx: &Cx,
         bp: &BlockPointer,

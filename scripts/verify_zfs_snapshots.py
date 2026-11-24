@@ -527,8 +527,10 @@ def main() -> None:
                         "-o", "feature@bookmarks=enabled",
                         "-o", "feature@empty_bpobj=enabled",
                         "-o", "feature@enabled_txg=enabled",
+                        "-o", "feature@encryption=enabled",
                         "-o", "feature@extensible_dataset=enabled",
                         "-o", "feature@hole_birth=enabled",
+                        "-o", "feature@lz4_compress=enabled",
                         "-o", "feature@spacemap_histogram=enabled",
                         "-o", "feature@spacemap_v2=enabled",
                     ])
@@ -835,6 +837,107 @@ def main() -> None:
                     run_ds_tx("data/snap_vol_clone", "tx-zvol-destroy", writable_img)
                     run_ds_tx("data/snap_vol", "tx-destroy-snapshot", writable_img, "vsnap1")
                     run_ds_tx("data/snap_vol", "tx-zvol-destroy", writable_img)
+
+                    # Native encrypted dataset snapshot lifecycle: raw keyless snapshot listing/scrub,
+                    # keyed head vs snapshot readback, atomic key rotation (tx-change-key), and locked destroy!
+                    with tempfile.TemporaryDirectory(prefix="ffs-zfs-snap-keys-") as snap_key_dir:
+                        os.chmod(snap_key_dir, 0o700)
+                        enc_key_v1 = Path(snap_key_dir) / "snap-v1.key"
+                        enc_key_v2 = Path(snap_key_dir) / "snap-v2.key"
+                        enc_key_v1.write_bytes(secrets.token_bytes(32))
+                        enc_key_v2.write_bytes(secrets.token_bytes(32))
+                        os.chmod(enc_key_v1, 0o600)
+                        os.chmod(enc_key_v2, 0o600)
+                        enc_v1_payload = b"ENCRYPTED_SNAPSHOT_V1_BLOCK_" * 900
+                        enc_v2_payload = b"ENCRYPTED_HEAD_V2_OVERWRITE_" * 900
+                        enc_v1_file = directory / "enc-snap-v1.bin"
+                        enc_v2_file = directory / "enc-snap-v2.bin"
+                        enc_v1_file.write_bytes(enc_v1_payload)
+                        enc_v2_file.write_bytes(enc_v2_payload)
+
+                        run_ds_tx(
+                            "data", "tx-create-dataset", writable_img, "enc_snap",
+                            "--encryption", "aes-256-gcm",
+                            "--keylocation", "prompt",
+                            "--new-key-file", enc_key_v1,
+                            "--prop", "compression=lz4",
+                        )
+                        run_ds_tx(
+                            "data/enc_snap", "tx-create", writable_img, "/secret.bin",
+                            "--mode", "0640", "--key-file", enc_key_v1,
+                        )
+                        run_ds_tx(
+                            "data/enc_snap", "tx-write", writable_img, "/secret.bin",
+                            "--data-file", enc_v1_file, "--sha256", "--key-file", enc_key_v1,
+                        )
+                        run_ds_tx(
+                            "data/enc_snap", "tx-snapshot", writable_img, "es1",
+                            "--key-file", enc_key_v1,
+                        )
+                        run_ds_tx(
+                            "data/enc_snap", "tx-write", writable_img, "/secret.bin",
+                            "--data-file", enc_v2_file, "--sha256", "--key-file", enc_key_v1,
+                        )
+                        enc_snap_opts = [
+                            "--offline-image", "--pool-guid", tx_pool_guid, "--label", "0",
+                            "--slot", str(cur_slot), "--dataset", "data/enc_snap",
+                        ]
+                        enc_snaps = json.loads(command(binary, "snapshots", writable_img, *enc_snap_opts))
+                        enc_snap_ids = snapshot_identities(enc_snaps, tx_pool_guid, "data/enc_snap", cur_txg)
+                        require("es1" in enc_snap_ids, "encrypted snapshot @es1 missing from keyless inventory")
+                        # Keyless raw scrub succeeds on both encrypted head and snapshot; keyless read refuses.
+                        for s_extra in ([], ["--snapshot", "es1"]):
+                            raw_sc = json.loads(command(binary, "scrub", writable_img, *enc_snap_opts, *s_extra))
+                            require(
+                                raw_sc["clean"] is True and raw_sc["key_status"] == "unavailable",
+                                f"keyless encrypted snapshot scrub failed ({s_extra}): {raw_sc}",
+                            )
+                            command(binary, "read", writable_img, "/secret.bin", *enc_snap_opts, *s_extra, fails=True)
+                        # Keyed read with v1 matches exact pre/post snapshot payloads.
+                        require(
+                            command(binary, "read", writable_img, "/secret.bin", *enc_snap_opts,
+                                    "--snapshot", "es1", "--key-file", enc_key_v1) == enc_v1_payload,
+                            "encrypted @es1 readback mismatch before change-key",
+                        )
+                        require(
+                            command(binary, "read", writable_img, "/secret.bin", *enc_snap_opts,
+                                    "--key-file", enc_key_v1) == enc_v2_payload,
+                            "encrypted head readback mismatch before change-key",
+                        )
+                        # Rotate wrapping key v1 -> v2 and verify old key fails closed while v2 reads head + @es1!
+                        run_ds_tx(
+                            "data/enc_snap", "tx-change-key", writable_img,
+                            "--key-file", enc_key_v1,
+                            "--new-key-file", enc_key_v2,
+                        )
+                        enc_snap_opts = [
+                            "--offline-image", "--pool-guid", tx_pool_guid, "--label", "0",
+                            "--slot", str(cur_slot), "--dataset", "data/enc_snap",
+                        ]
+                        command(binary, "read", writable_img, "/secret.bin", *enc_snap_opts,
+                                "--snapshot", "es1", "--key-file", enc_key_v1, fails=True)
+                        require(
+                            command(binary, "read", writable_img, "/secret.bin", *enc_snap_opts,
+                                    "--snapshot", "es1", "--key-file", enc_key_v2) == enc_v1_payload,
+                            "encrypted @es1 readback mismatch after change-key",
+                        )
+                        require(
+                            command(binary, "read", writable_img, "/secret.bin", *enc_snap_opts,
+                                    "--key-file", enc_key_v2) == enc_v2_payload,
+                            "encrypted head readback mismatch after change-key",
+                        )
+                        for s_extra in ([], ["--snapshot", "es1"]):
+                            keyed_sc = json.loads(
+                                command(binary, "scrub", writable_img, *enc_snap_opts, *s_extra,
+                                        "--key-file", enc_key_v2)
+                            )
+                            require(
+                                keyed_sc["clean"] is True and keyed_sc["key_status"] == "available",
+                                f"keyed encrypted snapshot scrub failed ({s_extra}): {keyed_sc}",
+                            )
+                        # Locked keyless destroy of encrypted snapshot + dataset so zdb -bccm verifies zero leaks!
+                        run_ds_tx("data/enc_snap", "tx-destroy-snapshot", writable_img, "es1")
+                        run_ds_tx("data/enc_snap", "tx-destroy-dataset", writable_img)
 
                 command("zdb", "-lu", writable_img)
                 bccm_text = command("zdb", "-e", "-p", writable_dir, "-bccm", tx_pool).decode("utf-8", errors="replace")

@@ -3,10 +3,11 @@
 //! nonce uniqueness, and persistence-prefix fault-cut rollback integration tests.
 
 use super::*;
-use ffs_core::FsOps;
+use ffs_core::{FsOps, RequestScope};
 use ffs_ondisk::zfs::crypto::{
     DSL_CRYPTO_MAC, DSL_DIR_CRYPTO_KEY_OBJ, ZfsKeyFormat, ZioEncrypt, bp_crypt_iv, bp_crypt_salt,
-    decrypt_dnode_block, verify_objset_macs,
+    decrypt_dnode_block, decrypt_regular_block, encode_crypt_mac_words, encrypt_regular_block,
+    verify_objset_macs,
 };
 use ffs_zfs::reader::dmu::properties::PropertyValue;
 use ffs_zfs::{
@@ -735,10 +736,16 @@ fn encrypted_key_lifecycle_change_key_unload_revocation_zvol_and_locked_destroy(
     .unwrap();
     let root_ino = ffs_types::InodeNumber(1);
     let attr = fs
-        .lookup(&cx, root_ino, std::ffi::OsStr::new("alpha.txt"))
+        .lookup(
+            &cx,
+            &mut RequestScope::empty(),
+            root_ino,
+            std::ffi::OsStr::new("alpha.txt"),
+        )
         .unwrap();
     assert_eq!(
-        fs.read(&cx, attr.ino, 0, 30).unwrap(),
+        fs.read(&cx, &mut RequestScope::empty(), attr.ino, 0, 30)
+            .unwrap(),
         &original_bytes[..30]
     );
     let root_ddobj = post_mos
@@ -746,9 +753,15 @@ fn encrypted_key_lifecycle_change_key_unload_revocation_zvol_and_locked_destroy(
         .unwrap()
         .unwrap()
         .encryption_root_ddobj;
-    assert!(fs.keyring().unload_key(root_ddobj).unwrap());
+    assert!(
+        fs.keyring()
+            .unwrap()
+            .unwrap()
+            .unload_key(root_ddobj)
+            .unwrap()
+    );
     assert!(matches!(
-        fs.read(&cx, attr.ino, 0, 30),
+        fs.read(&cx, &mut RequestScope::empty(), attr.ino, 0, 30),
         Err(FfsError::PermissionDenied)
     ));
     drop(fs);
@@ -1018,7 +1031,7 @@ fn encrypted_tamper_rejection_nonce_uniqueness_and_fault_cut_rollback() {
 
     // 4d. Flip 1 bit in `dsl_crypto_key` ZAP physical block -> `load_key` MUST fail closed!
     {
-        let mut tampered = clean_img;
+        let mut tampered = clean_img.clone();
         let ck_dn = inspect_mos.object(&cx, crypto.crypto_key_obj).unwrap();
         let ck_dva = ck_dn.pointers()[0].data_dvas().unwrap()[0];
         let ck_off = find_dva_physical_offset(ck_dva);
@@ -1030,6 +1043,214 @@ fn encrypted_tamper_rejection_nonce_uniqueness_and_fault_cut_rollback() {
             "tampered dsl_crypto_key ({:?}/{:?}) must fail closed",
             std::str::from_utf8(DSL_DIR_CRYPTO_KEY_OBJ),
             std::str::from_utf8(DSL_CRYPTO_MAC),
+        );
+    }
+
+    // 4e. Replayed block / swapped `(salt, iv)` / birth-TXG replay MUST fail closed without plaintext fabrication!
+    {
+        let key = inspect_mos
+            .keyring()
+            .get(crypto.encryption_root_ddobj)
+            .unwrap();
+        let l0_0_off = find_dva_physical_offset(l0_bps[0].data_dvas().unwrap()[0]);
+        let l0_0_phys = &clean_img[l0_0_off..l0_0_off + l0_bps[0].physical_bytes()];
+        // Replaying valid block 1's `(salt, iv, mac)` metadata against block 0's ciphertext fails AEAD MAC.
+        assert!(
+            decrypt_regular_block(&key, &l0_bps[1], l0_0_phys).is_err(),
+            "replayed BlockPointer from sibling block must fail AEAD authentication"
+        );
+        // Mutating salt/IV inside an otherwise valid BlockPointer fails AEAD authentication.
+        let order = l0_bps[0].payload_order();
+        let mut mutated_raw = [0_u8; 128];
+        for word_idx in 0..16 {
+            mutated_raw[word_idx * 8..(word_idx + 1) * 8]
+                .copy_from_slice(&order.encode(l0_bps[0].raw_word(word_idx)));
+        }
+        mutated_raw[4 * 8] ^= 0x01; // flip 1 bit in salt
+        let mutated_salt_bp = BlockPointer::parse(&mutated_raw, order).unwrap();
+        assert!(
+            decrypt_regular_block(&key, &mutated_salt_bp, l0_0_phys).is_err(),
+            "mutated salt in BlockPointer must fail AEAD authentication"
+        );
+        // Swapping valid L0 block 1's BP into L0 block 0's slot on disk inside L1 indirect block
+        // fails closed on BOTH keyless scrub AND keyed read!
+        let mut replayed_img = clean_img.clone();
+        let l1_off = find_dva_physical_offset(l1_bp.data_dvas().unwrap()[0]);
+        let bp1_bytes = replayed_img[l1_off + 128..l1_off + 256].to_vec();
+        replayed_img[l1_off..l1_off + 128].copy_from_slice(&bp1_bytes);
+        let tdev = vec![FaultableMemberDevice::new(replayed_img)];
+        let mut tmos = open_pool_objects(&cx, &tdev, built.pool_guid, last_slot);
+        let keyless_scrub = tmos
+            .scrub_dataset(&cx, &enc_ds, None, ScrubLimits::default())
+            .unwrap();
+        assert!(
+            !keyless_scrub.is_clean(),
+            "keyless scrub must reject replayed/swapped L0 slot inside L1 indirect block"
+        );
+        tmos.load_key(&cx, &enc_ds, &key1).unwrap();
+        let mut tzpl = tmos.zpl(&cx, &enc_ds).unwrap();
+        assert!(tzpl.read(&cx, file_obj, 0, 4096).is_err());
+    }
+
+    // 4f. Truncated ciphertext & forged compressed LZ4 decompression-bomb payload fail closed cleanly!
+    {
+        let key = inspect_mos
+            .keyring()
+            .get(crypto.encryption_root_ddobj)
+            .unwrap();
+        let l0_0_off = find_dva_physical_offset(l0_bps[0].data_dvas().unwrap()[0]);
+        let l0_0_phys = &clean_img[l0_0_off..l0_0_off + l0_bps[0].physical_bytes()];
+        // Truncated ciphertext slice fails AEAD verification before any decode.
+        assert!(
+            decrypt_regular_block(&key, &l0_bps[0], &l0_0_phys[..l0_0_phys.len() - 7]).is_err(),
+            "truncated encrypted block must fail closed"
+        );
+        // Even with an authentic AEAD MAC, a malformed/truncated LZ4 decompression payload
+        // declaring an invalid compressed length or bomb-like expansion must fail closed without OOM/fabrication.
+        let order = l0_bps[0].payload_order();
+        let salt = bp_crypt_salt(&l0_bps[0]);
+        let iv = bp_crypt_iv(&l0_bps[0]);
+        let mut bomb_plain = vec![0_u8; 4096];
+        // ZFS LZ4 header = big-endian compressed payload length; 0xFFFF_FFFF exceeds physical buffer (truncated/bomb).
+        bomb_plain[0..4].copy_from_slice(&0xFFFF_FFFF_u32.to_be_bytes());
+        let (bomb_ct, bomb_mac) = encrypt_regular_block(&key, &salt, &iv, &bomb_plain).unwrap();
+        let mut bomb_bp_raw = [0_u8; 128];
+        for word_idx in 0..16 {
+            bomb_bp_raw[word_idx * 8..(word_idx + 1) * 8]
+                .copy_from_slice(&order.encode(l0_bps[0].raw_word(word_idx)));
+        }
+        // Set compression field (word 6, bits 32..39) to LZ4 (15) and update MAC words[14..16].
+        let w6_lz4 = (l0_bps[0].raw_word(6) & !(0x7F_u64 << 32)) | (15_u64 << 32);
+        bomb_bp_raw[6 * 8..7 * 8].copy_from_slice(&order.encode(w6_lz4));
+        let mac_words = encode_crypt_mac_words(&bomb_mac, order);
+        bomb_bp_raw[14 * 8..15 * 8].copy_from_slice(&order.encode(mac_words[0]));
+        bomb_bp_raw[15 * 8..16 * 8].copy_from_slice(&order.encode(mac_words[1]));
+        let bomb_bp = BlockPointer::parse(&bomb_bp_raw, order).unwrap();
+        assert!(
+            decrypt_regular_block(&key, &bomb_bp, &bomb_ct).is_err(),
+            "malformed/bomb LZ4 payload inside encrypted block must fail closed"
+        );
+    }
+
+    // 4g. Pre-cancelled `Cx` on create_encrypted_dataset, change_key, and encrypted write MUST
+    //     fail closed with `NotCommitted(Cancelled)` and mutate neither disk nor `engine.keyring()`!
+    {
+        let cancelled = Cx::for_testing();
+        cancelled.cancel_with(asupersync::types::CancelKind::User, Some("test cancel"));
+        let before_txg = engine.committed_txg();
+        let before_slot = engine.committed_slot();
+        let before_media = devices[0].durable_snapshot();
+        let before_roots = engine.keyring().loaded_roots();
+
+        assert!(matches!(
+            engine.create_encrypted_dataset(
+                &cancelled,
+                &parent_ds,
+                b"cancelled_ds",
+                &[],
+                &ZfsEncryptionCreateOptions {
+                    suite: ZioEncrypt::Aes256Gcm,
+                    key_material: Some(key2.clone()),
+                    keylocation: Some(b"prompt".to_vec()),
+                    pbkdf2_iters: None,
+                    extra_entropy: b"cancel-create".to_vec(),
+                },
+                ts,
+            ),
+            ZfsTxOutcome::NotCommitted(FfsError::Cancelled)
+        ));
+        assert!(matches!(
+            engine.change_key(&cancelled, &enc_ds, &key2, None, None, b"cancel-rot"),
+            ZfsTxOutcome::NotCommitted(FfsError::Cancelled)
+        ));
+        assert!(matches!(
+            engine.write_file_data(
+                &cancelled,
+                &enc_ds,
+                file_obj,
+                0,
+                b"should-not-write",
+                ts,
+                ZfsDataChecksum::Sha256,
+            ),
+            ZfsTxOutcome::NotCommitted(FfsError::Cancelled)
+        ));
+
+        assert_eq!(engine.committed_txg(), before_txg);
+        assert_eq!(engine.committed_slot(), before_slot);
+        assert_eq!(devices[0].durable_snapshot(), before_media);
+        assert_eq!(engine.keyring().loaded_roots(), before_roots);
+    }
+
+    // 4h. `ENOSPC` / `refquota` exhaustion on encrypted dataset MUST fail closed without
+    //     corrupting existing ciphertext or evicting valid loaded keys!
+    {
+        let tight_ds = vec![b"data".to_vec(), b"sec".to_vec(), b"tight".to_vec()];
+        let (_, _) = engine
+            .create_dataset(
+                &cx,
+                &enc_ds,
+                b"tight",
+                &[
+                    ("recordsize".to_owned(), ZfsPropertySetValue::Number(4096)),
+                    (
+                        "refquota".to_owned(),
+                        ZfsPropertySetValue::Number(128 * 1024),
+                    ),
+                ],
+                ts,
+            )
+            .into_result()
+            .unwrap();
+        let (tight_file, _) = engine
+            .create_file(
+                &cx,
+                &tight_ds,
+                2,
+                b"keep.bin",
+                0o644,
+                0,
+                0,
+                ts,
+                ZfsDataChecksum::Sha256,
+            )
+            .into_result()
+            .unwrap();
+        let seed_payload = vec![0x5A_u8; 4096];
+        let (_, good_tok) = engine
+            .write_file_data(
+                &cx,
+                &tight_ds,
+                tight_file,
+                0,
+                &seed_payload,
+                ts,
+                ZfsDataChecksum::Sha256,
+            )
+            .into_result()
+            .unwrap();
+        let too_big = vec![0xA5_u8; 256 * 1024];
+        let oos = engine.write_file_data(
+            &cx,
+            &tight_ds,
+            tight_file,
+            0,
+            &too_big,
+            ts,
+            ZfsDataChecksum::Sha256,
+        );
+        assert!(
+            matches!(oos, ZfsTxOutcome::NotCommitted(FfsError::NoSpace)),
+            "expected NotCommitted(NoSpace) on encrypted refquota exhaustion, got {oos:?}"
+        );
+        // Existing encrypted payload and key remain 100% intact after refusal!
+        let mut post_mos =
+            open_pool_objects(&cx, &devices, built.pool_guid, good_tok.published_slot());
+        post_mos.load_key(&cx, &enc_ds, &key1).unwrap();
+        let mut post_zpl = post_mos.zpl(&cx, &tight_ds).unwrap();
+        assert_eq!(
+            post_zpl.read(&cx, tight_file, 0, 4096).unwrap(),
+            seed_payload
         );
     }
 }
