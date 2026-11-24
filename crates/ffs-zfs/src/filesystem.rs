@@ -812,7 +812,7 @@ impl FsOps for ZfsFs {
                         ..crate::ZfsPosixSetAttr::default()
                     },
                     timestamp,
-                    crate::ZfsDataChecksum::default(),
+                    crate::ZfsDataChecksum::Inherit,
                 )
             })?;
         }
@@ -908,7 +908,7 @@ impl FsOps for ZfsFs {
                 u64::from(uid),
                 u64::from(gid),
                 timestamp,
-                crate::ZfsDataChecksum::default(),
+                crate::ZfsDataChecksum::Inherit,
             )
         })?;
         state.publish_committed(|state| {
@@ -954,7 +954,7 @@ impl FsOps for ZfsFs {
                 offset,
                 data,
                 timestamp,
-                crate::ZfsDataChecksum::default(),
+                crate::ZfsDataChecksum::Inherit,
             )
         })?;
         Ok(written)
@@ -999,7 +999,7 @@ impl FsOps for ZfsFs {
                 length,
                 operation,
                 timestamp,
-                crate::ZfsDataChecksum::default(),
+                crate::ZfsDataChecksum::Inherit,
             )
         })?;
         // No result metadata is needed. Preserve a known committed outcome if
@@ -1123,7 +1123,7 @@ impl FsOps for ZfsFs {
                     object,
                     &native_attrs,
                     timestamp,
-                    crate::ZfsDataChecksum::default(),
+                    crate::ZfsDataChecksum::Inherit,
                 )
             })?;
             return state.publish_committed(|state| {
@@ -1394,7 +1394,7 @@ impl FsOps for ZfsFs {
                         ..crate::ZfsPosixSetAttr::default()
                     },
                     timestamp,
-                    crate::ZfsDataChecksum::default(),
+                    crate::ZfsDataChecksum::Inherit,
                 )
             })?;
             state.publish_committed(|state| state.refresh_head(cx))?;

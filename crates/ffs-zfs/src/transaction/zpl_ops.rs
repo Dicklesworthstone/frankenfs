@@ -161,9 +161,11 @@ fn clear_setid_bits_for_nonroot(mode: u64) -> u64 {
     next
 }
 
-/// Checksum algorithm used for newly written DMU data blocks (`ZIO_CHECKSUM_*`).
+/// Checksum selection for newly written DMU data blocks (`ZIO_CHECKSUM_*`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub enum ZfsDataChecksum {
+    /// Resolve the native dnode override and effective dataset property for ZPL writes.
+    Inherit,
     #[default]
     Fletcher4,
     Sha256,
@@ -173,6 +175,7 @@ impl ZfsDataChecksum {
     #[must_use]
     pub const fn code(self) -> u8 {
         match self {
+            Self::Inherit => 0,
             Self::Fletcher4 => 7,
             Self::Sha256 => 8,
         }
@@ -414,8 +417,34 @@ struct DatasetContext {
     sa_reg_dirty: bool,
     sa_lay_dirty: bool,
     recordsize: usize,
+    checksum: u8,
     unlinked_set: Option<u64>,
     write_crypto: Option<DatasetWriteCrypto>,
+}
+
+impl DatasetContext {
+    fn data_checksum(&self, requested: ZfsDataChecksum, node: Option<&Dnode>) -> Result<u8> {
+        let native = node.map_or(0, Dnode::checksum_type);
+        let inherited = match native {
+            0 => self.checksum,
+            1 => ZfsDataChecksum::Fletcher4.code(),
+            6 | 7 => native,
+            // Explicit SHA256 retains its integrity policy on every data rewrite.
+            // Native dnode overrides contain only legacy checksum selectors;
+            // SHA512/256 is selected through the dataset property instead.
+            8 => return Ok(native),
+            _ => {
+                return Err(unsupported(format!(
+                    "native ZPL dnode checksum selector {native} is outside the writer profile"
+                )));
+            }
+        };
+        Ok(if requested == ZfsDataChecksum::Inherit {
+            inherited
+        } else {
+            requested.code()
+        })
+    }
 }
 
 fn validate_component(name: &[u8], utf8_only: bool) -> Result<()> {
@@ -432,6 +461,37 @@ fn validate_component(name: &[u8], utf8_only: bool) -> Result<()> {
         return Err(FfsError::Format(
             "non-UTF8 directory entry name on utf8only ZPL dataset".into(),
         ));
+    }
+    Ok(())
+}
+
+fn admit_existing_sha512_ownership(
+    cx: &Cx,
+    mos: &mut Objects,
+    head_object: u64,
+    head: &Dnode,
+) -> Result<()> {
+    // First use requires atomic per-dataset feature activation. Until that
+    // lifecycle is supported here, only continue an already-owned native use.
+    if head.object_type() != DMU_OTN_ZAP_METADATA
+        || zap_optional_u64(&mos.zap_values(cx, head_object)?, b"org.illumos:sha512")? != Some(0)
+    {
+        return Err(unsupported(
+            "native SHA512 writes require existing dataset feature ownership",
+        ));
+    }
+    let directory = mos.zap_values(cx, 1)?;
+    let features_object = zap_required_u64(&directory, b"features_for_read")?;
+    let features = mos.zap_values(cx, features_object)?;
+    for feature in [
+        b"org.illumos:sha512".as_slice(),
+        b"com.delphix:extensible_dataset".as_slice(),
+    ] {
+        if zap_optional_u64(&features, feature)?.is_none_or(|count| count == 0) {
+            return Err(unsupported(
+                "native SHA512 writes require active SHA512 and extensible-dataset features",
+            ));
+        }
     }
     Ok(())
 }
@@ -453,14 +513,18 @@ fn open_head_dataset_context(
             "native ZFS ZPL writes require an initialized case-sensitive filesystem head",
         ));
     }
-    // Resolve the same local/received/inherited policy that a native import
-    // observes. Checking only this directory's property ZAP would permit writes
-    // under an inherited readonly=on and miss received/$inherit precedence.
+    // Resolve native local/received/inherited policy from one committed MOS.
+    // A raw local property lookup misses both ancestors and $inherit precedence.
     let properties = mos.properties(
         cx,
         dataset_components,
         None,
-        &["readonly".into(), "compression".into(), "recordsize".into()],
+        &[
+            "readonly".into(),
+            "compression".into(),
+            "recordsize".into(),
+            "checksum".into(),
+        ],
     )?;
     match properties
         .values
@@ -559,6 +623,29 @@ fn open_head_dataset_context(
             ));
         }
     };
+    let checksum = match properties
+        .values
+        .get(3)
+        .and_then(|property| property.value.as_ref())
+    {
+        Some(PropertyValue::Number(1 | 7)) => 7,
+        Some(PropertyValue::Number(value @ (6 | 8 | 11))) => *value as u8,
+        Some(PropertyValue::Number(value)) => {
+            return Err(unsupported(format!(
+                "effective ZFS checksum selector {value} is outside the native writer profile"
+            )));
+        }
+        _ => {
+            return Err(corrupt(
+                "missing or invalid effective ZFS checksum property",
+            ));
+        }
+    };
+    if checksum == 11 || old_os_bp.checksum_type() == 11 {
+        // Finalization also rewrites the object-set root with its old algorithm,
+        // even when a caller requests Fletcher4 or changes only metadata.
+        admit_existing_sha512_ownership(cx, mos, ds_row.head_object, &head_dn)?;
+    }
 
     let (write_crypto, view_crypto) = if let (Some(info), Some(key)) = (crypto_info, loaded_key) {
         let ivset_guid = if head_dn.object_type() == DMU_OTN_ZAP_METADATA {
@@ -646,6 +733,7 @@ fn open_head_dataset_context(
             sa_reg_dirty: false,
             sa_lay_dirty: false,
             recordsize,
+            checksum,
             unlinked_set,
             write_crypto,
         },
@@ -1670,7 +1758,7 @@ pub(super) fn stage_zpl_mutation(
                     existing: None,
                     object_type: DMU_OT_PLAIN_FILE_CONTENTS,
                     bonus_type,
-                    checksum_type: checksum.code(),
+                    checksum_type: ds_ctx.data_checksum(*checksum, None)?,
                     compress_type: 2,
                     user_flags: acct_flags,
                     indirect_shift: 17,
@@ -2165,7 +2253,7 @@ pub(super) fn stage_zpl_mutation(
                         existing: Some((&loaded.dnode, loaded.ceiling)),
                         object_type: DMU_OT_PLAIN_FILE_CONTENTS,
                         bonus_type: loaded.dnode.bonus_type(),
-                        checksum_type: checksum.code(),
+                        checksum_type: ds_ctx.data_checksum(*checksum, Some(&loaded.dnode))?,
                         compress_type: 2,
                         user_flags: acct_flags,
                         indirect_shift: loaded.dnode.indirect_shift(),
@@ -2319,11 +2407,7 @@ pub(super) fn stage_zpl_mutation(
             } else {
                 None
             };
-            let cksum_code = if loaded.dnode.checksum_type() == ZfsDataChecksum::Sha256.code() {
-                ZfsDataChecksum::Sha256.code()
-            } else {
-                checksum.code()
-            };
+            let cksum_code = ds_ctx.data_checksum(*checksum, Some(&loaded.dnode))?;
             let (bonus, spill) = encode_updated_zpl_bonus_with_options(
                 &loaded,
                 *file_obj,
@@ -2477,13 +2561,7 @@ pub(super) fn stage_zpl_mutation(
                         existing: Some((&loaded.dnode, loaded.ceiling)),
                         object_type: DMU_OT_PLAIN_FILE_CONTENTS,
                         bonus_type: loaded.dnode.bonus_type(),
-                        checksum_type: if loaded.dnode.checksum_type()
-                            == ZfsDataChecksum::Sha256.code()
-                        {
-                            ZfsDataChecksum::Sha256.code()
-                        } else {
-                            checksum.code()
-                        },
+                        checksum_type: ds_ctx.data_checksum(*checksum, Some(&loaded.dnode))?,
                         compress_type: loaded.dnode.compress_type(),
                         user_flags: acct_flags,
                         indirect_shift: loaded.dnode.indirect_shift(),
@@ -2679,7 +2757,7 @@ pub(super) fn stage_zpl_mutation(
                         existing: Some((&loaded.dnode, loaded.ceiling)),
                         object_type: DMU_OT_PLAIN_FILE_CONTENTS,
                         bonus_type: loaded.dnode.bonus_type(),
-                        checksum_type: checksum.code(),
+                        checksum_type: ds_ctx.data_checksum(*checksum, Some(&loaded.dnode))?,
                         compress_type: loaded.dnode.compress_type(),
                         user_flags: acct_flags,
                         indirect_shift: loaded.dnode.indirect_shift(),

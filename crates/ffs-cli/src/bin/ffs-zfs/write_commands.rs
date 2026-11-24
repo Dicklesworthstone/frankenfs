@@ -111,7 +111,7 @@ pub struct WritePoolArgs {
     /// Deterministic POSIX seconds timestamp recorded on modified ZPL nodes and published Uberblock.
     #[arg(long, default_value_t = 1_710_000_000)]
     pub timestamp: i64,
-    /// Stamp newly written file data blocks with `ZIO_CHECKSUM_SHA256` instead of `Fletcher4`.
+    /// Select SHA-256 (default: dataset policy for files, Fletcher4 for ZVOLs).
     #[arg(long)]
     pub sha256: bool,
     #[command(flatten)]
@@ -153,7 +153,15 @@ impl WritePoolArgs {
         }
     }
 
-    const fn data_checksum(&self) -> ZfsDataChecksum {
+    const fn file_checksum(&self) -> ZfsDataChecksum {
+        if self.sha256 {
+            ZfsDataChecksum::Sha256
+        } else {
+            ZfsDataChecksum::Inherit
+        }
+    }
+
+    const fn volume_checksum(&self) -> ZfsDataChecksum {
         if self.sha256 {
             ZfsDataChecksum::Sha256
         } else {
@@ -1021,7 +1029,7 @@ impl WriteCommand {
                     uid,
                     gid,
                     pool.zpl_timestamp(),
-                    pool.data_checksum(),
+                    pool.file_checksum(),
                 );
                 emit_tx_outcome("tx_create", &pool.dataset, &engine, outcome)
             }
@@ -1072,7 +1080,7 @@ impl WriteCommand {
                     write_offset,
                     &payload,
                     pool.zpl_timestamp(),
-                    pool.data_checksum(),
+                    pool.file_checksum(),
                 );
                 emit_tx_outcome("tx_write", &pool.dataset, &engine, outcome)
             }
@@ -1085,7 +1093,7 @@ impl WriteCommand {
                     file_obj,
                     size,
                     pool.zpl_timestamp(),
-                    pool.data_checksum(),
+                    pool.file_checksum(),
                 );
                 emit_tx_outcome("tx_truncate", &pool.dataset, &engine, outcome)
             }
@@ -1415,7 +1423,7 @@ impl WriteCommand {
                     target_obj,
                     &attrs,
                     pool.zpl_timestamp(),
-                    pool.data_checksum(),
+                    pool.file_checksum(),
                 );
                 emit_tx_outcome("tx_setattr", &pool.dataset, &engine, outcome)
             }
@@ -1547,7 +1555,7 @@ impl WriteCommand {
                     &components,
                     write_offset,
                     &payload,
-                    pool.data_checksum(),
+                    pool.volume_checksum(),
                 ) {
                     ZfsTxOutcome::Committed { value, token } => {
                         engine
@@ -1591,7 +1599,7 @@ impl WriteCommand {
                     &components,
                     discard_offset,
                     bytes,
-                    pool.data_checksum(),
+                    pool.volume_checksum(),
                 ) {
                     ZfsTxOutcome::Committed { value, token } => {
                         engine
@@ -1893,7 +1901,7 @@ fn edit_file_range(
         length,
         operation,
         pool.zpl_timestamp(),
-        pool.data_checksum(),
+        pool.file_checksum(),
     );
     let command = match operation {
         ZfsFileRangeOperation::PunchHole => "tx_punch_hole",

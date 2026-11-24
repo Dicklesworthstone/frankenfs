@@ -137,6 +137,8 @@ struct PoolFixtureSpec {
     hello_ownership: Option<ffs_ondisk::zfs_zpl::ReclamationOwnership>,
     root_properties: Vec<(&'static [u8], u64)>,
     data_properties: Vec<(&'static [u8], u64)>,
+    data_head_features: Vec<(&'static [u8], u64)>,
+    data_objectset_checksum: Option<u8>,
     auxiliary_ownership: Option<(u64, AuxiliaryOwnership)>,
 }
 
@@ -181,6 +183,8 @@ impl Default for PoolFixtureSpec {
             hello_ownership: None,
             root_properties: Vec::new(),
             data_properties: Vec::new(),
+            data_head_features: Vec::new(),
+            data_objectset_checksum: None,
             auxiliary_ownership: None,
         }
     }
@@ -1733,8 +1737,25 @@ fn build_zpl_objectset(
                 .expect("accounting dnode");
         }
     }
-    let encoded_os = os_obj.encode(objectset_order).expect("encode zpl os");
-    let os_bp = arena.alloc_block(&encoded_os, DMU_OT_OBJSET, 0, birth, objectset_order);
+    let mut encoded_os = os_obj.encode(objectset_order).expect("encode zpl os");
+    let os_bp = if head_object == 18
+        && let Some(checksum) = spec.data_objectset_checksum
+    {
+        let min_block = usize::try_from(arena.sector).unwrap().max(512);
+        encoded_os.resize(encoded_os.len().max(min_block).next_multiple_of(512), 0);
+        arena.alloc_raw_compressed(
+            &encoded_os,
+            &encoded_os,
+            DMU_OT_OBJSET,
+            0,
+            2,
+            checksum,
+            birth,
+            objectset_order,
+        )
+    } else {
+        arena.alloc_block(&encoded_os, DMU_OT_OBJSET, 0, birth, objectset_order)
+    };
     let referenced = os_obj.meta.used_bytes() + bp_allocated_bytes(&os_bp);
     (os_bp, referenced, snap_hello_bytes)
 }
@@ -2182,11 +2203,23 @@ fn build_clean_zfs_pool(spec: &PoolFixtureSpec) -> BuiltPool {
         &data_os_bp,
         order,
     );
-    set_mos(
-        &mut mos_tables,
-        18,
-        &make_dnode(16, 512, Vec::new(), 16, data_ds_bonus, None, 0, order),
-    );
+    let data_head = if spec.data_head_features.is_empty() {
+        make_dnode(16, 512, Vec::new(), 16, data_ds_bonus, None, 0, order)
+    } else {
+        let raw = mzap(&spec.data_head_features, 0x112, order);
+        let pointer = arena.alloc_block(&raw, 196, 0, INITIAL_TXG, order);
+        make_dnode(
+            196,
+            pointer.logical_bytes(),
+            vec![pointer],
+            16,
+            data_ds_bonus,
+            None,
+            0,
+            order,
+        )
+    };
+    set_mos(&mut mos_tables, 18, &data_head);
 
     // Object 17: `data` `DSL_DIR` & Object 2: root `DSL_DIR`
     let data_dir_bonus = encode_dsl_dir_bonus(18, 2, 26, 19, 20, data_ref_bytes, order);
@@ -2207,7 +2240,10 @@ fn build_clean_zfs_pool(spec: &PoolFixtureSpec) -> BuiltPool {
     let mut rf_entries: Vec<(&[u8], u64)> = vec![
         (b"org.illumos:lz4_compress", 1),
         (b"com.delphix:hole_birth", 1),
-        (b"com.delphix:extensible_dataset", 0),
+        (
+            b"com.delphix:extensible_dataset",
+            u64::from(!spec.data_head_features.is_empty()),
+        ),
     ];
     for &(name, count) in &spec.additional_read_features {
         rf_entries.push((name, count));
@@ -4622,7 +4658,6 @@ fn native_zpl_file_dnode(
 }
 
 #[test]
-#[allow(clippy::too_many_lines)]
 fn native_writes_resolve_effective_recordsize_before_choosing_file_geometry() {
     const RECORDSIZE: &[u8] = b"recordsize";
     const RECEIVED: &[u8] = b"recordsize$recvd";
@@ -4789,6 +4824,588 @@ fn native_writes_reject_invalid_effective_recordsize_without_backing_writes() {
             });
         }
     }
+}
+
+#[test]
+fn native_zpl_writes_resolve_dataset_checksum_sources() {
+    const SHA512: &[u8] = b"org.illumos:sha512";
+    const CHECKSUM: &[u8] = b"checksum";
+    const RECEIVED: &[u8] = b"checksum$recvd";
+    const INHERIT: &[u8] = b"checksum$inherit";
+    let cases = [
+        ("default", vec![], vec![], 7_u8),
+        ("on", vec![(CHECKSUM, 1)], vec![], 7),
+        ("inherited-sha256", vec![(CHECKSUM, 8)], vec![], 8),
+        ("local-sha256", vec![(CHECKSUM, 7)], vec![(CHECKSUM, 8)], 8),
+        (
+            "local-fletcher4",
+            vec![(CHECKSUM, 8)],
+            vec![(CHECKSUM, 7)],
+            7,
+        ),
+        (
+            "received-sha256",
+            vec![(CHECKSUM, 7)],
+            vec![(RECEIVED, 8)],
+            8,
+        ),
+        (
+            "inherit-suppresses-received",
+            vec![(CHECKSUM, 8)],
+            vec![(RECEIVED, 7), (INHERIT, 1)],
+            8,
+        ),
+        (
+            "local-precedes-inherit",
+            vec![(CHECKSUM, 8)],
+            vec![(CHECKSUM, 7), (RECEIVED, 8), (INHERIT, 1)],
+            7,
+        ),
+        ("inherited-received", vec![(RECEIVED, 8)], vec![], 8),
+        ("fletcher2", vec![(CHECKSUM, 6)], vec![], 6),
+        ("owned-inherited-sha512", vec![(CHECKSUM, 11)], vec![], 11),
+        (
+            "owned-local-sha512",
+            vec![(CHECKSUM, 7)],
+            vec![(CHECKSUM, 11)],
+            11,
+        ),
+    ];
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    let time = Timestamp {
+        seconds: 1_715_000_800,
+        nanos: 0,
+    };
+    for (case, root_properties, data_properties, expected_checksum) in cases {
+        let owns_sha512 = expected_checksum == 11;
+        let built = build_clean_zfs_pool(&PoolFixtureSpec {
+            root_properties,
+            data_properties,
+            data_head_features: if owns_sha512 {
+                vec![(SHA512, 0)]
+            } else {
+                Vec::new()
+            },
+            additional_read_features: if owns_sha512 {
+                vec![(SHA512, 1)]
+            } else {
+                Vec::new()
+            },
+            ..PoolFixtureSpec::default()
+        });
+        let devices: Vec<_> = built
+            .members
+            .into_iter()
+            .map(FaultableMemberDevice::new)
+            .collect();
+        let mut engine = open_engine_on_devices(
+            &cx,
+            &devices,
+            default_write_opts(built.pool_guid, built.initial_slot),
+        )
+        .unwrap();
+        let (object, _) = engine
+            .create_file(
+                &cx,
+                &dataset,
+                2,
+                b"checksummed",
+                0o644,
+                1000,
+                1000,
+                time,
+                ZfsDataChecksum::Inherit,
+            )
+            .into_result()
+            .unwrap();
+        let check = |engine: &ZfsTransactionEngine| {
+            let node = native_zpl_file_dnode(&cx, engine, &devices[0], &dataset, object);
+            assert_eq!(
+                node.checksum_type(),
+                0,
+                "{case}: inherited policy was pinned"
+            );
+            assert_eq!(node.levels(), 1, "{case}");
+            assert!(!node.pointers()[0].hole(), "{case}");
+            assert_eq!(
+                node.pointers()[0].checksum_type(),
+                expected_checksum,
+                "{case}: durable data block used the wrong checksum"
+            );
+        };
+        let payload = vec![0x5B; 8192];
+        engine
+            .write_file_data(
+                &cx,
+                &dataset,
+                object,
+                0,
+                &payload,
+                time,
+                ZfsDataChecksum::Inherit,
+            )
+            .into_result()
+            .unwrap();
+        check(&engine);
+        engine
+            .truncate_file(&cx, &dataset, object, 3333, time, ZfsDataChecksum::Inherit)
+            .into_result()
+            .unwrap();
+        check(&engine);
+        engine
+            .edit_file_range(
+                &cx,
+                &dataset,
+                object,
+                13,
+                71,
+                ffs_zfs::ZfsFileRangeOperation::PunchHole,
+                time,
+                ZfsDataChecksum::Inherit,
+            )
+            .into_result()
+            .unwrap();
+        check(&engine);
+        let slot = engine.committed_slot();
+        drop(engine);
+        let durable: Vec<_> = devices
+            .iter()
+            .map(FaultableMemberDevice::fresh_from_durable)
+            .collect();
+        let reopened =
+            open_engine_on_devices(&cx, &durable, default_write_opts(built.pool_guid, slot))
+                .unwrap();
+        let mut view = reopened
+            .open_read_objects(&cx)
+            .unwrap()
+            .zpl(&cx, &dataset)
+            .unwrap();
+        let mut expected = vec![0x5B; 3333];
+        expected[13..84].fill(0);
+        assert_eq!(view.read(&cx, object, 0, 8192).unwrap(), expected, "{case}");
+        let node = native_zpl_file_dnode(&cx, &reopened, &durable[0], &dataset, object);
+        assert_eq!(
+            node.pointers()[0].checksum_type(),
+            expected_checksum,
+            "{case}"
+        );
+        if owns_sha512 {
+            let mut mos = reopened.open_read_objects(&cx).unwrap();
+            assert_eq!(mos.object(&cx, 18).unwrap().object_type(), 196, "{case}");
+            let ownership = mos.zap(&cx, 18).unwrap();
+            assert_eq!(
+                ownership
+                    .iter()
+                    .find(|entry| entry.name == SHA512)
+                    .map(|entry| entry.value),
+                Some(0),
+                "{case}: native dataset ownership must survive rewrites"
+            );
+            let features = mos.zap(&cx, 10).unwrap();
+            for feature in [SHA512, b"com.delphix:extensible_dataset".as_slice()] {
+                assert_eq!(
+                    features
+                        .iter()
+                        .find(|entry| entry.name == feature)
+                        .map(|entry| entry.value),
+                    Some(1),
+                    "{case}: continuing owned SHA512 must preserve feature refcounts"
+                );
+            }
+        }
+        assert_pool_scrub_and_allocation_clean(&cx, &durable, built.pool_guid, Some(slot));
+    }
+}
+
+#[test]
+fn native_checksum_changes_preserve_explicit_sha256_objects() {
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    let time = Timestamp {
+        seconds: 1_715_000_801,
+        nanos: 0,
+    };
+    let built = build_clean_zfs_pool(&PoolFixtureSpec {
+        root_properties: vec![(b"checksum", 8)],
+        ..PoolFixtureSpec::default()
+    });
+    let devices: Vec<_> = built
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut engine = open_engine_on_devices(
+        &cx,
+        &devices,
+        default_write_opts(built.pool_guid, built.initial_slot),
+    )
+    .unwrap();
+    let (inherited, _) = engine
+        .create_file(
+            &cx,
+            &dataset,
+            2,
+            b"inherited",
+            0o644,
+            1000,
+            1000,
+            time,
+            ZfsDataChecksum::Inherit,
+        )
+        .into_result()
+        .unwrap();
+    let (pinned, _) = engine
+        .create_file(
+            &cx,
+            &dataset,
+            2,
+            b"pinned",
+            0o644,
+            1000,
+            1000,
+            time,
+            ZfsDataChecksum::Sha256,
+        )
+        .into_result()
+        .unwrap();
+    let payload = vec![0x5A; 8192];
+    for object in [inherited, pinned] {
+        engine
+            .write_file_data(
+                &cx,
+                &dataset,
+                object,
+                0,
+                &payload,
+                time,
+                ZfsDataChecksum::Inherit,
+            )
+            .into_result()
+            .unwrap();
+        let node = native_zpl_file_dnode(&cx, &engine, &devices[0], &dataset, object);
+        assert_eq!(node.pointers()[0].checksum_type(), 8);
+    }
+    engine
+        .set_property(
+            &cx,
+            &dataset,
+            "checksum",
+            ffs_zfs::ZfsPropertySetValue::Number(7),
+        )
+        .into_result()
+        .unwrap();
+    for (object, expected_checksum, expected_override) in [(inherited, 7, 0), (pinned, 8, 8)] {
+        engine
+            .write_file_data(
+                &cx,
+                &dataset,
+                object,
+                7,
+                b"next",
+                time,
+                ZfsDataChecksum::Inherit,
+            )
+            .into_result()
+            .unwrap();
+        let node = native_zpl_file_dnode(&cx, &engine, &devices[0], &dataset, object);
+        assert_eq!(node.pointers()[0].checksum_type(), expected_checksum);
+        assert_eq!(node.checksum_type(), expected_override);
+        engine
+            .truncate_file(
+                &cx,
+                &dataset,
+                object,
+                3073,
+                time,
+                ZfsDataChecksum::Fletcher4,
+            )
+            .into_result()
+            .unwrap();
+        let node = native_zpl_file_dnode(&cx, &engine, &devices[0], &dataset, object);
+        assert_eq!(node.pointers()[0].checksum_type(), expected_checksum);
+        engine
+            .edit_file_range(
+                &cx,
+                &dataset,
+                object,
+                20,
+                11,
+                ffs_zfs::ZfsFileRangeOperation::PunchHole,
+                time,
+                ZfsDataChecksum::Inherit,
+            )
+            .into_result()
+            .unwrap();
+        let node = native_zpl_file_dnode(&cx, &engine, &devices[0], &dataset, object);
+        assert_eq!(node.pointers()[0].checksum_type(), expected_checksum);
+    }
+    // An explicit Fletcher4 request remains explicit. A subsequent inherited
+    // request sees the current dataset property because dn_checksum stayed zero.
+    engine
+        .set_property(
+            &cx,
+            &dataset,
+            "checksum",
+            ffs_zfs::ZfsPropertySetValue::Number(8),
+        )
+        .into_result()
+        .unwrap();
+    for (selection, expected_checksum) in [
+        (ZfsDataChecksum::Fletcher4, 7),
+        (ZfsDataChecksum::Inherit, 8),
+    ] {
+        engine
+            .write_file_data(&cx, &dataset, inherited, 0, b"tail", time, selection)
+            .into_result()
+            .unwrap();
+        let node = native_zpl_file_dnode(&cx, &engine, &devices[0], &dataset, inherited);
+        assert_eq!(node.pointers()[0].checksum_type(), expected_checksum);
+        assert_eq!(node.checksum_type(), 0);
+    }
+    let slot = engine.committed_slot();
+    drop(engine);
+    let durable: Vec<_> = devices
+        .iter()
+        .map(FaultableMemberDevice::fresh_from_durable)
+        .collect();
+    let reopened =
+        open_engine_on_devices(&cx, &durable, default_write_opts(built.pool_guid, slot)).unwrap();
+    let mut view = reopened
+        .open_read_objects(&cx)
+        .unwrap()
+        .zpl(&cx, &dataset)
+        .unwrap();
+    for object in [inherited, pinned] {
+        let mut expected = vec![0x5A; 3073];
+        expected[7..11].copy_from_slice(b"next");
+        expected[20..31].fill(0);
+        if object == inherited {
+            expected[..4].copy_from_slice(b"tail");
+        }
+        assert_eq!(view.read(&cx, object, 0, 8192).unwrap(), expected);
+        let node = native_zpl_file_dnode(&cx, &reopened, &durable[0], &dataset, object);
+        assert_eq!(node.pointers()[0].checksum_type(), 8);
+    }
+    assert_pool_scrub_and_allocation_clean(&cx, &durable, built.pool_guid, Some(slot));
+}
+
+#[test]
+fn native_zpl_checksum_policy_refuses_unadmitted_algorithms_before_writes() {
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    let time = Timestamp {
+        seconds: 1_715_000_802,
+        nanos: 0,
+    };
+    for value in [0, 2, 9, 11, u64::MAX] {
+        let built = build_clean_zfs_pool(&PoolFixtureSpec {
+            root_properties: vec![(b"checksum", value)],
+            ..PoolFixtureSpec::default()
+        });
+        let devices: Vec<_> = built
+            .members
+            .into_iter()
+            .map(FaultableMemberDevice::new)
+            .collect();
+        let mut engine = open_engine_on_devices(
+            &cx,
+            &devices,
+            default_write_opts(built.pool_guid, built.initial_slot),
+        )
+        .unwrap();
+        assert_native_write_refused(&mut engine, &devices, libc::EOPNOTSUPP, |writer| {
+            writer.create_file(
+                &cx,
+                &dataset,
+                2,
+                b"refused",
+                0o644,
+                1000,
+                1000,
+                time,
+                ZfsDataChecksum::Inherit,
+            )
+        });
+        assert_native_write_refused(&mut engine, &devices, libc::EOPNOTSUPP, |writer| {
+            writer.write_file_data(
+                &cx,
+                &dataset,
+                4,
+                0,
+                b"must not publish",
+                time,
+                ZfsDataChecksum::Inherit,
+            )
+        });
+        let mut view = engine
+            .open_read_objects(&cx)
+            .unwrap()
+            .zpl(&cx, &dataset)
+            .unwrap();
+        assert_eq!(
+            view.read(&cx, 4, 0, 8192).unwrap(),
+            built.snap_hello_expected
+        );
+        assert!(matches!(
+            view.resolve(&cx, b"/refused"),
+            Err(FfsError::NotFound(_))
+        ));
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn native_sha512_writes_refuse_unowned_or_inactive_features() {
+    const SHA512: &[u8] = b"org.illumos:sha512";
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    let timestamp = Timestamp {
+        seconds: 1_715_000_803,
+        nanos: 0,
+    };
+    let cases = [
+        ("missing-owner", None, Some(1), None, 11),
+        ("inactive-feature", Some(0), Some(0), None, 11),
+        ("missing-feature", Some(0), None, None, 11),
+        ("malformed-owner", Some(1), Some(1), None, 11),
+        ("old-root-missing-owner", None, Some(1), Some(11), 7),
+        ("old-root-inactive-feature", Some(0), Some(0), Some(11), 7),
+    ];
+    for (case, owner, feature, old_root_checksum, checksum) in cases {
+        let built = build_clean_zfs_pool(&PoolFixtureSpec {
+            data_properties: vec![(b"checksum", checksum)],
+            data_head_features: owner.into_iter().map(|value| (SHA512, value)).collect(),
+            additional_read_features: feature.into_iter().map(|value| (SHA512, value)).collect(),
+            data_objectset_checksum: old_root_checksum,
+            ..PoolFixtureSpec::default()
+        });
+        let devices: Vec<_> = built
+            .members
+            .into_iter()
+            .map(FaultableMemberDevice::new)
+            .collect();
+        let mut engine = open_engine_on_devices(
+            &cx,
+            &devices,
+            default_write_opts(built.pool_guid, built.initial_slot),
+        )
+        .unwrap();
+        for requested in [ZfsDataChecksum::Inherit, ZfsDataChecksum::Fletcher4] {
+            assert_native_write_refused(&mut engine, &devices, libc::EOPNOTSUPP, |writer| {
+                writer.write_file_data(
+                    &cx,
+                    &dataset,
+                    4,
+                    0,
+                    b"must not publish",
+                    timestamp,
+                    requested,
+                )
+            });
+        }
+        // A metadata-only update also rewrites the old object-set root. Its
+        // SHA512 ownership must be admitted even with a Fletcher4 data request.
+        assert_native_write_refused(&mut engine, &devices, libc::EOPNOTSUPP, |writer| {
+            writer.set_attributes(
+                &cx,
+                &dataset,
+                4,
+                &ffs_zfs::ZfsSetAttr {
+                    mtime: Some(timestamp),
+                    ..ffs_zfs::ZfsSetAttr::default()
+                },
+                timestamp,
+                ZfsDataChecksum::Fletcher4,
+            )
+        });
+        let mut view = engine
+            .open_read_objects(&cx)
+            .unwrap()
+            .zpl(&cx, &dataset)
+            .unwrap();
+        assert_eq!(
+            view.read(&cx, 4, 0, 8192).unwrap(),
+            built.snap_hello_expected,
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn native_zvol_refuses_unresolved_checksum_inheritance_before_publication() {
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    let built = build_clean_zfs_pool(&PoolFixtureSpec {
+        zvol_orders: Some((Endian::Little, Endian::Little)),
+        ..PoolFixtureSpec::default()
+    });
+    let devices: Vec<_> = built
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut engine = open_engine_on_devices(
+        &cx,
+        &devices,
+        default_write_opts(built.pool_guid, built.initial_slot),
+    )
+    .unwrap();
+    engine.zvol_info(&cx, &dataset, None).unwrap();
+    let txg = engine.committed_txg();
+    let events = engine.persistence_events().len();
+    let io_before: Vec<_> = devices
+        .iter()
+        .map(|device| {
+            let media = device.state.lock().unwrap();
+            (media.write_calls, media.sync_calls)
+        })
+        .collect();
+    let payload = [0x5A; 512];
+    let outcomes = [
+        engine.zvol_write_at(&cx, &dataset, 0, &payload, ZfsDataChecksum::Inherit),
+        engine.zvol_discard(&cx, &dataset, 0, 512, ZfsDataChecksum::Inherit),
+        engine.zvol_batch_apply(&cx, &dataset, &BTreeMap::new(), ZfsDataChecksum::Inherit),
+    ];
+    for outcome in outcomes {
+        match outcome {
+            ZfsTxOutcome::NotCommitted(FfsError::UnsupportedFeature(detail)) => {
+                assert_eq!(
+                    detail,
+                    "checksum inheritance is only supported for native ZPL writes"
+                );
+            }
+            other => panic!("expected checksum admission refusal, got {other:?}"),
+        }
+    }
+    assert_eq!(engine.committed_txg(), txg);
+    assert_eq!(engine.persistence_events().len(), events);
+    let io_after: Vec<_> = devices
+        .iter()
+        .map(|device| {
+            let media = device.state.lock().unwrap();
+            (media.write_calls, media.sync_calls)
+        })
+        .collect();
+    assert_eq!(io_after, io_before);
+    // Explicit volume checksums still publish and survive a fresh native open.
+    engine
+        .zvol_write_at(&cx, &dataset, 0, &payload, ZfsDataChecksum::Sha256)
+        .into_result()
+        .unwrap();
+    let slot = engine.committed_slot();
+    drop(engine);
+    let durable: Vec<_> = devices
+        .iter()
+        .map(FaultableMemberDevice::fresh_from_durable)
+        .collect();
+    let reopened =
+        open_engine_on_devices(&cx, &durable, default_write_opts(built.pool_guid, slot)).unwrap();
+    let mut actual = [0; 512];
+    reopened
+        .zvol_read_at(&cx, &dataset, None, 0, &mut actual)
+        .unwrap();
+    assert_eq!(actual, payload);
 }
 
 #[test]

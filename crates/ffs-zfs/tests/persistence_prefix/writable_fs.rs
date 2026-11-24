@@ -3532,3 +3532,96 @@ fn file_range_fsops_late_cancellation_preserves_success_and_refreshes_next_reque
     assert_eq!(read(&fs, &next, file.ino), b"ab\0X\0fghi");
     assert_pool_scrub_and_allocation_clean(&next, &devices, POOL_GUID, None);
 }
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn native_fsops_data_mutations_follow_inherited_checksum_policy() {
+    const RECEIVED: &[u8] = b"checksum$recvd";
+    let cx = Cx::for_testing();
+    let dataset = vec![b"data".to_vec()];
+    for (data_properties, expected_checksum) in [(vec![], 8_u8), (vec![(RECEIVED, 7)], 7)] {
+        let (engine, devices) = writer_fixture(
+            &cx,
+            &PoolFixtureSpec {
+                root_properties: vec![(b"checksum", 8)],
+                data_properties,
+                ..PoolFixtureSpec::default()
+            },
+        );
+        let pool_guid = engine.storage_identity().pool_guid;
+        let fs = ZfsFs::with_writer(&cx, engine, dataset.clone()).unwrap();
+        let mut scope = RequestScope::empty();
+        let file = create(&fs, &cx, ROOT, "checksummed");
+        let payload = vec![0x63; 8192];
+        assert_eq!(
+            fs.write(&cx, &mut scope, file.ino, 0, &payload).unwrap(),
+            8192
+        );
+        fs.setattr(
+            &cx,
+            &mut scope,
+            file.ino,
+            &SetAttrRequest {
+                size: Some(3073),
+                ..SetAttrRequest::default()
+            },
+        )
+        .unwrap();
+        fs.fallocate(
+            &cx,
+            &mut scope,
+            file.ino,
+            13,
+            71,
+            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+        )
+        .unwrap();
+        let target = "x".repeat(1024);
+        fs.symlink(
+            &cx,
+            &mut scope,
+            ROOT,
+            OsStr::new("checksummed-link"),
+            Path::new(&target),
+            1234,
+            5678,
+        )
+        .unwrap();
+        let token = fs.last_durable_token().unwrap().unwrap();
+        drop(fs);
+
+        let durable: Vec<_> = devices
+            .iter()
+            .map(FaultableMemberDevice::fresh_from_durable)
+            .collect();
+        let reopened = open_engine_on_devices(
+            &cx,
+            &durable,
+            default_write_opts(pool_guid, token.published_slot()),
+        )
+        .unwrap();
+        let mut view = reopened
+            .open_read_objects(&cx)
+            .unwrap()
+            .zpl(&cx, &dataset)
+            .unwrap();
+        let file_object = view.resolve(&cx, b"/checksummed").unwrap();
+        let mut expected = vec![0x63; 3073];
+        expected[13..84].fill(0);
+        assert_eq!(view.read(&cx, file_object, 0, 8192).unwrap(), expected);
+        let link_object = view.resolve(&cx, b"/checksummed-link").unwrap();
+        assert_eq!(view.readlink(&cx, link_object).unwrap(), target.as_bytes());
+        for object in [file_object, link_object] {
+            let node = native_zpl_file_dnode(&cx, &reopened, &durable[0], &dataset, object);
+            assert_eq!(node.checksum_type(), 0);
+            assert!(!node.pointers()[0].hole());
+            assert_eq!(node.pointers()[0].checksum_type(), expected_checksum);
+        }
+        assert_pool_scrub_and_allocation_clean(
+            &cx,
+            &durable,
+            pool_guid,
+            Some(token.published_slot()),
+        );
+    }
+}

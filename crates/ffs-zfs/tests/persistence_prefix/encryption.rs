@@ -3,7 +3,7 @@
 //! nonce uniqueness, and persistence-prefix fault-cut rollback integration tests.
 
 use super::*;
-use ffs_core::{FsOps, RequestScope};
+use ffs_core::{FsOps, RequestScope, SetAttrRequest};
 use ffs_ondisk::zfs::crypto::{
     DSL_CRYPTO_MAC, DSL_DIR_CRYPTO_KEY_OBJ, ZfsKeyFormat, ZioEncrypt, bp_crypt_iv, bp_crypt_salt,
     decrypt_dnode_block, decrypt_regular_block, encode_crypt_mac_words, encrypt_regular_block,
@@ -125,6 +125,133 @@ fn inspect_raw_encrypted_file_bps(
         l0_bps.push(bp);
     }
     (os_bp, l1_bp, l0_bps)
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn encrypted_fsops_mutations_preserve_inherited_checksum_policy() {
+    let cx = Cx::for_testing();
+    let parent_ds = vec![b"data".to_vec()];
+    let dataset = vec![b"data".to_vec(), b"checksummed".to_vec()];
+    let material = ZfsKeyMaterial::Raw([0x5C; 32]);
+    let built = build_clean_zfs_pool(&PoolFixtureSpec {
+        data_properties: vec![
+            (b"checksum", 8),
+            (b"recordsize", 16_384),
+            (b"compression", 15),
+        ],
+        ..encryption_pool_spec(1)
+    });
+    let devices: Vec<_> = built
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut engine = open_engine_on_devices(
+        &cx,
+        &devices,
+        default_write_opts(built.pool_guid, built.initial_slot),
+    )
+    .unwrap();
+    engine
+        .create_encrypted_dataset(
+            &cx,
+            &parent_ds,
+            b"checksummed",
+            &[],
+            &ZfsEncryptionCreateOptions {
+                suite: ZioEncrypt::Aes256Gcm,
+                key_material: Some(material.clone()),
+                keylocation: Some(b"prompt".to_vec()),
+                pbkdf2_iters: None,
+                extra_entropy: b"inherited-checksum-policy".to_vec(),
+            },
+            Timestamp {
+                seconds: 1_730_000_000,
+                nanos: 0,
+            },
+        )
+        .into_result()
+        .unwrap();
+    let fs = ZfsFs::with_writer(&cx, engine, dataset.clone()).unwrap();
+    let mut scope = RequestScope::empty();
+    let file = fs
+        .create(
+            &cx,
+            &mut scope,
+            ffs_types::InodeNumber(1),
+            std::ffi::OsStr::new("payload"),
+            0o640,
+            1000,
+            1000,
+        )
+        .unwrap();
+    let payload: Vec<u8> = (0..5_u8)
+        .flat_map(|block| std::iter::repeat_n(0x41 + block, 16_384))
+        .collect();
+    assert_eq!(
+        fs.write(&cx, &mut scope, file.ino, 0, &payload).unwrap(),
+        payload.len() as u32
+    );
+    let retained_len = 4 * 16_384 + 1111;
+    fs.setattr(
+        &cx,
+        &mut scope,
+        file.ino,
+        &SetAttrRequest {
+            size: Some(retained_len as u64),
+            ..SetAttrRequest::default()
+        },
+    )
+    .unwrap();
+    fs.fallocate(
+        &cx,
+        &mut scope,
+        file.ino,
+        17,
+        61,
+        libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+    )
+    .unwrap();
+    let token = fs.last_durable_token().unwrap().unwrap();
+    drop(fs);
+
+    let durable: Vec<_> = devices
+        .iter()
+        .map(FaultableMemberDevice::fresh_from_durable)
+        .collect();
+    let mut mos = open_pool_objects(&cx, &durable, built.pool_guid, token.published_slot());
+    assert!(matches!(
+        mos.zpl(&cx, &dataset),
+        Err(FfsError::PermissionDenied)
+    ));
+    mos.load_key(&cx, &dataset, &material).unwrap();
+    let mut view = mos.zpl(&cx, &dataset).unwrap();
+    let object = view.resolve(&cx, b"/payload").unwrap();
+    let mut expected = payload[..retained_len].to_vec();
+    expected[17..78].fill(0);
+    assert_eq!(view.read(&cx, object, 0, payload.len()).unwrap(), expected);
+
+    let media = durable[0].durable_snapshot();
+    let (_, indirect, leaves) =
+        inspect_raw_encrypted_file_bps(&cx, &mut mos, &media, &dataset, object);
+    assert_eq!(indirect.checksum_type(), 8);
+    for pointer in leaves {
+        assert!(!pointer.hole());
+        assert!(pointer.is_encrypted());
+        assert_eq!(pointer.checksum_type(), 8);
+        assert_eq!(pointer.compression(), 15);
+    }
+    let scrub = mos
+        .scrub_dataset(&cx, &dataset, None, ScrubLimits::default())
+        .unwrap();
+    assert!(scrub.is_clean(), "keyed scrub failed: {scrub:?}");
+    assert_pool_scrub_and_allocation_clean(
+        &cx,
+        &durable,
+        built.pool_guid,
+        Some(token.published_slot()),
+    );
 }
 
 #[test]

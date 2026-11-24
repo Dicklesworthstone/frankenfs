@@ -325,7 +325,7 @@ impl ZfsFs {
                 u64::from(uid),
                 u64::from(gid),
                 timestamp,
-                crate::ZfsDataChecksum::default(),
+                crate::ZfsDataChecksum::Inherit,
             )
         })?;
         let attr = state.publish_committed(|state| {

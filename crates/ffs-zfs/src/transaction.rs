@@ -2168,6 +2168,11 @@ impl ZfsTransactionEngine {
         data: &[u8],
         checksum: ZfsDataChecksum,
     ) -> ZfsTxOutcome<ZfsCommitReceipt> {
+        if checksum == ZfsDataChecksum::Inherit {
+            return ZfsTxOutcome::NotCommitted(unsupported(
+                "checksum inheritance is only supported for native ZPL writes",
+            ));
+        }
         let empty_bpobj_id = self.empty_bpobj_id;
         let order = self.order;
         let outcome = self.execute_staged_txg(
@@ -2205,6 +2210,11 @@ impl ZfsTransactionEngine {
         len: u64,
         checksum: ZfsDataChecksum,
     ) -> ZfsTxOutcome<ZfsCommitReceipt> {
+        if checksum == ZfsDataChecksum::Inherit {
+            return ZfsTxOutcome::NotCommitted(unsupported(
+                "checksum inheritance is only supported for native ZPL writes",
+            ));
+        }
         let empty_bpobj_id = self.empty_bpobj_id;
         let order = self.order;
         let outcome = self.execute_staged_txg(
@@ -2240,6 +2250,11 @@ impl ZfsTransactionEngine {
         dirty_blocks: &BTreeMap<u64, Option<Vec<u8>>>,
         checksum: ZfsDataChecksum,
     ) -> ZfsTxOutcome<ZfsCommitReceipt> {
+        if checksum == ZfsDataChecksum::Inherit {
+            return ZfsTxOutcome::NotCommitted(unsupported(
+                "checksum inheritance is only supported for native ZPL writes",
+            ));
+        }
         let empty_bpobj_id = self.empty_bpobj_id;
         let order = self.order;
         let outcome = self.execute_staged_txg(
