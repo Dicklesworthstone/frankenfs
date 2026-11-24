@@ -664,7 +664,7 @@ fn open_head_dataset_context(
             ds_row.guid
         };
         let wc = DatasetWriteCrypto {
-            nonces: ZfsNonceGenerator::new(ivset_guid, info.record.guid, new_txg, &[]),
+            nonces: ZfsNonceGenerator::new(cx, ivset_guid, info.record.guid, new_txg, &[])?,
             key,
             compression,
             zstd_level,

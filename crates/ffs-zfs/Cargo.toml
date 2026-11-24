@@ -8,14 +8,16 @@ rust-version.workspace = true
 
 [dependencies]
 asupersync = { workspace = true }
-blake3 = { workspace = true }
+blake3 = { workspace = true, features = ["zeroize"] }
 ffs-block = { workspace = true }
 ffs-core = { workspace = true }
 ffs-error = { workspace = true }
 ffs-ondisk = { workspace = true }
 ffs-types = { workspace = true }
+getrandom = { workspace = true }
 libc = { workspace = true }
 serde = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 asupersync = { workspace = true, features = ["test-internals"] }

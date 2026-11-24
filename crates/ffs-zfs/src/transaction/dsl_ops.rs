@@ -24,6 +24,7 @@ use ffs_ondisk::zfs_zap::Entry as RawZapEntry;
 use ffs_ondisk::zfs_zap::names::NamePolicy as ZapNamePolicy;
 use ffs_ondisk::zfs_zpl::{Kind, Metadata, SaRegistry, Timestamp, encode_directory_reference};
 use serde::Serialize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::{
     ZfsDatasetCryptoInfo, ZfsKeyMaterial, ZfsNonceGenerator, encode_dsl_crypto_key_zap,
@@ -102,7 +103,7 @@ pub struct ZfsEncryptionCreateOptions {
     pub keylocation: Option<Vec<u8>>,
     /// Optional PBKDF2-HMAC-SHA1 iteration count for `keyformat=passphrase` (`>= 100_000`, default `350_000`).
     pub pbkdf2_iters: Option<u64>,
-    /// Optional extra entropy mixed into deterministic key/IV derivation.
+    /// Optional caller input mixed with mandatory OS entropy for key/IV generation.
     pub extra_entropy: Vec<u8>,
 }
 
@@ -4733,7 +4734,9 @@ fn stage_create_dataset(
             let wrapping =
                 key_material.resolve_wrapping_key(keyformat, pbkdf2_salt, pbkdf2_iters)?;
             let (master, hmac, wrap_iv, key_guid) =
-                generate_new_dataset_keys(pool_guid, ds_guid, new_txg, &opts.extra_entropy);
+                generate_new_dataset_keys(cx, pool_guid, ds_guid, new_txg, &opts.extra_entropy)?;
+            let master = Zeroizing::new(master);
+            let hmac = Zeroizing::new(hmac);
             let record = DslCryptoKeyRecord::wrap(
                 opts.suite.effective(),
                 key_guid,
@@ -4745,7 +4748,7 @@ fn stage_create_dataset(
                 pbkdf2_iters,
                 wrap_iv,
                 wrapping.as_bytes(),
-                &master,
+                master.as_slice(),
                 &hmac,
             )
             .map_err(|e| parse_err(&e))?;
@@ -4785,7 +4788,13 @@ fn stage_create_dataset(
                     .unwrap_or_else(|| b"prompt".to_vec()),
             );
             Some(DatasetWriteCrypto {
-                nonces: ZfsNonceGenerator::new(ivset_guid, key_guid, new_txg, &opts.extra_entropy),
+                nonces: ZfsNonceGenerator::new(
+                    cx,
+                    ivset_guid,
+                    key_guid,
+                    new_txg,
+                    &opts.extra_entropy,
+                )?,
                 key: key_arc,
                 compression,
                 zstd_level,
@@ -4814,7 +4823,13 @@ fn stage_create_dataset(
                 crypto_key_obj_for_dir = Some(p_info.crypto_key_obj);
                 ivset_guid_for_head = Some(ivset_guid);
                 Some(DatasetWriteCrypto {
-                    nonces: ZfsNonceGenerator::new(ivset_guid, p_info.record.guid, new_txg, &[]),
+                    nonces: ZfsNonceGenerator::new(
+                        cx,
+                        ivset_guid,
+                        p_info.record.guid,
+                        new_txg,
+                        &[],
+                    )?,
                     key,
                     compression,
                     zstd_level,
@@ -6454,8 +6469,10 @@ fn stage_change_key(
     };
     let new_wrapping =
         new_material.resolve_wrapping_key(new_keyformat, new_pbkdf2_salt, new_pbkdf2_iters)?;
-    let (_, _, mut new_wrap_iv, _) =
-        generate_new_dataset_keys(pool_guid, info.record.guid, new_txg, extra_entropy);
+    let (mut unused_master, mut unused_hmac, mut new_wrap_iv, _) =
+        generate_new_dataset_keys(cx, pool_guid, info.record.guid, new_txg, extra_entropy)?;
+    unused_master.zeroize();
+    unused_hmac.zeroize();
     if new_wrap_iv == info.record.iv {
         new_wrap_iv[0] ^= 0x01;
     }

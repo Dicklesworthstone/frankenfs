@@ -89,6 +89,7 @@ crc32c = "0.6.9"
 ctrlc = "3.5.3"
 criterion = { version = "0.8.2", features = ["html_reports"] }
 crossbeam-epoch = "0.9.21"
+getrandom = { version = "0.4.3", features = ["std"] }
 hex = "0.4.3"
 insta = "1.49.0"
 libc = "0.2.191"
@@ -110,6 +111,7 @@ tracing-subscriber = "0.3.23"
 xxhash-rust = { version = "0.8.21", features = ["xxh3", "xxh64"] }
 fuser = { version = "0.17.0", features = ["abi-7-42"] }
 zstd = "0.14.4"
+zeroize = "1.8.2"
 brotli = "8.0.4"
 # zlib-rs backend: a pure-safe-Rust reimplementation of zlib that inflates
 # markedly faster than the default `miniz_oxide` (rust_backend) — the btrfs
