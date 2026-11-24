@@ -996,6 +996,106 @@ fn zvol_volume_manager_enforces_exclusive_leases_and_epoch_invalidation() {
 }
 
 #[test]
+fn zvol_failed_fua_requests_restore_prior_writeback_data_and_holes() {
+    let cx = Cx::for_testing();
+    let mut built = build_clean_zfs_pool(&PoolFixtureSpec {
+        image_bytes: 20 * 1024 * 1024,
+        ashift: 9,
+        ..PoolFixtureSpec::default()
+    });
+    let device = FaultableMemberDevice::new(built.members.remove(0));
+    let mut engine = open_engine_on_devices(
+        &cx,
+        std::slice::from_ref(&device),
+        default_write_opts(built.pool_guid, built.initial_slot),
+    )
+    .unwrap();
+    let interrupt_publication = Arc::new(AtomicBool::new(false));
+    let trigger = Arc::clone(&interrupt_publication);
+    engine.with_fault_hook(move |event| {
+        if matches!(event.stage, ZfsPersistenceStage::UberblockBarrier { .. })
+            && trigger.swap(false, Ordering::SeqCst)
+        {
+            return Err(FfsError::Io(std::io::Error::other("uncertain publication")));
+        }
+        Ok(())
+    });
+    let manager = ZfsVolumeManager::new(engine);
+    let dataset = [b"data".to_vec(), b"writeback".to_vec()];
+    manager
+        .zvol_create(
+            &cx,
+            &dataset[..1],
+            b"writeback",
+            &ZfsZvolCreateOptions {
+                volsize: 64 * 1024,
+                volblocksize: 4096,
+                sparse: true,
+                initial_props: Vec::new(),
+                timestamp: Timestamp {
+                    seconds: 1_726_400_000,
+                    nanos: 0,
+                },
+            },
+        )
+        .into_result()
+        .unwrap();
+    let mut session = manager
+        .open_writable_session(
+            &cx,
+            &dataset,
+            ZvolSyncPolicy::FlushBarrier,
+            true,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .unwrap();
+    // Seed a durable block, then mask it with an acknowledged volatile discard.
+    session.write_at(&cx, 4096, &[0x43; 4096], true).unwrap();
+    session.discard(&cx, 4096, 4096).unwrap();
+    session.write_at(&cx, 0, &[0x51; 4096], false).unwrap();
+    let mut expected = vec![0; 3 * 4096];
+    expected[..4096].fill(0x51);
+    let original_txg = manager.committed_txg().unwrap();
+    for trim in [false, true] {
+        device.set_fault(DeviceFault::FailWriteOnCall {
+            call_index: device.write_calls(),
+        });
+        let outcome = if trim {
+            session.discard_with_fua(&cx, 0, 3 * 4096, true)
+        } else {
+            session.write_at(&cx, 0, &[0x92; 3 * 4096], true)
+        };
+        assert!(matches!(outcome, Err(FfsError::Io(_))));
+        assert_eq!(manager.committed_txg().unwrap(), original_txg);
+        let mut observed = vec![0xFF; expected.len()];
+        session.read_at(&cx, 0, &mut observed).unwrap();
+        assert_eq!(observed, expected);
+    }
+    device.set_fault(DeviceFault::None);
+    session.flush(&cx).unwrap();
+    let fresh = device.fresh_from_durable();
+    let reopened = open_engine_on_devices(
+        &cx,
+        std::slice::from_ref(&fresh),
+        default_write_opts(built.pool_guid, manager.committed_slot().unwrap()),
+    )
+    .unwrap();
+    let mut persisted = vec![0xFF; expected.len()];
+    reopened
+        .zvol_read_at(&cx, &dataset, None, 0, &mut persisted)
+        .unwrap();
+    assert_eq!(persisted, expected);
+
+    // Once an uberblock write has escaped, volatile writes cannot safely be ACKed.
+    interrupt_publication.store(true, Ordering::SeqCst);
+    assert!(session.write_at(&cx, 0, &[0x71; 4096], true).is_err());
+    assert!(session.write_at(&cx, 0, &[0x82; 512], false).is_err());
+    assert!(session.discard(&cx, 4096, 4096).is_err());
+    assert!(session.read_at(&cx, 0, &mut persisted).is_err());
+    assert!(session.flush(&cx).is_err());
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn zvol_nbd_unix_tcp_always_readonly_flush_barrier_and_revocation() {
     let cx = Cx::for_testing();
