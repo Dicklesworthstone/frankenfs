@@ -4,15 +4,16 @@
 
 use std::fs::{self, OpenOptions};
 use std::os::unix::fs::FileExt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use asupersync::Cx;
 use asupersync::types::CancelKind;
 use ffs_block::ByteDevice;
 use ffs_error::FfsError;
 use ffs_ntfs::formatter::{
-    NtfsFormatOptions, NtfsFormatStage, NtfsFormatStageHook, NtfsFormatVersion, format_image_file,
+    NtfsFormatOptions, NtfsFormatStage, NtfsFormatStageHook, NtfsFormatVersion, format_device,
+    format_image_file,
 };
 use ffs_ntfs::reader::check::repair::{
     NtfsRepairAction, apply_bounded_repair, plan_bounded_repair,
@@ -26,11 +27,226 @@ use ffs_ntfs::resize::{
 };
 use ffs_ntfs::{NtfsTransactionEngine, NtfsVolume, NtfsWriteOptions};
 use ffs_ondisk::ntfs::NtfsGeometry;
+use ffs_types::ByteOffset;
 use tempfile::tempdir;
 
 fn file_blake3(path: &std::path::Path) -> String {
     let bytes = fs::read(path).expect("read file for blake3");
     blake3::hash(&bytes).to_hex().to_string()
+}
+
+#[derive(Default, Debug)]
+struct FormatProtectionState {
+    depth: usize,
+    completed: usize,
+    aborted: usize,
+    writes: usize,
+    syncs: usize,
+    unprotected_writes: usize,
+    unprotected_syncs: usize,
+    refuse: bool,
+    fail_sync: Option<usize>,
+}
+
+struct FormatProtectionDevice {
+    file: fs::File,
+    bytes: u64,
+    state: Mutex<FormatProtectionState>,
+}
+
+impl FormatProtectionDevice {
+    fn create(path: &std::path::Path) -> Arc<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .expect("create format target");
+        let bytes = 8 * 1024 * 1024;
+        file.set_len(bytes).expect("size format target");
+        Arc::new(Self {
+            file,
+            bytes,
+            state: Mutex::new(FormatProtectionState::default()),
+        })
+    }
+}
+
+impl ByteDevice for FormatProtectionDevice {
+    fn len_bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    fn read_exact_at(&self, cx: &Cx, offset: ByteOffset, data: &mut [u8]) -> ffs_error::Result<()> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        self.file.read_exact_at(data, offset.0)?;
+        Ok(())
+    }
+
+    fn write_all_at(&self, cx: &Cx, offset: ByteOffset, data: &[u8]) -> ffs_error::Result<()> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        let mut state = self.state.lock().unwrap();
+        state.writes += 1;
+        if state.depth == 0 {
+            state.unprotected_writes += 1;
+        }
+        drop(state);
+        self.file.write_all_at(data, offset.0)?;
+        Ok(())
+    }
+
+    fn sync(&self, cx: &Cx) -> ffs_error::Result<()> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        let mut state = self.state.lock().unwrap();
+        state.syncs += 1;
+        if state.depth == 0 {
+            state.unprotected_syncs += 1;
+        }
+        if state.fail_sync == Some(state.syncs) {
+            return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                libc::ENOSPC,
+            )));
+        }
+        drop(state);
+        self.file.sync_all()?;
+        Ok(())
+    }
+
+    fn begin_durability_commit(&self, cx: &Cx) -> ffs_error::Result<()> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        let mut state = self.state.lock().unwrap();
+        if state.refuse {
+            return Err(FfsError::ReadOnly);
+        }
+        state.depth += 1;
+        Ok(())
+    }
+
+    fn complete_durability_commit(&self) {
+        let mut state = self.state.lock().unwrap();
+        assert!(state.depth > 0);
+        state.depth -= 1;
+        state.completed += 1;
+    }
+
+    fn abort_durability_commit(&self) {
+        let mut state = self.state.lock().unwrap();
+        assert!(state.depth > 0);
+        state.depth -= 1;
+        state.aborted += 1;
+    }
+}
+
+#[test]
+fn format_device_defers_protection_until_primary_boot_is_durable() {
+    let cx = Cx::for_testing();
+    let dir = tempdir().expect("tempdir");
+    for nested in [false, true] {
+        let image = dir.path().join(format!("protected_format_{nested}.img"));
+        let device = FormatProtectionDevice::create(&image);
+        let target: Arc<dyn ByteDevice> = device.clone();
+        let opts = NtfsFormatOptions::new_image(image.clone(), 8);
+
+        device.state.lock().unwrap().refuse = true;
+        assert!(matches!(
+            format_device(&cx, &target, &opts, None),
+            Err(FfsError::ReadOnly)
+        ));
+        {
+            let mut state = device.state.lock().unwrap();
+            assert_eq!((state.writes, state.syncs, state.depth), (0, 0, 0));
+            assert_eq!((state.completed, state.aborted), (0, 0));
+            state.refuse = false;
+        }
+        if nested {
+            device.begin_durability_commit(&cx).unwrap();
+        }
+        let observer = Arc::clone(&device);
+        let hook: NtfsFormatStageHook = Box::new(move |stage| {
+            let state = observer.state.lock().unwrap();
+            let expected_depth =
+                usize::from(nested) + usize::from(stage != NtfsFormatStage::TargetCreated);
+            assert_eq!(state.depth, expected_depth, "stage {stage:?}");
+            if stage == NtfsFormatStage::Synced {
+                assert_eq!(state.syncs, 2);
+                assert_eq!(state.completed, 0);
+            }
+            drop(state);
+            if stage == NtfsFormatStage::PrePublishVerified {
+                let mut primary_boot = [0_u8; 512];
+                observer.file.read_exact_at(&mut primary_boot, 0)?;
+                assert!(primary_boot.iter().all(|&b| b == 0));
+            }
+            Ok(())
+        });
+        let report = format_device(&cx, &target, &opts, Some(&hook)).expect("format target");
+        assert!(report.boot_published && report.check_clean);
+        {
+            let state = device.state.lock().unwrap();
+            assert_eq!(state.depth, usize::from(nested));
+            assert_eq!((state.completed, state.aborted), (1, 0));
+            assert!(state.writes > 2);
+            assert_eq!(state.syncs, 2);
+            assert_eq!((state.unprotected_writes, state.unprotected_syncs), (0, 0));
+        }
+        if nested {
+            device.complete_durability_commit();
+        }
+        device.sync(&cx).expect("seal completed format");
+        assert_eq!(device.state.lock().unwrap().unprotected_syncs, 1);
+        assert!(
+            check_image_file(&cx, &image, 0, None, NtfsCheckLimits::default())
+                .expect("cold check completed format")
+                .clean
+        );
+    }
+}
+
+#[test]
+fn format_device_aborts_protection_on_failed_publication() {
+    let cx = Cx::for_testing();
+    let dir = tempdir().expect("tempdir");
+    let cuts = [
+        (Some(NtfsFormatStage::SystemStreamsWritten), None),
+        (Some(NtfsFormatStage::MftAndMirrorWritten), None),
+        (Some(NtfsFormatStage::BackupBootWritten), None),
+        (Some(NtfsFormatStage::PrePublishVerified), None),
+        (Some(NtfsFormatStage::PrimaryBootPublished), None),
+        (Some(NtfsFormatStage::Synced), None),
+        (None, Some(1)),
+        (None, Some(2)),
+    ];
+    for (index, (cut_stage, fail_sync)) in cuts.into_iter().enumerate() {
+        let image = dir
+            .path()
+            .join(format!("format_protection_cut_{index}.img"));
+        let device = FormatProtectionDevice::create(&image);
+        device.state.lock().unwrap().fail_sync = fail_sync;
+        let target: Arc<dyn ByteDevice> = device.clone();
+        let hook: NtfsFormatStageHook = Box::new(move |stage| {
+            if Some(stage) == cut_stage {
+                return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                    libc::ENOSPC,
+                )));
+            }
+            Ok(())
+        });
+        assert!(
+            format_device(
+                &cx,
+                &target,
+                &NtfsFormatOptions::new_image(image, 8),
+                Some(&hook),
+            )
+            .is_err(),
+            "format must fail at {cut_stage:?}, sync {fail_sync:?}"
+        );
+        let state = device.state.lock().unwrap();
+        assert_eq!(state.depth, 0);
+        assert_eq!((state.completed, state.aborted), (0, 1));
+        assert!(state.writes > 0);
+        assert_eq!((state.unprotected_writes, state.unprotected_syncs), (0, 0));
+    }
 }
 
 #[test]
