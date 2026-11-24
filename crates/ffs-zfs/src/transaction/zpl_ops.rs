@@ -2,10 +2,12 @@
 //! lowered into COW DMU object-set, DSL dataset/dir accounting, and deadlist updates.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use asupersync::Cx;
 use ffs_error::{FfsError, Result};
-use ffs_ondisk::zfs::{BlockPointer, Endian, RegularBlockSpec};
+use ffs_ondisk::zfs::crypto::DSL_DATASET_IVSET_GUID;
+use ffs_ondisk::zfs::{BlockPointer, Endian};
 use ffs_ondisk::zfs_dmu::{
     DMU_OT_DNODE, DNODE_BLOCK_BYTES, DNODE_BYTES, Dnode, DnodeSpec, OBJSET_GROUPUSED_OFFSET,
     OBJSET_PROJECTUSED_OFFSET, OBJSET_USERUSED_OFFSET, ObjectSet, dnode_at,
@@ -17,19 +19,24 @@ use ffs_ondisk::zfs_zpl::{
 };
 use serde::Serialize;
 
-use crate::reader::dmu::Objects;
+use crate::crypto::ZfsNonceGenerator;
 use crate::reader::dmu::properties::PropertyValue;
+use crate::reader::dmu::{DatasetCryptoContext, Objects};
 
 use super::dmu_cow::{
-    DMU_OT_DIRECTORY_CONTENTS, DMU_OT_OBJSET, DMU_OT_PLAIN_FILE_CONTENTS, DMU_OT_SA, DMU_OT_ZNODE,
-    DnodeCowOutput, DnodeCowSpec, OwnerQuotaLimits, PoolSpaceAllocator, QuotaDelta, SpaceDelta,
-    StagedBlockWrite, WriteBucket, allocate_object_id, allocated_leaf_blocks_in_range,
-    apply_objectset_quota_deltas, collect_non_hole_bps_from, cow_update_dnode,
-    encode_zap_blocks_for_dnode, enqueue_into_dataset_deadlist, load_owner_quota_limits,
-    objectset_user_accounting_flags, put_dnode_in_table, read_staged_or_committed_dnode,
-    remove_dnode_from_table, zap_optional_u64, zap_required_u64,
+    DMU_OT_DIRECTORY_CONTENTS, DMU_OT_PLAIN_FILE_CONTENTS, DMU_OT_SA, DMU_OT_ZNODE,
+    DatasetWriteCrypto, DnodeCowOutput, DnodeCowSpec, OwnerQuotaLimits, PoolSpaceAllocator,
+    QuotaDelta, SpaceDelta, StagedBlockWrite, WriteBucket, allocate_object_id,
+    allocated_leaf_blocks_in_range, apply_objectset_quota_deltas, collect_non_hole_bps_from,
+    cow_update_dnode_with_crypto, decode_compression_property, encode_zap_blocks_for_dnode,
+    enqueue_into_dataset_deadlist, load_owner_quota_limits, objectset_user_accounting_flags,
+    put_dnode_in_table, read_staged_or_committed_dnode, remove_dnode_from_table,
+    write_dataset_block, write_dataset_objset_block, zap_optional_u64, zap_required_u64,
 };
+use super::dsl_ops::DMU_OTN_ZAP_METADATA;
 use super::{checkpoint, corrupt, parse_err, unsupported};
+
+const DMU_SPILL_BLKID: u64 = u64::MAX - 1;
 
 const DEFAULT_RECORDSIZE: usize = 131_072;
 const MAX_WRITE_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
@@ -402,6 +409,7 @@ struct DatasetContext {
     sa_lay_dirty: bool,
     recordsize: usize,
     unlinked_set: Option<u64>,
+    write_crypto: Option<DatasetWriteCrypto>,
 }
 
 fn validate_component(name: &[u8], utf8_only: bool) -> Result<()> {
@@ -426,6 +434,7 @@ fn open_head_dataset_context(
     cx: &Cx,
     mos: &mut Objects,
     dataset_components: &[Vec<u8>],
+    new_txg: u64,
 ) -> Result<(DatasetContext, Objects)> {
     checkpoint(cx)?;
     let ds_row = mos
@@ -441,7 +450,12 @@ fn open_head_dataset_context(
     // Resolve the same local/received/inherited policy that a native import
     // observes. Checking only this directory's property ZAP would permit writes
     // under an inherited readonly=on and miss received/$inherit precedence.
-    let properties = mos.properties(cx, dataset_components, None, &["readonly".into()])?;
+    let properties = mos.properties(
+        cx,
+        dataset_components,
+        None,
+        &["readonly".into(), "compression".into()],
+    )?;
     match properties
         .values
         .first()
@@ -455,22 +469,40 @@ fn open_head_dataset_context(
             ));
         }
     }
+    let compression_raw = match properties
+        .values
+        .get(1)
+        .and_then(|property| property.value.as_ref())
+    {
+        Some(PropertyValue::Number(raw)) => *raw,
+        _ => 2,
+    };
+    let (compression, zstd_level) = decode_compression_property(compression_raw);
+
+    let crypto_info = mos.dataset_crypto_info(cx, dataset_components)?;
+    let loaded_key = if let Some(ref info) = crypto_info {
+        Some(
+            mos.keyring()
+                .get(info.encryption_root_ddobj)
+                .ok_or(FfsError::PermissionDenied)?,
+        )
+    } else {
+        None
+    };
+
     let (head_dn, head_ceiling) = mos.object_with_ceiling(cx, ds_row.head_object)?;
     let order = head_dn.order();
     let prev_snap_txg = order.u64(head_dn.bonus(), 16).map_err(|e| parse_err(&e))?;
     let deadlist_obj = order.u64(head_dn.bonus(), 64).map_err(|e| parse_err(&e))?;
     let old_os_bp =
         BlockPointer::parse(&head_dn.bonus()[128..256], order).map_err(|e| parse_err(&e))?;
-    let (os_raw, os_order, _) = mos
-        .checked_raw(
-            cx,
-            &old_os_bp,
-            DMU_OT_OBJSET,
-            0,
-            old_os_bp.logical_bytes(),
-            head_ceiling,
-        )?
-        .ok_or_else(|| corrupt("ZPL head object set is a hole"))?;
+    let (os_raw, os_order, _) = mos.read_dataset_objset_block_raw(
+        cx,
+        &old_os_bp,
+        head_ceiling,
+        loaded_key.as_deref(),
+        false,
+    )?;
     let mut os = ObjectSet::parse(&os_raw, os_order).map_err(|e| parse_err(&e))?;
     if os.kind != 2 {
         return Err(corrupt("selected dataset is not a ZPL object set"));
@@ -519,7 +551,37 @@ fn open_head_dataset_context(
         recordsize = (rs as usize).min(DEFAULT_RECORDSIZE);
     }
 
-    let mut os_view = mos.open_objectset_view(os.meta.clone(), old_os_bp.birth(), mos.txg);
+    let (write_crypto, view_crypto) = if let (Some(info), Some(key)) = (crypto_info, loaded_key) {
+        let ivset_guid = if head_dn.object_type() == DMU_OTN_ZAP_METADATA {
+            zap_optional_u64(
+                &mos.zap_values(cx, ds_row.head_object)?,
+                DSL_DATASET_IVSET_GUID,
+            )?
+            .unwrap_or(ds_row.guid)
+        } else {
+            ds_row.guid
+        };
+        let wc = DatasetWriteCrypto {
+            nonces: ZfsNonceGenerator::new(ivset_guid, info.record.guid, new_txg, &[]),
+            key,
+            compression,
+            zstd_level,
+        };
+        let vc = Arc::new(DatasetCryptoContext {
+            info,
+            raw_scrub_only: false,
+        });
+        (Some(wc), Some(vc))
+    } else {
+        (None, None)
+    };
+
+    let mut os_view = mos.open_objectset_view_with_crypto(
+        os.meta.clone(),
+        old_os_bp.birth(),
+        mos.txg,
+        view_crypto,
+    );
     let master = os_view.zap_values(cx, 1)?;
     // Limits are read from the selected committed object set and checked
     // against the same net owner deltas that will be published with this TXG.
@@ -576,6 +638,7 @@ fn open_head_dataset_context(
             sa_lay_dirty: false,
             recordsize,
             unlinked_set,
+            write_crypto,
         },
         os_view,
     ))
@@ -742,6 +805,7 @@ fn decode_zpl_node(
 #[allow(clippy::too_many_arguments)]
 fn encode_updated_zpl_bonus_with_options(
     loaded: &LoadedZplNode,
+    object_id: u64,
     new_meta: &Metadata,
     ds_ctx: &mut DatasetContext,
     rebuild_trivial_acl: bool,
@@ -839,25 +903,21 @@ fn encode_updated_zpl_bonus_with_options(
                     if padded == *old_raw {
                         Some(old_bp.clone())
                     } else {
-                        let dva = alloc.allocate(padded.len())?;
-                        let bp = BlockPointer::new_regular(&RegularBlockSpec {
-                            dvas: &[dva],
-                            physical: &padded,
-                            logical_bytes: padded.len(),
-                            compression: 2,
-                            checksum_type: 7,
-                            object_type: DMU_OT_SA,
-                            level: 0,
-                            payload_order: order,
-                            birth: new_txg,
-                            fill: 1,
-                        })
-                        .map_err(|e| parse_err(&e))?;
-                        staged_writes.push(StagedBlockWrite {
-                            bucket: WriteBucket::ChildBlocks,
-                            dva_offset: dva.offset,
-                            bytes: padded,
-                        });
+                        let bp = write_dataset_block(
+                            alloc,
+                            &padded,
+                            object_id,
+                            DMU_SPILL_BLKID,
+                            DMU_OT_SA,
+                            0,
+                            7,
+                            order,
+                            new_txg,
+                            1,
+                            WriteBucket::ChildBlocks,
+                            ds_ctx.write_crypto.as_mut(),
+                            staged_writes,
+                        )?;
                         Some(bp)
                     }
                 }
@@ -868,25 +928,21 @@ fn encode_updated_zpl_bonus_with_options(
                     }
                     let mut padded = vec![0_u8; target_len];
                     padded[..new_raw.len()].copy_from_slice(&new_raw);
-                    let dva = alloc.allocate(padded.len())?;
-                    let bp = BlockPointer::new_regular(&RegularBlockSpec {
-                        dvas: &[dva],
-                        physical: &padded,
-                        logical_bytes: padded.len(),
-                        compression: 2,
-                        checksum_type: 7,
-                        object_type: DMU_OT_SA,
-                        level: 0,
-                        payload_order: order,
-                        birth: new_txg,
-                        fill: 1,
-                    })
-                    .map_err(|e| parse_err(&e))?;
-                    staged_writes.push(StagedBlockWrite {
-                        bucket: WriteBucket::ChildBlocks,
-                        dva_offset: dva.offset,
-                        bytes: padded,
-                    });
+                    let bp = write_dataset_block(
+                        alloc,
+                        &padded,
+                        object_id,
+                        DMU_SPILL_BLKID,
+                        DMU_OT_SA,
+                        0,
+                        7,
+                        order,
+                        new_txg,
+                        1,
+                        WriteBucket::ChildBlocks,
+                        ds_ctx.write_crypto.as_mut(),
+                        staged_writes,
+                    )?;
                     Some(bp)
                 }
                 _ => None,
@@ -897,13 +953,16 @@ fn encode_updated_zpl_bonus_with_options(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn encode_updated_zpl_bonus(
     loaded: &LoadedZplNode,
+    object_id: u64,
     new_meta: &Metadata,
     sa_registry: Option<&SaRegistry>,
     alloc: &mut PoolSpaceAllocator,
     order: Endian,
     new_txg: u64,
+    write_crypto: Option<&mut DatasetWriteCrypto>,
     staged_writes: &mut Vec<StagedBlockWrite>,
 ) -> Result<(Vec<u8>, Option<BlockPointer>)> {
     match loaded.dnode.bonus_type() {
@@ -929,25 +988,21 @@ fn encode_updated_zpl_bonus(
                     if padded == *old_raw {
                         Some(old_bp.clone())
                     } else {
-                        let dva = alloc.allocate(padded.len())?;
-                        let bp = BlockPointer::new_regular(&RegularBlockSpec {
-                            dvas: &[dva],
-                            physical: &padded,
-                            logical_bytes: padded.len(),
-                            compression: 2,
-                            checksum_type: 7,
-                            object_type: DMU_OT_SA,
-                            level: 0,
-                            payload_order: order,
-                            birth: new_txg,
-                            fill: 1,
-                        })
-                        .map_err(|e| parse_err(&e))?;
-                        staged_writes.push(StagedBlockWrite {
-                            bucket: WriteBucket::ChildBlocks,
-                            dva_offset: dva.offset,
-                            bytes: padded,
-                        });
+                        let bp = write_dataset_block(
+                            alloc,
+                            &padded,
+                            object_id,
+                            DMU_SPILL_BLKID,
+                            DMU_OT_SA,
+                            0,
+                            7,
+                            order,
+                            new_txg,
+                            1,
+                            WriteBucket::ChildBlocks,
+                            write_crypto,
+                            staged_writes,
+                        )?;
                         Some(bp)
                     }
                 }
@@ -1136,6 +1191,7 @@ fn flush_dir_node(
     cx: &Cx,
     os_view: &mut Objects,
     alloc: &mut PoolSpaceAllocator,
+    dir_obj: u64,
     dir_loaded: &LoadedZplNode,
     new_dir_meta: &Metadata,
     entries: &[RawZapEntry],
@@ -1143,6 +1199,7 @@ fn flush_dir_node(
     acct_flags: u8,
     order: Endian,
     new_txg: u64,
+    mut write_crypto: Option<&mut DatasetWriteCrypto>,
     staged_writes: &mut Vec<StagedBlockWrite>,
     zpl_born: &mut SpaceDelta,
     zpl_retired: &mut Vec<BlockPointer>,
@@ -1163,15 +1220,17 @@ fn flush_dir_node(
     }
     let (bonus, spill) = encode_updated_zpl_bonus(
         dir_loaded,
+        dir_obj,
         new_dir_meta,
         sa_registry,
         alloc,
         order,
         new_txg,
+        write_crypto.as_deref_mut(),
         staged_writes,
     )?;
     let old_used = dir_loaded.dnode.used_bytes();
-    let out = cow_update_dnode(
+    let out = cow_update_dnode_with_crypto(
         cx,
         os_view,
         alloc,
@@ -1195,6 +1254,8 @@ fn flush_dir_node(
             indirect_bucket: WriteBucket::ChildBlocks,
         },
         &dirty,
+        dir_obj,
+        write_crypto,
         staged_writes,
     )?;
     zpl_born.add_assign(out.born)?;
@@ -1316,7 +1377,8 @@ pub(super) fn pending_unlinks(
     mos: &mut Objects,
     dataset_components: &[Vec<u8>],
 ) -> Result<Vec<ZfsUnlinkedObject>> {
-    let (context, mut view) = open_head_dataset_context(cx, mos, dataset_components)?;
+    let mos_txg = mos.txg;
+    let (context, mut view) = open_head_dataset_context(cx, mos, dataset_components, mos_txg)?;
     if context.unlinked_set.is_none() {
         return Ok(Vec::new());
     }
@@ -1350,7 +1412,7 @@ pub(super) fn pending_unlinks(
 fn stage_unlinked_set_change(
     cx: &Cx,
     view: &mut Objects,
-    context: &DatasetContext,
+    context: &mut DatasetContext,
     dirty_dnodes: &mut BTreeMap<u64, Vec<u8>>,
     target: u64,
     add: bool,
@@ -1398,7 +1460,7 @@ fn stage_unlinked_set_change(
         .enumerate()
         .map(|(index, bytes)| (index as u64, Some(bytes)))
         .collect();
-    let out = cow_update_dnode(
+    let out = cow_update_dnode_with_crypto(
         cx,
         view,
         alloc,
@@ -1422,6 +1484,8 @@ fn stage_unlinked_set_change(
             indirect_bucket: WriteBucket::ChildBlocks,
         },
         &dirty,
+        object,
+        context.write_crypto.as_mut(),
         staged_writes,
     )?;
     born.add_assign(out.born)?;
@@ -1456,7 +1520,8 @@ pub(super) fn stage_zpl_mutation(
     staged_writes: &mut Vec<StagedBlockWrite>,
 ) -> Result<u64> {
     checkpoint(cx)?;
-    let (mut ds_ctx, mut os_view) = open_head_dataset_context(cx, mos, dataset_components)?;
+    let (mut ds_ctx, mut os_view) =
+        open_head_dataset_context(cx, mos, dataset_components, new_txg)?;
     // ObjectSet retains its embedded usage dnodes in the source byte order.
     // Until that tail is converted as a unit, a transaction must not rewrite
     // selected fields and retain the remaining counters in a different order.
@@ -1551,7 +1616,7 @@ pub(super) fn stage_zpl_mutation(
                 _ => (min_blk, None),
             };
             let file_dirty = BTreeMap::from([(0, file_contents)]);
-            let file_out = cow_update_dnode(
+            let file_out = cow_update_dnode_with_crypto(
                 cx,
                 &mut os_view,
                 alloc,
@@ -1575,6 +1640,8 @@ pub(super) fn stage_zpl_mutation(
                     indirect_bucket: WriteBucket::ChildBlocks,
                 },
                 &file_dirty,
+                new_obj,
+                ds_ctx.write_crypto.as_mut(),
                 staged_writes,
             )?;
             zpl_born.add_assign(file_out.born)?;
@@ -1621,6 +1688,7 @@ pub(super) fn stage_zpl_mutation(
                 cx,
                 &mut os_view,
                 alloc,
+                *parent_dir,
                 &parent_loaded,
                 &new_parent_meta,
                 &entries,
@@ -1628,6 +1696,7 @@ pub(super) fn stage_zpl_mutation(
                 acct_flags,
                 order,
                 new_txg,
+                ds_ctx.write_crypto.as_mut(),
                 staged_writes,
                 &mut zpl_born,
                 &mut zpl_retired,
@@ -1702,7 +1771,7 @@ pub(super) fn stage_zpl_mutation(
             for (i, blk) in blocks.into_iter().enumerate() {
                 dir_dirty.insert(i as u64, Some(blk));
             }
-            let dir_out = cow_update_dnode(
+            let dir_out = cow_update_dnode_with_crypto(
                 cx,
                 &mut os_view,
                 alloc,
@@ -1726,6 +1795,8 @@ pub(super) fn stage_zpl_mutation(
                     indirect_bucket: WriteBucket::ChildBlocks,
                 },
                 &dir_dirty,
+                new_obj,
+                ds_ctx.write_crypto.as_mut(),
                 staged_writes,
             )?;
             zpl_born.add_assign(dir_out.born)?;
@@ -1764,6 +1835,7 @@ pub(super) fn stage_zpl_mutation(
                 cx,
                 &mut os_view,
                 alloc,
+                *parent_dir,
                 &parent_loaded,
                 &new_parent_meta,
                 &entries,
@@ -1771,6 +1843,7 @@ pub(super) fn stage_zpl_mutation(
                 acct_flags,
                 order,
                 new_txg,
+                ds_ctx.write_crypto.as_mut(),
                 staged_writes,
                 &mut zpl_born,
                 &mut zpl_retired,
@@ -1866,14 +1939,16 @@ pub(super) fn stage_zpl_mutation(
             source_meta.times[2] = *timestamp;
             let (bonus, spill) = encode_updated_zpl_bonus(
                 &source,
+                *source_object,
                 &source_meta,
                 ds_ctx.sa_registry.as_ref(),
                 alloc,
                 order,
                 new_txg,
+                ds_ctx.write_crypto.as_mut(),
                 staged_writes,
             )?;
-            let source_out = cow_update_dnode(
+            let source_out = cow_update_dnode_with_crypto(
                 cx,
                 &mut os_view,
                 alloc,
@@ -1897,6 +1972,8 @@ pub(super) fn stage_zpl_mutation(
                     indirect_bucket: WriteBucket::ChildBlocks,
                 },
                 &BTreeMap::new(),
+                *source_object,
+                ds_ctx.write_crypto.as_mut(),
                 staged_writes,
             )?;
             zpl_born.add_assign(source_out.born)?;
@@ -1934,6 +2011,7 @@ pub(super) fn stage_zpl_mutation(
                 cx,
                 &mut os_view,
                 alloc,
+                *parent_dir,
                 &parent,
                 &parent_meta,
                 &entries,
@@ -1941,6 +2019,7 @@ pub(super) fn stage_zpl_mutation(
                 acct_flags,
                 order,
                 new_txg,
+                ds_ctx.write_crypto.as_mut(),
                 staged_writes,
                 &mut zpl_born,
                 &mut zpl_retired,
@@ -2015,14 +2094,16 @@ pub(super) fn stage_zpl_mutation(
                 )?;
                 let (bonus, spill) = encode_updated_zpl_bonus(
                     &loaded,
+                    *file_obj,
                     &new_meta,
                     ds_ctx.sa_registry.as_ref(),
                     alloc,
                     order,
                     new_txg,
+                    ds_ctx.write_crypto.as_mut(),
                     staged_writes,
                 )?;
-                let out = cow_update_dnode(
+                let out = cow_update_dnode_with_crypto(
                     cx,
                     &mut os_view,
                     alloc,
@@ -2046,6 +2127,8 @@ pub(super) fn stage_zpl_mutation(
                         indirect_bucket: WriteBucket::ChildBlocks,
                     },
                     &dirty_leaves,
+                    *file_obj,
+                    ds_ctx.write_crypto.as_mut(),
                     staged_writes,
                 )?;
                 zpl_born.add_assign(out.born)?;
@@ -2177,15 +2260,17 @@ pub(super) fn stage_zpl_mutation(
             };
             let (bonus, spill) = encode_updated_zpl_bonus(
                 &loaded,
+                *file_obj,
                 &new_meta,
                 ds_ctx.sa_registry.as_ref(),
                 alloc,
                 order,
                 new_txg,
+                ds_ctx.write_crypto.as_mut(),
                 staged_writes,
             )?;
             let old_used = loaded.dnode.used_bytes();
-            let out = cow_update_dnode(
+            let out = cow_update_dnode_with_crypto(
                 cx,
                 &mut os_view,
                 alloc,
@@ -2209,6 +2294,8 @@ pub(super) fn stage_zpl_mutation(
                     indirect_bucket: WriteBucket::ChildBlocks,
                 },
                 &dirty_leaves,
+                *file_obj,
+                ds_ctx.write_crypto.as_mut(),
                 staged_writes,
             )?;
             zpl_born.add_assign(out.born)?;
@@ -2292,14 +2379,16 @@ pub(super) fn stage_zpl_mutation(
                 new_meta.times[2] = *timestamp;
                 let (bonus, spill) = encode_updated_zpl_bonus(
                     &loaded,
+                    *file_obj,
                     &new_meta,
                     ds_ctx.sa_registry.as_ref(),
                     alloc,
                     order,
                     new_txg,
+                    ds_ctx.write_crypto.as_mut(),
                     staged_writes,
                 )?;
-                let out = cow_update_dnode(
+                let out = cow_update_dnode_with_crypto(
                     cx,
                     &mut os_view,
                     alloc,
@@ -2329,6 +2418,8 @@ pub(super) fn stage_zpl_mutation(
                         indirect_bucket: WriteBucket::ChildBlocks,
                     },
                     &dirty_leaves,
+                    *file_obj,
+                    ds_ctx.write_crypto.as_mut(),
                     staged_writes,
                 )?;
                 zpl_born.add_assign(out.born)?;
@@ -2474,6 +2565,7 @@ pub(super) fn stage_zpl_mutation(
             new_meta.times[2] = *timestamp;
             let (bonus, spill) = encode_updated_zpl_bonus_with_options(
                 &loaded,
+                *file_obj,
                 &new_meta,
                 &mut ds_ctx,
                 rebuild_trivial_acl,
@@ -2485,7 +2577,7 @@ pub(super) fn stage_zpl_mutation(
             )?;
             let old_used = loaded.dnode.used_bytes();
             let out = if attrs.size.is_some() {
-                cow_update_dnode(
+                cow_update_dnode_with_crypto(
                     cx,
                     &mut os_view,
                     alloc,
@@ -2509,6 +2601,8 @@ pub(super) fn stage_zpl_mutation(
                         indirect_bucket: WriteBucket::ChildBlocks,
                     },
                     &dirty_leaves,
+                    *file_obj,
+                    ds_ctx.write_crypto.as_mut(),
                     staged_writes,
                 )?
             } else {
@@ -2767,7 +2861,7 @@ pub(super) fn stage_zpl_mutation(
                     stage_unlinked_set_change(
                         cx,
                         &mut os_view,
-                        &ds_ctx,
+                        &mut ds_ctx,
                         &mut zpl_dirty_dnodes,
                         target_obj,
                         true,
@@ -2796,6 +2890,7 @@ pub(super) fn stage_zpl_mutation(
                     order,
                     new_txg,
                     *timestamp,
+                    ds_ctx.write_crypto.as_mut(),
                     staged_writes,
                     &mut zpl_born,
                     &mut zpl_retired,
@@ -2834,6 +2929,7 @@ pub(super) fn stage_zpl_mutation(
                     cx,
                     &mut os_view,
                     alloc,
+                    *src_dir,
                     &src_parent,
                     &p_meta,
                     &dst_entries,
@@ -2841,6 +2937,7 @@ pub(super) fn stage_zpl_mutation(
                     acct_flags,
                     order,
                     new_txg,
+                    ds_ctx.write_crypto.as_mut(),
                     staged_writes,
                     &mut zpl_born,
                     &mut zpl_retired,
@@ -2871,6 +2968,7 @@ pub(super) fn stage_zpl_mutation(
                     cx,
                     &mut os_view,
                     alloc,
+                    *src_dir,
                     &src_parent,
                     &sp_meta,
                     &src_entries,
@@ -2878,6 +2976,7 @@ pub(super) fn stage_zpl_mutation(
                     acct_flags,
                     order,
                     new_txg,
+                    ds_ctx.write_crypto.as_mut(),
                     staged_writes,
                     &mut zpl_born,
                     &mut zpl_retired,
@@ -2915,6 +3014,7 @@ pub(super) fn stage_zpl_mutation(
                     cx,
                     &mut os_view,
                     alloc,
+                    *dst_dir,
                     &dst_parent,
                     &dp_meta,
                     &dst_entries,
@@ -2922,6 +3022,7 @@ pub(super) fn stage_zpl_mutation(
                     acct_flags,
                     order,
                     new_txg,
+                    ds_ctx.write_crypto.as_mut(),
                     staged_writes,
                     &mut zpl_born,
                     &mut zpl_retired,
@@ -2946,14 +3047,16 @@ pub(super) fn stage_zpl_mutation(
             moved_meta.flags |= dst_parent.metadata.flags & ZFS_PROJINHERIT;
             let (m_bonus, m_spill) = encode_updated_zpl_bonus(
                 &src_obj_loaded,
+                source_obj,
                 &moved_meta,
                 ds_ctx.sa_registry.as_ref(),
                 alloc,
                 order,
                 new_txg,
+                ds_ctx.write_crypto.as_mut(),
                 staged_writes,
             )?;
-            let m_out = cow_update_dnode(
+            let m_out = cow_update_dnode_with_crypto(
                 cx,
                 &mut os_view,
                 alloc,
@@ -2977,6 +3080,8 @@ pub(super) fn stage_zpl_mutation(
                     indirect_bucket: WriteBucket::ChildBlocks,
                 },
                 &BTreeMap::new(),
+                source_obj,
+                ds_ctx.write_crypto.as_mut(),
                 staged_writes,
             )?;
             zpl_born.add_assign(m_out.born)?;
@@ -3177,6 +3282,7 @@ pub(super) fn stage_zpl_mutation(
                     cx,
                     &mut os_view,
                     alloc,
+                    [*src_dir, *dst_dir][index],
                     &parents[index],
                     &metadata,
                     &entries[index],
@@ -3184,6 +3290,7 @@ pub(super) fn stage_zpl_mutation(
                     acct_flags,
                     order,
                     new_txg,
+                    ds_ctx.write_crypto.as_mut(),
                     staged_writes,
                     &mut zpl_born,
                     &mut zpl_retired,
@@ -3200,20 +3307,23 @@ pub(super) fn stage_zpl_mutation(
                 )?;
             }
             for (index, loaded) in nodes.iter().enumerate() {
+                let obj_id = [source.object, target.object][index];
                 let mut metadata = loaded.metadata.clone();
                 metadata.parent = [*dst_dir, *src_dir][index];
                 metadata.times[2] = *timestamp;
                 metadata.flags |= parents[1 - index].metadata.flags & ZFS_PROJINHERIT;
                 let (bonus, spill) = encode_updated_zpl_bonus(
                     loaded,
+                    obj_id,
                     &metadata,
                     ds_ctx.sa_registry.as_ref(),
                     alloc,
                     order,
                     new_txg,
+                    ds_ctx.write_crypto.as_mut(),
                     staged_writes,
                 )?;
-                let out = cow_update_dnode(
+                let out = cow_update_dnode_with_crypto(
                     cx,
                     &mut os_view,
                     alloc,
@@ -3237,6 +3347,8 @@ pub(super) fn stage_zpl_mutation(
                         indirect_bucket: WriteBucket::ChildBlocks,
                     },
                     &BTreeMap::new(),
+                    obj_id,
+                    ds_ctx.write_crypto.as_mut(),
                     staged_writes,
                 )?;
                 zpl_born.add_assign(out.born)?;
@@ -3332,7 +3444,7 @@ pub(super) fn stage_zpl_mutation(
                 stage_unlinked_set_change(
                     cx,
                     &mut os_view,
-                    &ds_ctx,
+                    &mut ds_ctx,
                     &mut zpl_dirty_dnodes,
                     target_obj,
                     true,
@@ -3357,6 +3469,7 @@ pub(super) fn stage_zpl_mutation(
                 cx,
                 &mut os_view,
                 alloc,
+                *parent_dir,
                 &parent_loaded,
                 &p_meta,
                 &entries,
@@ -3364,6 +3477,7 @@ pub(super) fn stage_zpl_mutation(
                 acct_flags,
                 order,
                 new_txg,
+                ds_ctx.write_crypto.as_mut(),
                 staged_writes,
                 &mut zpl_born,
                 &mut zpl_retired,
@@ -3396,6 +3510,7 @@ pub(super) fn stage_zpl_mutation(
                 order,
                 new_txg,
                 *timestamp,
+                ds_ctx.write_crypto.as_mut(),
                 staged_writes,
                 &mut zpl_born,
                 &mut zpl_retired,
@@ -3446,6 +3561,7 @@ pub(super) fn stage_zpl_mutation(
                 order,
                 new_txg,
                 loaded.metadata.times[2],
+                ds_ctx.write_crypto.as_mut(),
                 staged_writes,
                 &mut zpl_born,
                 &mut zpl_retired,
@@ -3454,7 +3570,7 @@ pub(super) fn stage_zpl_mutation(
             stage_unlinked_set_change(
                 cx,
                 &mut os_view,
-                &ds_ctx,
+                &mut ds_ctx,
                 &mut zpl_dirty_dnodes,
                 identity.object,
                 false,
@@ -3509,6 +3625,7 @@ fn retire_or_decrement_zpl_target(
     order: Endian,
     new_txg: u64,
     timestamp: Timestamp,
+    mut write_crypto: Option<&mut DatasetWriteCrypto>,
     staged_writes: &mut Vec<StagedBlockWrite>,
     zpl_born: &mut SpaceDelta,
     zpl_retired: &mut Vec<BlockPointer>,
@@ -3525,14 +3642,16 @@ fn retire_or_decrement_zpl_target(
         next_meta.times[2] = timestamp;
         let (bonus, spill) = encode_updated_zpl_bonus(
             target_loaded,
+            target_obj,
             &next_meta,
             sa_registry,
             alloc,
             order,
             new_txg,
+            write_crypto.as_deref_mut(),
             staged_writes,
         )?;
-        let out = cow_update_dnode(
+        let out = cow_update_dnode_with_crypto(
             cx,
             os_view,
             alloc,
@@ -3556,6 +3675,8 @@ fn retire_or_decrement_zpl_target(
                 indirect_bucket: WriteBucket::ChildBlocks,
             },
             &BTreeMap::new(),
+            target_obj,
+            write_crypto,
             staged_writes,
         )?;
         zpl_born.add_assign(out.born)?;
@@ -3750,6 +3871,7 @@ fn stage_sa_xattr_mutation(
     new_meta.times[2] = timestamp;
     let (bonus, spill) = encode_updated_zpl_bonus_with_options(
         &loaded,
+        target_obj,
         &new_meta,
         ds_ctx,
         false,
@@ -3797,6 +3919,7 @@ fn flush_sa_table_zap(
     alloc: &mut PoolSpaceAllocator,
     order: Endian,
     new_txg: u64,
+    write_crypto: Option<&mut DatasetWriteCrypto>,
     staged_writes: &mut Vec<StagedBlockWrite>,
     zpl_born: &mut SpaceDelta,
     zpl_retired: &mut Vec<BlockPointer>,
@@ -3827,7 +3950,7 @@ fn flush_sa_table_zap(
         .enumerate()
         .map(|(i, b)| (i as u64, Some(b)))
         .collect();
-    let out = cow_update_dnode(
+    let out = cow_update_dnode_with_crypto(
         cx,
         os_view,
         alloc,
@@ -3851,6 +3974,8 @@ fn flush_sa_table_zap(
             indirect_bucket: WriteBucket::ChildBlocks,
         },
         &dirty,
+        obj_id,
+        write_crypto,
         staged_writes,
     )?;
     zpl_born.add_assign(out.born)?;
@@ -3982,6 +4107,7 @@ fn finalize_dataset_to_mos(
             alloc,
             order,
             new_txg,
+            ds_ctx.write_crypto.as_mut(),
             staged_writes,
             &mut zpl_born,
             &mut zpl_retired,
@@ -4002,6 +4128,7 @@ fn finalize_dataset_to_mos(
             alloc,
             order,
             new_txg,
+            ds_ctx.write_crypto.as_mut(),
             staged_writes,
             &mut zpl_born,
             &mut zpl_retired,
@@ -4018,6 +4145,7 @@ fn finalize_dataset_to_mos(
         &ds_ctx.owner_quota_limits,
         order,
         new_txg,
+        ds_ctx.write_crypto.as_mut(),
         staged_writes,
         &mut zpl_born,
         &mut zpl_retired,
@@ -4031,7 +4159,7 @@ fn finalize_dataset_to_mos(
     let zpl_max_block = zpl_meta_base
         .max_block()
         .max(all_zpl_dirty.keys().copied().max().unwrap_or(0));
-    let meta_out = cow_update_dnode(
+    let meta_out = cow_update_dnode_with_crypto(
         cx,
         os_view,
         alloc,
@@ -4055,39 +4183,29 @@ fn finalize_dataset_to_mos(
             indirect_bucket: WriteBucket::DatasetMetadata,
         },
         &zpl_meta_dirty,
+        0,
+        ds_ctx.write_crypto.as_mut(),
         staged_writes,
     )?;
     zpl_born.add_assign(meta_out.born)?;
     zpl_retired.extend(meta_out.retired_bps);
 
     ds_ctx.os.meta = meta_out.dnode;
-    let zpl_os_bytes = ds_ctx.os.encode(order).map_err(|e| parse_err(&e))?;
-    let zpl_os_fill = ds_ctx.os.meta_fill();
-    let zpl_os_dva = alloc.allocate(zpl_os_bytes.len())?;
-    let zpl_os_cksum = if matches!(ds_ctx.old_os_bp.checksum_type(), 6..=8) {
+    let zpl_os_cksum = if matches!(ds_ctx.old_os_bp.checksum_type(), 6..=8 | 11) {
         ds_ctx.old_os_bp.checksum_type()
     } else {
         7
     };
-    let new_os_bp = BlockPointer::new_regular(&RegularBlockSpec {
-        dvas: &[zpl_os_dva],
-        physical: &zpl_os_bytes,
-        logical_bytes: zpl_os_bytes.len(),
-        compression: 2,
-        checksum_type: zpl_os_cksum,
-        object_type: DMU_OT_OBJSET,
-        level: 0,
-        payload_order: order,
-        birth: new_txg,
-        fill: zpl_os_fill,
-    })
-    .map_err(|e| parse_err(&e))?;
+    let new_os_bp = write_dataset_objset_block(
+        &mut ds_ctx.os,
+        alloc,
+        zpl_os_cksum,
+        order,
+        new_txg,
+        ds_ctx.write_crypto.as_ref(),
+        staged_writes,
+    )?;
     zpl_born.add_assign(SpaceDelta::from_bp(&new_os_bp)?)?;
-    staged_writes.push(StagedBlockWrite {
-        bucket: WriteBucket::DatasetMetadata,
-        dva_offset: zpl_os_dva.offset,
-        bytes: zpl_os_bytes,
-    });
     zpl_retired.push(ds_ctx.old_os_bp.clone());
 
     // 3. Classify retired ZPL blocks: `birth > prev_snap_txg` -> free DVAs;

@@ -6,6 +6,8 @@
 
 #[path = "persistence_prefix/creation_project.rs"]
 mod creation_project;
+#[path = "persistence_prefix/encryption.rs"]
+mod encryption;
 #[path = "persistence_prefix/growth.rs"]
 mod growth;
 #[path = "persistence_prefix/mixed_order.rs"]

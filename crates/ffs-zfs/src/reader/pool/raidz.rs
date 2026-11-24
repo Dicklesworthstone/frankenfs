@@ -102,6 +102,7 @@ struct Stripe<'a> {
     // A retained handle index for internal bookkeeping, never an absent route.
     // Native provenance remains the full per-column RAIDZ report below.
     report_member: usize,
+    raw_only: bool,
 }
 
 struct Columns {
@@ -123,7 +124,7 @@ impl Pool {
         let dvas = if bp.gang() {
             bp.gang_dvas(&super::gang::header_allocations(config, bp)?)
         } else {
-            bp.regular_dvas()
+            bp.data_dvas()
         }
         .map_err(|error| parse(&error))?;
         if !(1..=3).contains(&group.parity)
@@ -234,6 +235,17 @@ impl Pool {
         bp: &BlockPointer,
         group: &RaidzGroup,
     ) -> Result<BlockRead> {
+        self.read_raidz_block_inner(cx, config, bp, group, false)
+    }
+
+    pub(super) fn read_raidz_block_inner(
+        &self,
+        cx: &Cx,
+        config: &VdevConfig,
+        bp: &BlockPointer,
+        group: &RaidzGroup,
+        raw_only: bool,
+    ) -> Result<BlockRead> {
         // Complete every map before a usable first DVA can conceal another
         // foreign, unsupported or out-of-range declared copy.
         let maps = self.raidz_maps(cx, config, bp, group)?;
@@ -267,6 +279,7 @@ impl Pool {
                 dva_offset: dva.offset,
                 copy_index,
                 report_member,
+                raw_only,
             };
             match self.read_raidz_stripe(cx, &stripe) {
                 Ok(block) => {
@@ -411,10 +424,7 @@ fn verify_candidate(
             .map_err(|error| parse(&error))?;
         physical
     } else {
-        stripe
-            .pointer
-            .decode(&physical)
-            .map_err(|error| parse(&error))?
+        super::super::decode_or_verify(stripe.pointer, physical, stripe.raw_only)?
     };
     checkpoint(cx)?;
     Ok(bytes)

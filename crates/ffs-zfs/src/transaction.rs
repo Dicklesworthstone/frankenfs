@@ -27,19 +27,21 @@ use ffs_ondisk::zfs_zpl::Timestamp;
 use ffs_types::ParseError;
 use serde::Serialize;
 
+use crate::crypto::{ZfsDatasetCryptoInfo, ZfsKeyMaterial, ZfsKeyRing, ZfsKeyStatus};
 use crate::reader::dmu::Objects;
 use crate::reader::dmu::allocation::AllocationLimits;
 use crate::reader::dmu::scrub::ScrubLimits;
 use crate::{Leaf, Pool};
 
 use self::dmu_cow::{
-    DMU_OT_OBJSET, MosFeatureState, PoolSpaceAllocator, StagedBlockWrite, WriteBucket,
+    MosFeatureState, PoolSpaceAllocator, StagedBlockWrite, WriteBucket,
     finalize_mos_and_space_maps_to_convergence, zap_optional_u64, zap_required_u64,
 };
 pub(crate) use self::dsl_ops::dataset_statfs_quota_space;
 use self::dsl_ops::{DslMutation, stage_dsl_mutation};
 pub use self::dsl_ops::{
-    ZfsBookmarkInfo, ZfsHoldInfo, ZfsPropertySetValue, list_bookmarks_in_mos, list_holds_in_mos,
+    ZfsBookmarkInfo, ZfsEncryptionCreateOptions, ZfsHoldInfo, ZfsPropertySetValue,
+    list_bookmarks_in_mos, list_holds_in_mos,
 };
 pub use self::zpl_ops::{
     ZfsDataChecksum, ZfsFileRangeOperation, ZfsObjectIdentity, ZfsPosixSetAttr, ZfsSetAttr,
@@ -332,6 +334,7 @@ pub struct ZfsTransactionEngine {
     events: Vec<ZfsPersistenceEvent>,
     fault_hook: Option<FaultHook>,
     poisoned_uncertain: bool,
+    keyring: ZfsKeyRing,
 }
 
 impl ZfsTransactionEngine {
@@ -705,9 +708,8 @@ impl ZfsTransactionEngine {
             let (hd_dn, hd_ceil) = mos.object_with_ceiling(cx, ds.head_object)?;
             let ds_bp = BlockPointer::parse(&hd_dn.bonus()[128..256], hd_dn.order())
                 .map_err(|e| parse_err(&e))?;
-            let (ds_raw, ds_ord, _) = mos
-                .checked_raw(cx, &ds_bp, DMU_OT_OBJSET, 0, ds_bp.logical_bytes(), hd_ceil)?
-                .ok_or_else(|| corrupt("head dataset ObjectSet is a hole"))?;
+            let (ds_raw, ds_ord, _) =
+                mos.read_dataset_objset_block_raw(cx, &ds_bp, hd_ceil, None, true)?;
             let ds_os = ObjectSet::parse(&ds_raw, ds_ord).map_err(|e| parse_err(&e))?;
             if mos.dataset_has_pending_zil_work(
                 cx,
@@ -849,7 +851,54 @@ impl ZfsTransactionEngine {
             events: Vec::new(),
             fault_hook: None,
             poisoned_uncertain: false,
+            keyring: ZfsKeyRing::new(),
         })
+    }
+
+    /// Attach a shared [`ZfsKeyRing`] to this transaction engine.
+    #[must_use]
+    pub fn with_keyring(mut self, keyring: ZfsKeyRing) -> Self {
+        self.keyring = keyring;
+        self
+    }
+
+    /// Borrow the engine's in-memory [`ZfsKeyRing`].
+    #[must_use]
+    pub const fn keyring(&self) -> &ZfsKeyRing {
+        &self.keyring
+    }
+
+    /// Discover native `com.datto:encryption` metadata for `dataset_components`.
+    pub fn dataset_crypto_info(
+        &self,
+        cx: &Cx,
+        dataset_components: &[Vec<u8>],
+    ) -> Result<Option<ZfsDatasetCryptoInfo>> {
+        let mut mos = self.open_read_objects(cx)?;
+        mos.dataset_crypto_info(cx, dataset_components)
+    }
+
+    /// Unwrap and load the dataset encryption key for `dataset_components`.
+    pub fn load_key(
+        &self,
+        cx: &Cx,
+        dataset_components: &[Vec<u8>],
+        material: &ZfsKeyMaterial,
+    ) -> Result<ZfsDatasetCryptoInfo> {
+        let mut mos = self.open_read_objects(cx)?;
+        mos.load_key(cx, dataset_components, material)
+    }
+
+    /// Unload and scrub the encryption key for `dataset_components`'s encryption root.
+    pub fn unload_key(&self, cx: &Cx, dataset_components: &[Vec<u8>]) -> Result<bool> {
+        let mut mos = self.open_read_objects(cx)?;
+        mos.unload_key(cx, dataset_components)
+    }
+
+    /// Report runtime [`ZfsKeyStatus`] for `dataset_components`.
+    pub fn key_status(&self, cx: &Cx, dataset_components: &[Vec<u8>]) -> Result<ZfsKeyStatus> {
+        let mut mos = self.open_read_objects(cx)?;
+        mos.key_status(cx, dataset_components)
     }
 
     pub fn with_fault_hook(
@@ -960,10 +1009,13 @@ impl ZfsTransactionEngine {
         Ok(())
     }
 
-    /// Open a fresh read-only [`Objects`] view pinned to the currently committed `(0, slot)`.
+    /// Open a fresh read-only [`Objects`] view pinned to the currently committed `(0, slot)`
+    /// with this engine's shared [`ZfsKeyRing`] attached.
     pub fn open_read_objects(&self, cx: &Cx) -> Result<Objects> {
-        self.pool
-            .objects(cx, 0, self.committed_slot, self.storage_identity.pool_guid)
+        let objects =
+            self.pool
+                .objects(cx, 0, self.committed_slot, self.storage_identity.pool_guid)?;
+        Ok(objects.with_keyring(self.keyring.clone()))
     }
 
     /// Create a new regular file in `parent_dir` on `dataset_components` (`&[]` = root dataset)
@@ -1744,7 +1796,58 @@ impl ZfsTransactionEngine {
                 parent_dataset: parent_dataset.to_vec(),
                 child_name: child_name.to_vec(),
                 initial_props: initial_props.to_vec(),
+                encryption: None,
                 timestamp,
+            },
+        )
+    }
+
+    /// Create a fresh child ZPL filesystem dataset with explicit native encryption parameters.
+    ///
+    /// When creating a new encryption root (`options.suite.is_active()`), the unwrapped key is
+    /// inserted into this engine's keyring ONLY after the TXG commits durably across all 4 labels;
+    /// pre-Uberblock failures leave the keyring untouched.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_encrypted_dataset(
+        &mut self,
+        cx: &Cx,
+        parent_dataset: &[Vec<u8>],
+        child_name: &[u8],
+        initial_props: &[(String, ZfsPropertySetValue)],
+        encryption: &ZfsEncryptionCreateOptions,
+        timestamp: Timestamp,
+    ) -> ZfsTxOutcome<u64> {
+        self.execute_dsl_txg(
+            cx,
+            &DslMutation::CreateDataset {
+                parent_dataset: parent_dataset.to_vec(),
+                child_name: child_name.to_vec(),
+                initial_props: initial_props.to_vec(),
+                encryption: Some(encryption.clone()),
+                timestamp,
+            },
+        )
+    }
+
+    /// Atomically rotate the wrapping key (and optional `keylocation`) of an encrypted root dataset
+    /// without rewriting any dataset data blocks.
+    pub fn change_key(
+        &mut self,
+        cx: &Cx,
+        dataset_components: &[Vec<u8>],
+        new_material: &ZfsKeyMaterial,
+        new_keylocation: Option<&[u8]>,
+        pbkdf2_iters: Option<u64>,
+        extra_entropy: &[u8],
+    ) -> ZfsTxOutcome<u64> {
+        self.execute_dsl_txg(
+            cx,
+            &DslMutation::ChangeKey {
+                dataset: dataset_components.to_vec(),
+                new_material: new_material.clone(),
+                new_keylocation: new_keylocation.map(<[u8]>::to_vec),
+                pbkdf2_iters,
+                extra_entropy: extra_entropy.to_vec(),
             },
         )
     }
@@ -2195,11 +2298,11 @@ impl ZfsTransactionEngine {
     fn execute_dsl_txg(&mut self, cx: &Cx, mutation: &DslMutation) -> ZfsTxOutcome<u64> {
         let empty_bpobj_id = self.empty_bpobj_id;
         let order = self.order;
-        self.execute_staged_txg(
+        let outcome = self.execute_staged_txg_typed(
             cx,
             mutation.op_name(),
             |mos, mos_dirty_dnodes, draft_features, draft_alloc, new_txg, base_staged| {
-                stage_dsl_mutation(
+                let staged = stage_dsl_mutation(
                     cx,
                     mos,
                     mutation,
@@ -2210,9 +2313,32 @@ impl ZfsTransactionEngine {
                     order,
                     new_txg,
                     base_staged,
-                )
+                )?;
+                let value = staged.value;
+                Ok((staged, value))
             },
-        )
+        );
+        match outcome {
+            ZfsTxOutcome::Committed { value, token } => {
+                if let Some((root_ddobj, unwrapped)) = value.new_root_key {
+                    let _ = self.keyring.insert_unwrapped(root_ddobj, unwrapped);
+                }
+                ZfsTxOutcome::Committed {
+                    value: value.value,
+                    token,
+                }
+            }
+            ZfsTxOutcome::NotCommitted(err) => ZfsTxOutcome::NotCommitted(err),
+            ZfsTxOutcome::Uncertain {
+                reason,
+                target_txg,
+                target_slot,
+            } => ZfsTxOutcome::Uncertain {
+                reason,
+                target_txg,
+                target_slot,
+            },
+        }
     }
 
     fn execute_staged_txg(

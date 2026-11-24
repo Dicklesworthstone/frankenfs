@@ -86,6 +86,8 @@ fn view(leaf: &Leaf, order: Endian, extra_flags: u64) -> Objects {
         meta: Dnode::parse(&raw, order).unwrap(),
         cache: VecDeque::new(),
         cached_bytes: 0,
+        keyring: crate::crypto::ZfsKeyRing::new(),
+        crypto: None,
     }
 }
 

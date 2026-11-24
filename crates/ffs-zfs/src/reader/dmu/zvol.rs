@@ -6,8 +6,8 @@
 //! allocation determines capacity. Pending ZIL intent is not replayed.
 
 use super::{
-    BlockPointer, Cx, FfsError, MAX_READ_BYTES, Object, ObjectSet, Objects, Result, VecDeque,
-    checkpoint, corrupt, parse, unsupported,
+    BlockPointer, Cx, FfsError, MAX_READ_BYTES, Object, ObjectSet, Objects, Result, checkpoint,
+    corrupt, parse, unsupported,
 };
 use ffs_block::ByteDevice;
 use ffs_types::ByteOffset;
@@ -90,9 +90,26 @@ impl Objects {
         if kind != OBJECTSET_TYPE || flags & 0x1_0000 != 0 {
             return Err(unsupported("zvol reads require a native volume object set"));
         }
-        let block = self
-            .checked(cx, &root, 11, 0, root.logical_bytes(), ceiling)?
-            .ok_or_else(|| corrupt("volume object-set root is a hole"))?;
+        let crypto_info = self.dataset_crypto_info(cx, components)?;
+        let (block, crypto_ctx) = if let Some(info) = crypto_info {
+            let key = self
+                .keyring
+                .get(info.encryption_root_ddobj)
+                .ok_or(FfsError::PermissionDenied)?;
+            let block = self.read_dataset_objset_block(cx, &root, ceiling, Some(&key), false)?;
+            (
+                block,
+                Some(std::sync::Arc::new(super::DatasetCryptoContext {
+                    info,
+                    raw_scrub_only: false,
+                })),
+            )
+        } else {
+            (
+                self.read_dataset_objset_block(cx, &root, ceiling, None, false)?,
+                None,
+            )
+        };
         let os = ObjectSet::parse(&block.bytes, block.order).map_err(|error| parse(&error))?;
         if os.kind != OBJECTSET_TYPE {
             return Err(corrupt("selected volume object-set type changed"));
@@ -108,15 +125,8 @@ impl Objects {
             dnode_used_bytes: 0,
             snapshot: snapshot.is_some(),
         };
-        let view = Self {
-            pool: self.pool.clone(),
-            config: self.config.clone(),
-            txg: view_txg,
-            root_birth: root.birth(),
-            meta: os.meta,
-            cache: VecDeque::new(),
-            cached_bytes: 0,
-        };
+        let view =
+            self.open_objectset_view_with_crypto(os.meta, root.birth(), view_txg, crypto_ctx);
         Zvol::open(cx, view, info)
     }
 }

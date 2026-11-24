@@ -129,7 +129,7 @@ pub(super) fn header_allocation(config: &VdevConfig) -> Result<u64> {
 
 /// Keep one header allocation per actual DVA, in copy order.
 pub(super) fn header_allocations(config: &VdevConfig, pointer: &BlockPointer) -> Result<Vec<u64>> {
-    let dvas = pointer.regular_dvas().map_err(|error| parse(&error))?;
+    let dvas = pointer.data_dvas().map_err(|error| parse(&error))?;
     if let Some(group) = &config.raidz_members
         && group.parity == 0
     {
@@ -238,11 +238,12 @@ impl Pool {
         checkpoint(cx)
     }
 
-    pub(in super::super) fn read_gang_block(
+    pub(in super::super) fn read_gang_block_inner(
         &self,
         cx: &Cx,
         config: &VdevConfig,
         pointer: &BlockPointer,
+        raw_only: bool,
     ) -> Result<BlockRead> {
         checkpoint(cx)?;
         self.gang_allocated_work(config, pointer)?;
@@ -271,7 +272,7 @@ impl Pool {
         }
         // Compression belongs to the leader, not to its fragments. Even if
         // every individual fragment verified, the complete leader must match.
-        result.bytes = pointer.decode(&physical).map_err(|error| parse(&error))?;
+        result.bytes = super::super::decode_or_verify(pointer, physical, raw_only)?;
         checkpoint(cx)?;
         Ok(result)
     }
@@ -338,7 +339,7 @@ impl Pool {
                 let dvas = self.gang_header_dvas(cx, config, pointer)?;
                 return Ok(dvas.into_iter().zip(header_allocs).collect());
             }
-            let dvas = pointer.regular_dvas().map_err(|error| parse(&error))?;
+            let dvas = pointer.data_dvas().map_err(|error| parse(&error))?;
             for dva in &dvas {
                 checkpoint(cx)?;
                 let vdev = group

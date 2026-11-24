@@ -12,7 +12,7 @@ pub use path::PathPolicy;
 use super::zil::{self, OwnedEdit};
 use super::{
     BTreeSet, BlockPointer, Cx, FfsError, MAX_READ_BYTES, Object, ObjectSet, Objects, Result,
-    VecDeque, checkpoint, corrupt, parse, unsupported,
+    checkpoint, corrupt, parse, unsupported,
 };
 use ffs_ondisk::zfs_dmu::{ZapEntry, ZilHeader, ZilRecordPayload};
 use ffs_ondisk::zfs_zpl::{Attributes, Kind, Metadata, SA_BYTES, SaRegistry, directory_reference};
@@ -102,6 +102,7 @@ impl Objects {
                 "ZPL reads require a case-sensitive filesystem head",
             ));
         }
+        let crypto_info = self.dataset_crypto_info(cx, components)?;
         let object = self.load(cx, dataset.head_object)?;
         let referenced_bytes = object
             .node
@@ -110,23 +111,31 @@ impl Objects {
             .map_err(|error| parse(&error))?;
         let bp = BlockPointer::parse(&object.node.bonus()[128..256], object.node.order())
             .map_err(|error| parse(&error))?;
-        let raw = self
-            .checked(cx, &bp, 11, 0, bp.logical_bytes(), object.ceiling)?
-            .ok_or_else(|| corrupt("ZPL head object set is a hole"))?;
+        let (raw, crypto_ctx) = if let Some(info) = crypto_info {
+            let key = self
+                .keyring
+                .get(info.encryption_root_ddobj)
+                .ok_or(FfsError::PermissionDenied)?;
+            let raw = self.read_dataset_objset_block(cx, &bp, object.ceiling, Some(&key), false)?;
+            (
+                raw,
+                Some(Arc::new(super::DatasetCryptoContext {
+                    info,
+                    raw_scrub_only: false,
+                })),
+            )
+        } else {
+            (
+                self.read_dataset_objset_block(cx, &bp, object.ceiling, None, false)?,
+                None,
+            )
+        };
         let os = ObjectSet::parse(&raw.bytes, raw.order).map_err(|error| parse(&error))?;
         if os.kind != 2 || bp.birth() != dataset.root_birth {
             return Err(corrupt("selected ZPL head identity changed"));
         }
         let zil_header = os.zil_header;
-        let view = Self {
-            pool: self.pool.clone(),
-            config: self.config.clone(),
-            txg: self.txg,
-            root_birth: bp.birth(),
-            meta: os.meta,
-            cache: VecDeque::new(),
-            cached_bytes: 0,
-        };
+        let view = self.open_objectset_view_with_crypto(os.meta, bp.birth(), self.txg, crypto_ctx);
         Zpl::open(
             cx,
             view,
@@ -148,6 +157,23 @@ impl Zpl {
         limits: super::scrub::ScrubLimits,
     ) -> Result<super::scrub::ScrubReport> {
         self.objects.scrub(cx, limits)
+    }
+
+    /// Unload this dataset's encryption root key from the shared keyring and immediately
+    /// evict all cached decoded blocks from this `Zpl` view.
+    pub fn unload_key(&mut self, cx: &Cx) -> Result<bool> {
+        checkpoint(cx)?;
+        let Some(ctx) = self.objects.crypto.as_ref() else {
+            return Err(FfsError::Format(
+                "cannot unload key for an unencrypted ZFS dataset".into(),
+            ));
+        };
+        let removed = self
+            .objects
+            .keyring
+            .unload_key(ctx.info.encryption_root_ddobj)?;
+        self.objects.clear_cache();
+        Ok(removed)
     }
 
     fn open(

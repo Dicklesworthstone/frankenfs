@@ -327,6 +327,8 @@ fn view(leaf: &Leaf, meta: Dnode) -> Objects {
         meta,
         cache: VecDeque::new(),
         cached_bytes: 0,
+        keyring: crate::crypto::ZfsKeyRing::new(),
+        crypto: None,
     }
 }
 

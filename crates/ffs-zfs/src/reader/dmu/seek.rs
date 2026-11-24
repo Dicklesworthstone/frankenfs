@@ -336,6 +336,8 @@ mod tests {
                 meta: node(512, 1, 0, 0, &[vec![0; 128]], Endian::Little),
                 cache: std::collections::VecDeque::new(),
                 cached_bytes: 0,
+                keyring: crate::crypto::ZfsKeyRing::new(),
+                crypto: None,
             },
             reads,
         )

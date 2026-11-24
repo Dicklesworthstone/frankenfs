@@ -15,6 +15,8 @@ pub struct VolumeArgs {
     /// Exact native snapshot; omit for this volume's committed head.
     #[arg(long)]
     snapshot: Option<OsString>,
+    #[command(flatten)]
+    key: super::super::KeyArgs,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -93,6 +95,7 @@ impl Command {
         }
         let components = dataset_components(&args.dataset)?;
         let mut objects = args.candidate.objects(cx)?;
+        args.key.load_into_objects(cx, &mut objects, &components)?;
         let mut volume = objects.zvol(
             cx,
             &components,

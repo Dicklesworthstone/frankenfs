@@ -3,8 +3,8 @@
 //! against its predecessor chain. No rewind, clone traversal, replay or writes.
 
 use super::{
-    BlockPointer, Cx, FfsError, Object, ObjectSet, Objects, Result, VecDeque, Zpl, checkpoint,
-    corrupt, parse, unsupported,
+    BlockPointer, Cx, FfsError, Object, ObjectSet, Objects, Result, Zpl, checkpoint, corrupt,
+    parse, unsupported,
 };
 use ffs_ondisk::zfs_zap::names::NamePolicy;
 use std::collections::{BTreeMap, BTreeSet};
@@ -234,16 +234,13 @@ impl Objects {
                     "snapshot object-set size is outside the native profile",
                 ));
             }
-            let block = self
-                .checked(
-                    cx,
-                    &record.root,
-                    11,
-                    0,
-                    record.root.logical_bytes(),
-                    record.ceiling.min(record.creation_txg),
-                )?
-                .ok_or_else(|| corrupt("named snapshot has a missing object-set root"))?;
+            let block = self.read_dataset_objset_block(
+                cx,
+                &record.root,
+                record.ceiling.min(record.creation_txg),
+                None,
+                true,
+            )?;
             let os = ObjectSet::parse(&block.bytes, block.order).map_err(|error| parse(&error))?;
             if Some(os.kind) != dataset.objectset_kind {
                 return Err(corrupt(
@@ -370,27 +367,46 @@ impl Objects {
                 "ZPL snapshot reads require a case-sensitive filesystem",
             ));
         }
-        let block = self
-            .checked(
+        let crypto_info = self.dataset_crypto_info(cx, components)?;
+        let (block, crypto_ctx) = if let Some(info) = crypto_info {
+            let key = self
+                .keyring
+                .get(info.encryption_root_ddobj)
+                .ok_or(FfsError::PermissionDenied)?;
+            let block = self.read_dataset_objset_block(
                 cx,
                 &selected.root,
-                11,
-                0,
-                selected.root.logical_bytes(),
                 selected.info.creation_txg,
-            )?
-            .ok_or_else(|| corrupt("selected snapshot object set is a hole"))?;
+                Some(&key),
+                false,
+            )?;
+            (
+                block,
+                Some(std::sync::Arc::new(super::super::DatasetCryptoContext {
+                    info,
+                    raw_scrub_only: false,
+                })),
+            )
+        } else {
+            (
+                self.read_dataset_objset_block(
+                    cx,
+                    &selected.root,
+                    selected.info.creation_txg,
+                    None,
+                    false,
+                )?,
+                None,
+            )
+        };
         let os = ObjectSet::parse(&block.bytes, block.order).map_err(|error| parse(&error))?;
         let zil_header = os.zil_header;
-        let view = Self {
-            pool: self.pool.clone(),
-            config: self.config.clone(),
-            txg: selected.info.creation_txg,
-            root_birth: selected.root.birth(),
-            meta: os.meta,
-            cache: VecDeque::new(),
-            cached_bytes: 0,
-        };
+        let view = self.open_objectset_view_with_crypto(
+            os.meta,
+            selected.root.birth(),
+            selected.info.creation_txg,
+            crypto_ctx,
+        );
         Zpl::open(
             cx,
             view,

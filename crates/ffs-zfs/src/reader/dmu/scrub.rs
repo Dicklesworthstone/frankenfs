@@ -8,10 +8,11 @@
 mod copies;
 
 use super::{
-    BlockPointer, CheckedBlock, Cx, DNODE_BLOCK_BYTES, DNODE_BYTES, Dnode, FfsError, MAX_OBJECT,
-    Objects, Result, checkpoint, corrupt, parse, unsupported,
+    BlockPointer, CheckedBlock, Cx, DNODE_BLOCK_BYTES, DNODE_BYTES, DatasetCryptoContext, Dnode,
+    FfsError, MAX_OBJECT, ObjectSet, Objects, Result, checkpoint, corrupt, parse, unsupported,
 };
 use serde::Serialize;
+use std::sync::Arc;
 
 const MAX_ISSUES: usize = 128;
 
@@ -246,22 +247,45 @@ impl Walker<'_> {
             if !self.charge_bytes(bp.logical_bytes()) {
                 return Ok(());
             }
-            match self
-                .view
-                .checked(cx, bp, 44, 0, bp.logical_bytes(), tree.ceiling)
-            {
-                Ok(Some(block)) => {
-                    self.report.verified_blocks += 1;
-                    self.report.verified_bytes += block.bytes.len() as u64;
-                    self.audit_copies(cx, tree.number, position, bp)?;
+            if self.view.is_raw_scrub_keyless() && bp.protected() {
+                match self
+                    .view
+                    .validate_pointer(bp, 44, 0, bp.logical_bytes(), tree.ceiling)
+                {
+                    Ok(true) => match self.view.pool.read_raw_block(cx, &self.view.config, bp) {
+                        Ok(_) => {
+                            self.report.verified_blocks += 1;
+                            self.report.verified_bytes += bp.logical_bytes() as u64;
+                            self.audit_copies(cx, tree.number, position, bp)?;
+                        }
+                        Err(error) => self.issue(tree.number, position, &error, false)?,
+                    },
+                    Ok(false) => self.issue(
+                        tree.number,
+                        position,
+                        &corrupt("allocated SA spill is a hole"),
+                        false,
+                    )?,
+                    Err(error) => self.issue(tree.number, position, &error, false)?,
                 }
-                Ok(None) => self.issue(
-                    tree.number,
-                    position,
-                    &corrupt("allocated SA spill is a hole"),
-                    false,
-                )?,
-                Err(error) => self.issue(tree.number, position, &error, false)?,
+            } else {
+                match self
+                    .view
+                    .checked(cx, bp, 44, 0, bp.logical_bytes(), tree.ceiling)
+                {
+                    Ok(Some(block)) => {
+                        self.report.verified_blocks += 1;
+                        self.report.verified_bytes += block.bytes.len() as u64;
+                        self.audit_copies(cx, tree.number, position, bp)?;
+                    }
+                    Ok(None) => self.issue(
+                        tree.number,
+                        position,
+                        &corrupt("allocated SA spill is a hole"),
+                        false,
+                    )?,
+                    Err(error) => self.issue(tree.number, position, &error, false)?,
+                }
             }
         }
         Ok(())
@@ -296,6 +320,31 @@ impl Walker<'_> {
         };
         if !bp.hole() && !self.charge_bytes(size) {
             return Ok(());
+        }
+        if self.view.is_raw_scrub_keyless() && bp.protected() && position.level == 0 && !tree.dnodes
+        {
+            match self.view.validate_pointer(
+                bp,
+                tree.node.object_type(),
+                position.level,
+                size,
+                ceiling,
+            ) {
+                Ok(true) => match self.view.pool.read_raw_block(cx, &self.view.config, bp) {
+                    Ok(_) => {
+                        self.report.verified_blocks += 1;
+                        self.report.verified_bytes += size as u64;
+                        self.audit_copies(cx, tree.number, position, bp)?;
+                        return Ok(());
+                    }
+                    Err(error) => return self.issue(tree.number, position, &error, descendants),
+                },
+                Ok(false) => {
+                    self.report.hole_pointers += 1;
+                    return Ok(());
+                }
+                Err(error) => return self.issue(tree.number, position, &error, descendants),
+            }
         }
         let block = match self.view.checked(
             cx,
@@ -495,6 +544,71 @@ impl Objects {
         checkpoint(cx)?;
         Ok(walker.report)
     }
+
+    /// Scrub a named dataset head or snapshot from this MOS view.
+    ///
+    /// For encrypted datasets:
+    /// - If the dataset key is loaded in `self.keyring()`, verifies `objset_phys_t`
+    ///   portable/local HMACs, indirect SHA-512 MACs, full AEAD/HMAC tags on every
+    ///   dnode/data/spill block, and all physical checksums.
+    /// - If the key is NOT loaded (`ZfsKeyStatus::Unavailable`), performs a full
+    ///   OpenZFS-compatible keyless raw scrub: verifies physical checksums on the
+    ///   objset, indirect blocks, dnode table, and every encrypted L0 block, plus
+    ///   keyless indirect-block SHA-512 MACs across the complete tree!
+    pub fn scrub_dataset(
+        &mut self,
+        cx: &Cx,
+        components: &[Vec<u8>],
+        snapshot: Option<&[u8]>,
+        limits: ScrubLimits,
+    ) -> Result<ScrubReport> {
+        checkpoint(cx)?;
+        let (root_bp, view_txg, ceiling) = if let Some(name) = snapshot {
+            let selected = self.named_snapshot_root(cx, components, name)?;
+            (
+                selected.root,
+                selected.info.creation_txg,
+                selected.info.creation_txg,
+            )
+        } else {
+            let selected = self
+                .datasets(cx)?
+                .into_iter()
+                .find(|row| row.components == components)
+                .ok_or_else(|| FfsError::NotFound("ZFS dataset".into()))?;
+            if selected.objectset_kind.is_none() {
+                return Err(unsupported(
+                    "dataset scrub requires an initialized object set",
+                ));
+            }
+            let object = self.load(cx, selected.head_object)?;
+            let bp = BlockPointer::parse(&object.node.bonus()[128..256], object.node.order())
+                .map_err(|error| parse(&error))?;
+            (bp, self.txg, object.ceiling)
+        };
+        let crypto_info = self.dataset_crypto_info(cx, components)?;
+        let (raw, crypto_ctx) = if let Some(info) = crypto_info {
+            let key = self.keyring().get(info.encryption_root_ddobj);
+            let raw =
+                self.read_dataset_objset_block(cx, &root_bp, ceiling, key.as_deref(), true)?;
+            (
+                raw,
+                Some(Arc::new(DatasetCryptoContext {
+                    info,
+                    raw_scrub_only: true,
+                })),
+            )
+        } else {
+            (
+                self.read_dataset_objset_block(cx, &root_bp, ceiling, None, false)?,
+                None,
+            )
+        };
+        let os = ObjectSet::parse(&raw.bytes, raw.order).map_err(|error| parse(&error))?;
+        let child_view =
+            self.open_objectset_view_with_crypto(os.meta, root_bp.birth(), view_txg, crypto_ctx);
+        child_view.scrub(cx, limits)
+    }
 }
 
 companion_bin_tests! {
@@ -605,6 +719,7 @@ companion_bin_tests! {
                     },
                     txg: 43, root_birth: 42, meta: Dnode::parse(&meta, self.order).unwrap(),
                     cache: VecDeque::new(), cached_bytes: 0,
+                    keyring: crate::crypto::ZfsKeyRing::new(), crypto: None,
                 }
             }
         }

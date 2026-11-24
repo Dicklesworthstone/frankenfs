@@ -38,6 +38,14 @@ fn unsupported(detail: impl Into<String>) -> FfsError {
 fn parse(error: &ffs_types::ParseError) -> FfsError {
     corrupt(error.to_string())
 }
+fn decode_or_verify(bp: &BlockPointer, raw: Vec<u8>, raw_only: bool) -> Result<Vec<u8>> {
+    if raw_only {
+        bp.verify_physical(&raw).map_err(|error| parse(&error))?;
+        Ok(raw)
+    } else {
+        bp.decode(&raw).map_err(|error| parse(&error))
+    }
+}
 fn integer(list: &NvList, name: &str) -> Result<u64> {
     list.unsigned(name)
         .ok_or_else(|| corrupt(format!("missing or mistyped ZFS config integer {name}")))
@@ -626,8 +634,18 @@ impl Leaf {
         config: &VdevConfig,
         bp: &BlockPointer,
     ) -> Result<(Vec<u8>, u64, usize)> {
+        self.read_block_inner(cx, config, bp, false)
+    }
+
+    pub(self) fn read_block_inner(
+        &self,
+        cx: &Cx,
+        config: &VdevConfig,
+        bp: &BlockPointer,
+        raw_only: bool,
+    ) -> Result<(Vec<u8>, u64, usize)> {
         if bp.gang() {
-            let block = Pool::from(self.clone()).read_gang_block(cx, config, bp)?;
+            let block = Pool::from(self.clone()).read_gang_block_inner(cx, config, bp, raw_only)?;
             return Ok((block.bytes, block.physical_offset, block.copy_index));
         }
         let dvas = self.block_dvas(config, bp)?;
@@ -637,7 +655,7 @@ impl Leaf {
             let offset = DATA_OFFSET + dva.offset;
             let result = self
                 .read(cx, offset, bp.physical_bytes())
-                .and_then(|bytes| bp.decode(&bytes).map_err(|error| parse(&error)));
+                .and_then(|bytes| decode_or_verify(bp, bytes, raw_only));
             match result {
                 Ok(data) => {
                     checkpoint(cx)?;
@@ -690,7 +708,7 @@ impl Leaf {
 
     /// Validate the whole DVA set against one physical member before data I/O.
     fn block_dvas(&self, config: &VdevConfig, bp: &BlockPointer) -> Result<Vec<Dva>> {
-        let dvas = bp.regular_dvas().map_err(|error| parse(&error))?;
+        let dvas = bp.data_dvas().map_err(|error| parse(&error))?;
         let sector = 1_u64 << config.ashift;
         let aligned_end = self.length / LABEL_BYTES * LABEL_BYTES - 2 * LABEL_BYTES;
         if config.allocated_bytes == 0

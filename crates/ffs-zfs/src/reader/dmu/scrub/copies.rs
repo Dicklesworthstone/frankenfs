@@ -71,6 +71,10 @@ impl Contents<'_> {
                     "gang header replica disagrees with the admitted fragment graph",
                 ));
             }
+        } else if self.pointer.protected() {
+            self.pointer
+                .verify_physical(bytes)
+                .map_err(|error| super::parse(&error))?;
         } else {
             self.pointer
                 .decode(bytes)
@@ -99,7 +103,7 @@ fn plan(view: &Objects, contents: &Contents<'_>) -> Result<(Plan, u64)> {
     let dvas = if bp.gang() {
         bp.gang_dvas(contents.header_allocations)
     } else {
-        bp.regular_dvas()
+        bp.data_dvas()
     }
     .map_err(|error| super::parse(&error))?;
     let mut work = 0_u64;

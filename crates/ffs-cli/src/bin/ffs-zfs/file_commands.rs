@@ -4,7 +4,7 @@ mod zil;
 mod zvol;
 
 use super::reader::dmu::zpl::PathPolicy;
-use super::{CandidateArgs, Context, Cx, Result, bail, json};
+use super::{CandidateArgs, Context, Cx, KeyArgs, Result, bail, json};
 use clap::{Args, Subcommand};
 use ffs_ondisk::zfs_zpl::{Kind, Metadata};
 use std::ffi::OsString;
@@ -25,6 +25,8 @@ pub struct FileArgs {
     /// Refuse symlink traversal; a final link remains available for inspection.
     #[arg(long)]
     no_symlinks: bool,
+    #[command(flatten)]
+    key: KeyArgs,
     /// Native path confined to this dataset or snapshot, never a host path.
     path: PathBuf,
 }
@@ -35,6 +37,26 @@ pub enum FileCommand {
     Zil(zil::Command),
     #[command(flatten)]
     Zvol(zvol::Command),
+    /// Inspect native encryption suite, keyformat, encryptionroot, and keystatus (never prints secrets).
+    KeyStatus {
+        #[command(flatten)]
+        candidate: CandidateArgs,
+        /// Head dataset relative to the pool; empty selects the pool root.
+        #[arg(long, default_value = "")]
+        dataset: String,
+        #[command(flatten)]
+        key: KeyArgs,
+    },
+    /// Verify a wrapping key against an offline encrypted dataset's `dsl_crypto_key` without writing.
+    LoadKey {
+        #[command(flatten)]
+        candidate: CandidateArgs,
+        /// Head dataset relative to the pool; empty selects the pool root.
+        #[arg(long, default_value = "")]
+        dataset: String,
+        #[command(flatten)]
+        key: KeyArgs,
+    },
     /// Verify one dataset's allocated DMU blocks without writing or healing.
     Scrub {
         #[command(flatten)]
@@ -45,6 +67,8 @@ pub enum FileCommand {
         /// Exact native snapshot name; omit for the selected committed head.
         #[arg(long)]
         snapshot: Option<OsString>,
+        #[command(flatten)]
+        key: KeyArgs,
         /// Maximum pointer visits, including sparse and failed branches.
         #[arg(long, default_value_t = 16_777_216, value_parser = clap::value_parser!(u64).range(1..=4_294_967_296))]
         max_pointers: u64,
@@ -71,6 +95,8 @@ pub enum FileCommand {
         /// Exact native snapshot name; omit for the selected committed head.
         #[arg(long)]
         snapshot: Option<OsString>,
+        #[command(flatten)]
+        key: KeyArgs,
         /// Existing empty host directory outside every backing image's path.
         mountpoint: PathBuf,
         /// Synthetic ownership; native ZFS ACLs are not projected or enforced.
@@ -196,10 +222,89 @@ impl FileCommand {
         let (file, output) = match self {
             Self::Zil(command) => return command.run(cx),
             Self::Zvol(command) => return command.run(cx),
+            Self::KeyStatus {
+                candidate,
+                dataset,
+                key,
+            } => {
+                if candidate.image.sidecar.is_some() {
+                    bail!("read-only ZFS key-status does not admit sidecar healing");
+                }
+                let components = dataset_components(&dataset)?;
+                let mut pool = candidate.objects(cx)?;
+                key.load_into_objects(cx, &mut pool, &components)?;
+                let pool_guid = pool.pool_guid();
+                let info = pool.dataset_crypto_info(cx, &components)?;
+                let status = pool.key_status(cx, &components)?;
+                let encryption_root = info.as_ref().map(|c| {
+                    c.encryption_root_components
+                        .iter()
+                        .map(|p| String::from_utf8_lossy(p).into_owned())
+                        .collect::<Vec<_>>()
+                        .join("/")
+                });
+                cx.checkpoint()
+                    .map_err(|_| ffs_error::FfsError::Cancelled)?;
+                return json(&serde_json::json!({
+                    "format": "ZFS",
+                    "operation": "key_status",
+                    "read_only": true,
+                    "backing_writes": false,
+                    "pool_guid": pool_guid.to_string(),
+                    "txg": pool.txg,
+                    "dataset": dataset,
+                    "encrypted": info.is_some(),
+                    "encryption": info.as_ref().map_or("off", |c| c.record.suite.name()),
+                    "keyformat": info.as_ref().map_or("none", |c| c.record.keyformat.name()),
+                    "keylocation": info.as_ref().map(|c| String::from_utf8_lossy(&c.keylocation).into_owned()),
+                    "pbkdf2iters": info.as_ref().map_or(0, |c| c.record.pbkdf2_iters),
+                    "encryptionroot": encryption_root,
+                    "keystatus": status.as_str(),
+                }));
+            }
+            Self::LoadKey {
+                candidate,
+                dataset,
+                key,
+            } => {
+                if candidate.image.sidecar.is_some() {
+                    bail!("read-only ZFS load-key does not admit sidecar healing");
+                }
+                let components = dataset_components(&dataset)?;
+                let Some(material) = key.load_material()? else {
+                    bail!("load-key requires --key-file, --key-hex-file, or --passphrase-file");
+                };
+                let mut pool = candidate.objects(cx)?;
+                let target_components = match &key.key_dataset {
+                    Some(ds) => dataset_components(ds)?,
+                    None => components,
+                };
+                pool.load_key(cx, &target_components, &material)
+                    .context("verifying ZFS wrapping key against dsl_crypto_key")?;
+                let info = pool
+                    .dataset_crypto_info(cx, &target_components)?
+                    .ok_or_else(|| anyhow::anyhow!("dataset is not encrypted"))?;
+                let status = pool.key_status(cx, &target_components)?;
+                cx.checkpoint()
+                    .map_err(|_| ffs_error::FfsError::Cancelled)?;
+                return json(&serde_json::json!({
+                    "format": "ZFS",
+                    "operation": "load_key",
+                    "read_only": true,
+                    "backing_writes": false,
+                    "pool_guid": pool.pool_guid().to_string(),
+                    "txg": pool.txg,
+                    "dataset": dataset,
+                    "encryption": info.record.suite.name(),
+                    "keyformat": info.record.keyformat.name(),
+                    "keystatus": status.as_str(),
+                }));
+            }
             Self::Scrub {
                 candidate,
                 dataset,
                 snapshot,
+                key,
                 max_pointers,
                 max_bytes,
                 max_objects,
@@ -216,33 +321,34 @@ impl FileCommand {
                 }
                 let components = dataset_components(&dataset)?;
                 let mut pool = candidate.objects(cx)?;
+                key.load_into_objects(cx, &mut pool, &components)?;
                 let pool_txg = pool.txg;
-                let ds_kind = pool
-                    .datasets(cx)?
-                    .into_iter()
-                    .find(|d| d.components == components)
-                    .and_then(|d| d.objectset_kind);
+                let key_status = pool.key_status(cx, &components)?;
+                let dataset_guid = if let Some(name) = snapshot.as_deref() {
+                    pool.snapshots(cx, &components)?
+                        .into_iter()
+                        .find(|s| s.name == name.as_bytes())
+                        .ok_or_else(|| ffs_error::FfsError::NotFound("ZFS snapshot".into()))?
+                        .guid
+                } else {
+                    pool.datasets(cx)?
+                        .into_iter()
+                        .find(|d| d.components == components)
+                        .ok_or_else(|| ffs_error::FfsError::NotFound("ZFS dataset".into()))?
+                        .guid
+                };
                 let limits = super::reader::dmu::scrub::ScrubLimits {
                     pointers: max_pointers,
                     decoded_bytes: max_bytes,
                     objects: max_objects,
                     copy_bytes: verify_redundancy.then_some(max_copy_bytes.unwrap_or(1 << 40)),
                 };
-                let (dataset_guid, report) = if ds_kind == Some(3) {
-                    let zvol =
-                        pool.zvol(cx, &components, snapshot.as_deref().map(OsStrExt::as_bytes))?;
-                    let guid = zvol.info().dataset_guid;
-                    let rep = zvol.scrub(cx, limits)?;
-                    (guid, rep)
-                } else {
-                    let view = match snapshot.as_deref() {
-                        Some(name) => pool.zpl_snapshot(cx, &components, name.as_bytes())?,
-                        None => pool.zpl(cx, &components)?,
-                    };
-                    let guid = view.dataset_guid;
-                    let rep = view.scrub(cx, limits)?;
-                    (guid, rep)
-                };
+                let report = pool.scrub_dataset(
+                    cx,
+                    &components,
+                    snapshot.as_deref().map(OsStrExt::as_bytes),
+                    limits,
+                )?;
                 let clean = report.is_clean();
                 cx.checkpoint()
                     .map_err(|_| ffs_error::FfsError::Cancelled)?;
@@ -251,6 +357,7 @@ impl FileCommand {
                     "scope": "selected_dataset_dmu_blocks",
                     "pool_guid": report.pool_guid.to_string(), "pool_txg": pool_txg,
                     "dataset": dataset, "dataset_guid": dataset_guid.to_string(),
+                    "key_status": key_status.as_str(),
                     "snapshot": snapshot.as_deref().and_then(|name| name.to_str()),
                     "snapshot_name_bytes": snapshot.as_deref().map(OsStrExt::as_bytes),
                     "clean": clean, "repaired_blocks": 0,
@@ -278,6 +385,7 @@ impl FileCommand {
                 candidate,
                 dataset,
                 snapshot,
+                key,
                 mountpoint,
                 uid,
                 gid,
@@ -296,6 +404,7 @@ impl FileCommand {
                 }
                 candidate.reject_hidden_images(&mountpoint)?;
                 let mut pool = candidate.objects(cx)?;
+                key.load_into_objects(cx, &mut pool, &components)?;
                 let mut view = match snapshot.as_deref() {
                     Some(name) => pool.zpl_snapshot(cx, &components, name.as_bytes())?,
                     None => pool.zpl(cx, &components)?,
@@ -401,6 +510,7 @@ impl FileCommand {
         let components = dataset_components(&file.dataset)?;
         let c = file.candidate;
         let mut pool = c.objects(cx)?;
+        file.key.load_into_objects(cx, &mut pool, &components)?;
         let txg = pool.txg;
         let mut view = match file.snapshot.as_deref() {
             Some(name) => pool.zpl_snapshot(cx, &components, name.as_bytes())?,
@@ -583,6 +693,7 @@ mod tests {
             candidate,
             dataset,
             snapshot,
+            key,
             mountpoint,
             uid,
             gid,
@@ -590,6 +701,7 @@ mod tests {
         else {
             panic!("mount command");
         };
+        assert!(key.is_empty());
         assert_eq!(
             (candidate.label, candidate.slot, candidate.pool_guid),
             (0, 2, 123)
@@ -884,6 +996,7 @@ mod tests {
             candidate,
             dataset,
             snapshot,
+            key,
             max_pointers,
             max_bytes,
             max_objects,
@@ -893,6 +1006,7 @@ mod tests {
         else {
             panic!("scrub command");
         };
+        assert!(key.is_empty());
         assert!(candidate.auto_import);
         assert!(candidate.image.offline_image);
         assert_eq!(candidate.members, [PathBuf::from("second.img")]);
@@ -1015,6 +1129,92 @@ mod tests {
                     .unwrap_err()
                     .to_string()
                     .contains(reason)
+            );
+        }
+    }
+
+    #[test]
+    fn encryption_read_key_status_and_load_key_cli_contracts() {
+        let parsed = Cli::try_parse_from([
+            "ffs-zfs",
+            "key-status",
+            "leaf.img",
+            "--offline-image",
+            "--pool-guid",
+            "123",
+            "--label",
+            "0",
+            "--slot",
+            "2",
+            "--dataset",
+            "data/enc",
+            "--key-file",
+            "/tmp/raw.key",
+        ])
+        .unwrap();
+        let Command::File(FileCommand::KeyStatus { dataset, key, .. }) = parsed.command else {
+            panic!("key-status command");
+        };
+        assert_eq!(dataset, "data/enc");
+        assert_eq!(key.key_file, Some(PathBuf::from("/tmp/raw.key")));
+
+        let parsed = Cli::try_parse_from([
+            "ffs-zfs",
+            "load-key",
+            "leaf.img",
+            "--offline-image",
+            "--auto-import",
+            "--dataset",
+            "data/enc",
+            "--passphrase-file",
+            "/tmp/pass.txt",
+        ])
+        .unwrap();
+        let Command::File(FileCommand::LoadKey { dataset, key, .. }) = parsed.command else {
+            panic!("load-key command");
+        };
+        assert_eq!(dataset, "data/enc");
+        assert_eq!(key.passphrase_file, Some(PathBuf::from("/tmp/pass.txt")));
+
+        // Conflicting key sources must be rejected by clap.
+        assert!(
+            Cli::try_parse_from([
+                "ffs-zfs",
+                "read",
+                "leaf.img",
+                "/secret.txt",
+                "--offline-image",
+                "--auto-import",
+                "--dataset",
+                "data/enc",
+                "--key-file",
+                "/tmp/a.key",
+                "--key-hex-file",
+                "/tmp/b.hex",
+            ])
+            .is_err()
+        );
+        // Sidecar healing refused before image open on key-status and load-key.
+        for cmd in ["key-status", "load-key"] {
+            let cli = Cli::try_parse_from([
+                "ffs-zfs",
+                cmd,
+                "unopened.img",
+                "--offline-image",
+                "--auto-import",
+                "--sidecar",
+                "unopened.rq",
+            ])
+            .unwrap();
+            let Command::File(command) = cli.command else {
+                panic!("file command");
+            };
+            assert!(
+                command
+                    .run(&Cx::for_testing())
+                    .unwrap_err()
+                    .to_string()
+                    .contains("does not admit sidecar healing")
             );
         }
     }

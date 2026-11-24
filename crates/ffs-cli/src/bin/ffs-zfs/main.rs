@@ -11,10 +11,172 @@ use asupersync::Cx;
 use clap::{Args, Parser, Subcommand};
 use ffs_error::FfsError;
 use ffs_ondisk::zfs::UBERBLOCK_RING_BYTES;
-use ffs_zfs::{filesystem, reader};
+use ffs_ondisk::zfs::crypto::{ZFS_WRAPPING_KEY_LEN, scrub_bytes};
+use ffs_zfs::{ZfsKeyMaterial, ZfsTransactionEngine, filesystem, reader};
 use reader::{Leaf, Pool};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+
+#[derive(Debug, Default, Args)]
+pub struct KeyArgs {
+    /// Host file containing an exact 32-byte raw wrapping key (`keyformat=raw`).
+    #[arg(long, conflicts_with_all = ["key_hex_file", "passphrase_file"])]
+    pub key_file: Option<PathBuf>,
+    /// Host file containing 64 ASCII hexadecimal digits (`keyformat=hex`).
+    #[arg(long, conflicts_with_all = ["key_file", "passphrase_file"])]
+    pub key_hex_file: Option<PathBuf>,
+    /// Host file containing a passphrase (`keyformat=passphrase`, single trailing newline stripped).
+    #[arg(long, conflicts_with_all = ["key_file", "key_hex_file"])]
+    pub passphrase_file: Option<PathBuf>,
+    /// Optional pool-relative dataset whose encryption root should be unlocked (defaults to `--dataset`).
+    #[arg(long)]
+    pub key_dataset: Option<String>,
+}
+
+pub fn load_key_material_from_files(
+    raw_file: Option<&Path>,
+    hex_file: Option<&Path>,
+    passphrase_file: Option<&Path>,
+) -> Result<Option<ZfsKeyMaterial>> {
+    match (raw_file, hex_file, passphrase_file) {
+        (None, None, None) => Ok(None),
+        (Some(path), None, None) => {
+            let mut bytes = std::fs::read(path)
+                .with_context(|| format!("reading raw ZFS key file {}", path.display()))?;
+            if bytes.len() != ZFS_WRAPPING_KEY_LEN {
+                let len = bytes.len();
+                scrub_bytes(&mut bytes);
+                bail!(
+                    "raw ZFS key file {} must be exactly {ZFS_WRAPPING_KEY_LEN} bytes (got {len})",
+                    path.display()
+                );
+            }
+            let mut key = [0_u8; ZFS_WRAPPING_KEY_LEN];
+            key.copy_from_slice(&bytes);
+            scrub_bytes(&mut bytes);
+            Ok(Some(ZfsKeyMaterial::Raw(key)))
+        }
+        (None, Some(path), None) => {
+            let mut raw = std::fs::read(path)
+                .with_context(|| format!("reading hex ZFS key file {}", path.display()))?;
+            let text = match std::str::from_utf8(&raw) {
+                Ok(s) => s.trim().to_owned(),
+                Err(_) => {
+                    scrub_bytes(&mut raw);
+                    bail!("hex ZFS key file {} is not valid UTF-8", path.display());
+                }
+            };
+            scrub_bytes(&mut raw);
+            if text.len() != ZFS_WRAPPING_KEY_LEN * 2 || !text.is_ascii() {
+                bail!(
+                    "hex ZFS key file {} must contain exactly 64 ASCII hex characters",
+                    path.display()
+                );
+            }
+            Ok(Some(ZfsKeyMaterial::Hex(text)))
+        }
+        (None, None, Some(path)) => {
+            let mut bytes = std::fs::read(path)
+                .with_context(|| format!("reading ZFS passphrase file {}", path.display()))?;
+            if bytes.last() == Some(&b'\n') {
+                bytes.pop();
+                if bytes.last() == Some(&b'\r') {
+                    bytes.pop();
+                }
+            }
+            if bytes.len() < 8 {
+                scrub_bytes(&mut bytes);
+                bail!(
+                    "ZFS passphrase file {} must contain at least 8 bytes",
+                    path.display()
+                );
+            }
+            Ok(Some(ZfsKeyMaterial::Passphrase(bytes)))
+        }
+        _ => bail!("specify at most one key source file"),
+    }
+}
+
+fn parse_key_dataset(name: &str) -> Result<Vec<Vec<u8>>> {
+    if name.is_empty() {
+        return Ok(Vec::new());
+    }
+    if name.len() > 65_536 {
+        bail!("key dataset path is too long");
+    }
+    let mut out = Vec::new();
+    for part in name.split('/') {
+        if part.is_empty() || part == "." || part == ".." || part.contains(['\0', '@', '#']) {
+            bail!("invalid `--key-dataset` component");
+        }
+        out.push(part.as_bytes().to_vec());
+        if out.len() > 64 {
+            bail!("key dataset path is too deep");
+        }
+    }
+    Ok(out)
+}
+
+impl KeyArgs {
+    pub fn is_empty(&self) -> bool {
+        self.key_file.is_none()
+            && self.key_hex_file.is_none()
+            && self.passphrase_file.is_none()
+            && self.key_dataset.is_none()
+    }
+
+    pub fn load_material(&self) -> Result<Option<ZfsKeyMaterial>> {
+        load_key_material_from_files(
+            self.key_file.as_deref(),
+            self.key_hex_file.as_deref(),
+            self.passphrase_file.as_deref(),
+        )
+    }
+
+    pub fn load_into_objects(
+        &self,
+        cx: &Cx,
+        objects: &mut reader::dmu::Objects,
+        default_dataset: &[Vec<u8>],
+    ) -> Result<bool> {
+        let Some(material) = self.load_material()? else {
+            if self.key_dataset.is_some() {
+                bail!("--key-dataset requires --key-file, --key-hex-file, or --passphrase-file");
+            }
+            return Ok(false);
+        };
+        let target = match &self.key_dataset {
+            Some(ds) => parse_key_dataset(ds)?,
+            None => default_dataset.to_vec(),
+        };
+        objects
+            .load_key(cx, &target, &material)
+            .context("unlocking ZFS dataset encryption key")?;
+        Ok(true)
+    }
+
+    pub fn load_into_engine(
+        &self,
+        cx: &Cx,
+        engine: &ZfsTransactionEngine,
+        default_dataset: &[Vec<u8>],
+    ) -> Result<bool> {
+        let Some(material) = self.load_material()? else {
+            if self.key_dataset.is_some() {
+                bail!("--key-dataset requires --key-file, --key-hex-file, or --passphrase-file");
+            }
+            return Ok(false);
+        };
+        let target = match &self.key_dataset {
+            Some(ds) => parse_key_dataset(ds)?,
+            None => default_dataset.to_vec(),
+        };
+        engine
+            .load_key(cx, &target, &material)
+            .context("unlocking ZFS dataset encryption key on transaction engine")?;
+        Ok(true)
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(

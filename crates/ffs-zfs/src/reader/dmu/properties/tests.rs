@@ -352,6 +352,8 @@ fn fixture(order: Endian, case: u8, failure: Option<(u64, bool)>) -> (Objects, R
             meta: Dnode::parse(&meta, order).unwrap(),
             cache: std::collections::VecDeque::new(),
             cached_bytes: 0,
+            keyring: crate::crypto::ZfsKeyRing::new(),
+            crypto: None,
         },
         reads,
     )

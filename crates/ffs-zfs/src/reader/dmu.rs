@@ -18,7 +18,18 @@ use super::{
     BlockPointer, Cx, Endian, FfsError, Leaf, Pool, Result, RootBlock, VdevConfig, checkpoint,
     corrupt, parse, unsupported,
 };
-use ffs_ondisk::zfs_dmu::{DNODE_BLOCK_BYTES, DNODE_BYTES, Dnode, ObjectSet, ZapEntry, dnode_at};
+use crate::crypto::{
+    ZfsDatasetCryptoInfo, ZfsKeyMaterial, ZfsKeyRing, ZfsKeyStatus, parse_dsl_crypto_key_zap,
+};
+use ffs_ondisk::zfs::crypto::{
+    DSL_DIR_CRYPTO_KEY_OBJ, UnwrappedDslKey, bp_crypt_mac, compute_authenticated_block_mac,
+    compute_indirect_block_mac, ct_eq, decrypt_regular_block, verify_objset_macs,
+};
+use ffs_ondisk::zfs::decompress;
+use ffs_ondisk::zfs_dmu::{
+    DMU_OT_DNODE, DMU_OT_OBJSET, DNODE_BLOCK_BYTES, DNODE_BYTES, Dnode, ObjectSet, ZapEntry,
+    dnode_at,
+};
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 
@@ -39,6 +50,12 @@ struct Object {
     ceiling: u64,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct DatasetCryptoContext {
+    pub(crate) info: ZfsDatasetCryptoInfo,
+    pub(crate) raw_scrub_only: bool,
+}
+
 /// Root/configuration ownership never leaves this object. Cache keys include
 /// the complete block pointer and caches never cross selected root lifetimes.
 pub struct Objects {
@@ -49,6 +66,8 @@ pub struct Objects {
     meta: Dnode,
     cache: VecDeque<(BlockPointer, CheckedBlock)>,
     cached_bytes: usize,
+    keyring: ZfsKeyRing,
+    crypto: Option<Arc<DatasetCryptoContext>>,
 }
 
 impl Leaf {
@@ -99,8 +118,177 @@ impl Objects {
         self.root_birth
     }
 
+    /// Attach a shared keyring to this MOS / object-set view.
+    #[must_use]
+    pub fn with_keyring(mut self, keyring: ZfsKeyRing) -> Self {
+        self.keyring = keyring;
+        self
+    }
+
+    /// Borrow the keyring attached to this view.
+    #[must_use]
+    pub const fn keyring(&self) -> &ZfsKeyRing {
+        &self.keyring
+    }
+
+    #[must_use]
+    pub(crate) fn is_raw_scrub_keyless(&self) -> bool {
+        self.crypto.as_ref().is_some_and(|ctx| {
+            ctx.raw_scrub_only && self.keyring.get(ctx.info.encryption_root_ddobj).is_none()
+        })
+    }
+
+    /// Discover native `com.datto:encryption` metadata for `components` from this MOS view.
+    pub fn dataset_crypto_info(
+        &mut self,
+        cx: &Cx,
+        components: &[Vec<u8>],
+    ) -> Result<Option<ZfsDatasetCryptoInfo>> {
+        checkpoint(cx)?;
+        let all_datasets = self.datasets(cx)?;
+        let dataset = all_datasets
+            .iter()
+            .find(|row| row.components == components)
+            .ok_or_else(|| FfsError::NotFound("ZFS dataset".into()))?;
+        self.dataset_crypto_info_from_dir(cx, dataset.directory_object, &all_datasets)
+    }
+
+    pub(crate) fn dataset_crypto_info_for_dir(
+        &mut self,
+        cx: &Cx,
+        directory_object: u64,
+    ) -> Result<Option<ZfsDatasetCryptoInfo>> {
+        checkpoint(cx)?;
+        let all_datasets = self.datasets(cx)?;
+        self.dataset_crypto_info_from_dir(cx, directory_object, &all_datasets)
+    }
+
+    fn dataset_crypto_info_from_dir(
+        &mut self,
+        cx: &Cx,
+        directory_object: u64,
+        all_datasets: &[datasets::DatasetInfo],
+    ) -> Result<Option<ZfsDatasetCryptoInfo>> {
+        let dir = self.load(cx, directory_object)?;
+        if dir.node.object_type() != 196 {
+            return Ok(None);
+        }
+        let dir_entries = self.zap_values(cx, directory_object)?;
+        let Some(entry) = dir_entries
+            .iter()
+            .find(|row| row.name == DSL_DIR_CRYPTO_KEY_OBJ)
+        else {
+            return Ok(None);
+        };
+        let crypto_key_obj = entry.scalar().map_err(|error| parse(&error))?;
+        if crypto_key_obj == 0 {
+            return Ok(None);
+        }
+        let key_dnode = self.object(cx, crypto_key_obj)?;
+        if key_dnode.object_type() != 196 {
+            return Err(corrupt("dsl_crypto_key object has non-ZAP DMU type"));
+        }
+        let key_entries = self.zap_values(cx, crypto_key_obj)?;
+        let record = parse_dsl_crypto_key_zap(&key_entries)?;
+        let root_ddobj = record.root_ddobj;
+        let root_dir = self.load(cx, root_ddobj)?;
+        if !matches!(root_dir.node.object_type(), 12 | 196)
+            || root_dir.node.bonus_type() != 12
+            || root_dir.node.bonus().len() != 256
+        {
+            return Err(corrupt("DSL_CRYPTO_ROOT_DDOBJ is not a valid dsl_dir"));
+        }
+        let encryption_root_components = all_datasets
+            .iter()
+            .find(|row| row.directory_object == root_ddobj)
+            .map(|row| row.components.clone())
+            .ok_or_else(|| corrupt("DSL_CRYPTO_ROOT_DDOBJ absent from DSL directory hierarchy"))?;
+        let root_props_obj = root_dir
+            .node
+            .order()
+            .u64(root_dir.node.bonus(), 80)
+            .map_err(|error| parse(&error))?;
+        let mut keylocation = b"prompt".to_vec();
+        if root_props_obj > 1
+            && let Ok(prop_entries) = self.zap_values(cx, root_props_obj)
+            && let Some(loc_entry) = prop_entries.iter().find(|row| row.name == b"keylocation")
+            && loc_entry.integer_bytes == 1
+            && loc_entry.values.last() == Some(&0)
+        {
+            let mut decoded = Vec::with_capacity(loc_entry.values.len().saturating_sub(1));
+            let mut valid = true;
+            for &val in &loc_entry.values[..loc_entry.values.len() - 1] {
+                match u8::try_from(val) {
+                    Ok(byte) if byte != 0 => decoded.push(byte),
+                    _ => {
+                        valid = false;
+                        break;
+                    }
+                }
+            }
+            if valid && !decoded.is_empty() {
+                keylocation = decoded;
+            }
+        }
+        Ok(Some(ZfsDatasetCryptoInfo {
+            encryption_root_ddobj: root_ddobj,
+            encryption_root_components,
+            crypto_key_obj,
+            record,
+            keylocation,
+        }))
+    }
+
+    /// Unwrap and load the dataset encryption key for `components` into this view's keyring.
+    pub fn load_key(
+        &mut self,
+        cx: &Cx,
+        components: &[Vec<u8>],
+        material: &ZfsKeyMaterial,
+    ) -> Result<ZfsDatasetCryptoInfo> {
+        let info = self.dataset_crypto_info(cx, components)?.ok_or_else(|| {
+            FfsError::Format("cannot load key for an unencrypted ZFS dataset".into())
+        })?;
+        self.keyring.load_key(&info, material)?;
+        Ok(info)
+    }
+
+    /// Unload the encryption key for `components`'s encryption root from this view's keyring.
+    pub fn unload_key(&mut self, cx: &Cx, components: &[Vec<u8>]) -> Result<bool> {
+        let info = self.dataset_crypto_info(cx, components)?.ok_or_else(|| {
+            FfsError::Format("cannot unload key for an unencrypted ZFS dataset".into())
+        })?;
+        let removed = self.keyring.unload_key(info.encryption_root_ddobj)?;
+        self.clear_cache();
+        Ok(removed)
+    }
+
+    pub(super) fn clear_cache(&mut self) {
+        self.cache.clear();
+        self.cached_bytes = 0;
+    }
+
+    /// Report runtime `ZfsKeyStatus` for `components`.
+    pub fn key_status(&mut self, cx: &Cx, components: &[Vec<u8>]) -> Result<ZfsKeyStatus> {
+        let info = self.dataset_crypto_info(cx, components)?;
+        Ok(self
+            .keyring
+            .key_status(info.as_ref().map(|item| item.encryption_root_ddobj)))
+    }
+
     #[must_use]
     pub(crate) fn open_objectset_view(&self, meta: Dnode, root_birth: u64, txg: u64) -> Self {
+        self.open_objectset_view_with_crypto(meta, root_birth, txg, None)
+    }
+
+    #[must_use]
+    pub(crate) fn open_objectset_view_with_crypto(
+        &self,
+        meta: Dnode,
+        root_birth: u64,
+        txg: u64,
+        crypto: Option<Arc<DatasetCryptoContext>>,
+    ) -> Self {
         Self {
             pool: self.pool.clone(),
             config: self.config.clone(),
@@ -109,7 +297,22 @@ impl Objects {
             meta,
             cache: VecDeque::new(),
             cached_bytes: 0,
+            keyring: self.keyring.clone(),
+            crypto,
         }
+    }
+
+    pub(crate) fn read_dataset_objset_block_raw(
+        &mut self,
+        cx: &Cx,
+        bp: &BlockPointer,
+        ceiling: u64,
+        verify_key: Option<&UnwrappedDslKey>,
+        allow_protected_keyless: bool,
+    ) -> Result<CheckedDmuBlock> {
+        let blk =
+            self.read_dataset_objset_block(cx, bp, ceiling, verify_key, allow_protected_keyless)?;
+        Ok((blk.bytes, blk.order, blk.birth))
     }
 
     pub(crate) fn checked_raw(
@@ -156,6 +359,8 @@ impl Objects {
             meta: self.meta.clone(),
             cache: VecDeque::new(),
             cached_bytes: 0,
+            keyring: self.keyring.clone(),
+            crypto: self.crypto.clone(),
         }
     }
 
@@ -176,6 +381,8 @@ impl Objects {
             meta: objectset.meta,
             cache: VecDeque::new(),
             cached_bytes: 0,
+            keyring: ZfsKeyRing::new(),
+            crypto: None,
         };
         // Label features only describe what is needed to bootstrap the MOS.
         // Keep this view private until its complete native feature catalogs
@@ -183,6 +390,67 @@ impl Objects {
         view.admit_features(cx)?;
         checkpoint(cx)?;
         Ok(view)
+    }
+
+    /// Decode a dataset root `DMU_OT_OBJSET` block pointer from the MOS.
+    ///
+    /// When `verify_key` is `Some`, the pointer MUST be protected (`BP_IS_PROTECTED`)
+    /// and its `os_portable_mac`/`os_local_mac` are authenticated with `verify_key`.
+    /// When `verify_key` is `None` and `allow_protected_keyless` is `true` (e.g.,
+    /// keyless `datasets`/`snapshots`/`raw_scrub` inspection), protected objset
+    /// blocks are physically checksummed and decompressed without needing the key.
+    pub(super) fn read_dataset_objset_block(
+        &mut self,
+        cx: &Cx,
+        bp: &BlockPointer,
+        ceiling: u64,
+        verify_key: Option<&UnwrappedDslKey>,
+        allow_protected_keyless: bool,
+    ) -> Result<CheckedBlock> {
+        checkpoint(cx)?;
+        if bp.hole() {
+            return Err(corrupt("dataset object-set root is a hole"));
+        }
+        if bp.protected() {
+            if verify_key.is_none() && !allow_protected_keyless {
+                return Err(FfsError::PermissionDenied);
+            }
+            if bp.embedded()
+                || bp.birth() == 0
+                || bp.birth() > ceiling
+                || bp.birth() > self.txg
+                || bp.level() != 0
+                || bp.object_type() != DMU_OT_OBJSET
+                || !matches!(bp.logical_bytes(), 2048 | 4096)
+            {
+                return Err(corrupt(
+                    "protected dataset object-set block pointer has invalid geometry or birth",
+                ));
+            }
+            let raw = self.pool.read_raw_block(cx, &self.config, bp)?.bytes;
+            let logical = decompress(&raw, bp.compression(), bp.logical_bytes())
+                .map_err(|error| parse(&error))?;
+            if logical.len() != bp.logical_bytes() {
+                return Err(corrupt("decoded protected objset has the wrong length"));
+            }
+            if let Some(key) = verify_key {
+                verify_objset_macs(&logical, bp.payload_order(), &key.hmac_key, key.version)
+                    .map_err(|error| parse(&error))?;
+            }
+            checkpoint(cx)?;
+            return Ok(CheckedBlock {
+                bytes: Arc::new(logical),
+                order: bp.payload_order(),
+                birth: bp.birth(),
+            });
+        }
+        if verify_key.is_some() {
+            return Err(corrupt(
+                "encrypted dataset root block pointer lacks BP_IS_PROTECTED",
+            ));
+        }
+        self.checked(cx, bp, DMU_OT_OBJSET, 0, bp.logical_bytes(), ceiling)?
+            .ok_or_else(|| corrupt("dataset object-set root is a hole"))
     }
 }
 
@@ -198,10 +466,8 @@ impl Objects {
         size: usize,
         ceiling: u64,
     ) -> Result<bool> {
-        if bp.protected() {
-            return Err(unsupported(
-                "encrypted DMU blocks need their native pipeline",
-            ));
+        if bp.embedded() && bp.protected() {
+            return Err(corrupt("embedded DMU block cannot be protected"));
         }
         if bp.birth() > ceiling || bp.birth() > self.txg {
             return Err(corrupt(
@@ -209,8 +475,27 @@ impl Objects {
             ));
         }
         if bp.hole() {
+            if bp.protected() {
+                return Err(corrupt("hole DMU pointer cannot be protected"));
+            }
             self.validate_hole(bp, kind, level, size)?;
             return Ok(false);
+        }
+        if self.crypto.is_some() {
+            if !bp.protected() {
+                return Err(corrupt(
+                    "unprotected non-hole block pointer inside encrypted dataset",
+                ));
+            }
+            if bp.embedded() {
+                return Err(corrupt(
+                    "embedded block pointer is forbidden inside encrypted dataset",
+                ));
+            }
+        } else if bp.protected() {
+            return Err(unsupported(
+                "encrypted DMU blocks need their native pipeline",
+            ));
         }
         if bp.birth() == 0
             || bp.level() != level
@@ -248,6 +533,15 @@ impl Objects {
         ceiling: u64,
     ) -> Result<Option<CheckedBlock>> {
         checkpoint(cx)?;
+        if let Some(ctx) = &self.crypto
+            && !ctx.raw_scrub_only
+            && self.keyring.get(ctx.info.encryption_root_ddobj).is_none()
+        {
+            // Immediate fail-closed revocation if key was unloaded while view is open.
+            self.cache.clear();
+            self.cached_bytes = 0;
+            return Err(FfsError::PermissionDenied);
+        }
         if !self.validate_pointer(bp, kind, level, size, ceiling)? {
             return Ok(None);
         }
@@ -265,6 +559,65 @@ impl Objects {
         // Embedded words are payload, not DVAs or an independent checksum.
         let bytes = if bp.embedded() {
             bp.decode_embedded().map_err(|error| parse(&error))?
+        } else if bp.protected() {
+            let ctx = self
+                .crypto
+                .as_ref()
+                .ok_or_else(|| unsupported("encrypted DMU blocks need their native pipeline"))?
+                .clone();
+            let raw = self.pool.read_raw_block(cx, &self.config, bp)?.bytes;
+            if bp.level() > 0 {
+                // Indirect blocks are authenticated keylessly via SHA-512 over child blkptr_auth_bufs.
+                let logical = decompress(&raw, bp.compression(), bp.logical_bytes())
+                    .map_err(|error| parse(&error))?;
+                let expected = compute_indirect_block_mac(
+                    &logical,
+                    bp.payload_order(),
+                    ctx.info.record.version,
+                )
+                .map_err(|error| parse(&error))?;
+                if !ct_eq(&expected, &bp_crypt_mac(bp)) {
+                    return Err(corrupt("protected indirect block MAC mismatch"));
+                }
+                logical
+            } else if bp.is_encrypted() {
+                if let Some(key) = self.keyring.get(ctx.info.encryption_root_ddobj) {
+                    decrypt_regular_block(&key, bp, &raw).map_err(|error| parse(&error))?
+                } else if ctx.raw_scrub_only && bp.object_type() == DMU_OT_DNODE {
+                    // OpenZFS leaves dnode cores, child BPs, and spill BPs plaintext so locked
+                    // pools can scrub indirect MACs and physical checksums keylessly.
+                    if bp.compression() != 2 || raw.len() != DNODE_BLOCK_BYTES {
+                        return Err(corrupt(
+                            "encrypted DMU_OT_DNODE block must be uncompressed 16 KiB",
+                        ));
+                    }
+                    raw
+                } else {
+                    return Err(FfsError::PermissionDenied);
+                }
+            } else if bp.object_type() == DMU_OT_OBJSET {
+                let logical = decompress(&raw, bp.compression(), bp.logical_bytes())
+                    .map_err(|error| parse(&error))?;
+                if let Some(key) = self.keyring.get(ctx.info.encryption_root_ddobj) {
+                    verify_objset_macs(&logical, bp.payload_order(), &key.hmac_key, key.version)
+                        .map_err(|error| parse(&error))?;
+                } else if !ctx.raw_scrub_only {
+                    return Err(FfsError::PermissionDenied);
+                }
+                logical
+            } else {
+                // Authenticated-only level-0 block (e.g. userused/groupused/projectused).
+                if let Some(key) = self.keyring.get(ctx.info.encryption_root_ddobj) {
+                    let expected = compute_authenticated_block_mac(&key.hmac_key, &raw);
+                    if !ct_eq(&expected, &bp_crypt_mac(bp)) {
+                        return Err(corrupt("authenticated DMU block MAC mismatch"));
+                    }
+                } else if !ctx.raw_scrub_only {
+                    return Err(FfsError::PermissionDenied);
+                }
+                decompress(&raw, bp.compression(), bp.logical_bytes())
+                    .map_err(|error| parse(&error))?
+            }
         } else {
             self.pool.read_block(cx, &self.config, bp)?.bytes
         };
@@ -510,9 +863,8 @@ impl Objects {
                     if !matches!(bp.logical_bytes(), 1024 | 2048 | 4096) {
                         return Err(corrupt("dataset object-set size exceeds native profile"));
                     }
-                    let raw = self
-                        .checked(cx, &bp, 11, 0, bp.logical_bytes(), dataset.ceiling)?
-                        .ok_or_else(|| corrupt("head dataset has no object-set root"))?;
+                    let raw =
+                        self.read_dataset_objset_block(cx, &bp, dataset.ceiling, None, true)?;
                     let objectset =
                         ObjectSet::parse(&raw.bytes, raw.order).map_err(|error| parse(&error))?;
                     if !matches!(objectset.kind, 2 | 3) {

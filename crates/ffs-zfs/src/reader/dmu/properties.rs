@@ -7,6 +7,7 @@
 //! This is inspection, not mount policy, ACL enforcement, or write admission.
 
 use super::{Cx, FfsError, Object, Objects, Result, checkpoint, corrupt, parse, unsupported};
+use ffs_ondisk::zfs::crypto::{ZfsKeyFormat, ZioEncrypt};
 use ffs_ondisk::zfs_zap::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -239,6 +240,47 @@ impl Spec {
                 Index::None,
             ),
             "context" | "fscontext" | "defcontext" | "rootcontext" => (
+                DefaultValue::Text(b"none"),
+                false,
+                true,
+                true,
+                true,
+                Index::None,
+            ),
+            "encryption" => (
+                DefaultValue::Number(ZioEncrypt::Off.raw()),
+                true,
+                true,
+                true,
+                true,
+                Index::Range(0, 8),
+            ),
+            "keyformat" => (
+                DefaultValue::Number(ZfsKeyFormat::None.raw()),
+                false,
+                true,
+                true,
+                true,
+                Index::Range(0, 3),
+            ),
+            "pbkdf2iters" => (
+                DefaultValue::Number(0),
+                false,
+                true,
+                true,
+                true,
+                Index::None,
+            ),
+            "keylocation" => (
+                DefaultValue::Text(b"none"),
+                false,
+                true,
+                true,
+                true,
+                Index::None,
+            ),
+            "encryptionroot" => (DefaultValue::User, false, true, true, true, Index::None),
+            "keystatus" => (
                 DefaultValue::Text(b"none"),
                 false,
                 true,
@@ -621,9 +663,118 @@ impl Objects {
         {
             return Err(corrupt("property catalog aliases its DSL owner"));
         }
+        let needs_crypto = names.iter().any(|name| {
+            matches!(
+                name.as_str(),
+                "encryption"
+                    | "keyformat"
+                    | "pbkdf2iters"
+                    | "keylocation"
+                    | "encryptionroot"
+                    | "keystatus"
+            )
+        });
+        let crypto_info = if needs_crypto {
+            self.dataset_crypto_info(cx, components)?
+        } else {
+            None
+        };
         let mut catalogs = Catalogs::new(layers);
         for (name, spec) in names.iter().zip(specs) {
-            report.values.push(catalogs.resolve(self, cx, name, &spec)?);
+            let prop = match name.as_str() {
+                "encryption" | "keyformat" | "pbkdf2iters" | "keylocation" | "encryptionroot"
+                | "keystatus" => {
+                    let is_root_local = crypto_info.as_ref().is_some_and(|info| {
+                        info.encryption_root_ddobj == dataset.directory_object && snapshot.is_none()
+                    });
+                    let origin_source = if is_root_local {
+                        PropertySource::Local
+                    } else {
+                        PropertySource::Inherited
+                    };
+                    match (name.as_str(), crypto_info.as_ref()) {
+                        ("encryption", Some(info)) => Property {
+                            name: name.clone(),
+                            value: Some(PropertyValue::Number(info.record.suite.raw())),
+                            source: origin_source,
+                            setpoint: Some(info.encryption_root_components.clone()),
+                            setpoint_snapshot: None,
+                            stored_source: Some(PropertySource::Local),
+                            received: None,
+                        },
+                        ("keyformat", Some(info)) => Property {
+                            name: name.clone(),
+                            value: Some(PropertyValue::Number(info.record.keyformat.raw())),
+                            source: origin_source,
+                            setpoint: Some(info.encryption_root_components.clone()),
+                            setpoint_snapshot: None,
+                            stored_source: Some(PropertySource::Local),
+                            received: None,
+                        },
+                        ("pbkdf2iters", Some(info)) => Property {
+                            name: name.clone(),
+                            value: Some(PropertyValue::Number(info.record.pbkdf2_iters)),
+                            source: origin_source,
+                            setpoint: Some(info.encryption_root_components.clone()),
+                            setpoint_snapshot: None,
+                            stored_source: Some(PropertySource::Local),
+                            received: None,
+                        },
+                        ("keylocation", Some(info)) => Property {
+                            name: name.clone(),
+                            value: Some(PropertyValue::Text(info.keylocation.clone())),
+                            source: origin_source,
+                            setpoint: Some(info.encryption_root_components.clone()),
+                            setpoint_snapshot: None,
+                            stored_source: Some(PropertySource::Local),
+                            received: None,
+                        },
+                        ("encryptionroot", Some(info)) => Property {
+                            name: name.clone(),
+                            value: Some(PropertyValue::Text(
+                                info.encryption_root_components.join(&b'/'),
+                            )),
+                            source: origin_source,
+                            setpoint: Some(info.encryption_root_components.clone()),
+                            setpoint_snapshot: None,
+                            stored_source: Some(PropertySource::Local),
+                            received: None,
+                        },
+                        ("keystatus", info) => {
+                            let status = self
+                                .keyring()
+                                .key_status(info.map(|item| item.encryption_root_ddobj));
+                            Property {
+                                name: name.clone(),
+                                value: Some(PropertyValue::Text(
+                                    status.as_str().as_bytes().to_vec(),
+                                )),
+                                source: PropertySource::Default,
+                                setpoint: None,
+                                setpoint_snapshot: None,
+                                stored_source: None,
+                                received: None,
+                            }
+                        }
+                        (_, None) => Property {
+                            name: name.clone(),
+                            value: spec.default_value(),
+                            source: if matches!(spec.default, DefaultValue::User) {
+                                PropertySource::Unset
+                            } else {
+                                PropertySource::Default
+                            },
+                            setpoint: None,
+                            setpoint_snapshot: None,
+                            stored_source: None,
+                            received: None,
+                        },
+                        _ => unreachable!(),
+                    }
+                }
+                _ => catalogs.resolve(self, cx, name, &spec)?,
+            };
+            report.values.push(prop);
         }
         checkpoint(cx)?;
         Ok(report)

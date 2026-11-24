@@ -123,6 +123,7 @@ companion_bin_tests! {
                     read_features: vec!["com.delphix:hole_birth".into()], raidz_members: None,
                 },
                 txg: 100, root_birth: 90, meta: node, cache: VecDeque::new(), cached_bytes: 0,
+                keyring: crate::crypto::ZfsKeyRing::new(), crypto: None,
             };
             (view, object)
         }

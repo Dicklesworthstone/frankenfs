@@ -576,9 +576,7 @@ impl Objects {
         let object = self.load(cx, dataset.head_object)?;
         let bp = BlockPointer::parse(&object.node.bonus()[128..256], object.node.order())
             .map_err(|error| parse(&error))?;
-        let root = self
-            .checked(cx, &bp, 11, 0, bp.logical_bytes(), object.ceiling)?
-            .ok_or_else(|| corrupt("ZIL owner object set is a hole"))?;
+        let root = self.read_dataset_objset_block(cx, &bp, object.ceiling, None, true)?;
         if let Ok(ds_os) = ffs_ondisk::zfs_dmu::ObjectSet::parse(&root.bytes, root.order)
             && self.is_inherited_snapshot_zil(
                 cx,

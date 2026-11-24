@@ -6,10 +6,15 @@
 //! reservations (`set_property`, `inherit_property`, quota preflight).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use asupersync::Cx;
 use ffs_error::{FfsError, Result};
-use ffs_ondisk::zfs::{BlockPointer, Endian, RegularBlockSpec};
+use ffs_ondisk::zfs::crypto::{
+    DSL_CRYPTO_KEY_VERSION_V1, DSL_DATASET_IVSET_GUID, DSL_DIR_CRYPTO_KEY_OBJ, DslCryptoKeyRecord,
+    UnwrappedDslKey, ZFS_PBKDF2_DEFAULT_ITERS, ZFS_PBKDF2_MIN_ITERS, ZfsKeyFormat, ZioEncrypt,
+};
+use ffs_ondisk::zfs::{BlockPointer, Endian};
 use ffs_ondisk::zfs_dmu::{
     DMU_OT_DNODE, DNODE_BLOCK_BYTES, DNODE_BYTES, DNODE_FLAG_USED_BYTES, Dnode, DnodeSpec,
     OBJSET_GROUPUSED_OFFSET, OBJSET_PROJECTUSED_OFFSET, OBJSET_USERUSED_OFFSET, ObjectSet,
@@ -20,16 +25,22 @@ use ffs_ondisk::zfs_zap::names::NamePolicy as ZapNamePolicy;
 use ffs_ondisk::zfs_zpl::{Kind, Metadata, SaRegistry, Timestamp, encode_directory_reference};
 use serde::Serialize;
 
-use crate::reader::dmu::Objects;
+use crate::crypto::{
+    ZfsDatasetCryptoInfo, ZfsKeyMaterial, ZfsNonceGenerator, encode_dsl_crypto_key_zap,
+    generate_new_dataset_keys, parse_dsl_crypto_key_zap,
+};
+use crate::reader::dmu::properties::PropertyValue;
+use crate::reader::dmu::{DatasetCryptoContext, Objects};
 
 use super::dmu_cow::{
     DMU_OT_BPOBJ, DMU_OT_BPOBJ_HDR, DMU_OT_DEADLIST, DMU_OT_DEADLIST_HDR,
-    DMU_OT_DIRECTORY_CONTENTS, DMU_OT_OBJSET, DnodeCowSpec, FATZAP_BLOCK_BYTES, MosFeatureState,
-    PoolSpaceAllocator, SpaceDelta, StagedBlockWrite, WriteBucket, allocate_object_id,
-    append_bps_to_bpobj_inner, collect_non_hole_bps_from, cow_update_dnode,
-    encode_zap_blocks_for_dnode, encode_zap_blocks_for_dnode_with_normflags,
-    objectset_user_accounting_flags, put_dnode_in_table, read_dnode_prefix,
-    read_staged_or_committed_dnode, remove_dnode_from_table, zap_optional_u64, zap_required_u64,
+    DMU_OT_DIRECTORY_CONTENTS, DatasetWriteCrypto, DnodeCowSpec, FATZAP_BLOCK_BYTES,
+    MosFeatureState, PoolSpaceAllocator, SpaceDelta, StagedBlockWrite, WriteBucket,
+    allocate_object_id, append_bps_to_bpobj_inner, collect_non_hole_bps_from, cow_update_dnode,
+    cow_update_dnode_with_crypto, decode_compression_property, encode_zap_blocks_for_dnode,
+    encode_zap_blocks_for_dnode_with_normflags, objectset_user_accounting_flags,
+    put_dnode_in_table, read_dnode_prefix, read_staged_or_committed_dnode, remove_dnode_from_table,
+    write_dataset_objset_block, zap_optional_u64, zap_required_u64,
 };
 use super::{checkpoint, corrupt, parse_err, unsupported};
 
@@ -80,6 +91,21 @@ pub enum ZfsPropertySetValue {
     Text(Vec<u8>),
 }
 
+/// Native encryption creation parameters for [`super::ZfsTransactionEngine::create_encrypted_dataset`].
+#[derive(Debug, Clone)]
+pub struct ZfsEncryptionCreateOptions {
+    /// Requested OpenZFS cipher suite (`On`, `Off`, `Inherit`, or concrete AES-128/192/256 GCM/CCM).
+    pub suite: ZioEncrypt,
+    /// Required wrapping key input when creating a new encryption root (`suite.is_active()`).
+    pub key_material: Option<ZfsKeyMaterial>,
+    /// Optional `keylocation` property text (defaults to `"prompt"` for new encryption roots).
+    pub keylocation: Option<Vec<u8>>,
+    /// Optional PBKDF2-HMAC-SHA1 iteration count for `keyformat=passphrase` (`>= 100_000`, default `350_000`).
+    pub pbkdf2_iters: Option<u64>,
+    /// Optional extra entropy mixed into deterministic key/IV derivation.
+    pub extra_entropy: Vec<u8>,
+}
+
 /// DSL-level pool/dataset mutation staged in one atomic TXG.
 #[derive(Debug, Clone)]
 pub(super) enum DslMutation {
@@ -123,6 +149,7 @@ pub(super) enum DslMutation {
         parent_dataset: Vec<Vec<u8>>,
         child_name: Vec<u8>,
         initial_props: Vec<(String, ZfsPropertySetValue)>,
+        encryption: Option<ZfsEncryptionCreateOptions>,
         timestamp: Timestamp,
     },
     CreateClone {
@@ -149,6 +176,13 @@ pub(super) enum DslMutation {
         dataset: Vec<Vec<u8>>,
         name: String,
     },
+    ChangeKey {
+        dataset: Vec<Vec<u8>>,
+        new_material: ZfsKeyMaterial,
+        new_keylocation: Option<Vec<u8>>,
+        pbkdf2_iters: Option<u64>,
+        extra_entropy: Vec<u8>,
+    },
 }
 
 impl DslMutation {
@@ -167,8 +201,16 @@ impl DslMutation {
             Self::DestroyDataset { .. } => "destroy_dataset",
             Self::SetProperty { .. } => "set_property",
             Self::InheritProperty { .. } => "inherit_property",
+            Self::ChangeKey { .. } => "change_key",
         }
     }
+}
+
+/// Staged DSL mutation result carrying any freshly created encryption-root key
+/// to be inserted into the engine keyring ONLY after durable TXG commit.
+pub(super) struct DslStageResult {
+    pub value: u64,
+    pub new_root_key: Option<(u64, UnwrappedDslKey)>,
 }
 
 fn reject_busy(detail: impl Into<String>) -> FfsError {
@@ -1125,12 +1167,15 @@ enum ObjectSetWalkMode {
 
 /// Walk all blocks reachable from `os_bp` with `bp.birth() > min_exclusive_birth`,
 /// pruning any subtree born at or before `min_exclusive_birth`.
+/// Supports encrypted datasets keylessly (using physical checksums + indirect SHA-512 MACs
+/// + plaintext dnode core/BP layout) so locked destroy works natively.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn walk_objectset_above_txg(
     cx: &Cx,
     mos: &mut Objects,
     os_bp: &BlockPointer,
     os_ceiling: u64,
+    crypto_info: Option<&ZfsDatasetCryptoInfo>,
     min_exclusive_birth: u64,
     mode: ObjectSetWalkMode,
     alloc: &mut PoolSpaceAllocator,
@@ -1140,23 +1185,27 @@ fn walk_objectset_above_txg(
     if os_bp.hole() || os_bp.birth() <= min_exclusive_birth {
         return Ok((SpaceDelta::default(), false));
     }
-    let (os_raw, os_ord, _) = mos
-        .checked_raw(
-            cx,
-            os_bp,
-            DMU_OT_OBJSET,
-            0,
-            os_bp.logical_bytes(),
-            os_ceiling,
-        )?
-        .ok_or_else(|| corrupt("ObjectSet root is a hole"))?;
+    let (os_raw, os_ord, _) =
+        mos.read_dataset_objset_block_raw(cx, os_bp, os_ceiling, None, true)?;
     let os = ObjectSet::parse(&os_raw, os_ord).map_err(|e| parse_err(&e))?;
     let has_projectused = os
         .embedded_dnode(OBJSET_PROJECTUSED_OFFSET, os_ord)
         .map_err(|e| parse_err(&e))?
         .is_some();
 
-    let mut os_view = mos.open_objectset_view(os.meta.clone(), os_bp.birth(), mos.txg);
+    let view_crypto = if os_bp.protected() {
+        let info = crypto_info.cloned().ok_or_else(|| {
+            corrupt("protected dataset ObjectSet missing dsl_crypto_key metadata during walk")
+        })?;
+        Some(Arc::new(DatasetCryptoContext {
+            info,
+            raw_scrub_only: true,
+        }))
+    } else {
+        None
+    };
+    let mut os_view =
+        mos.open_objectset_view_with_crypto(os.meta.clone(), os_bp.birth(), mos.txg, view_crypto);
     let mut total = SpaceDelta::from_bp(os_bp)?;
     if mode == ObjectSetWalkMode::FreeToAllocator {
         alloc.free_block_dvas(os_bp, new_txg)?;
@@ -1612,135 +1661,157 @@ pub(super) fn stage_dsl_mutation(
     order: Endian,
     new_txg: u64,
     staged_writes: &mut Vec<StagedBlockWrite>,
-) -> Result<u64> {
+) -> Result<DslStageResult> {
     checkpoint(cx)?;
     match mutation {
         DslMutation::CreateSnapshot {
             dataset,
             snap_name,
             timestamp,
-        } => stage_create_snapshot(
-            cx,
-            mos,
-            dataset,
-            snap_name,
-            *timestamp,
-            mos_dirty_dnodes,
-            features,
-            empty_bpobj_id,
-            alloc,
-            order,
-            new_txg,
-            staged_writes,
-        ),
+        } => Ok(DslStageResult {
+            value: stage_create_snapshot(
+                cx,
+                mos,
+                dataset,
+                snap_name,
+                *timestamp,
+                mos_dirty_dnodes,
+                features,
+                empty_bpobj_id,
+                alloc,
+                order,
+                new_txg,
+                staged_writes,
+            )?,
+            new_root_key: None,
+        }),
         DslMutation::DestroySnapshot {
             dataset,
             snap_name,
             defer,
-        } => stage_destroy_snapshot(
-            cx,
-            mos,
-            dataset,
-            snap_name,
-            *defer,
-            mos_dirty_dnodes,
-            features,
-            empty_bpobj_id,
-            alloc,
-            order,
-            new_txg,
-            staged_writes,
-        ),
+        } => Ok(DslStageResult {
+            value: stage_destroy_snapshot(
+                cx,
+                mos,
+                dataset,
+                snap_name,
+                *defer,
+                mos_dirty_dnodes,
+                features,
+                empty_bpobj_id,
+                alloc,
+                order,
+                new_txg,
+                staged_writes,
+            )?,
+            new_root_key: None,
+        }),
         DslMutation::RenameSnapshot {
             dataset,
             old_snap_name,
             new_snap_name,
-        } => stage_rename_snapshot(
-            cx,
-            mos,
-            dataset,
-            old_snap_name,
-            new_snap_name,
-            mos_dirty_dnodes,
-            alloc,
-            order,
-            new_txg,
-            staged_writes,
-        ),
+        } => Ok(DslStageResult {
+            value: stage_rename_snapshot(
+                cx,
+                mos,
+                dataset,
+                old_snap_name,
+                new_snap_name,
+                mos_dirty_dnodes,
+                alloc,
+                order,
+                new_txg,
+                staged_writes,
+            )?,
+            new_root_key: None,
+        }),
         DslMutation::HoldSnapshot {
             dataset,
             snap_name,
             tag,
             timestamp,
-        } => stage_hold_snapshot(
-            cx,
-            mos,
-            dataset,
-            snap_name,
-            tag,
-            *timestamp,
-            mos_dirty_dnodes,
-            alloc,
-            order,
-            new_txg,
-            staged_writes,
-        ),
+        } => Ok(DslStageResult {
+            value: stage_hold_snapshot(
+                cx,
+                mos,
+                dataset,
+                snap_name,
+                tag,
+                *timestamp,
+                mos_dirty_dnodes,
+                alloc,
+                order,
+                new_txg,
+                staged_writes,
+            )?,
+            new_root_key: None,
+        }),
         DslMutation::ReleaseSnapshot {
             dataset,
             snap_name,
             tag,
-        } => stage_release_snapshot(
-            cx,
-            mos,
-            dataset,
-            snap_name,
-            tag,
-            mos_dirty_dnodes,
-            features,
-            empty_bpobj_id,
-            alloc,
-            order,
-            new_txg,
-            staged_writes,
-        ),
+        } => Ok(DslStageResult {
+            value: stage_release_snapshot(
+                cx,
+                mos,
+                dataset,
+                snap_name,
+                tag,
+                mos_dirty_dnodes,
+                features,
+                empty_bpobj_id,
+                alloc,
+                order,
+                new_txg,
+                staged_writes,
+            )?,
+            new_root_key: None,
+        }),
         DslMutation::CreateBookmark {
             dataset,
             bookmark_name,
             source_name,
             source_is_bookmark,
-        } => stage_create_bookmark(
-            cx,
-            mos,
-            dataset,
-            bookmark_name,
-            source_name,
-            *source_is_bookmark,
-            mos_dirty_dnodes,
-            features,
-            alloc,
-            order,
-            new_txg,
-            staged_writes,
-        ),
+        } => Ok(DslStageResult {
+            value: stage_create_bookmark(
+                cx,
+                mos,
+                dataset,
+                bookmark_name,
+                source_name,
+                *source_is_bookmark,
+                mos_dirty_dnodes,
+                features,
+                alloc,
+                order,
+                new_txg,
+                staged_writes,
+            )?,
+            new_root_key: None,
+        }),
         DslMutation::DestroyBookmark {
             dataset,
             bookmark_name,
-        } => stage_destroy_bookmark(
-            cx,
-            mos,
-            dataset,
-            bookmark_name,
-            mos_dirty_dnodes,
-            features,
-            alloc,
-            order,
-            new_txg,
-            staged_writes,
-        ),
+        } => Ok(DslStageResult {
+            value: stage_destroy_bookmark(
+                cx,
+                mos,
+                dataset,
+                bookmark_name,
+                mos_dirty_dnodes,
+                features,
+                alloc,
+                order,
+                new_txg,
+                staged_writes,
+            )?,
+            new_root_key: None,
+        }),
         DslMutation::CreateDataset {
             parent_dataset,
             child_name,
             initial_props,
+            encryption,
             timestamp,
         } => stage_create_dataset(
             cx,
@@ -1748,6 +1819,7 @@ pub(super) fn stage_dsl_mutation(
             parent_dataset,
             child_name,
             initial_props,
+            encryption.as_ref(),
             *timestamp,
             mos_dirty_dnodes,
             features,
@@ -1764,79 +1836,118 @@ pub(super) fn stage_dsl_mutation(
             target_name,
             initial_props,
             timestamp,
-        } => stage_create_clone(
-            cx,
-            mos,
-            origin_dataset,
-            origin_snap,
-            target_parent,
-            target_name,
-            initial_props,
-            *timestamp,
-            mos_dirty_dnodes,
-            features,
-            empty_bpobj_id,
-            alloc,
-            order,
-            new_txg,
-            staged_writes,
-        ),
+        } => Ok(DslStageResult {
+            value: stage_create_clone(
+                cx,
+                mos,
+                origin_dataset,
+                origin_snap,
+                target_parent,
+                target_name,
+                initial_props,
+                *timestamp,
+                mos_dirty_dnodes,
+                features,
+                empty_bpobj_id,
+                alloc,
+                order,
+                new_txg,
+                staged_writes,
+            )?,
+            new_root_key: None,
+        }),
         DslMutation::RenameDataset {
             old_dataset,
             new_dataset,
-        } => stage_rename_dataset(
-            cx,
-            mos,
-            old_dataset,
-            new_dataset,
-            mos_dirty_dnodes,
-            alloc,
-            order,
-            new_txg,
-            staged_writes,
-        ),
-        DslMutation::DestroyDataset { dataset } => stage_destroy_dataset(
-            cx,
-            mos,
-            dataset,
-            mos_dirty_dnodes,
-            features,
-            empty_bpobj_id,
-            alloc,
-            order,
-            new_txg,
-            staged_writes,
-        ),
+        } => Ok(DslStageResult {
+            value: stage_rename_dataset(
+                cx,
+                mos,
+                old_dataset,
+                new_dataset,
+                mos_dirty_dnodes,
+                alloc,
+                order,
+                new_txg,
+                staged_writes,
+            )?,
+            new_root_key: None,
+        }),
+        DslMutation::DestroyDataset { dataset } => Ok(DslStageResult {
+            value: stage_destroy_dataset(
+                cx,
+                mos,
+                dataset,
+                mos_dirty_dnodes,
+                features,
+                empty_bpobj_id,
+                alloc,
+                order,
+                new_txg,
+                staged_writes,
+            )?,
+            new_root_key: None,
+        }),
         DslMutation::SetProperty {
             dataset,
             name,
             value,
-        } => stage_set_property(
-            cx,
-            mos,
+        } => Ok(DslStageResult {
+            value: stage_set_property(
+                cx,
+                mos,
+                dataset,
+                name,
+                Some(value),
+                mos_dirty_dnodes,
+                features,
+                alloc,
+                order,
+                new_txg,
+                staged_writes,
+            )?,
+            new_root_key: None,
+        }),
+        DslMutation::InheritProperty { dataset, name } => Ok(DslStageResult {
+            value: stage_set_property(
+                cx,
+                mos,
+                dataset,
+                name,
+                None,
+                mos_dirty_dnodes,
+                features,
+                alloc,
+                order,
+                new_txg,
+                staged_writes,
+            )?,
+            new_root_key: None,
+        }),
+        DslMutation::ChangeKey {
             dataset,
-            name,
-            Some(value),
-            mos_dirty_dnodes,
-            features,
-            alloc,
-            order,
-            new_txg,
-            staged_writes,
-        ),
-        DslMutation::InheritProperty { dataset, name } => stage_set_property(
-            cx,
-            mos,
-            dataset,
-            name,
-            None,
-            mos_dirty_dnodes,
-            features,
-            alloc,
-            order,
-            new_txg,
-            staged_writes,
-        ),
+            new_material,
+            new_keylocation,
+            pbkdf2_iters,
+            extra_entropy,
+        } => Ok(DslStageResult {
+            value: stage_change_key(
+                cx,
+                mos,
+                dataset,
+                new_material,
+                new_keylocation.as_deref(),
+                *pbkdf2_iters,
+                extra_entropy,
+                mos_dirty_dnodes,
+                features,
+                alloc,
+                order,
+                new_txg,
+                staged_writes,
+            )?,
+            new_root_key: None,
+        }),
     }
 }
 
@@ -1859,7 +1970,7 @@ pub(super) fn stage_create_snapshot(
     let (dir_obj, head_obj, pool_guid) = resolve_dataset_ids(cx, mos, dataset)?;
     let mos_meta = mos.meta_dnode().clone();
     let mos_ceiling = mos.root_birth_txg();
-    let (head_dn, _) = read_staged_or_committed_dnode(
+    let (head_dn, head_ceil) = read_staged_or_committed_dnode(
         cx,
         mos,
         &mos_meta,
@@ -1950,19 +2061,35 @@ pub(super) fn stage_create_snapshot(
         .copy_from_slice(&order.encode((head_flags & 0x1_0006) | DS_FLAG_UNIQUE_ACCURATE));
     snap_bonus[128..256].copy_from_slice(&head_dn.bonus()[128..256]); // identical ObjectSet BP!
 
-    let head_has_large_blocks = head_dn.object_type() == DMU_OTN_ZAP_METADATA
-        && mos
-            .zap_values(cx, head_obj)
-            .is_ok_and(|rows| rows.iter().any(|e| e.name == b"org.open-zfs:large_blocks"));
+    let mut head_zap_entries = if head_dn.object_type() == DMU_OTN_ZAP_METADATA {
+        mos.zap_values(cx, head_obj)?
+    } else {
+        Vec::new()
+    };
+    let head_has_large_blocks = head_zap_entries
+        .iter()
+        .any(|e| e.name == b"org.open-zfs:large_blocks");
+    let inherited_ivset_guid = zap_optional_u64(&head_zap_entries, DSL_DATASET_IVSET_GUID)?;
+    let mut snap_zap_entries = Vec::new();
     if head_has_large_blocks {
-        features.increment_read("com.delphix:extensible_dataset", new_txg)?;
         features.increment_read("org.open-zfs:large_blocks", new_txg)?;
-        let lb_entries = [RawZapEntry {
+        snap_zap_entries.push(RawZapEntry {
             name: b"org.open-zfs:large_blocks".to_vec(),
             integer_bytes: 8,
             values: vec![0],
             collision: 0,
-        }];
+        });
+    }
+    if let Some(ivset_guid) = inherited_ivset_guid {
+        snap_zap_entries.push(RawZapEntry {
+            name: DSL_DATASET_IVSET_GUID.to_vec(),
+            integer_bytes: 8,
+            values: vec![ivset_guid],
+            collision: 0,
+        });
+    }
+    if !snap_zap_entries.is_empty() {
+        features.increment_read("com.delphix:extensible_dataset", new_txg)?;
         write_zap_dnode_in_mos(
             cx,
             mos,
@@ -1975,7 +2102,7 @@ pub(super) fn stage_create_snapshot(
             DMU_OTN_ZAP_METADATA,
             DMU_OT_DSL_DATASET,
             snap_bonus,
-            &lb_entries,
+            &snap_zap_entries,
             0,
             false,
             order,
@@ -2107,25 +2234,60 @@ pub(super) fn stage_create_snapshot(
     )?;
 
     // 4. Update `head` (`ds_prev_snap_obj`, `ds_prev_snap_txg`, `ds_deadlist_obj`, `ds_unique_bytes = 0`).
+    // For encrypted datasets, also rotate `head`'s `com.datto:ivset_guid` so post-snapshot writes
+    // belong to a distinct IV-set from the snapshot.
     let mut head_bonus = head_dn.bonus().to_vec();
     head_bonus[8..16].copy_from_slice(&order.encode(snap_ds_obj));
     head_bonus[16..24].copy_from_slice(&order.encode(new_txg));
     head_bonus[64..72].copy_from_slice(&order.encode(new_head_dl));
     head_bonus[96..104].copy_from_slice(&order.encode(0));
-    let mut updated_head = head_dn;
-    let head_btype = updated_head.bonus_type();
-    updated_head
-        .set_bonus_and_spill(head_btype, head_bonus, None)
-        .map_err(|e| parse_err(&e))?;
-    put_dnode_in_table(
-        cx,
-        mos,
-        &mos_meta,
-        mos_ceiling,
-        mos_dirty_dnodes,
-        head_obj,
-        &updated_head,
-    )?;
+    if let Some(old_ivset) = inherited_ivset_guid {
+        let mut next_ivset = derive_unique_guid(pool_guid, new_txg, head_obj, 11);
+        if next_ivset == old_ivset {
+            next_ivset = next_ivset.wrapping_add(1).max(1);
+        }
+        head_zap_entries.retain(|e| e.name != DSL_DATASET_IVSET_GUID);
+        head_zap_entries.push(RawZapEntry {
+            name: DSL_DATASET_IVSET_GUID.to_vec(),
+            integer_bytes: 8,
+            values: vec![next_ivset],
+            collision: 0,
+        });
+        write_zap_dnode_in_mos(
+            cx,
+            mos,
+            &mos_meta,
+            mos_ceiling,
+            mos_dirty_dnodes,
+            alloc,
+            head_obj,
+            Some((&head_dn, head_ceil)),
+            DMU_OTN_ZAP_METADATA,
+            DMU_OT_DSL_DATASET,
+            head_bonus,
+            &head_zap_entries,
+            0,
+            false,
+            order,
+            new_txg,
+            staged_writes,
+        )?;
+    } else {
+        let mut updated_head = head_dn;
+        let head_btype = updated_head.bonus_type();
+        updated_head
+            .set_bonus_and_spill(head_btype, head_bonus, None)
+            .map_err(|e| parse_err(&e))?;
+        put_dnode_in_table(
+            cx,
+            mos,
+            &mos_meta,
+            mos_ceiling,
+            mos_dirty_dnodes,
+            head_obj,
+            &updated_head,
+        )?;
+    }
 
     // 5. Insert `snap_name -> snap_ds_obj` into `head.ds_snapnames_zapobj` (preserving `normflags = 2`).
     let (sm_dn, sm_ceil) = mos.object_with_ceiling(cx, snapmap_obj)?;
@@ -2582,11 +2744,13 @@ fn stage_destroy_snapshot_by_id(
     let new_next_unique = if next_obj == head_obj {
         let next_bp = BlockPointer::parse(&next_dn_cur.bonus()[128..256], order)
             .map_err(|e| parse_err(&e))?;
+        let dir_crypto = mos.dataset_crypto_info_for_dir(cx, dir_obj)?;
         let (measured, _) = walk_objectset_above_txg(
             cx,
             mos,
             &next_bp,
             next_ceil,
+            dir_crypto.as_ref(),
             prev_txg,
             ObjectSetWalkMode::MeasureOnly,
             alloc,
@@ -3445,6 +3609,83 @@ fn read_bookmarks_on_head(
     Ok(out)
 }
 
+/// Adjust `DSL_CRYPTO_REFCOUNT` on a MOS `dsl_crypto_key` ZAP object by `delta` (`+1` or `-1`).
+/// Returns the updated refcount (`0` means the caller must free `crypto_key_obj` and decrement
+/// `com.datto:encryption` in `features_for_read`).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn adjust_dsl_crypto_key_refcount(
+    cx: &Cx,
+    mos: &mut Objects,
+    mos_meta: &Dnode,
+    mos_ceiling: u64,
+    mos_dirty_dnodes: &mut BTreeMap<u64, Vec<u8>>,
+    alloc: &mut PoolSpaceAllocator,
+    crypto_key_obj: u64,
+    delta: i64,
+    order: Endian,
+    new_txg: u64,
+    staged_writes: &mut Vec<StagedBlockWrite>,
+) -> Result<u64> {
+    let (key_dn, key_ceil) = mos.object_with_ceiling(cx, crypto_key_obj)?;
+    let key_entries = mos.zap_values(cx, crypto_key_obj)?;
+    let mut record = parse_dsl_crypto_key_zap(&key_entries)?;
+    let next = u64::try_from(
+        i128::from(record.refcount)
+            .checked_add(i128::from(delta))
+            .filter(|&v| v >= 0)
+            .ok_or_else(|| corrupt("DSL_CRYPTO_REFCOUNT underflow/overflow"))?,
+    )
+    .map_err(|_| corrupt("DSL_CRYPTO_REFCOUNT u64 overflow"))?;
+    if next == 0 {
+        return Ok(0);
+    }
+    record.refcount = next;
+    let updated_entries = encode_dsl_crypto_key_zap(&record);
+    write_zap_dnode_in_mos(
+        cx,
+        mos,
+        mos_meta,
+        mos_ceiling,
+        mos_dirty_dnodes,
+        alloc,
+        crypto_key_obj,
+        Some((&key_dn, key_ceil)),
+        DMU_OTN_ZAP_METADATA,
+        0,
+        Vec::new(),
+        &updated_entries,
+        0,
+        true,
+        order,
+        new_txg,
+        staged_writes,
+    )?;
+    Ok(next)
+}
+
+/// Resolve effective `(compression, zstd_level)` for a newly created child dataset from
+/// `initial_props` (falling back to inherited `parent_dataset` `compression` property).
+pub(super) fn effective_compression_for_new_dataset(
+    cx: &Cx,
+    mos: &mut Objects,
+    parent_dataset: &[Vec<u8>],
+    initial_props: &[(String, ZfsPropertySetValue)],
+) -> Result<(u8, Option<u8>)> {
+    for (k, v) in initial_props {
+        if k == "compression"
+            && let ZfsPropertySetValue::Number(raw) = v
+        {
+            return Ok(decode_compression_property(*raw));
+        }
+    }
+    let props = mos.properties(cx, parent_dataset, None, &["compression".into()])?;
+    let raw = match props.values.first().and_then(|p| p.value.as_ref()) {
+        Some(PropertyValue::Number(n)) => *n,
+        _ => 2,
+    };
+    Ok(decode_compression_property(raw))
+}
+
 /// Build a fresh ZPL v4/v5 `ObjectSet` mirroring the SA schema and embedded quota
 /// schema of `parent_head_obj`.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -3452,6 +3693,8 @@ fn build_fresh_zpl_objectset(
     cx: &Cx,
     mos: &mut Objects,
     parent_head_obj: u64,
+    parent_crypto: Option<&ZfsDatasetCryptoInfo>,
+    mut write_crypto: Option<&mut DatasetWriteCrypto>,
     features: &mut MosFeatureState,
     alloc: &mut PoolSpaceAllocator,
     timestamp: Timestamp,
@@ -3462,18 +3705,28 @@ fn build_fresh_zpl_objectset(
     let (p_dn, p_ceil) = mos.object_with_ceiling(cx, parent_head_obj)?;
     let p_os_bp =
         BlockPointer::parse(&p_dn.bonus()[128..256], p_dn.order()).map_err(|e| parse_err(&e))?;
-    let (p_os_raw, p_os_ord, _) = mos
-        .checked_raw(
-            cx,
-            &p_os_bp,
-            DMU_OT_OBJSET,
-            0,
-            p_os_bp.logical_bytes(),
-            p_ceil,
-        )?
-        .ok_or_else(|| corrupt("parent ObjectSet is a hole"))?;
+    let (p_verify_key, p_view_crypto) = if let Some(p_info) = parent_crypto {
+        let key = mos
+            .keyring()
+            .get(p_info.encryption_root_ddobj)
+            .ok_or(FfsError::PermissionDenied)?;
+        let vc = Arc::new(DatasetCryptoContext {
+            info: p_info.clone(),
+            raw_scrub_only: false,
+        });
+        (Some(key), Some(vc))
+    } else {
+        (None, None)
+    };
+    let (p_os_raw, p_os_ord, _) =
+        mos.read_dataset_objset_block_raw(cx, &p_os_bp, p_ceil, p_verify_key.as_deref(), false)?;
     let p_os = ObjectSet::parse(&p_os_raw, p_os_ord).map_err(|e| parse_err(&e))?;
-    let mut p_view = mos.open_objectset_view(p_os.meta.clone(), p_os_bp.birth(), mos.txg);
+    let mut p_view = mos.open_objectset_view_with_crypto(
+        p_os.meta.clone(),
+        p_os_bp.birth(),
+        mos.txg,
+        p_view_crypto,
+    );
     let p_master = p_view.zap_values(cx, 1)?;
     let p_root_id = zap_required_u64(&p_master, b"ROOT")?;
     let zpl_version = zap_required_u64(&p_master, b"VERSION")?;
@@ -3514,7 +3767,8 @@ fn build_fresh_zpl_objectset(
                              bonus: Vec<u8>,
                              user_flags: u8,
                              entries: &[RawZapEntry],
-                             force_fat: bool|
+                             force_fat: bool,
+                             wc: Option<&mut DatasetWriteCrypto>|
      -> Result<u64> {
         let (bsize, blocks) = if force_fat {
             let blks = ffs_ondisk::zfs_zap::encode_fatzap_with_normflags(
@@ -3535,7 +3789,7 @@ fn build_fresh_zpl_objectset(
             dirty.insert(i as u64, Some(b));
         }
         let nblkptr = if bonus.is_empty() { 3 } else { 1 };
-        let out = cow_update_dnode(
+        let out = cow_update_dnode_with_crypto(
             cx,
             &mut new_view,
             alloc,
@@ -3559,6 +3813,8 @@ fn build_fresh_zpl_objectset(
                 indirect_bucket: WriteBucket::ChildBlocks,
             },
             &dirty,
+            obj_id,
+            wc,
             staged_writes,
         )?;
         zpl_born.add_assign(out.born)?;
@@ -3646,6 +3902,7 @@ fn build_fresh_zpl_objectset(
                 },
             ],
             false,
+            write_crypto.as_deref_mut(),
         )?;
         let _ = write_zpl_zap(
             9,
@@ -3655,6 +3912,7 @@ fn build_fresh_zpl_objectset(
             0,
             &reg_entries,
             false,
+            write_crypto.as_deref_mut(),
         )?;
         let _ = write_zpl_zap(
             10,
@@ -3664,6 +3922,7 @@ fn build_fresh_zpl_objectset(
             0,
             &lay_entries,
             true, // uint16 array values require Fat-ZAP!
+            write_crypto.as_deref_mut(),
         )?;
         master_entries.push(RawZapEntry {
             name: b"SA_ATTRS".to_vec(),
@@ -3682,8 +3941,18 @@ fn build_fresh_zpl_objectset(
         0,
         &master_entries,
         false,
+        write_crypto.as_deref_mut(),
     )?;
-    let _ = write_zpl_zap(2, DMU_OT_UNLINKED_SET, 0, Vec::new(), 0, &[], false)?;
+    let _ = write_zpl_zap(
+        2,
+        DMU_OT_UNLINKED_SET,
+        0,
+        Vec::new(),
+        0,
+        &[],
+        false,
+        write_crypto.as_deref_mut(),
+    )?;
 
     // 4. Object 3 (`ROOT` directory, mode `0o40755`, self-parented `parent = 3`).
     let root_meta = Metadata {
@@ -3722,6 +3991,7 @@ fn build_fresh_zpl_objectset(
         acct_flags,
         &[],
         false,
+        write_crypto.as_deref_mut(),
     )?;
 
     // Build `ObjectSet` and write initial embedded quota ZAPs directly with Object 3's accounting
@@ -3743,12 +4013,17 @@ fn build_fresh_zpl_objectset(
             collision: 0,
         });
     }
+    let os_phys_bytes = if write_crypto.is_some() {
+        p_os.physical_bytes().max(2048)
+    } else {
+        p_os.physical_bytes()
+    };
     let mut new_os = ObjectSet::new(
         2,
         p_os.flags,
         empty_meta.clone(),
         ffs_ondisk::zfs_dmu::ZilHeader::empty(),
-        p_os.physical_bytes(),
+        os_phys_bytes,
     )
     .map_err(|e| parse_err(&e))?;
     for emb_off in [
@@ -3779,7 +4054,7 @@ fn build_fresh_zpl_objectset(
             for (i, b) in eblocks.into_iter().enumerate() {
                 edirty.insert(i as u64, Some(b));
             }
-            let eout = cow_update_dnode(
+            let eout = cow_update_dnode_with_crypto(
                 cx,
                 &mut new_view,
                 alloc,
@@ -3803,6 +4078,8 @@ fn build_fresh_zpl_objectset(
                     indirect_bucket: WriteBucket::ChildBlocks,
                 },
                 &edirty,
+                emb_off as u64,
+                write_crypto.as_deref_mut(),
                 staged_writes,
             )?;
             zpl_born.add_assign(eout.born)?;
@@ -3818,7 +4095,7 @@ fn build_fresh_zpl_objectset(
         meta_dirty.insert(bid, Some(blk.clone()));
     }
     let max_blk = zpl_dirty_dnodes.keys().copied().max().unwrap_or(0);
-    let meta_out = cow_update_dnode(
+    let meta_out = cow_update_dnode_with_crypto(
         cx,
         &mut new_view,
         alloc,
@@ -3842,33 +4119,23 @@ fn build_fresh_zpl_objectset(
             indirect_bucket: WriteBucket::DatasetMetadata,
         },
         &meta_dirty,
+        0,
+        write_crypto.as_deref_mut(),
         staged_writes,
     )?;
     zpl_born.add_assign(meta_out.born)?;
     new_os.meta = meta_out.dnode;
 
-    let os_bytes = new_os.encode(order).map_err(|e| parse_err(&e))?;
-    let os_fill = new_os.meta_fill();
-    let os_dva = alloc.allocate(os_bytes.len())?;
-    let os_bp = BlockPointer::new_regular(&RegularBlockSpec {
-        dvas: &[os_dva],
-        physical: &os_bytes,
-        logical_bytes: os_bytes.len(),
-        compression: 2,
-        checksum_type: 7,
-        object_type: DMU_OT_OBJSET,
-        level: 0,
-        payload_order: order,
-        birth: new_txg,
-        fill: os_fill,
-    })
-    .map_err(|e| parse_err(&e))?;
+    let os_bp = write_dataset_objset_block(
+        &mut new_os,
+        alloc,
+        7,
+        order,
+        new_txg,
+        write_crypto.as_deref(),
+        staged_writes,
+    )?;
     zpl_born.add_assign(SpaceDelta::from_bp(&os_bp)?)?;
-    staged_writes.push(StagedBlockWrite {
-        bucket: WriteBucket::DatasetMetadata,
-        dva_offset: os_dva.offset,
-        bytes: os_bytes,
-    });
     Ok((os_bp, zpl_born))
 }
 
@@ -3941,7 +4208,8 @@ pub(super) fn lookup_pool_origin_snapshot(
 }
 
 /// Write a newly created `dsl_dir` (`DMU_OT_DSL_DIR`), automatically zapifying with
-/// `filesystem_count = 0` and `snapshot_count = 0` when `com.joyent:filesystem_limits` is active.
+/// `filesystem_count = 0` and `snapshot_count = 0` when `com.joyent:filesystem_limits` is active
+/// and/or attaching any `extra_zap_entries` (such as `com.datto:crypto_key_obj`).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn put_new_dsl_dir_in_mos(
     cx: &Cx,
@@ -3953,6 +4221,7 @@ pub(super) fn put_new_dsl_dir_in_mos(
     alloc: &mut PoolSpaceAllocator,
     dd_obj: u64,
     dd_bonus: Vec<u8>,
+    extra_zap_entries: &[RawZapEntry],
     order: Endian,
     new_txg: u64,
     staged_writes: &mut Vec<StagedBlockWrite>,
@@ -3963,22 +4232,24 @@ pub(super) fn put_new_dsl_dir_in_mos(
         .copied()
         .unwrap_or(0)
         > 0;
-    if fs_ss_limit_active {
+    if fs_ss_limit_active || !extra_zap_entries.is_empty() {
         features.increment_read("com.delphix:extensible_dataset", new_txg)?;
-        let entries = [
-            RawZapEntry {
+        let mut entries = Vec::with_capacity(2 + extra_zap_entries.len());
+        if fs_ss_limit_active {
+            entries.push(RawZapEntry {
                 name: b"com.joyent:filesystem_count".to_vec(),
                 integer_bytes: 8,
                 values: vec![0],
                 collision: 0,
-            },
-            RawZapEntry {
+            });
+            entries.push(RawZapEntry {
                 name: b"com.joyent:snapshot_count".to_vec(),
                 integer_bytes: 8,
                 values: vec![0],
                 collision: 0,
-            },
-        ];
+            });
+        }
+        entries.extend_from_slice(extra_zap_entries);
         write_zap_dnode_in_mos(
             cx,
             mos,
@@ -4185,6 +4456,7 @@ fn stage_create_dataset(
     parent_dataset: &[Vec<u8>],
     child_name: &[u8],
     initial_props: &[(String, ZfsPropertySetValue)],
+    encryption: Option<&ZfsEncryptionCreateOptions>,
     timestamp: Timestamp,
     mos_dirty_dnodes: &mut BTreeMap<u64, Vec<u8>>,
     features: &mut MosFeatureState,
@@ -4193,10 +4465,11 @@ fn stage_create_dataset(
     order: Endian,
     new_txg: u64,
     staged_writes: &mut Vec<StagedBlockWrite>,
-) -> Result<u64> {
+) -> Result<DslStageResult> {
     validate_dsl_component(child_name, false)?;
     require_filesystem_parent(cx, mos, parent_dataset)?;
     let (parent_dd_obj, parent_head_obj, pool_guid) = resolve_dataset_ids(cx, mos, parent_dataset)?;
+    let parent_crypto = mos.dataset_crypto_info(cx, parent_dataset)?;
     let mos_meta = mos.meta_dnode().clone();
     let mos_ceiling = mos.root_birth_txg();
 
@@ -4215,11 +4488,172 @@ fn stage_create_dataset(
         return Err(FfsError::Exists);
     }
 
+    // Allocate core MOS object IDs upfront so new encryption roots can bind `DSL_CRYPTO_ROOT_DDOBJ`
+    // and `com.datto:ivset_guid` before writing the dataset's initial ObjectSet blocks.
+    let new_dd_obj = allocate_object_id(cx, mos, &mos_meta, mos_ceiling, mos_dirty_dnodes, 1)?;
+    let new_head_obj = allocate_object_id(cx, mos, &mos_meta, mos_ceiling, mos_dirty_dnodes, 1)?;
+    let new_child_zap = allocate_object_id(cx, mos, &mos_meta, mos_ceiling, mos_dirty_dnodes, 1)?;
+    let new_props_zap = allocate_object_id(cx, mos, &mos_meta, mos_ceiling, mos_dirty_dnodes, 1)?;
+    let new_snapmap_zap = allocate_object_id(cx, mos, &mos_meta, mos_ceiling, mos_dirty_dnodes, 1)?;
+
+    let ds_guid = derive_unique_guid(pool_guid, new_txg, new_head_obj, 2);
+    let ds_fsid = derive_fsid_guid(ds_guid);
+    let (compression, zstd_level) =
+        effective_compression_for_new_dataset(cx, mos, parent_dataset, initial_props)?;
+
+    // Resolve encryption creation mode:
+    // - Explicit `Off`: forbidden under encrypted parent; unencrypted otherwise.
+    // - Explicit active suite (`On` / `Aes*`): new encryption root with fresh `dsl_crypto_key`.
+    // - `None` or `Inherit`: inherit parent's `dsl_crypto_key` if parent is encrypted.
+    let mut crypto_key_obj_for_dir: Option<u64> = None;
+    let mut ivset_guid_for_head: Option<u64> = None;
+    let mut new_root_key: Option<(u64, UnwrappedDslKey)> = None;
+    let mut root_keylocation_prop: Option<Vec<u8>> = None;
+    let mut is_new_encryption_root = false;
+
+    let mut write_crypto: Option<DatasetWriteCrypto> = match encryption {
+        Some(opts) if opts.suite == ZioEncrypt::Off => {
+            if parent_crypto.is_some() {
+                return Err(reject_einval(
+                    "cannot create unencrypted ZFS dataset under an encrypted parent",
+                ));
+            }
+            None
+        }
+        Some(opts) if opts.suite.is_active() => {
+            if !features.read_features.contains_key("com.datto:encryption")
+                || !features
+                    .read_features
+                    .contains_key("com.delphix:extensible_dataset")
+                || !features.read_features.contains_key("com.datto:bookmark_v2")
+                || !features
+                    .write_features
+                    .contains_key("com.delphix:bookmarks")
+            {
+                return Err(unsupported(
+                    "ZFS native encryption requires com.datto:encryption, com.datto:bookmark_v2, com.delphix:bookmarks, and com.delphix:extensible_dataset enabled on pool",
+                ));
+            }
+            let key_material = opts.key_material.as_ref().ok_or_else(|| {
+                reject_einval("creating a new ZFS encryption root requires key_material")
+            })?;
+            let keyformat = key_material.format();
+            let crypto_key_obj =
+                allocate_object_id(cx, mos, &mos_meta, mos_ceiling, mos_dirty_dnodes, 1)?;
+            let (pbkdf2_salt, pbkdf2_iters) = if keyformat == ZfsKeyFormat::Passphrase {
+                let iters = opts.pbkdf2_iters.unwrap_or(ZFS_PBKDF2_DEFAULT_ITERS);
+                if iters < ZFS_PBKDF2_MIN_ITERS {
+                    return Err(reject_einval(
+                        "ZFS passphrase pbkdf2iters must be at least 100000",
+                    ));
+                }
+                let salt = derive_unique_guid(pool_guid, new_txg, crypto_key_obj, 99);
+                (salt, iters)
+            } else {
+                (0, 0)
+            };
+            let wrapping =
+                key_material.resolve_wrapping_key(keyformat, pbkdf2_salt, pbkdf2_iters)?;
+            let (master, hmac, wrap_iv, key_guid) =
+                generate_new_dataset_keys(pool_guid, ds_guid, new_txg, &opts.extra_entropy);
+            let record = DslCryptoKeyRecord::wrap(
+                opts.suite.effective(),
+                key_guid,
+                DSL_CRYPTO_KEY_VERSION_V1,
+                new_dd_obj,
+                1,
+                keyformat,
+                pbkdf2_salt,
+                pbkdf2_iters,
+                wrap_iv,
+                wrapping.as_bytes(),
+                &master,
+                &hmac,
+            )
+            .map_err(|e| parse_err(&e))?;
+            let unwrapped = record
+                .unwrap(wrapping.as_bytes())
+                .map_err(|e| parse_err(&e))?;
+            let key_entries = encode_dsl_crypto_key_zap(&record);
+            write_zap_dnode_in_mos(
+                cx,
+                mos,
+                &mos_meta,
+                mos_ceiling,
+                mos_dirty_dnodes,
+                alloc,
+                crypto_key_obj,
+                None,
+                DMU_OTN_ZAP_METADATA,
+                0,
+                Vec::new(),
+                &key_entries,
+                0,
+                true, // Fat-ZAP required for uint8 key/IV/MAC arrays!
+                order,
+                new_txg,
+                staged_writes,
+            )?;
+            features.increment_read("com.datto:encryption", new_txg)?;
+            let ivset_guid = derive_unique_guid(pool_guid, new_txg, new_head_obj, 7);
+            let key_arc = Arc::new(unwrapped.clone());
+            crypto_key_obj_for_dir = Some(crypto_key_obj);
+            ivset_guid_for_head = Some(ivset_guid);
+            new_root_key = Some((new_dd_obj, unwrapped));
+            is_new_encryption_root = true;
+            root_keylocation_prop = Some(
+                opts.keylocation
+                    .clone()
+                    .unwrap_or_else(|| b"prompt".to_vec()),
+            );
+            Some(DatasetWriteCrypto {
+                nonces: ZfsNonceGenerator::new(ivset_guid, key_guid, new_txg, &opts.extra_entropy),
+                key: key_arc,
+                compression,
+                zstd_level,
+            })
+        }
+        _ => {
+            if let Some(ref p_info) = parent_crypto {
+                let key = mos
+                    .keyring()
+                    .get(p_info.encryption_root_ddobj)
+                    .ok_or(FfsError::PermissionDenied)?;
+                let _ = adjust_dsl_crypto_key_refcount(
+                    cx,
+                    mos,
+                    &mos_meta,
+                    mos_ceiling,
+                    mos_dirty_dnodes,
+                    alloc,
+                    p_info.crypto_key_obj,
+                    1,
+                    order,
+                    new_txg,
+                    staged_writes,
+                )?;
+                let ivset_guid = derive_unique_guid(pool_guid, new_txg, new_head_obj, 7);
+                crypto_key_obj_for_dir = Some(p_info.crypto_key_obj);
+                ivset_guid_for_head = Some(ivset_guid);
+                Some(DatasetWriteCrypto {
+                    nonces: ZfsNonceGenerator::new(ivset_guid, p_info.record.guid, new_txg, &[]),
+                    key,
+                    compression,
+                    zstd_level,
+                })
+            } else {
+                None
+            }
+        }
+    };
+
     // Build fresh ZPL `ObjectSet` (`new_os_bp`, `os_space`).
     let (new_os_bp, os_space) = build_fresh_zpl_objectset(
         cx,
         mos,
         parent_head_obj,
+        parent_crypto.as_ref(),
+        write_crypto.as_mut(),
         features,
         alloc,
         timestamp,
@@ -4239,12 +4673,6 @@ fn stage_create_dataset(
         os_space.dsize,
         order,
     )?;
-
-    let new_dd_obj = allocate_object_id(cx, mos, &mos_meta, mos_ceiling, mos_dirty_dnodes, 1)?;
-    let new_head_obj = allocate_object_id(cx, mos, &mos_meta, mos_ceiling, mos_dirty_dnodes, 1)?;
-    let new_child_zap = allocate_object_id(cx, mos, &mos_meta, mos_ceiling, mos_dirty_dnodes, 1)?;
-    let new_props_zap = allocate_object_id(cx, mos, &mos_meta, mos_ceiling, mos_dirty_dnodes, 1)?;
-    let new_snapmap_zap = allocate_object_id(cx, mos, &mos_meta, mos_ceiling, mos_dirty_dnodes, 1)?;
 
     write_zap_dnode_in_mos(
         cx,
@@ -4327,8 +4755,6 @@ fn stage_create_dataset(
         staged_writes,
     )?;
 
-    let ds_guid = derive_unique_guid(pool_guid, new_txg, new_head_obj, 2);
-    let ds_fsid = derive_fsid_guid(ds_guid);
     let mut head_bonus = vec![0_u8; 320];
     head_bonus[0..8].copy_from_slice(&order.encode(new_dd_obj));
     head_bonus[8..16].copy_from_slice(&order.encode(origin_snap_obj));
@@ -4346,33 +4772,62 @@ fn stage_create_dataset(
     head_bonus[120..128].copy_from_slice(&order.encode(inherited_flags | DS_FLAG_UNIQUE_ACCURATE));
     head_bonus[128..256].copy_from_slice(&new_os_bp.encode(order));
 
-    let head_dn = Dnode::from_spec(DnodeSpec {
-        object_type: DMU_OT_DSL_DATASET,
-        bonus_type: DMU_OT_DSL_DATASET,
-        checksum_type: 0,
-        compress_type: 0,
-        flags: DNODE_FLAG_USED_BYTES,
-        order,
-        levels: 1,
-        indirect_shift: 17,
-        data_bytes: 512,
-        max_block: 0,
-        used_bytes: 0,
-        slots: 1,
-        pointers: vec![BlockPointer::hole_pointer()],
-        bonus: head_bonus,
-        spill: None,
-    })
-    .map_err(|e| parse_err(&e))?;
-    put_dnode_in_table(
-        cx,
-        mos,
-        &mos_meta,
-        mos_ceiling,
-        mos_dirty_dnodes,
-        new_head_obj,
-        &head_dn,
-    )?;
+    if let Some(ivset_guid) = ivset_guid_for_head {
+        features.increment_read("com.delphix:extensible_dataset", new_txg)?;
+        let head_zap = [RawZapEntry {
+            name: DSL_DATASET_IVSET_GUID.to_vec(),
+            integer_bytes: 8,
+            values: vec![ivset_guid],
+            collision: 0,
+        }];
+        write_zap_dnode_in_mos(
+            cx,
+            mos,
+            &mos_meta,
+            mos_ceiling,
+            mos_dirty_dnodes,
+            alloc,
+            new_head_obj,
+            None,
+            DMU_OTN_ZAP_METADATA,
+            DMU_OT_DSL_DATASET,
+            head_bonus,
+            &head_zap,
+            0,
+            false,
+            order,
+            new_txg,
+            staged_writes,
+        )?;
+    } else {
+        let head_dn = Dnode::from_spec(DnodeSpec {
+            object_type: DMU_OT_DSL_DATASET,
+            bonus_type: DMU_OT_DSL_DATASET,
+            checksum_type: 0,
+            compress_type: 0,
+            flags: DNODE_FLAG_USED_BYTES,
+            order,
+            levels: 1,
+            indirect_shift: 17,
+            data_bytes: 512,
+            max_block: 0,
+            used_bytes: 0,
+            slots: 1,
+            pointers: vec![BlockPointer::hole_pointer()],
+            bonus: head_bonus,
+            spill: None,
+        })
+        .map_err(|e| parse_err(&e))?;
+        put_dnode_in_table(
+            cx,
+            mos,
+            &mos_meta,
+            mos_ceiling,
+            mos_dirty_dnodes,
+            new_head_obj,
+            &head_dn,
+        )?;
+    }
 
     let mut dd_bonus = vec![0_u8; 256];
     dd_bonus[0..8].copy_from_slice(&order.encode(timestamp.seconds.cast_unsigned()));
@@ -4387,6 +4842,15 @@ fn stage_create_dataset(
     dd_bonus[96..104].copy_from_slice(&order.encode(DD_FLAG_USED_BREAKDOWN));
     dd_bonus[104..112].copy_from_slice(&order.encode(os_space.dsize)); // DD_USED_HEAD
 
+    let mut dd_extra_zap = Vec::new();
+    if let Some(ck_obj) = crypto_key_obj_for_dir {
+        dd_extra_zap.push(RawZapEntry {
+            name: DSL_DIR_CRYPTO_KEY_OBJ.to_vec(),
+            integer_bytes: 8,
+            values: vec![ck_obj],
+            collision: 0,
+        });
+    }
     put_new_dsl_dir_in_mos(
         cx,
         mos,
@@ -4397,6 +4861,7 @@ fn stage_create_dataset(
         alloc,
         new_dd_obj,
         dd_bonus,
+        &dd_extra_zap,
         order,
         new_txg,
         staged_writes,
@@ -4478,7 +4943,13 @@ fn stage_create_dataset(
         staged_writes,
     )?;
 
-    let prop_updates: Vec<(&str, Option<&ZfsPropertySetValue>)> = initial_props
+    let mut effective_props = initial_props.to_vec();
+    if let Some(loc) = root_keylocation_prop
+        && !effective_props.iter().any(|(k, _)| k == "keylocation")
+    {
+        effective_props.push(("keylocation".to_owned(), ZfsPropertySetValue::Text(loc)));
+    }
+    let prop_updates: Vec<(&str, Option<&ZfsPropertySetValue>)> = effective_props
         .iter()
         .map(|(k, v)| (k.as_str(), Some(v)))
         .collect();
@@ -4490,6 +4961,7 @@ fn stage_create_dataset(
         new_props_zap,
         None,
         false,
+        is_new_encryption_root,
         &prop_updates,
         mos_dirty_dnodes,
         features,
@@ -4499,7 +4971,10 @@ fn stage_create_dataset(
         staged_writes,
     )?;
 
-    Ok(new_head_obj)
+    Ok(DslStageResult {
+        value: new_head_obj,
+        new_root_key,
+    })
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -4685,19 +5160,52 @@ fn stage_create_clone(
         .copy_from_slice(&order.encode((o_snap_flags & 0x1_0006) | DS_FLAG_UNIQUE_ACCURATE));
     head_bonus[128..256].copy_from_slice(&o_snap_dn.bonus()[128..256]); // zero-copy ObjectSet BP!
 
+    let origin_crypto = mos.dataset_crypto_info(cx, origin_dataset)?;
     let o_snap_has_large_blocks = o_snap_dn.object_type() == DMU_OTN_ZAP_METADATA
         && mos
             .zap_values(cx, origin_snap_obj)
             .is_ok_and(|rows| rows.iter().any(|e| e.name == b"org.open-zfs:large_blocks"));
+    let mut clone_head_zap = Vec::new();
     if o_snap_has_large_blocks {
-        features.increment_read("com.delphix:extensible_dataset", new_txg)?;
         features.increment_read("org.open-zfs:large_blocks", new_txg)?;
-        let lb_entries = [RawZapEntry {
+        clone_head_zap.push(RawZapEntry {
             name: b"org.open-zfs:large_blocks".to_vec(),
             integer_bytes: 8,
             values: vec![0],
             collision: 0,
-        }];
+        });
+    }
+    let mut clone_dd_extra_zap = Vec::new();
+    if let Some(ref o_info) = origin_crypto {
+        let _ = adjust_dsl_crypto_key_refcount(
+            cx,
+            mos,
+            &mos_meta,
+            mos_ceiling,
+            mos_dirty_dnodes,
+            alloc,
+            o_info.crypto_key_obj,
+            1,
+            order,
+            new_txg,
+            staged_writes,
+        )?;
+        let clone_ivset_guid = derive_unique_guid(pool_guid, new_txg, clone_head_obj, 13);
+        clone_head_zap.push(RawZapEntry {
+            name: DSL_DATASET_IVSET_GUID.to_vec(),
+            integer_bytes: 8,
+            values: vec![clone_ivset_guid],
+            collision: 0,
+        });
+        clone_dd_extra_zap.push(RawZapEntry {
+            name: DSL_DIR_CRYPTO_KEY_OBJ.to_vec(),
+            integer_bytes: 8,
+            values: vec![o_info.crypto_key_obj],
+            collision: 0,
+        });
+    }
+    if !clone_head_zap.is_empty() {
+        features.increment_read("com.delphix:extensible_dataset", new_txg)?;
         write_zap_dnode_in_mos(
             cx,
             mos,
@@ -4710,7 +5218,7 @@ fn stage_create_clone(
             DMU_OTN_ZAP_METADATA,
             DMU_OT_DSL_DATASET,
             head_bonus,
-            &lb_entries,
+            &clone_head_zap,
             0,
             false,
             order,
@@ -4766,6 +5274,7 @@ fn stage_create_clone(
         alloc,
         clone_dd_obj,
         dd_bonus,
+        &clone_dd_extra_zap,
         order,
         new_txg,
         staged_writes,
@@ -4840,6 +5349,7 @@ fn stage_create_clone(
         clone_props_zap,
         None,
         origin_is_zvol,
+        false,
         &prop_updates,
         mos_dirty_dnodes,
         features,
@@ -4879,6 +5389,20 @@ fn stage_rename_dataset(
         resolve_dataset_ids(cx, mos, &new_dataset[..new_dataset.len() - 1])?;
     if old_dataset == new_dataset {
         return Ok(target_head_obj);
+    }
+    if old_parent_dd != new_parent_dd
+        && let Some(target_crypto) = mos.dataset_crypto_info(cx, old_dataset)?
+        && target_crypto.encryption_root_ddobj != target_dd_obj
+    {
+        let new_parent_crypto =
+            mos.dataset_crypto_info(cx, &new_dataset[..new_dataset.len() - 1])?;
+        if new_parent_crypto.as_ref().map(|c| c.encryption_root_ddobj)
+            != Some(target_crypto.encryption_root_ddobj)
+        {
+            return Err(reject_einval(
+                "cannot move encrypted non-root ZFS dataset outside its encryption root",
+            ));
+        }
     }
 
     let mos_meta = mos.meta_dnode().clone();
@@ -5258,21 +5782,24 @@ pub(super) fn stage_destroy_dataset(
         return Err(reject_busy("ZFS dataset has snapshots"));
     }
 
+    let dataset_crypto = mos.dataset_crypto_info(cx, dataset)?;
+    if let Some(ref c_info) = dataset_crypto
+        && c_info.encryption_root_ddobj == dd_obj
+        && c_info.record.refcount > 1
+    {
+        return Err(reject_busy(
+            "cannot destroy ZFS encryption root while dependent datasets or clones share its key",
+        ));
+    }
+
     // 1. Free ONLY blocks in `head.ds_bp` born strictly after `origin_txg`, plus any
     // unclaimed head-owned ZIL tail block (`zh_log`) not inherited from an origin/snapshot!
     let origin_txg = if origin_obj == 0 { 0 } else { prev_snap_txg };
     let head_bp =
         BlockPointer::parse(&head_dn.bonus()[128..256], order).map_err(|e| parse_err(&e))?;
-    if !head_bp.hole()
-        && let Some((os_raw, os_order, _)) = mos.checked_raw(
-            cx,
-            &head_bp,
-            DMU_OT_OBJSET,
-            0,
-            head_bp.logical_bytes(),
-            head_ceil,
-        )?
-    {
+    if !head_bp.hole() {
+        let (os_raw, os_order, _) =
+            mos.read_dataset_objset_block_raw(cx, &head_bp, head_ceil, None, true)?;
         let os = ObjectSet::parse(&os_raw, os_order).map_err(|e| parse_err(&e))?;
         if let Some((zil_bp, zil_dvas)) = crate::reader::dmu::zil::parse_unclaimed_head_zil_dvas(
             &os_raw[512..704],
@@ -5290,6 +5817,7 @@ pub(super) fn stage_destroy_dataset(
         mos,
         &head_bp,
         head_ceil,
+        dataset_crypto.as_ref(),
         origin_txg,
         ObjectSetWalkMode::FreeToAllocator,
         alloc,
@@ -5475,6 +6003,45 @@ pub(super) fn stage_destroy_dataset(
                 order,
                 new_txg,
             )?;
+        }
+    }
+
+    // 5b. Decrement `DSL_CRYPTO_REFCOUNT` (or free `dsl_crypto_key` + decrement `com.datto:encryption` at 0).
+    if let Some(ref c_info) = dataset_crypto {
+        let remaining = adjust_dsl_crypto_key_refcount(
+            cx,
+            mos,
+            &mos_meta,
+            mos_ceiling,
+            mos_dirty_dnodes,
+            alloc,
+            c_info.crypto_key_obj,
+            -1,
+            order,
+            new_txg,
+            staged_writes,
+        )?;
+        if remaining == 0 {
+            free_mos_object_completely(
+                cx,
+                mos,
+                &mos_meta,
+                mos_ceiling,
+                mos_dirty_dnodes,
+                alloc,
+                c_info.crypto_key_obj,
+                order,
+                new_txg,
+            )?;
+            if features
+                .read_features
+                .get("com.datto:encryption")
+                .copied()
+                .unwrap_or(0)
+                > 0
+            {
+                features.decrement_read("com.datto:encryption")?;
+            }
         }
     }
 
@@ -5664,6 +6231,151 @@ pub(super) fn stage_destroy_dataset(
     Ok(head_obj)
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn stage_change_key(
+    cx: &Cx,
+    mos: &mut Objects,
+    dataset: &[Vec<u8>],
+    new_material: &ZfsKeyMaterial,
+    new_keylocation: Option<&[u8]>,
+    pbkdf2_iters: Option<u64>,
+    extra_entropy: &[u8],
+    mos_dirty_dnodes: &mut BTreeMap<u64, Vec<u8>>,
+    features: &mut MosFeatureState,
+    alloc: &mut PoolSpaceAllocator,
+    order: Endian,
+    new_txg: u64,
+    staged_writes: &mut Vec<StagedBlockWrite>,
+) -> Result<u64> {
+    let (dd_obj, head_obj, pool_guid) = resolve_dataset_ids(cx, mos, dataset)?;
+    let info = mos
+        .dataset_crypto_info(cx, dataset)?
+        .ok_or_else(|| reject_einval("cannot change key on an unencrypted ZFS dataset"))?;
+    if info.encryption_root_ddobj != dd_obj {
+        return Err(reject_einval(
+            "change_key target must be a ZFS encryption root dataset",
+        ));
+    }
+    let loaded = mos
+        .keyring()
+        .get(dd_obj)
+        .ok_or(FfsError::PermissionDenied)?;
+
+    let new_keyformat = new_material.format();
+    let (new_pbkdf2_salt, new_pbkdf2_iters) = if new_keyformat == ZfsKeyFormat::Passphrase {
+        let iters = pbkdf2_iters.unwrap_or(ZFS_PBKDF2_DEFAULT_ITERS);
+        if iters < ZFS_PBKDF2_MIN_ITERS {
+            return Err(reject_einval(
+                "ZFS passphrase pbkdf2iters must be at least 100000",
+            ));
+        }
+        let mut salt = derive_unique_guid(pool_guid, new_txg, info.crypto_key_obj, 101);
+        if salt == info.record.pbkdf2_salt {
+            salt = salt.wrapping_add(1).max(1);
+        }
+        (salt, iters)
+    } else {
+        (0, 0)
+    };
+    let new_wrapping =
+        new_material.resolve_wrapping_key(new_keyformat, new_pbkdf2_salt, new_pbkdf2_iters)?;
+    let (_, _, mut new_wrap_iv, _) =
+        generate_new_dataset_keys(pool_guid, info.record.guid, new_txg, extra_entropy);
+    if new_wrap_iv == info.record.iv {
+        new_wrap_iv[0] ^= 0x01;
+    }
+
+    let new_record = DslCryptoKeyRecord::wrap(
+        info.record.suite,
+        info.record.guid,
+        info.record.version,
+        info.record.root_ddobj,
+        info.record.refcount,
+        new_keyformat,
+        new_pbkdf2_salt,
+        new_pbkdf2_iters,
+        new_wrap_iv,
+        new_wrapping.as_bytes(),
+        loaded.active_master_key(),
+        &loaded.hmac_key,
+    )
+    .map_err(|e| parse_err(&e))?;
+    let verified = new_record
+        .unwrap(new_wrapping.as_bytes())
+        .map_err(|e| parse_err(&e))?;
+    if verified.active_master_key() != loaded.active_master_key()
+        || verified.hmac_key != loaded.hmac_key
+    {
+        return Err(corrupt(
+            "re-wrapped dsl_crypto_key failed roundtrip verification",
+        ));
+    }
+
+    let mos_meta = mos.meta_dnode().clone();
+    let mos_ceiling = mos.root_birth_txg();
+    let (key_dn, key_ceil) = mos.object_with_ceiling(cx, info.crypto_key_obj)?;
+    let key_entries = encode_dsl_crypto_key_zap(&new_record);
+    write_zap_dnode_in_mos(
+        cx,
+        mos,
+        &mos_meta,
+        mos_ceiling,
+        mos_dirty_dnodes,
+        alloc,
+        info.crypto_key_obj,
+        Some((&key_dn, key_ceil)),
+        DMU_OTN_ZAP_METADATA,
+        0,
+        Vec::new(),
+        &key_entries,
+        0,
+        true,
+        order,
+        new_txg,
+        staged_writes,
+    )?;
+
+    if let Some(loc) = new_keylocation {
+        let (dd_dn, _) = read_staged_or_committed_dnode(
+            cx,
+            mos,
+            &mos_meta,
+            mos_ceiling,
+            mos_dirty_dnodes,
+            dd_obj,
+            order,
+        )?;
+        let props_zap = order.u64(dd_dn.bonus(), 80).map_err(|e| parse_err(&e))?;
+        let (pz_dn, pz_ceil) = mos.object_with_ceiling(cx, props_zap)?;
+        let is_zvol = mos
+            .datasets(cx)?
+            .into_iter()
+            .find(|d| d.head_object == head_obj)
+            .is_some_and(|d| d.objectset_kind == Some(3));
+        let val = ZfsPropertySetValue::Text(loc.to_vec());
+        let updates = [("keylocation", Some(&val))];
+        apply_properties_batch_on_ids(
+            cx,
+            mos,
+            dd_obj,
+            head_obj,
+            props_zap,
+            Some((&pz_dn, pz_ceil)),
+            is_zvol,
+            true,
+            &updates,
+            mos_dirty_dnodes,
+            features,
+            alloc,
+            order,
+            new_txg,
+            staged_writes,
+        )?;
+    }
+
+    Ok(head_obj)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn stage_set_property(
     cx: &Cx,
@@ -5679,6 +6391,9 @@ fn stage_set_property(
     staged_writes: &mut Vec<StagedBlockWrite>,
 ) -> Result<u64> {
     let (dd_obj, head_obj, _) = resolve_dataset_ids(cx, mos, dataset)?;
+    let is_encryption_root = mos
+        .dataset_crypto_info(cx, dataset)?
+        .is_some_and(|c| c.encryption_root_ddobj == dd_obj);
     let mos_meta = mos.meta_dnode().clone();
     let mos_ceiling = mos.root_birth_txg();
     let (dd_dn, _) = read_staged_or_committed_dnode(
@@ -5706,6 +6421,7 @@ fn stage_set_property(
         props_zap,
         Some((&pz_dn, pz_ceil)),
         is_zvol,
+        is_encryption_root,
         &updates,
         mos_dirty_dnodes,
         features,
@@ -5726,6 +6442,7 @@ pub(super) fn apply_properties_batch_on_ids(
     props_zap: u64,
     existing_pz: Option<(&Dnode, u64)>,
     is_zvol: bool,
+    is_encryption_root: bool,
     updates: &[(&str, Option<&ZfsPropertySetValue>)],
     mos_dirty_dnodes: &mut BTreeMap<u64, Vec<u8>>,
     features: &mut MosFeatureState,
@@ -5822,12 +6539,22 @@ pub(super) fn apply_properties_batch_on_ids(
         let has_recvd = rows.iter().any(|r| r.name == recvd_key);
 
         if let Some(val) = value {
-            if is_user_prop {
+            if is_user_prop || name == "keylocation" {
+                if name == "keylocation" && !is_encryption_root {
+                    return Err(reject_einval(
+                        "keylocation property may only be set on a ZFS encryption root",
+                    ));
+                }
                 let ZfsPropertySetValue::Text(bytes) = val else {
-                    return Err(reject_einval("user ZFS property requires a string value"));
+                    return Err(reject_einval(format!(
+                        "ZFS property {name} requires a string value"
+                    )));
                 };
-                if bytes.len() >= 8192 || bytes.contains(&0) {
-                    return Err(reject_einval("invalid user ZFS property value"));
+                if (name == "keylocation" && bytes.is_empty())
+                    || bytes.len() >= 8192
+                    || bytes.contains(&0)
+                {
+                    return Err(reject_einval(format!("invalid ZFS property {name} value")));
                 }
                 let mut vals: Vec<u64> = bytes.iter().map(|&b| u64::from(b)).collect();
                 vals.push(0);
@@ -5964,10 +6691,36 @@ pub(super) fn apply_properties_batch_on_ids(
                         }
                     }
                     "checksum" => {
-                        if !matches!(num, 1 | 6 | 7 | 8) {
+                        if !matches!(num, 1 | 6 | 7 | 8 | 11) {
                             return Err(unsupported(format!(
                                 "unsupported ZFS checksum property index {num}"
                             )));
+                        }
+                    }
+                    "compression" => {
+                        let is_zstd = num & 127 == 16 && matches!(num >> 7, 0 | 1..=19);
+                        if !matches!(num, 0 | 1 | 2 | 5..=15) && !is_zstd {
+                            return Err(unsupported(format!(
+                                "unsupported ZFS compression property index {num}"
+                            )));
+                        }
+                        if matches!(num, 1 | 15)
+                            && features.read_features.get("org.illumos:lz4_compress") == Some(&0)
+                        {
+                            features.increment_read("org.illumos:lz4_compress", new_txg)?;
+                        }
+                        if is_zstd {
+                            if !features
+                                .read_features
+                                .contains_key("org.freebsd:zstd_compress")
+                            {
+                                return Err(unsupported(
+                                    "ZFS zstd compression requires org.freebsd:zstd_compress feature",
+                                ));
+                            }
+                            if features.read_features.get("org.freebsd:zstd_compress") == Some(&0) {
+                                features.increment_read("org.freebsd:zstd_compress", new_txg)?;
+                            }
                         }
                     }
                     _ => {

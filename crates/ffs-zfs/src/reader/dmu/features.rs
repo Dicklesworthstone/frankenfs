@@ -47,10 +47,10 @@ fn policy(name: &str) -> Option<Policy> {
         "com.datto:encryption" => (
             false,
             false,
-            false,
+            true,
             &["com.delphix:extensible_dataset", "com.datto:bookmark_v2"],
         ),
-        "com.datto:bookmark_v2" => (false, false, false, BOOKMARK_V2),
+        "com.datto:bookmark_v2" => (false, false, true, BOOKMARK_V2),
         "com.delphix:redaction_bookmarks" | "com.delphix:bookmark_written" => {
             (false, false, false, REDACTION)
         }

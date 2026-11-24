@@ -300,6 +300,8 @@ fn build(specs: &BTreeMap<u64, Spec>, order: Endian, fault: Fault) -> (Zpl, Read
         meta: Dnode::parse(&meta, payload).unwrap(),
         cache: VecDeque::new(),
         cached_bytes: 0,
+        keyring: crate::crypto::ZfsKeyRing::new(),
+        crypto: None,
     };
     let view = Zpl::open(
         &cx,

@@ -138,7 +138,9 @@ fn hex_nibble(byte: u8) -> Result<u8> {
         b'0'..=b'9' => Ok(byte - b'0'),
         b'a'..=b'f' => Ok(byte - b'a' + 10),
         b'A'..=b'F' => Ok(byte - b'A' + 10),
-        _ => Err(FfsError::Format("invalid hexadecimal character in ZFS key".into())),
+        _ => Err(FfsError::Format(
+            "invalid hexadecimal character in ZFS key".into(),
+        )),
     }
 }
 
@@ -210,11 +212,7 @@ impl ZfsKeyRing {
 
     /// Unwrap and load the key for `info`'s encryption root. Fails closed with
     /// `FfsError::PermissionDenied` if the wrapping key/format/passphrase fails MAC verification.
-    pub fn load_key(
-        &self,
-        info: &ZfsDatasetCryptoInfo,
-        material: &ZfsKeyMaterial,
-    ) -> Result<()> {
+    pub fn load_key(&self, info: &ZfsDatasetCryptoInfo, material: &ZfsKeyMaterial) -> Result<()> {
         let wrapping = material.resolve_wrapping_key(
             info.record.keyformat,
             info.record.pbkdf2_salt,
@@ -233,11 +231,7 @@ impl ZfsKeyRing {
     }
 
     /// Directly register a freshly generated unwrapped key for a newly created encryption root.
-    pub fn insert_unwrapped(
-        &self,
-        encryption_root_ddobj: u64,
-        key: UnwrappedDslKey,
-    ) -> Result<()> {
+    pub fn insert_unwrapped(&self, encryption_root_ddobj: u64, key: UnwrappedDslKey) -> Result<()> {
         let mut guard = self
             .keys
             .write()
@@ -305,15 +299,12 @@ fn find_zap_u64(entries: &[ZapEntry], name: &[u8]) -> Result<Option<u64>> {
 }
 
 fn find_zap_bytes<const N: usize>(entries: &[ZapEntry], name: &[u8]) -> Result<[u8; N]> {
-    let entry = entries
-        .iter()
-        .find(|e| e.name == name)
-        .ok_or_else(|| {
-            corrupt(format!(
-                "dsl_crypto_key missing required byte array {:?}",
-                String::from_utf8_lossy(name)
-            ))
-        })?;
+    let entry = entries.iter().find(|e| e.name == name).ok_or_else(|| {
+        corrupt(format!(
+            "dsl_crypto_key missing required byte array {:?}",
+            String::from_utf8_lossy(name)
+        ))
+    })?;
     if entry.integer_bytes != 1 || entry.values.len() != N {
         return Err(corrupt(format!(
             "dsl_crypto_key field {:?} expected {N} bytes, got {} x {}B",
@@ -470,7 +461,12 @@ pub fn generate_new_dataset_keys(
     dataset_guid: u64,
     txg: u64,
     extra_entropy: &[u8],
-) -> ([u8; ZFS_MAX_MASTER_KEY_LEN], [u8; ZFS_HMAC_KEY_LEN], [u8; ZIO_DATA_IV_LEN], u64) {
+) -> (
+    [u8; ZFS_MAX_MASTER_KEY_LEN],
+    [u8; ZFS_HMAC_KEY_LEN],
+    [u8; ZIO_DATA_IV_LEN],
+    u64,
+) {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"frankenfs.zfs.newkey.v1");
     hasher.update(&pool_guid.to_le_bytes());
@@ -533,7 +529,10 @@ mod tests {
 
         // Wrong key must fail closed and leave status Unavailable.
         let wrong = ZfsKeyMaterial::Raw([0x43_u8; ZFS_WRAPPING_KEY_LEN]);
-        assert!(matches!(ring.load_key(&info, &wrong), Err(FfsError::PermissionDenied)));
+        assert!(matches!(
+            ring.load_key(&info, &wrong),
+            Err(FfsError::PermissionDenied)
+        ));
         assert_eq!(ring.key_status(Some(55)), ZfsKeyStatus::Unavailable);
 
         // Wrong format must fail closed.
@@ -590,10 +589,10 @@ mod tests {
         assert_eq!(parsed.pbkdf2_iters, ZFS_PBKDF2_MIN_ITERS);
         let _ = ZFS_PBKDF2_DEFAULT_ITERS;
 
-        let mut gen = ZfsNonceGenerator::new(100, key_guid, 5, b"");
-        let a = gen.next_salt_iv(1, 0, 0);
-        let b = gen.next_salt_iv(1, 0, 0);
-        let c = gen.next_salt_iv(1, 0, 1);
+        let mut nonce_gen = ZfsNonceGenerator::new(100, key_guid, 5, b"");
+        let a = nonce_gen.next_salt_iv(1, 0, 0);
+        let b = nonce_gen.next_salt_iv(1, 0, 0);
+        let c = nonce_gen.next_salt_iv(1, 0, 1);
         assert_ne!(a, b);
         assert_ne!(b, c);
         assert_ne!(a, c);

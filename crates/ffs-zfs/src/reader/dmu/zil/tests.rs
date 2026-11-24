@@ -796,6 +796,8 @@ fn recovery_graph_xattrs(
         meta: Dnode::parse(&meta, order).unwrap(),
         cache: std::collections::VecDeque::new(),
         cached_bytes: 0,
+        keyring: crate::crypto::ZfsKeyRing::new(),
+        crypto: None,
     };
     (objects, reads, faults)
 }

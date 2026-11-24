@@ -11,10 +11,12 @@
 //!   `"size" -> volsize` (`u64`, exact multiple of `volblocksize`).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use asupersync::Cx;
 use ffs_error::{FfsError, Result};
-use ffs_ondisk::zfs::{BlockPointer, Endian, RegularBlockSpec};
+use ffs_ondisk::zfs::crypto::{DSL_DATASET_IVSET_GUID, DSL_DIR_CRYPTO_KEY_OBJ};
+use ffs_ondisk::zfs::{BlockPointer, Endian};
 use ffs_ondisk::zfs_dmu::{
     DMU_OT_DNODE, DNODE_BLOCK_BYTES, DNODE_FLAG_USED_BYTES, Dnode, DnodeSpec, ObjectSet, ZilHeader,
 };
@@ -22,24 +24,27 @@ use ffs_ondisk::zfs_zap::Entry as RawZapEntry;
 use ffs_ondisk::zfs_zpl::Timestamp;
 use serde::Serialize;
 
-use crate::reader::dmu::Objects;
+use crate::crypto::ZfsNonceGenerator;
 use crate::reader::dmu::properties::PropertyValue;
+use crate::reader::dmu::{DatasetCryptoContext, Objects};
 
 use super::dmu_cow::{
-    DMU_OT_OBJSET, DnodeCowSpec, MosFeatureState, PoolSpaceAllocator, SpaceDelta, StagedBlockWrite,
-    WriteBucket, allocate_object_id, cow_update_dnode, encode_zap_blocks_for_dnode,
-    enqueue_into_dataset_deadlist, put_dnode_in_table, read_staged_or_committed_dnode,
-    zap_required_u64,
+    DatasetWriteCrypto, DnodeCowSpec, MosFeatureState, PoolSpaceAllocator, SpaceDelta,
+    StagedBlockWrite, WriteBucket, allocate_object_id, cow_update_dnode_with_crypto,
+    decode_compression_property, encode_zap_blocks_for_dnode, enqueue_into_dataset_deadlist,
+    put_dnode_in_table, read_staged_or_committed_dnode, write_dataset_objset_block,
+    zap_optional_u64, zap_required_u64,
 };
 use super::dsl_ops::{
     DD_FLAG_USED_BREAKDOWN, DMU_OT_DSL_DATASET, DMU_OT_DSL_DIR_CHILD_MAP, DMU_OT_DSL_DS_SNAP_MAP,
-    DMU_OTN_ZAP_METADATA, DS_FLAG_UNIQUE_ACCURATE, allocate_fresh_deadlist,
-    apply_properties_batch_on_ids, bump_filesystem_limits_counter_if_present, derive_fsid_guid,
-    derive_unique_guid, effective_local_numeric_prop, enforce_dataset_quotas_for_growth,
-    enforce_pool_reservations_for_growth, link_dataset_to_origin_snapshot,
-    lookup_pool_origin_snapshot, propagate_dsl_dir_space_delta, put_new_dsl_dir_in_mos,
-    reject_einval, require_filesystem_parent, resolve_dataset_ids, stage_create_snapshot,
-    stage_destroy_dataset, validate_dsl_component, write_zap_dnode_in_mos,
+    DMU_OTN_ZAP_METADATA, DS_FLAG_UNIQUE_ACCURATE, adjust_dsl_crypto_key_refcount,
+    allocate_fresh_deadlist, apply_properties_batch_on_ids,
+    bump_filesystem_limits_counter_if_present, derive_fsid_guid, derive_unique_guid,
+    effective_compression_for_new_dataset, effective_local_numeric_prop,
+    enforce_dataset_quotas_for_growth, enforce_pool_reservations_for_growth,
+    link_dataset_to_origin_snapshot, lookup_pool_origin_snapshot, propagate_dsl_dir_space_delta,
+    put_new_dsl_dir_in_mos, reject_einval, require_filesystem_parent, resolve_dataset_ids,
+    stage_create_snapshot, stage_destroy_dataset, validate_dsl_component, write_zap_dnode_in_mos,
 };
 use super::zpl_ops::ZfsDataChecksum;
 use super::{
@@ -130,6 +135,7 @@ struct ZvolContext {
     prop_ceiling: u64,
     volsize: u64,
     volblocksize: usize,
+    write_crypto: Option<DatasetWriteCrypto>,
 }
 
 fn validate_sector_span(offset: u64, len: u64, volsize: u64, max_bytes: usize) -> Result<()> {
@@ -173,6 +179,7 @@ fn open_zvol_head_context(
     mos: &mut Objects,
     dataset: &[Vec<u8>],
     commit_order: Endian,
+    new_txg: u64,
 ) -> Result<(ZvolContext, Objects)> {
     checkpoint(cx)?;
     let ds_row = mos
@@ -188,9 +195,37 @@ fn open_zvol_head_context(
             "native ZVOL writes refuse inconsistent datasets",
         ));
     }
-    if effective_readonly(cx, mos, dataset)? {
-        return Err(FfsError::ReadOnly);
+    let props = mos.properties(
+        cx,
+        dataset,
+        None,
+        &["readonly".into(), "compression".into()],
+    )?;
+    match props.values.first().and_then(|p| p.value.as_ref()) {
+        Some(PropertyValue::Number(0)) => {}
+        Some(PropertyValue::Number(1)) => return Err(FfsError::ReadOnly),
+        _ => {
+            return Err(corrupt(
+                "missing or invalid effective ZFS readonly property",
+            ));
+        }
     }
+    let compression_raw = match props.values.get(1).and_then(|p| p.value.as_ref()) {
+        Some(PropertyValue::Number(raw)) => *raw,
+        _ => 2,
+    };
+    let (compression, zstd_level) = decode_compression_property(compression_raw);
+
+    let crypto_info = mos.dataset_crypto_info(cx, dataset)?;
+    let loaded_key = if let Some(ref info) = crypto_info {
+        Some(
+            mos.keyring()
+                .get(info.encryption_root_ddobj)
+                .ok_or(FfsError::PermissionDenied)?,
+        )
+    } else {
+        None
+    };
 
     let (head_dn, head_ceiling) = mos.object_with_ceiling(cx, ds_row.head_object)?;
     let order = head_dn.order();
@@ -198,16 +233,13 @@ fn open_zvol_head_context(
     let deadlist_obj = order.u64(head_dn.bonus(), 64).map_err(|e| parse_err(&e))?;
     let old_os_bp =
         BlockPointer::parse(&head_dn.bonus()[128..256], order).map_err(|e| parse_err(&e))?;
-    let (os_raw, os_order, _) = mos
-        .checked_raw(
-            cx,
-            &old_os_bp,
-            DMU_OT_OBJSET,
-            0,
-            old_os_bp.logical_bytes(),
-            head_ceiling,
-        )?
-        .ok_or_else(|| corrupt("ZVOL head object set is a hole"))?;
+    let (os_raw, os_order, _) = mos.read_dataset_objset_block_raw(
+        cx,
+        &old_os_bp,
+        head_ceiling,
+        loaded_key.as_deref(),
+        false,
+    )?;
     let mut os = ObjectSet::parse(&os_raw, os_order).map_err(|e| parse_err(&e))?;
     if os.kind != OBJSET_TYPE_ZVOL {
         return Err(corrupt("selected dataset is not a ZVOL object set"));
@@ -242,7 +274,37 @@ fn open_zvol_head_context(
         os.zil_header = ZilHeader::empty();
     }
 
-    let mut os_view = mos.open_objectset_view(os.meta.clone(), old_os_bp.birth(), mos.txg);
+    let (write_crypto, view_crypto) = if let (Some(info), Some(key)) = (crypto_info, loaded_key) {
+        let ivset_guid = if head_dn.object_type() == DMU_OTN_ZAP_METADATA {
+            zap_optional_u64(
+                &mos.zap_values(cx, ds_row.head_object)?,
+                DSL_DATASET_IVSET_GUID,
+            )?
+            .unwrap_or(ds_row.guid)
+        } else {
+            ds_row.guid
+        };
+        let wc = DatasetWriteCrypto {
+            nonces: ZfsNonceGenerator::new(ivset_guid, info.record.guid, new_txg, &[]),
+            key,
+            compression,
+            zstd_level,
+        };
+        let vc = Arc::new(DatasetCryptoContext {
+            info,
+            raw_scrub_only: false,
+        });
+        (Some(wc), Some(vc))
+    } else {
+        (None, None)
+    };
+
+    let mut os_view = mos.open_objectset_view_with_crypto(
+        os.meta.clone(),
+        old_os_bp.birth(),
+        mos.txg,
+        view_crypto,
+    );
     let (data_dnode, data_ceiling) = os_view.object_with_ceiling(cx, ZVOL_OBJ)?;
     let (prop_dnode, prop_ceiling) = os_view.object_with_ceiling(cx, ZVOL_ZAP_OBJ)?;
     for (dn, expected_ot) in [(&data_dnode, DMU_OT_ZVOL), (&prop_dnode, DMU_OT_ZVOL_PROP)] {
@@ -278,6 +340,7 @@ fn open_zvol_head_context(
         prop_ceiling,
         volsize,
         volblocksize,
+        write_crypto,
     };
     Ok((ctx, os_view))
 }
@@ -313,7 +376,7 @@ fn finalize_zvol_to_mos(
     let meta_max_block = zvol_meta_base
         .max_block()
         .max(zvol_dirty_dnodes.keys().copied().max().unwrap_or(0));
-    let meta_out = cow_update_dnode(
+    let meta_out = cow_update_dnode_with_crypto(
         cx,
         os_view,
         alloc,
@@ -337,39 +400,29 @@ fn finalize_zvol_to_mos(
             indirect_bucket: WriteBucket::DatasetMetadata,
         },
         &meta_dirty,
+        0,
+        ctx.write_crypto.as_mut(),
         staged_writes,
     )?;
     born.add_assign(meta_out.born)?;
     retired.extend(meta_out.retired_bps);
 
     ctx.os.meta = meta_out.dnode;
-    let os_bytes = ctx.os.encode(order).map_err(|e| parse_err(&e))?;
-    let os_fill = ctx.os.meta_fill();
-    let os_dva = alloc.allocate(os_bytes.len())?;
-    let os_cksum = if matches!(ctx.old_os_bp.checksum_type(), 6..=8) {
+    let os_cksum = if matches!(ctx.old_os_bp.checksum_type(), 6..=8 | 11) {
         ctx.old_os_bp.checksum_type()
     } else {
         7
     };
-    let new_os_bp = BlockPointer::new_regular(&RegularBlockSpec {
-        dvas: &[os_dva],
-        physical: &os_bytes,
-        logical_bytes: os_bytes.len(),
-        compression: 2,
-        checksum_type: os_cksum,
-        object_type: DMU_OT_OBJSET,
-        level: 0,
-        payload_order: order,
-        birth: new_txg,
-        fill: os_fill,
-    })
-    .map_err(|e| parse_err(&e))?;
+    let new_os_bp = write_dataset_objset_block(
+        &mut ctx.os,
+        alloc,
+        os_cksum,
+        order,
+        new_txg,
+        ctx.write_crypto.as_ref(),
+        staged_writes,
+    )?;
     born.add_assign(SpaceDelta::from_bp(&new_os_bp)?)?;
-    staged_writes.push(StagedBlockWrite {
-        bucket: WriteBucket::DatasetMetadata,
-        dva_offset: os_dva.offset,
-        bytes: os_bytes,
-    });
     retired.push(ctx.old_os_bp.clone());
 
     // 2. Partition retired BPs at `prev_snap_txg`.
@@ -620,18 +673,56 @@ pub(super) fn stage_create_zvol(
     let (p_head_dn, p_head_ceil) = mos.object_with_ceiling(cx, parent_head_obj)?;
     let p_os_bp = BlockPointer::parse(&p_head_dn.bonus()[128..256], p_head_dn.order())
         .map_err(|e| parse_err(&e))?;
-    let (p_os_raw, p_os_ord, _) = mos
-        .checked_raw(
-            cx,
-            &p_os_bp,
-            DMU_OT_OBJSET,
-            0,
-            p_os_bp.logical_bytes(),
-            p_head_ceil,
-        )?
-        .ok_or_else(|| corrupt("parent ObjectSet is a hole"))?;
+    let (p_os_raw, p_os_ord, _) =
+        mos.read_dataset_objset_block_raw(cx, &p_os_bp, p_head_ceil, None, true)?;
     let p_os = ObjectSet::parse(&p_os_raw, p_os_ord).map_err(|e| parse_err(&e))?;
-    let os_phys_bytes = p_os.physical_bytes();
+
+    let parent_crypto = mos.dataset_crypto_info(cx, parent_dataset)?;
+    let new_dd_obj = allocate_object_id(cx, mos, &mos_meta, mos_ceiling, mos_dirty_dnodes, 1)?;
+    let new_head_obj = allocate_object_id(cx, mos, &mos_meta, mos_ceiling, mos_dirty_dnodes, 1)?;
+    let new_child_zap = allocate_object_id(cx, mos, &mos_meta, mos_ceiling, mos_dirty_dnodes, 1)?;
+    let new_props_zap = allocate_object_id(cx, mos, &mos_meta, mos_ceiling, mos_dirty_dnodes, 1)?;
+    let new_snapmap_zap = allocate_object_id(cx, mos, &mos_meta, mos_ceiling, mos_dirty_dnodes, 1)?;
+
+    let mut inherited_ivset_guid: Option<u64> = None;
+    let mut inherited_crypto_key_obj: Option<u64> = None;
+    let mut write_crypto = if let Some(ref p_info) = parent_crypto {
+        let key = mos
+            .keyring()
+            .get(p_info.encryption_root_ddobj)
+            .ok_or(FfsError::PermissionDenied)?;
+        let (compression, zstd_level) =
+            effective_compression_for_new_dataset(cx, mos, parent_dataset, &opts.initial_props)?;
+        let ivset_guid = derive_unique_guid(pool_guid, new_txg, new_head_obj, 9);
+        let _ = adjust_dsl_crypto_key_refcount(
+            cx,
+            mos,
+            &mos_meta,
+            mos_ceiling,
+            mos_dirty_dnodes,
+            alloc,
+            p_info.crypto_key_obj,
+            1,
+            order,
+            new_txg,
+            staged_writes,
+        )?;
+        inherited_ivset_guid = Some(ivset_guid);
+        inherited_crypto_key_obj = Some(p_info.crypto_key_obj);
+        Some(DatasetWriteCrypto {
+            nonces: ZfsNonceGenerator::new(ivset_guid, p_info.record.guid, new_txg, &[]),
+            key,
+            compression,
+            zstd_level,
+        })
+    } else {
+        None
+    };
+    let os_phys_bytes = if write_crypto.is_some() {
+        p_os.physical_bytes().max(2048)
+    } else {
+        p_os.physical_bytes()
+    };
 
     // 1. Build fresh ZVOL `ObjectSet` (`kind = 3`, `flags = 0`, NO embedded quota dnodes).
     let empty_meta = Dnode::from_spec(DnodeSpec {
@@ -699,7 +790,7 @@ pub(super) fn stage_create_zvol(
     for (idx, blk) in prop_blocks.into_iter().enumerate() {
         prop_dirty.insert(idx as u64, Some(blk));
     }
-    let prop_out = cow_update_dnode(
+    let prop_out = cow_update_dnode_with_crypto(
         cx,
         &mut new_view,
         alloc,
@@ -723,6 +814,8 @@ pub(super) fn stage_create_zvol(
             indirect_bucket: WriteBucket::ChildBlocks,
         },
         &prop_dirty,
+        ZVOL_ZAP_OBJ,
+        write_crypto.as_mut(),
         staged_writes,
     )?;
     zvol_born.add_assign(prop_out.born)?;
@@ -741,7 +834,7 @@ pub(super) fn stage_create_zvol(
         meta_dirty.insert(bid, Some(blk.clone()));
     }
     let max_meta_blk = zvol_dirty_dnodes.keys().copied().max().unwrap_or(0);
-    let meta_out = cow_update_dnode(
+    let meta_out = cow_update_dnode_with_crypto(
         cx,
         &mut new_view,
         alloc,
@@ -765,11 +858,13 @@ pub(super) fn stage_create_zvol(
             indirect_bucket: WriteBucket::DatasetMetadata,
         },
         &meta_dirty,
+        0,
+        write_crypto.as_mut(),
         staged_writes,
     )?;
     zvol_born.add_assign(meta_out.born)?;
 
-    let new_os = ObjectSet::new(
+    let mut new_os = ObjectSet::new(
         OBJSET_TYPE_ZVOL,
         0,
         meta_out.dnode,
@@ -777,28 +872,16 @@ pub(super) fn stage_create_zvol(
         os_phys_bytes,
     )
     .map_err(|e| parse_err(&e))?;
-    let os_bytes = new_os.encode(order).map_err(|e| parse_err(&e))?;
-    let os_fill = new_os.meta_fill();
-    let os_dva = alloc.allocate(os_bytes.len())?;
-    let new_os_bp = BlockPointer::new_regular(&RegularBlockSpec {
-        dvas: &[os_dva],
-        physical: &os_bytes,
-        logical_bytes: os_bytes.len(),
-        compression: 2,
-        checksum_type: 7,
-        object_type: DMU_OT_OBJSET,
-        level: 0,
-        payload_order: order,
-        birth: new_txg,
-        fill: os_fill,
-    })
-    .map_err(|e| parse_err(&e))?;
+    let new_os_bp = write_dataset_objset_block(
+        &mut new_os,
+        alloc,
+        7,
+        order,
+        new_txg,
+        write_crypto.as_ref(),
+        staged_writes,
+    )?;
     zvol_born.add_assign(SpaceDelta::from_bp(&new_os_bp)?)?;
-    staged_writes.push(StagedBlockWrite {
-        bucket: WriteBucket::DatasetMetadata,
-        dva_offset: os_dva.offset,
-        bytes: os_bytes,
-    });
 
     // 2. Enforce parent/ancestor quota and pool reservation headroom before linking into MOS.
     enforce_dataset_quotas_for_growth(
@@ -822,12 +905,6 @@ pub(super) fn stage_create_zvol(
         alloc.total_free_bytes(),
         order,
     )?;
-
-    let new_dd_obj = allocate_object_id(cx, mos, &mos_meta, mos_ceiling, mos_dirty_dnodes, 1)?;
-    let new_head_obj = allocate_object_id(cx, mos, &mos_meta, mos_ceiling, mos_dirty_dnodes, 1)?;
-    let new_child_zap = allocate_object_id(cx, mos, &mos_meta, mos_ceiling, mos_dirty_dnodes, 1)?;
-    let new_props_zap = allocate_object_id(cx, mos, &mos_meta, mos_ceiling, mos_dirty_dnodes, 1)?;
-    let new_snapmap_zap = allocate_object_id(cx, mos, &mos_meta, mos_ceiling, mos_dirty_dnodes, 1)?;
 
     write_zap_dnode_in_mos(
         cx,
@@ -929,15 +1006,26 @@ pub(super) fn stage_create_zvol(
     head_bonus[120..128].copy_from_slice(&order.encode(inherited_flags | DS_FLAG_UNIQUE_ACCURATE));
     head_bonus[128..256].copy_from_slice(&new_os_bp.encode(order));
 
+    let mut head_zap = Vec::new();
     if volblocksize > 131_072 {
-        features.increment_read("com.delphix:extensible_dataset", new_txg)?;
         features.increment_read("org.open-zfs:large_blocks", new_txg)?;
-        let lb_entries = [RawZapEntry {
+        head_zap.push(RawZapEntry {
             name: b"org.open-zfs:large_blocks".to_vec(),
             integer_bytes: 8,
             values: vec![0],
             collision: 0,
-        }];
+        });
+    }
+    if let Some(ivset_guid) = inherited_ivset_guid {
+        head_zap.push(RawZapEntry {
+            name: DSL_DATASET_IVSET_GUID.to_vec(),
+            integer_bytes: 8,
+            values: vec![ivset_guid],
+            collision: 0,
+        });
+    }
+    if !head_zap.is_empty() {
+        features.increment_read("com.delphix:extensible_dataset", new_txg)?;
         write_zap_dnode_in_mos(
             cx,
             mos,
@@ -950,7 +1038,7 @@ pub(super) fn stage_create_zvol(
             DMU_OTN_ZAP_METADATA,
             DMU_OT_DSL_DATASET,
             head_bonus,
-            &lb_entries,
+            &head_zap,
             0,
             false,
             order,
@@ -1000,6 +1088,15 @@ pub(super) fn stage_create_zvol(
     dd_bonus[96..104].copy_from_slice(&order.encode(DD_FLAG_USED_BREAKDOWN));
     dd_bonus[104..112].copy_from_slice(&order.encode(zvol_born.dsize)); // DD_USED_HEAD
 
+    let mut dd_extra_zap = Vec::new();
+    if let Some(ck_obj) = inherited_crypto_key_obj {
+        dd_extra_zap.push(RawZapEntry {
+            name: DSL_DIR_CRYPTO_KEY_OBJ.to_vec(),
+            integer_bytes: 8,
+            values: vec![ck_obj],
+            collision: 0,
+        });
+    }
     put_new_dsl_dir_in_mos(
         cx,
         mos,
@@ -1010,6 +1107,7 @@ pub(super) fn stage_create_zvol(
         alloc,
         new_dd_obj,
         dd_bonus,
+        &dd_extra_zap,
         order,
         new_txg,
         staged_writes,
@@ -1109,6 +1207,7 @@ pub(super) fn stage_create_zvol(
         new_props_zap,
         None,
         true,
+        false,
         &prop_updates,
         mos_dirty_dnodes,
         features,
@@ -1235,7 +1334,7 @@ pub(super) fn stage_resize_zvol(
     new_txg: u64,
     staged_writes: &mut Vec<StagedBlockWrite>,
 ) -> Result<u64> {
-    let (mut ctx, mut os_view) = open_zvol_head_context(cx, mos, dataset, order)?;
+    let (mut ctx, mut os_view) = open_zvol_head_context(cx, mos, dataset, order, new_txg)?;
     let bs = ctx.volblocksize as u64;
     if new_volsize == 0 || i64::try_from(new_volsize).is_err() || !new_volsize.is_multiple_of(bs) {
         return Err(reject_einval(
@@ -1254,12 +1353,12 @@ pub(super) fn stage_resize_zvol(
         let new_last_bid = (new_volsize / bs) - 1;
         if ctx.data_dnode.max_block() > new_last_bid {
             let empty_dirty: BTreeMap<u64, Option<Vec<u8>>> = BTreeMap::new();
-            let cksum = if matches!(ctx.data_dnode.checksum_type(), 6..=8) {
+            let cksum = if matches!(ctx.data_dnode.checksum_type(), 6..=8 | 11) {
                 ctx.data_dnode.checksum_type()
             } else {
                 7
             };
-            let data_out = cow_update_dnode(
+            let data_out = cow_update_dnode_with_crypto(
                 cx,
                 &mut os_view,
                 alloc,
@@ -1283,6 +1382,8 @@ pub(super) fn stage_resize_zvol(
                     indirect_bucket: WriteBucket::ChildBlocks,
                 },
                 &empty_dirty,
+                ZVOL_OBJ,
+                ctx.write_crypto.as_mut(),
                 staged_writes,
             )?;
             born.add_assign(data_out.born)?;
@@ -1325,7 +1426,7 @@ pub(super) fn stage_resize_zvol(
     for (idx, blk) in prop_blocks.into_iter().enumerate() {
         prop_dirty.insert(idx as u64, Some(blk));
     }
-    let prop_out = cow_update_dnode(
+    let prop_out = cow_update_dnode_with_crypto(
         cx,
         &mut os_view,
         alloc,
@@ -1349,6 +1450,8 @@ pub(super) fn stage_resize_zvol(
             indirect_bucket: WriteBucket::ChildBlocks,
         },
         &prop_dirty,
+        ZVOL_ZAP_OBJ,
+        ctx.write_crypto.as_mut(),
         staged_writes,
     )?;
     born.add_assign(prop_out.born)?;
@@ -1400,7 +1503,7 @@ pub(super) fn stage_zvol_write_at(
     new_txg: u64,
     staged_writes: &mut Vec<StagedBlockWrite>,
 ) -> Result<u64> {
-    let (mut ctx, mut os_view) = open_zvol_head_context(cx, mos, dataset, order)?;
+    let (mut ctx, mut os_view) = open_zvol_head_context(cx, mos, dataset, order, new_txg)?;
     validate_sector_span(offset, data.len() as u64, ctx.volsize, MAX_ZVOL_IO_BYTES)?;
 
     let zvol_meta_base = ctx.os.meta.clone();
@@ -1445,7 +1548,7 @@ pub(super) fn stage_zvol_write_at(
         }
 
         let new_max_block = ctx.data_dnode.max_block().max(last_bid);
-        let data_out = cow_update_dnode(
+        let data_out = cow_update_dnode_with_crypto(
             cx,
             &mut os_view,
             alloc,
@@ -1469,6 +1572,8 @@ pub(super) fn stage_zvol_write_at(
                 indirect_bucket: WriteBucket::ChildBlocks,
             },
             &dirty_leaves,
+            ZVOL_OBJ,
+            ctx.write_crypto.as_mut(),
             staged_writes,
         )?;
         born.add_assign(data_out.born)?;
@@ -1521,7 +1626,7 @@ pub(super) fn stage_zvol_discard(
     new_txg: u64,
     staged_writes: &mut Vec<StagedBlockWrite>,
 ) -> Result<u64> {
-    let (mut ctx, mut os_view) = open_zvol_head_context(cx, mos, dataset, order)?;
+    let (mut ctx, mut os_view) = open_zvol_head_context(cx, mos, dataset, order, new_txg)?;
     if !offset.is_multiple_of(ZVOL_LOGICAL_SECTOR_BYTES as u64)
         || !len.is_multiple_of(ZVOL_LOGICAL_SECTOR_BYTES as u64)
         || offset.checked_add(len).is_none_or(|end| end > ctx.volsize)
@@ -1574,7 +1679,7 @@ pub(super) fn stage_zvol_discard(
         }
 
         if !dirty_leaves.is_empty() {
-            let data_out = cow_update_dnode(
+            let data_out = cow_update_dnode_with_crypto(
                 cx,
                 &mut os_view,
                 alloc,
@@ -1598,6 +1703,8 @@ pub(super) fn stage_zvol_discard(
                     indirect_bucket: WriteBucket::ChildBlocks,
                 },
                 &dirty_leaves,
+                ZVOL_OBJ,
+                ctx.write_crypto.as_mut(),
                 staged_writes,
             )?;
             born.add_assign(data_out.born)?;
@@ -1650,7 +1757,7 @@ pub(super) fn stage_zvol_batch_apply(
     new_txg: u64,
     staged_writes: &mut Vec<StagedBlockWrite>,
 ) -> Result<u64> {
-    let (mut ctx, mut os_view) = open_zvol_head_context(cx, mos, dataset, order)?;
+    let (mut ctx, mut os_view) = open_zvol_head_context(cx, mos, dataset, order, new_txg)?;
     let bs = ctx.volblocksize as u64;
     let total_blocks = ctx.volsize / bs;
     let mut filtered: BTreeMap<u64, Option<Vec<u8>>> = BTreeMap::new();
@@ -1688,7 +1795,7 @@ pub(super) fn stage_zvol_batch_apply(
     let mut retired = Vec::new();
 
     if !filtered.is_empty() {
-        let data_out = cow_update_dnode(
+        let data_out = cow_update_dnode_with_crypto(
             cx,
             &mut os_view,
             alloc,
@@ -1712,6 +1819,8 @@ pub(super) fn stage_zvol_batch_apply(
                 indirect_bucket: WriteBucket::ChildBlocks,
             },
             &filtered,
+            ZVOL_OBJ,
+            ctx.write_crypto.as_mut(),
             staged_writes,
         )?;
         born.add_assign(data_out.born)?;

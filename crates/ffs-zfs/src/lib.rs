@@ -28,11 +28,17 @@ macro_rules! companion_bin_tests {
     };
 }
 
+pub mod crypto;
 pub mod filesystem;
 pub mod reader;
 pub mod transaction;
 pub mod zvol_nbd;
 
+pub use crypto::{
+    WrappingKey, ZfsDatasetCryptoInfo, ZfsKeyMaterial, ZfsKeyRing, ZfsKeyStatus, ZfsNonceGenerator,
+    encode_dsl_crypto_key_zap, generate_new_dataset_keys, parse_dsl_crypto_key_zap,
+};
+pub use ffs_ondisk::zfs::crypto::{DslCryptoKeyRecord, UnwrappedDslKey, ZfsKeyFormat, ZioEncrypt};
 pub use filesystem::{ZfsFs, ZfsMountWriteOptions};
 pub use reader::dmu::Objects;
 pub use reader::dmu::zpl::Zpl;
@@ -41,10 +47,11 @@ pub use reader::{Label, Leaf, Pool, RootBlock};
 pub use transaction::{
     DEFAULT_VOLBLOCKSIZE, MAX_VOLBLOCKSIZE, MAX_ZVOL_IO_BYTES, ZVOL_LOGICAL_SECTOR_BYTES,
     ZfsAdmissionReport, ZfsBookmarkInfo, ZfsCommitReceipt, ZfsDataChecksum, ZfsDurableToken,
-    ZfsFileRangeOperation, ZfsHoldInfo, ZfsObjectIdentity, ZfsPersistenceEvent,
-    ZfsPersistenceStage, ZfsPosixSetAttr, ZfsPropertySetValue, ZfsSetAttr, ZfsStorageIdentity,
-    ZfsTopologyKind, ZfsTransactionEngine, ZfsTxOutcome, ZfsUnlinkedObject, ZfsWriteOptions,
-    ZfsXattrSetMode, ZfsZvolCreateOptions, ZfsZvolInfo, list_bookmarks_in_mos, list_holds_in_mos,
+    ZfsEncryptionCreateOptions, ZfsFileRangeOperation, ZfsHoldInfo, ZfsObjectIdentity,
+    ZfsPersistenceEvent, ZfsPersistenceStage, ZfsPosixSetAttr, ZfsPropertySetValue, ZfsSetAttr,
+    ZfsStorageIdentity, ZfsTopologyKind, ZfsTransactionEngine, ZfsTxOutcome, ZfsUnlinkedObject,
+    ZfsWriteOptions, ZfsXattrSetMode, ZfsZvolCreateOptions, ZfsZvolInfo, list_bookmarks_in_mos,
+    list_holds_in_mos,
 };
 pub use zvol_nbd::{
     NbdExportInfo, NbdServerConfig, ZfsVolumeManager, ZfsZvolNbdClient, ZfsZvolNbdServer,

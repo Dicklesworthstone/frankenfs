@@ -3,11 +3,18 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
+use std::sync::Arc;
 
 use asupersync::Cx;
 use ffs_error::{FfsError, Result};
+use ffs_ondisk::zfs::crypto::{
+    UnwrappedDslKey, ZIO_DATA_MAC_LEN, compress_block, compute_authenticated_block_mac,
+    compute_indirect_block_mac, dmu_ot_is_encrypted, encrypt_dnode_block, encrypt_regular_block,
+};
 use ffs_ondisk::zfs::nvlist::{NvList, Value};
-use ffs_ondisk::zfs::{BlockPointer, Dva, Endian, LABEL_CONFIG_BYTES, RegularBlockSpec};
+use ffs_ondisk::zfs::{
+    BlockPointer, Dva, Endian, LABEL_CONFIG_BYTES, ProtectedBlockSpec, RegularBlockSpec,
+};
 use ffs_ondisk::zfs_dmu::space_map::{
     AllocationMap, Header as SpaceMapHeader, MapType, Record as SpaceMapRecord, Records,
     extent_records_for_range,
@@ -24,6 +31,7 @@ use ffs_ondisk::zfs_zap::{
     names::NamePolicy as ZapNamePolicy,
 };
 
+use crate::crypto::ZfsNonceGenerator;
 use crate::reader::dmu::Objects;
 
 use super::{checkpoint, corrupt, parse_err, unsupported};
@@ -89,7 +97,7 @@ impl SpaceDelta {
         if bp.hole() || bp.embedded() {
             return Ok(Self::default());
         }
-        let dvas = bp.regular_dvas().map_err(|e| parse_err(&e))?;
+        let dvas = bp.data_dvas().map_err(|e| parse_err(&e))?;
         let mut dsize = 0_u64;
         for dva in &dvas {
             dsize = dsize
@@ -456,7 +464,7 @@ impl PoolSpaceAllocator {
             ));
         }
         let delta = SpaceDelta::from_bp(bp)?;
-        let dvas = bp.regular_dvas().map_err(|e| parse_err(&e))?;
+        let dvas = bp.data_dvas().map_err(|e| parse_err(&e))?;
         let ms_size = 1_u64 << self.metaslab_shift;
         for dva in dvas {
             if dva.vdev != 0 || dva.gang {
@@ -959,7 +967,252 @@ fn admit_rewritten_dnode_leaf(
     Ok(())
 }
 
-/// Bottom-up COW update of one dnode's data and indirect blocks.
+/// Per-TXG encryption and compression writer state for an encrypted dataset.
+pub(super) struct DatasetWriteCrypto {
+    pub key: Arc<UnwrappedDslKey>,
+    pub nonces: ZfsNonceGenerator,
+    /// Effective ZFS compression algorithm (`2` = off, `14` = zle, `15` = lz4,
+    /// `5..=13` = gzip-1..9, `16` = zstd).
+    pub compression: u8,
+    pub zstd_level: Option<u8>,
+}
+
+/// Decode a native ZFS `compression` property integer into `(algorithm, zstd_level)`.
+#[must_use]
+pub(super) fn decode_compression_property(raw: u64) -> (u8, Option<u8>) {
+    if raw == 0 || raw == 2 {
+        (2, None)
+    } else if raw == 1 {
+        (15, None) // ON -> LZ4
+    } else if raw & 127 == 16 {
+        let lvl = u8::try_from(raw >> 7)
+            .ok()
+            .filter(|v| (1..=19).contains(v))
+            .unwrap_or(3);
+        (16, Some(lvl))
+    } else if matches!(raw, 5..=15) {
+        (raw as u8, None)
+    } else {
+        (2, None)
+    }
+}
+
+/// Encode, optionally compress/encrypt/MAC, allocate, stage, and build a `BlockPointer`
+/// for one dataset data, metadata, dnode, spill, or indirect block.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn write_dataset_block(
+    alloc: &mut PoolSpaceAllocator,
+    logical: &[u8],
+    object_id: u64,
+    block_id: u64,
+    object_type: u8,
+    level: u8,
+    checksum_type: u8,
+    order: Endian,
+    new_txg: u64,
+    fill: u64,
+    bucket: WriteBucket,
+    crypto: Option<&mut DatasetWriteCrypto>,
+    staged_writes: &mut Vec<StagedBlockWrite>,
+) -> Result<BlockPointer> {
+    let effective_cksum = if matches!(checksum_type, 6..=8 | 11) {
+        checksum_type
+    } else {
+        7
+    };
+    if let Some(wc) = crypto {
+        let align = (1_usize << alloc.ashift).max(512);
+        if level > 0 {
+            let mac = compute_indirect_block_mac(logical, order, wc.key.version)
+                .map_err(|e| parse_err(&e))?;
+            let (phys, comp_alg) = compress_block(logical, wc.compression, wc.zstd_level, align)
+                .map_err(|e| parse_err(&e))?;
+            let dva = alloc.allocate(phys.len())?;
+            let bp = BlockPointer::new_protected(&ProtectedBlockSpec {
+                dvas: &[dva],
+                physical: &phys,
+                logical_bytes: logical.len(),
+                compression: comp_alg,
+                checksum_type: effective_cksum,
+                object_type,
+                level,
+                payload_order: order,
+                birth: new_txg,
+                fill,
+                salt: None,
+                iv: None,
+                mac,
+            })
+            .map_err(|e| parse_err(&e))?;
+            staged_writes.push(StagedBlockWrite {
+                bucket,
+                dva_offset: dva.offset,
+                bytes: phys,
+            });
+            return Ok(bp);
+        }
+        if dmu_ot_is_encrypted(object_type) {
+            let (salt, iv) = wc.nonces.next_salt_iv(object_id, 0, block_id);
+            let (ct, comp_alg, mac) = if object_type == DMU_OT_DNODE {
+                let (ct, mac) = encrypt_dnode_block(&wc.key, &salt, &iv, logical, order)
+                    .map_err(|e| parse_err(&e))?;
+                (ct, 2_u8, mac)
+            } else {
+                let (comp, comp_alg) =
+                    compress_block(logical, wc.compression, wc.zstd_level, align)
+                        .map_err(|e| parse_err(&e))?;
+                let (ct, mac) =
+                    encrypt_regular_block(&wc.key, &salt, &iv, &comp).map_err(|e| parse_err(&e))?;
+                (ct, comp_alg, mac)
+            };
+            let dva = alloc.allocate(ct.len())?;
+            let bp = BlockPointer::new_protected(&ProtectedBlockSpec {
+                dvas: &[dva],
+                physical: &ct,
+                logical_bytes: logical.len(),
+                compression: comp_alg,
+                checksum_type: effective_cksum,
+                object_type,
+                level: 0,
+                payload_order: order,
+                birth: new_txg,
+                fill,
+                salt: Some(salt),
+                iv: Some(iv),
+                mac,
+            })
+            .map_err(|e| parse_err(&e))?;
+            staged_writes.push(StagedBlockWrite {
+                bucket,
+                dva_offset: dva.offset,
+                bytes: ct,
+            });
+            return Ok(bp);
+        }
+        // Authenticated-only level-0 non-objset block (e.g. userused/groupused/projectused).
+        let (comp, comp_alg) = compress_block(logical, wc.compression, wc.zstd_level, align)
+            .map_err(|e| parse_err(&e))?;
+        let mac = compute_authenticated_block_mac(&wc.key.hmac_key, &comp);
+        let dva = alloc.allocate(comp.len())?;
+        let bp = BlockPointer::new_protected(&ProtectedBlockSpec {
+            dvas: &[dva],
+            physical: &comp,
+            logical_bytes: logical.len(),
+            compression: comp_alg,
+            checksum_type: effective_cksum,
+            object_type,
+            level: 0,
+            payload_order: order,
+            birth: new_txg,
+            fill,
+            salt: None,
+            iv: None,
+            mac,
+        })
+        .map_err(|e| parse_err(&e))?;
+        staged_writes.push(StagedBlockWrite {
+            bucket,
+            dva_offset: dva.offset,
+            bytes: comp,
+        });
+        return Ok(bp);
+    }
+
+    let dva = alloc.allocate(logical.len())?;
+    let bp = BlockPointer::new_regular(&RegularBlockSpec {
+        dvas: &[dva],
+        physical: logical,
+        logical_bytes: logical.len(),
+        compression: 2,
+        checksum_type: effective_cksum,
+        object_type,
+        level,
+        payload_order: order,
+        birth: new_txg,
+        fill,
+    })
+    .map_err(|e| parse_err(&e))?;
+    staged_writes.push(StagedBlockWrite {
+        bucket,
+        dva_offset: dva.offset,
+        bytes: logical.to_vec(),
+    });
+    Ok(bp)
+}
+
+/// Stamp MACs (if encrypted), encode, allocate, stage, and return the root `DMU_OT_OBJSET` BP.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn write_dataset_objset_block(
+    os: &mut ObjectSet,
+    alloc: &mut PoolSpaceAllocator,
+    checksum_type: u8,
+    order: Endian,
+    new_txg: u64,
+    crypto: Option<&DatasetWriteCrypto>,
+    staged_writes: &mut Vec<StagedBlockWrite>,
+) -> Result<BlockPointer> {
+    let effective_cksum = if matches!(checksum_type, 6..=8 | 11) {
+        checksum_type
+    } else {
+        7
+    };
+    let fill = os.meta_fill();
+    if let Some(wc) = crypto {
+        if os.physical_bytes() < 2048 {
+            os.tail_bytes.resize(4096 - 720, 0);
+        }
+        os.stamp_encrypted_macs(order, &wc.key.hmac_key, wc.key.version)
+            .map_err(|e| parse_err(&e))?;
+        let os_bytes = os.encode(order).map_err(|e| parse_err(&e))?;
+        let os_dva = alloc.allocate(os_bytes.len())?;
+        let bp = BlockPointer::new_protected(&ProtectedBlockSpec {
+            dvas: &[os_dva],
+            physical: &os_bytes,
+            logical_bytes: os_bytes.len(),
+            compression: 2,
+            checksum_type: effective_cksum,
+            object_type: DMU_OT_OBJSET,
+            level: 0,
+            payload_order: order,
+            birth: new_txg,
+            fill,
+            salt: None,
+            iv: None,
+            mac: [0_u8; ZIO_DATA_MAC_LEN],
+        })
+        .map_err(|e| parse_err(&e))?;
+        staged_writes.push(StagedBlockWrite {
+            bucket: WriteBucket::DatasetMetadata,
+            dva_offset: os_dva.offset,
+            bytes: os_bytes,
+        });
+        return Ok(bp);
+    }
+
+    let os_bytes = os.encode(order).map_err(|e| parse_err(&e))?;
+    let os_dva = alloc.allocate(os_bytes.len())?;
+    let bp = BlockPointer::new_regular(&RegularBlockSpec {
+        dvas: &[os_dva],
+        physical: &os_bytes,
+        logical_bytes: os_bytes.len(),
+        compression: 2,
+        checksum_type: effective_cksum,
+        object_type: DMU_OT_OBJSET,
+        level: 0,
+        payload_order: order,
+        birth: new_txg,
+        fill,
+    })
+    .map_err(|e| parse_err(&e))?;
+    staged_writes.push(StagedBlockWrite {
+        bucket: WriteBucket::DatasetMetadata,
+        dva_offset: os_dva.offset,
+        bytes: os_bytes,
+    });
+    Ok(bp)
+}
+
+/// Bottom-up COW update of one dnode's data and indirect blocks (unencrypted/MOS).
 pub(super) fn cow_update_dnode(
     cx: &Cx,
     view: &mut Objects,
@@ -968,10 +1221,25 @@ pub(super) fn cow_update_dnode(
     dirty_leaves: &BTreeMap<u64, Option<Vec<u8>>>,
     staged_writes: &mut Vec<StagedBlockWrite>,
 ) -> Result<DnodeCowOutput> {
+    cow_update_dnode_with_crypto(cx, view, alloc, spec, dirty_leaves, 0, None, staged_writes)
+}
+
+/// Bottom-up COW update of one dnode's data and indirect blocks with optional dataset encryption.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(super) fn cow_update_dnode_with_crypto(
+    cx: &Cx,
+    view: &mut Objects,
+    alloc: &mut PoolSpaceAllocator,
+    spec: DnodeCowSpec<'_>,
+    dirty_leaves: &BTreeMap<u64, Option<Vec<u8>>>,
+    object_id: u64,
+    mut crypto: Option<&mut DatasetWriteCrypto>,
+    staged_writes: &mut Vec<StagedBlockWrite>,
+) -> Result<DnodeCowOutput> {
     checkpoint(cx)?;
     let mut retired_bps = Vec::new();
     let mut born = SpaceDelta::default();
-    let effective_cksum = if matches!(spec.checksum_type, 6..=8) {
+    let effective_cksum = if matches!(spec.checksum_type, 6..=8 | 11) {
         spec.checksum_type
     } else {
         7
@@ -1063,26 +1331,22 @@ pub(super) fn cow_update_dnode(
             } else {
                 1
             };
-            let dva = alloc.allocate(payload.len())?;
-            let bp = BlockPointer::new_regular(&RegularBlockSpec {
-                dvas: &[dva],
-                physical: payload,
-                logical_bytes: payload.len(),
-                compression: 2,
-                checksum_type: effective_cksum,
-                object_type: spec.object_type,
-                level: 0,
-                payload_order: spec.order,
-                birth: spec.new_txg,
+            let bp = write_dataset_block(
+                alloc,
+                payload,
+                object_id,
+                block_id,
+                spec.object_type,
+                0,
+                effective_cksum,
+                spec.order,
+                spec.new_txg,
                 fill,
-            })
-            .map_err(|e| parse_err(&e))?;
+                spec.leaf_bucket,
+                crypto.as_deref_mut(),
+                staged_writes,
+            )?;
             born.add_assign(SpaceDelta::from_bp(&bp)?)?;
-            staged_writes.push(StagedBlockWrite {
-                bucket: spec.leaf_bucket,
-                dva_offset: dva.offset,
-                bytes: payload.clone(),
-            });
             bp
         } else {
             make_hole_bp(
@@ -1230,26 +1494,22 @@ pub(super) fn cow_update_dnode(
                     alloc.hole_birth_active,
                 )?
             } else {
-                let dva = alloc.allocate(indirect_bytes)?;
-                let bp = BlockPointer::new_regular(&RegularBlockSpec {
-                    dvas: &[dva],
-                    physical: &raw_block,
-                    logical_bytes: indirect_bytes,
-                    compression: 2,
-                    checksum_type: effective_cksum,
-                    object_type: spec.object_type,
-                    level: parent_level,
-                    payload_order: spec.order,
-                    birth: spec.new_txg,
-                    fill: fill_sum,
-                })
-                .map_err(|e| parse_err(&e))?;
+                let bp = write_dataset_block(
+                    alloc,
+                    &raw_block,
+                    object_id,
+                    parent_idx,
+                    spec.object_type,
+                    parent_level,
+                    effective_cksum,
+                    spec.order,
+                    spec.new_txg,
+                    fill_sum,
+                    spec.indirect_bucket,
+                    crypto.as_deref_mut(),
+                    staged_writes,
+                )?;
                 born.add_assign(SpaceDelta::from_bp(&bp)?)?;
-                staged_writes.push(StagedBlockWrite {
-                    bucket: spec.indirect_bucket,
-                    dva_offset: dva.offset,
-                    bytes: raw_block,
-                });
                 bp
             };
             next_updates.insert(parent_idx, new_ind_bp);
@@ -1709,6 +1969,7 @@ pub(super) fn apply_objectset_quota_deltas(
     limits: &OwnerQuotaLimits,
     order: Endian,
     new_txg: u64,
+    mut write_crypto: Option<&mut DatasetWriteCrypto>,
     staged_writes: &mut Vec<StagedBlockWrite>,
     born_out: &mut SpaceDelta,
     retired_out: &mut Vec<BlockPointer>,
@@ -1786,7 +2047,7 @@ pub(super) fn apply_objectset_quota_deltas(
         for (i, blk) in blocks.into_iter().enumerate() {
             dirty.insert(i as u64, Some(blk));
         }
-        let out = cow_update_dnode(
+        let out = cow_update_dnode_with_crypto(
             cx,
             os_view,
             alloc,
@@ -1810,6 +2071,8 @@ pub(super) fn apply_objectset_quota_deltas(
                 indirect_bucket: WriteBucket::DatasetMetadata,
             },
             &dirty,
+            slot_offset as u64,
+            write_crypto.as_deref_mut(),
             staged_writes,
         )?;
         born_out.add_assign(out.born)?;

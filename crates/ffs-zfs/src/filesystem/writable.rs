@@ -255,6 +255,15 @@ impl ZfsFs {
         Ok(state.writer.is_some())
     }
 
+    /// Return a handle to the writable engine's shared [`crate::ZfsKeyRing`], when writable.
+    pub fn keyring(&self) -> Result<Option<crate::ZfsKeyRing>> {
+        let state = self.state.lock().map_err(|_| errno(libc::EIO))?;
+        Ok(state
+            .writer
+            .as_ref()
+            .map(|writer| writer.engine.keyring().clone()))
+    }
+
     /// Return the admitted [`crate::transaction::ZfsStorageIdentity`] when writable.
     pub fn writable_storage_identity(
         &self,

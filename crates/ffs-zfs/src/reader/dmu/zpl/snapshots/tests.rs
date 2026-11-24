@@ -458,6 +458,8 @@ fn pool(leaf: &Leaf, meta: Dnode) -> Objects {
         root_birth: 90,
         cache: VecDeque::new(),
         cached_bytes: 0,
+        keyring: crate::crypto::ZfsKeyRing::new(),
+        crypto: None,
     }
 }
 fn old_bytes() -> Vec<u8> {

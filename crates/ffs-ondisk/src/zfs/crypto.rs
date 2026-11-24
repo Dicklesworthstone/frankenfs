@@ -239,24 +239,7 @@ pub const fn dmu_ot_is_encrypted(ot: u8) -> bool {
     }
     matches!(
         ot,
-        9 | 10
-            | 18
-            | 19
-            | 20
-            | 22
-            | 23
-            | 25
-            | 26
-            | 33
-            | 34
-            | 35
-            | 39
-            | 40
-            | 44
-            | 45
-            | 46
-            | 47
-            | 49
+        9 | 10 | 18 | 19 | 20 | 22 | 23 | 25 | 26 | 33 | 34 | 35 | 39 | 40 | 44 | 45 | 46 | 47 | 49
     )
 }
 
@@ -587,7 +570,11 @@ fn ccm_cbcmac(
     Ok(x)
 }
 
-fn ccm_ctr_in_place(aes: &AesKeySchedule, nonce: &[u8; ZIO_DATA_IV_LEN], data: &mut [u8]) -> [u8; 16] {
+fn ccm_ctr_in_place(
+    aes: &AesKeySchedule,
+    nonce: &[u8; ZIO_DATA_IV_LEN],
+    data: &mut [u8],
+) -> [u8; 16] {
     let mut a = [0_u8; 16];
     a[0] = 2; // L - 1 = 2
     a[1..13].copy_from_slice(nonce);
@@ -825,7 +812,12 @@ pub fn derive_zfs_passphrase_key(
         return Err(invalid("ZFS pbkdf2iters below minimum 100000"));
     }
     let mut dk = [0_u8; ZFS_WRAPPING_KEY_LEN];
-    pbkdf2_hmac_sha1(passphrase, &pbkdf2_salt.to_le_bytes(), pbkdf2_iters, &mut dk)?;
+    pbkdf2_hmac_sha1(
+        passphrase,
+        &pbkdf2_salt.to_le_bytes(),
+        pbkdf2_iters,
+        &mut dk,
+    )?;
     Ok(dk)
 }
 
@@ -874,7 +866,11 @@ pub fn hkdf_sha512(
         return Err(invalid("invalid HKDF-SHA512 output length"));
     }
     let zero_salt = [0_u8; 64];
-    let extract_salt = if salt.is_empty() { &zero_salt[..] } else { salt };
+    let extract_salt = if salt.is_empty() {
+        &zero_salt[..]
+    } else {
+        salt
+    };
     let mut prk = hmac_sha512(extract_salt, ikm);
 
     let mut okm = Vec::with_capacity(okm_len);
@@ -1456,7 +1452,9 @@ pub fn decrypt_dnode_block(
         return Err(invalid("expected protected level-0 DMU_OT_DNODE pointer"));
     }
     if bp.compression() != 2 || ciphertext.len() != DNODE_BLOCK_BYTES {
-        return Err(invalid("encrypted DMU_OT_DNODE block must be uncompressed 16 KiB"));
+        return Err(invalid(
+            "encrypted DMU_OT_DNODE block must be uncompressed 16 KiB",
+        ));
     }
     let order = bp.payload_order();
     let parts = split_dnode_block_for_crypt(ciphertext, order, key.version)?;
@@ -1559,12 +1557,12 @@ pub fn compute_objset_macs(
     let mut portable_mac = [0_u8; ZIO_OBJSET_MAC_LEN];
     portable_mac.copy_from_slice(&portable_full[..ZIO_OBJSET_MAC_LEN]);
 
-    let has_userused = raw.len() >= OBJSET_USERUSED_OFFSET + DNODE_BYTES
-        && raw[OBJSET_USERUSED_OFFSET] != 0;
-    let has_groupused = raw.len() >= OBJSET_GROUPUSED_OFFSET + DNODE_BYTES
-        && raw[OBJSET_GROUPUSED_OFFSET] != 0;
-    let has_projectused = raw.len() >= OBJSET_PROJECTUSED_OFFSET + DNODE_BYTES
-        && raw[OBJSET_PROJECTUSED_OFFSET] != 0;
+    let has_userused =
+        raw.len() >= OBJSET_USERUSED_OFFSET + DNODE_BYTES && raw[OBJSET_USERUSED_OFFSET] != 0;
+    let has_groupused =
+        raw.len() >= OBJSET_GROUPUSED_OFFSET + DNODE_BYTES && raw[OBJSET_GROUPUSED_OFFSET] != 0;
+    let has_projectused =
+        raw.len() >= OBJSET_PROJECTUSED_OFFSET + DNODE_BYTES && raw[OBJSET_PROJECTUSED_OFFSET] != 0;
 
     let mut local_mac = [0_u8; ZIO_OBJSET_MAC_LEN];
     if (os_flags & 1) != 0 && (has_userused || has_groupused || has_projectused) {
@@ -1770,8 +1768,8 @@ pub fn compress_block(
                 return Err(invalid("unexpected zstd frame magic"));
             }
             let magicless = &frame[4..];
-            let packed = u32::try_from(magicless.len())
-                .map_err(|_| invalid("ZFS zstd length overflow"))?;
+            let packed =
+                u32::try_from(magicless.len()).map_err(|_| invalid("ZFS zstd length overflow"))?;
             let mut framed = Vec::with_capacity(8 + magicless.len());
             framed.extend_from_slice(&packed.to_be_bytes());
             // Native OpenZFS zstd header[4..8]: big-endian level in byte 7, zero padding in 4..7.
@@ -1829,8 +1827,7 @@ mod tests {
             hex_to_bytes("dda97ca4864cdfe06eaf70a0ec0d7191").as_slice()
         );
         // C.3 AES-256
-        let k256 =
-            hex_to_bytes("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+        let k256 = hex_to_bytes("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
         let ct256 = AesKeySchedule::new(&k256).unwrap().encrypt_block(&pt);
         assert_eq!(
             ct256.as_slice(),
@@ -2019,7 +2016,10 @@ mod tests {
                 .unwrap();
                 let unwrapped = rec.unwrap(&wrapping).unwrap();
                 assert_eq!(unwrapped.suite, suite);
-                assert_eq!(unwrapped.active_master_key(), &master[..suite.key_len().unwrap()]);
+                assert_eq!(
+                    unwrapped.active_master_key(),
+                    &master[..suite.key_len().unwrap()]
+                );
                 assert_eq!(unwrapped.hmac_key, hmac);
                 assert!(rec.unwrap(&wrong).is_err());
 
@@ -2045,6 +2045,223 @@ mod tests {
                 assert_eq!(actual_alg, alg);
                 assert!(phys.len() < block.len());
             }
+        }
+    }
+
+    #[test]
+    fn protected_block_pointer_dnode_indirect_and_objset_mac_roundtrips() {
+        use crate::zfs::{Dva, ProtectedBlockSpec};
+        use crate::zfs_dmu::{Dnode, DnodeSpec, ObjectSet, ZilHeader};
+
+        let key = UnwrappedDslKey {
+            suite: ZioEncrypt::Aes256Gcm,
+            guid: 0xfeed_beef_cafe_1234,
+            version: DSL_CRYPTO_KEY_VERSION_V1,
+            master_key: [0x3c_u8; ZFS_MAX_MASTER_KEY_LEN],
+            master_key_len: 32,
+            hmac_key: [0x9a_u8; ZFS_HMAC_KEY_LEN],
+        };
+        let dva0 = Dva {
+            vdev: 0,
+            offset: 0x2000,
+            allocated_bytes: 4096,
+            gang: false,
+        };
+        let dva1 = Dva {
+            vdev: 0,
+            offset: 0x4000,
+            allocated_bytes: 4096,
+            gang: false,
+        };
+        let dva2 = Dva {
+            vdev: 0,
+            offset: 0x6000,
+            allocated_bytes: 4096,
+            gang: false,
+        };
+        let salt = [1_u8, 2, 3, 4, 5, 6, 7, 8];
+        let iv = [10_u8, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21];
+
+        for order in [Endian::Little, Endian::Big] {
+            // 1. Encrypted L0 regular block (compressed LZ4 + encrypted)
+            let mut plain = vec![0_u8; 4096];
+            plain[..128].fill(0x5A);
+            let (comp, comp_alg) = compress_block(&plain, 15, None, 512).unwrap();
+            assert_eq!(comp_alg, 15);
+            let (ct, mac) = encrypt_regular_block(&key, &salt, &iv, &comp).unwrap();
+            let comp_dva = Dva {
+                vdev: 0,
+                offset: 0x2000,
+                allocated_bytes: comp.len() as u64,
+                gang: false,
+            };
+            let bp = BlockPointer::new_protected(&ProtectedBlockSpec {
+                dvas: &[comp_dva],
+                logical_bytes: 4096,
+                physical: &ct,
+                compression: comp_alg,
+                checksum_type: 7,
+                object_type: 19,
+                level: 0,
+                payload_order: order,
+                birth: 11,
+                fill: 1,
+                salt: Some(salt),
+                iv: Some(iv),
+                mac,
+            })
+            .unwrap();
+            assert!(bp.protected());
+            assert!(bp.is_encrypted());
+            assert!(!bp.is_authenticated());
+            // Upper 32 bits of words[11] carry IV2; fill() must mask them off.
+            assert_eq!(bp.fill(), 1);
+            assert_eq!(bp_crypt_salt(&bp), salt);
+            assert_eq!(bp_crypt_iv(&bp), iv);
+            assert_eq!(bp_crypt_mac(&bp), mac);
+            // decode() MUST fail closed on protected pointers.
+            assert!(bp.decode(&ct).is_err());
+            bp.verify_physical(&ct).unwrap();
+            assert_eq!(decrypt_regular_block(&key, &bp, &ct).unwrap(), plain);
+
+            // Encrypted L0 rejects 3 DVAs (DVA2 slot is reserved for salt/IV1).
+            assert!(
+                BlockPointer::new_protected(&ProtectedBlockSpec {
+                    dvas: &[dva0, dva1, dva2],
+                    logical_bytes: 4096,
+                    physical: &vec![0_u8; 4096],
+                    compression: 2,
+                    checksum_type: 7,
+                    object_type: 19,
+                    level: 0,
+                    payload_order: order,
+                    birth: 11,
+                    fill: 1,
+                    salt: Some(salt),
+                    iv: Some(iv),
+                    mac,
+                })
+                .is_err()
+            );
+
+            // 2. Protected L1 indirect block (up to 3 DVAs, keyless SHA-512 MAC)
+            let mut indirect = vec![0_u8; 4096];
+            indirect[..128].copy_from_slice(&bp.encode(order));
+            let ind_mac = compute_indirect_block_mac(&indirect, order, key.version).unwrap();
+            let ind_bp = BlockPointer::new_protected(&ProtectedBlockSpec {
+                dvas: &[dva0, dva1, dva2],
+                logical_bytes: 4096,
+                physical: &indirect,
+                compression: 2,
+                checksum_type: 8,
+                object_type: 19,
+                level: 1,
+                payload_order: order,
+                birth: 11,
+                fill: 1,
+                salt: None,
+                iv: None,
+                mac: ind_mac,
+            })
+            .unwrap();
+            assert!(ind_bp.is_authenticated());
+            assert_eq!(ind_bp.protected_dvas().unwrap().len(), 3);
+            ind_bp.verify_physical(&indirect).unwrap();
+
+            // 3. Encrypted DMU_OT_DNODE block leaves core/BPs plaintext & encrypts SA bonus
+            let sa_bonus = vec![0x77_u8; 168];
+            let file_dnode = Dnode::from_spec(DnodeSpec {
+                object_type: 19,
+                bonus_type: 44, // DMU_OT_SA (encrypted!)
+                checksum_type: 7,
+                compress_type: 15,
+                flags: 1,
+                order,
+                levels: 2,
+                indirect_shift: 12,
+                data_bytes: 4096,
+                max_block: 0,
+                used_bytes: 4096,
+                slots: 1,
+                pointers: vec![ind_bp.clone()],
+                bonus: sa_bonus.clone(),
+                spill: None,
+            })
+            .unwrap();
+            let mut dnode_block = vec![0_u8; DNODE_BLOCK_BYTES];
+            dnode_block[DNODE_BYTES..2 * DNODE_BYTES]
+                .copy_from_slice(&file_dnode.encode().unwrap());
+            let (enc_dnode_block, dnode_mac) =
+                encrypt_dnode_block(&key, &salt, &iv, &dnode_block, order).unwrap();
+            // Core + BP stay plaintext, encrypted bonus differs from plaintext!
+            assert_eq!(
+                &enc_dnode_block[DNODE_BYTES..DNODE_BYTES + 64 + 128],
+                &dnode_block[DNODE_BYTES..DNODE_BYTES + 64 + 128]
+            );
+            assert_ne!(
+                &enc_dnode_block[DNODE_BYTES + 192..DNODE_BYTES + 192 + sa_bonus.len()],
+                sa_bonus.as_slice()
+            );
+            let dnode_dva = Dva {
+                vdev: 0,
+                offset: 0x8000,
+                allocated_bytes: DNODE_BLOCK_BYTES as u64,
+                gang: false,
+            };
+            let dnode_bp = BlockPointer::new_protected(&ProtectedBlockSpec {
+                dvas: &[dnode_dva],
+                logical_bytes: DNODE_BLOCK_BYTES,
+                physical: &enc_dnode_block,
+                compression: 2,
+                checksum_type: 7,
+                object_type: DMU_OT_DNODE,
+                level: 0,
+                payload_order: order,
+                birth: 11,
+                fill: 1,
+                salt: Some(salt),
+                iv: Some(iv),
+                mac: dnode_mac,
+            })
+            .unwrap();
+            assert_eq!(
+                decrypt_regular_block(&key, &dnode_bp, &enc_dnode_block).unwrap(),
+                dnode_block
+            );
+
+            // 4. Protected DMU_OT_OBJSET MAC stamping + verification + tamper rejection
+            let meta_dnode = Dnode::from_spec(DnodeSpec {
+                object_type: DMU_OT_DNODE,
+                bonus_type: 0,
+                checksum_type: 7,
+                compress_type: 2,
+                flags: 1,
+                order,
+                levels: 1,
+                indirect_shift: 12,
+                data_bytes: DNODE_BLOCK_BYTES,
+                max_block: 0,
+                used_bytes: DNODE_BLOCK_BYTES as u64,
+                slots: 1,
+                pointers: vec![dnode_bp],
+                bonus: Vec::new(),
+                spill: None,
+            })
+            .unwrap();
+            let mut os = ObjectSet {
+                meta: meta_dnode,
+                zil_header: ZilHeader::default(),
+                kind: 2,
+                flags: 0,
+                tail_bytes: vec![0_u8; 4096 - 720],
+            };
+            os.stamp_encrypted_macs(order, &key.hmac_key, key.version)
+                .unwrap();
+            let os_raw = os.encode(order).unwrap();
+            verify_objset_macs(&os_raw, order, &key.hmac_key, key.version).unwrap();
+            let mut tampered_os = os_raw.clone();
+            tampered_os[720] ^= 1;
+            assert!(verify_objset_macs(&tampered_os, order, &key.hmac_key, key.version).is_err());
         }
     }
 }

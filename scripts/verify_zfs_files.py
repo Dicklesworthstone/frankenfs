@@ -199,6 +199,30 @@ def run_negative_controls(
             ),
             b"Error",
         )
+        assert_refused_without_mutation(
+            probe,
+            lambda p: subprocess.run(
+                [
+                    str(binary),
+                    "tx-change-key",
+                    str(p),
+                    "--offline-image",
+                    "--pool-guid",
+                    "1",
+                    "--label",
+                    "0",
+                    "--slot",
+                    "0",
+                    "--new-key-file",
+                    str(p),
+                ],
+                capture_output=True,
+                timeout=30,
+                check=False,
+                env={**os.environ, "LC_ALL": "C"},
+            ),
+            b"--allow-write",
+        )
         binary_checked = True
 
     return {
@@ -459,15 +483,45 @@ def main() -> None:
                     stream.truncate(256 * 1024 * 1024)
                 tx_mount = directory / "tx-mount"
                 tx_mount.mkdir()
+                enc_oz_mount = directory / "enc-oz-mount"
+                enc_oz_mount.mkdir()
+                enc_ffs_mount = directory / "enc-ffs-mount"
+                enc_ffs_mount.mkdir()
+                enc_ffs_child_mount = directory / "enc-ffs-child-mount"
+                enc_ffs_child_mount.mkdir()
+                key_tmp_dir = tempfile.TemporaryDirectory(prefix="ffs-zfs-keys-")
+                key_root = Path(key_tmp_dir.name)
+                key_root.chmod(0o700)
+                oz_raw_key = key_root / "openzfs-raw.key"
+                wrong_raw_key = key_root / "wrong-raw.key"
+                ffs_key_v1 = key_root / "ffs-v1.key"
+                ffs_key_v2 = key_root / "ffs-v2.key"
+                oz_secret = b"OPENZFS_NATIVE_AES256GCM_LZ4_" * 3000 + b"END"
+                oz_secret_head = b"OPENZFS_HEAD_UPDATED_" + oz_secret[21:]
+                ffs_secret = b"FFS_NATIVE_ENCRYPTED_ROUNDTRIP_" * 2048 + b"OK!"
+                ffs_child_secret = b"inherited-child-key-ok\n"
+                if version == 5:
+                    oz_raw_key.write_bytes(secrets.token_bytes(32))
+                    wrong_raw_key.write_bytes(secrets.token_bytes(32))
+                    ffs_key_v1.write_bytes(secrets.token_bytes(32))
+                    ffs_key_v2.write_bytes(secrets.token_bytes(32))
+                    for kpath in (oz_raw_key, wrong_raw_key, ffs_key_v1, ffs_key_v2):
+                        kpath.chmod(0o600)
                 tx_create_flags = ["-d"]
                 if version == 5:
                     tx_create_flags.extend([
                         "-o", "feature@async_destroy=enabled",
+                        "-o", "feature@bookmark_v2=enabled",
+                        "-o", "feature@bookmarks=enabled",
                         "-o", "feature@empty_bpobj=enabled",
                         "-o", "feature@enabled_txg=enabled",
+                        "-o", "feature@encryption=enabled",
+                        "-o", "feature@extensible_dataset=enabled",
                         "-o", "feature@hole_birth=enabled",
+                        "-o", "feature@lz4_compress=enabled",
                         "-o", "feature@spacemap_histogram=enabled",
                         "-o", "feature@spacemap_v2=enabled",
+                        "-o", "feature@zstd_compress=enabled",
                     ])
                 command("zpool", "create", *tx_create_flags, "-m", "none",
                         "-o", "cachefile=none", "-o", "ashift=12", tx_pool, writable_img)
@@ -494,6 +548,29 @@ def main() -> None:
                     stream.truncate(sparse_size)
                     stream.flush()
                     os.fsync(stream.fileno())
+                if version == 5:
+                    command(
+                        "zfs", "create",
+                        "-o", "encryption=aes-256-gcm",
+                        "-o", "keyformat=raw",
+                        "-o", f"keylocation=file://{oz_raw_key}",
+                        "-o", "compression=lz4",
+                        "-o", "atime=off",
+                        "-o", f"mountpoint={enc_oz_mount}",
+                        tx_pool + "/enc_openzfs",
+                    )
+                    require(os.path.ismount(enc_oz_mount), "encrypted OpenZFS dataset was not mounted")
+                    oz_file = enc_oz_mount / "oz_secret.bin"
+                    with oz_file.open("xb") as stream:
+                        stream.write(oz_secret)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    command("zfs", "snapshot", tx_pool + "/enc_openzfs@oz_s1")
+                    with oz_file.open("r+b") as stream:
+                        stream.seek(0)
+                        stream.write(oz_secret_head[:21])
+                        stream.flush()
+                        os.fsync(stream.fileno())
                 command("zpool", "export", tx_pool)
                 tx_active = False
                 require(not os.path.ismount(tx_mount), "export left writable scratch dataset mounted")
@@ -840,6 +917,142 @@ def main() -> None:
                     cur_slot = int(pn_sel["slot"])
                     cur_txg = int(pn_sel["txg"])
 
+                    # Bidirectional OpenZFS <-> ffs-zfs native authenticated encryption verification!
+                    oz_enc_opts = [
+                        "--offline-image", "--pool-guid", tx_pool_guid, "--label", "0",
+                        "--slot", str(cur_slot), "--dataset", "enc_openzfs",
+                    ]
+                    oz_ks = json.loads(command(binary, "key-status", writable_img, *oz_enc_opts))
+                    require(
+                        oz_ks["encrypted"] is True
+                        and oz_ks["encryption"] == "aes-256-gcm"
+                        and oz_ks["keyformat"] == "raw"
+                        and oz_ks["keystatus"] == "unavailable",
+                        f"unexpected key-status on OpenZFS encrypted dataset: {oz_ks}",
+                    )
+                    # Keyless scrub succeeds; keyless or wrong-key read fails closed!
+                    oz_scrub_locked = json.loads(command(binary, "scrub", writable_img, *oz_enc_opts))
+                    require(
+                        oz_scrub_locked["clean"] is True
+                        and oz_scrub_locked["key_status"] == "unavailable",
+                        "keyless scrub failed on OpenZFS encrypted dataset",
+                    )
+                    command(binary, "read", writable_img, "/oz_secret.bin", *oz_enc_opts, fails=True)
+                    command(
+                        binary, "read", writable_img, "/oz_secret.bin", *oz_enc_opts,
+                        "--key-file", wrong_raw_key, fails=True,
+                    )
+                    oz_lk = json.loads(command(
+                        binary, "load-key", writable_img, *oz_enc_opts, "--key-file", oz_raw_key,
+                    ))
+                    require(oz_lk["keystatus"] == "available", "load-key failed on OpenZFS encrypted dataset")
+                    oz_scrub_keyed = json.loads(command(
+                        binary, "scrub", writable_img, *oz_enc_opts, "--key-file", oz_raw_key,
+                    ))
+                    require(
+                        oz_scrub_keyed["clean"] is True
+                        and oz_scrub_keyed["key_status"] == "available",
+                        "keyed scrub failed on OpenZFS encrypted dataset",
+                    )
+                    require(
+                        command(
+                            binary, "read", writable_img, "/oz_secret.bin", *oz_enc_opts,
+                            "--key-file", oz_raw_key,
+                        )
+                        == oz_secret_head,
+                        "ffs-zfs decrypted OpenZFS head payload mismatch",
+                    )
+                    require(
+                        command(
+                            binary, "read", writable_img, "/oz_secret.bin", *oz_enc_opts,
+                            "--snapshot", "oz_s1", "--key-file", oz_raw_key,
+                        )
+                        == oz_secret,
+                        "ffs-zfs decrypted OpenZFS snapshot payload mismatch",
+                    )
+
+                    # Now create an encrypted dataset + child + snapshot + change-key natively with ffs-zfs!
+                    def run_ds_enc_tx(ds_name: str, *sub_args: str | Path) -> dict:
+                        nonlocal cur_slot, cur_txg
+                        out = json.loads(command(
+                            binary, *sub_args, "--offline-image", "--allow-write",
+                            "--pool-guid", tx_pool_guid, "--label", "0",
+                            "--slot", str(cur_slot), "--dataset", ds_name,
+                        ))
+                        require(
+                            out["outcome"] == "Committed" and int(out["committed_txg"]) > cur_txg,
+                            f"encrypted TXG step {sub_args[0]!r} did not advance committed TXG",
+                        )
+                        cur_slot = int(out["published_slot"])
+                        cur_txg = int(out["committed_txg"])
+                        return out
+
+                    ffs_secret_file = directory / "ffs-secret.bin"
+                    ffs_secret_file.write_bytes(ffs_secret)
+                    run_ds_enc_tx(
+                        "data", "tx-create-dataset", writable_img, "enc_ffs",
+                        "--encryption", "aes-256-gcm",
+                        "--keylocation", f"file://{ffs_key_v1}",
+                        "--new-key-file", ffs_key_v1,
+                        "--prop", "compression=lz4",
+                    )
+                    run_ds_enc_tx(
+                        "data/enc_ffs", "tx-create", writable_img, "/ffs_secret.bin",
+                        "--mode", "0640", "--key-file", ffs_key_v1,
+                    )
+                    run_ds_enc_tx(
+                        "data/enc_ffs", "tx-write", writable_img, "/ffs_secret.bin",
+                        "--data-file", ffs_secret_file, "--sha256", "--key-file", ffs_key_v1,
+                    )
+                    run_ds_enc_tx(
+                        "data/enc_ffs", "tx-snapshot", writable_img, "ffs_s1",
+                        "--key-file", ffs_key_v1,
+                    )
+                    run_ds_enc_tx(
+                        "data/enc_ffs", "tx-create-dataset", writable_img, "child",
+                        "--key-file", ffs_key_v1,
+                    )
+                    run_ds_enc_tx(
+                        "data/enc_ffs/child", "tx-create", writable_img, "/inherited.txt",
+                        "--mode", "0644", "--key-file", ffs_key_v1,
+                    )
+                    run_ds_enc_tx(
+                        "data/enc_ffs/child", "tx-write", writable_img, "/inherited.txt",
+                        "--data", ffs_child_secret.decode("ascii"), "--key-file", ffs_key_v1,
+                    )
+                    # Atomically rotate wrapping key v1 -> v2 via tx-change-key!
+                    run_ds_enc_tx(
+                        "data/enc_ffs", "tx-change-key", writable_img,
+                        "--key-file", ffs_key_v1,
+                        "--new-key-file", ffs_key_v2,
+                        "--new-keylocation", f"file://{ffs_key_v2}",
+                    )
+                    # Verify old key v1 fails closed and new key v2 decrypts head, snapshot, and child!
+                    ffs_enc_opts = [
+                        "--offline-image", "--pool-guid", tx_pool_guid, "--label", "0",
+                        "--slot", str(cur_slot), "--dataset", "data/enc_ffs",
+                    ]
+                    command(
+                        binary, "read", writable_img, "/ffs_secret.bin", *ffs_enc_opts,
+                        "--key-file", ffs_key_v1, fails=True,
+                    )
+                    require(
+                        command(
+                            binary, "read", writable_img, "/ffs_secret.bin", *ffs_enc_opts,
+                            "--key-file", ffs_key_v2,
+                        )
+                        == ffs_secret,
+                        "ffs-zfs post-change-key head read mismatch",
+                    )
+                    require(
+                        command(
+                            binary, "read", writable_img, "/ffs_secret.bin", *ffs_enc_opts,
+                            "--snapshot", "ffs_s1", "--key-file", ffs_key_v2,
+                        )
+                        == ffs_secret,
+                        "ffs-zfs post-change-key snapshot read mismatch",
+                    )
+
                 command("zdb", "-lu", writable_img)
                 bccm_text = command("zdb", "-e", "-p", writable_dir, "-bccm", tx_pool).decode("utf-8", errors="replace")
                 require("No leaks (block sum matches space maps exactly)" in bccm_text,
@@ -916,6 +1129,29 @@ def main() -> None:
                                 == b"\x00" * (16 * 1024) + nbd_fua_payload[16 * 1024 :],
                                 "kernel /dev/zvol disagreed on NBD TRIM + FUA tail",
                             )
+                    # Verify OpenZFS zfs.ko rejects old key v1, accepts rotated key v2, and mounts ffs-created encrypted datasets!
+                    command(
+                        "zfs", "load-key", "-L", f"file://{ffs_key_v1}",
+                        tx_pool + "/data/enc_ffs", fails=True,
+                    )
+                    command("zfs", "load-key", tx_pool + "/data/enc_ffs")
+                    command("zfs", "set", f"mountpoint={enc_ffs_mount}", tx_pool + "/data/enc_ffs")
+                    command("zfs", "set", f"mountpoint={enc_ffs_child_mount}", tx_pool + "/data/enc_ffs/child")
+                    command("zfs", "mount", tx_pool + "/data/enc_ffs")
+                    command("zfs", "mount", tx_pool + "/data/enc_ffs/child")
+                    require(
+                        (enc_ffs_mount / "ffs_secret.bin").read_bytes() == ffs_secret,
+                        "kernel zfs.ko disagreed on ffs-zfs encrypted dataset payload after change-key",
+                    )
+                    require(
+                        (enc_ffs_mount / ".zfs" / "snapshot" / "ffs_s1" / "ffs_secret.bin").read_bytes()
+                        == ffs_secret,
+                        "kernel zfs.ko disagreed on ffs-zfs encrypted snapshot payload after change-key",
+                    )
+                    require(
+                        (enc_ffs_child_mount / "inherited.txt").read_bytes() == ffs_child_secret,
+                        "kernel zfs.ko disagreed on ffs-zfs inherited encrypted child payload",
+                    )
                 require(k_moved.read_bytes() == payload and k_moved.stat().st_nlink == 3,
                         "kernel zfs.ko moved hard-link content or st_nlink disagreed")
                 require((tx_mount / long_name).read_bytes() == payload
@@ -981,6 +1217,7 @@ def main() -> None:
                     command("zpool", "export", pool)  # Only our successfully created random pool.
                 if tx_active:
                     command("zpool", "export", tx_pool)
+                key_tmp_dir.cleanup()
         report["status"] = "passed"
     except Exception as error:
         report.update(status="failed", error=str(error))

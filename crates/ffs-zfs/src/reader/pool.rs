@@ -14,7 +14,7 @@ pub(super) mod stripe_mirrors;
 use super::{
     BlockPointer, BlockRead, Cx, DATA_OFFSET, FfsError, Label, Leaf, NvList, RaidzGroup,
     RaidzMember, Result, RootBlock, Uberblock, Value, VdevConfig, admit_vdev_state, checkpoint,
-    corrupt, integer, parse, unsupported,
+    corrupt, decode_or_verify, integer, parse, unsupported,
 };
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -454,26 +454,48 @@ impl Pool {
         config: &VdevConfig,
         bp: &BlockPointer,
     ) -> Result<BlockRead> {
+        self.read_block_inner(cx, config, bp, false)
+    }
+
+    /// Read and physically checksum-verify a block without decompressing or
+    /// requiring unprotected decoding. Used by the protected (encrypted /
+    /// authenticated) DMU pipeline before MAC / AEAD verification.
+    pub(super) fn read_raw_block(
+        &self,
+        cx: &Cx,
+        config: &VdevConfig,
+        bp: &BlockPointer,
+    ) -> Result<BlockRead> {
+        self.read_block_inner(cx, config, bp, true)
+    }
+
+    fn read_block_inner(
+        &self,
+        cx: &Cx,
+        config: &VdevConfig,
+        bp: &BlockPointer,
+        raw_only: bool,
+    ) -> Result<BlockRead> {
         checkpoint(cx)?;
         if bp.gang() {
-            return self.read_gang_block(cx, config, bp);
+            return self.read_gang_block_inner(cx, config, bp, raw_only);
         }
         if let Some(group) = &config.raidz_members {
             if group.parity == 0 {
-                return self.read_striped_block(cx, bp, group);
+                return self.read_striped_block_inner(cx, bp, group, raw_only);
             }
-            return self.read_raidz_block(cx, config, bp, group);
+            return self.read_raidz_block_inner(cx, config, bp, group, raw_only);
         }
         if self.members.len() == 1 {
-            return self.members[0].read_block(cx, config, bp).map(
-                |(bytes, physical_offset, copy_index)| BlockRead {
+            return self.members[0]
+                .read_block_inner(cx, config, bp, raw_only)
+                .map(|(bytes, physical_offset, copy_index)| BlockRead {
                     bytes,
                     physical_offset,
                     copy_index,
                     member_index: 0,
                     raidz: None,
-                },
-            );
+                });
         }
         // OpenZFS zfs-2.3.0 vdev_default_asize rounds physical bytes to the
         // top-level ashift. Mirror width does not multiply the DVA asize.
@@ -491,7 +513,7 @@ impl Pool {
                 checkpoint(cx)?;
                 let result = member
                     .read(cx, offset, bp.physical_bytes())
-                    .and_then(|raw| bp.decode(&raw).map_err(|error| parse(&error)));
+                    .and_then(|raw| decode_or_verify(bp, raw, raw_only));
                 match result {
                     Ok(bytes) => {
                         checkpoint(cx)?;
@@ -516,13 +538,14 @@ impl Pool {
         )))
     }
 
-    fn read_striped_block(
+    fn read_striped_block_inner(
         &self,
         cx: &Cx,
         bp: &BlockPointer,
         group: &RaidzGroup,
+        raw_only: bool,
     ) -> Result<BlockRead> {
-        let dvas = bp.regular_dvas().map_err(|error| parse(&error))?;
+        let dvas = bp.data_dvas().map_err(|error| parse(&error))?;
         for dva in &dvas {
             checkpoint(cx)?;
             let vdev_idx = usize::try_from(dva.vdev).map_err(|_| corrupt("vdev ID overflow"))?;
@@ -554,7 +577,7 @@ impl Pool {
                 checkpoint(cx)?;
                 let result = self.members[member_index]
                     .read(cx, offset, bp.physical_bytes())
-                    .and_then(|raw| bp.decode(&raw).map_err(|error| parse(&error)));
+                    .and_then(|raw| decode_or_verify(bp, raw, raw_only));
                 match result {
                     Ok(bytes) => {
                         checkpoint(cx)?;

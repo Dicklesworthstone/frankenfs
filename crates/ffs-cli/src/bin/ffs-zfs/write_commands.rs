@@ -15,13 +15,37 @@ use asupersync::Cx;
 use clap::{Args, Subcommand};
 use ffs_ondisk::zfs_zpl::Timestamp;
 use ffs_zfs::{
-    Leaf, NbdServerConfig, Pool, ZfsDataChecksum, ZfsFileRangeOperation, ZfsMountWriteOptions,
-    ZfsPosixSetAttr, ZfsPropertySetValue, ZfsTransactionEngine, ZfsTxOutcome, ZfsVolumeManager,
-    ZfsWriteOptions, ZfsXattrSetMode, ZfsZvolCreateOptions, ZfsZvolNbdClient, ZfsZvolNbdServer,
+    Leaf, NbdServerConfig, Pool, ZfsDataChecksum, ZfsEncryptionCreateOptions,
+    ZfsFileRangeOperation, ZfsKeyMaterial, ZfsMountWriteOptions, ZfsPosixSetAttr,
+    ZfsPropertySetValue, ZfsTransactionEngine, ZfsTxOutcome, ZfsVolumeManager, ZfsWriteOptions,
+    ZfsXattrSetMode, ZfsZvolCreateOptions, ZfsZvolNbdClient, ZfsZvolNbdServer, ZioEncrypt,
     ZvolSyncPolicy,
 };
 
-use super::json;
+use super::{KeyArgs, json, load_key_material_from_files};
+
+#[derive(Debug, Default, Args)]
+pub struct NewKeyArgs {
+    /// Host file containing an exact 32-byte raw wrapping key (`keyformat=raw`).
+    #[arg(long, conflicts_with_all = ["new_key_hex_file", "new_passphrase_file"])]
+    pub new_key_file: Option<PathBuf>,
+    /// Host file containing 64 ASCII hexadecimal digits (`keyformat=hex`).
+    #[arg(long, conflicts_with_all = ["new_key_file", "new_passphrase_file"])]
+    pub new_key_hex_file: Option<PathBuf>,
+    /// Host file containing a passphrase (`keyformat=passphrase`, single trailing newline stripped).
+    #[arg(long, conflicts_with_all = ["new_key_file", "new_key_hex_file"])]
+    pub new_passphrase_file: Option<PathBuf>,
+}
+
+impl NewKeyArgs {
+    fn load_material(&self) -> Result<Option<ZfsKeyMaterial>> {
+        load_key_material_from_files(
+            self.new_key_file.as_deref(),
+            self.new_key_hex_file.as_deref(),
+            self.new_passphrase_file.as_deref(),
+        )
+    }
+}
 
 #[derive(Debug, Args)]
 pub struct AdmitArgs {
@@ -90,6 +114,8 @@ pub struct WritePoolArgs {
     /// Stamp newly written file data blocks with `ZIO_CHECKSUM_SHA256` instead of `Fletcher4`.
     #[arg(long)]
     pub sha256: bool,
+    #[command(flatten)]
+    pub key: KeyArgs,
 }
 
 impl WritePoolArgs {
@@ -116,6 +142,7 @@ impl WritePoolArgs {
                 .with_context(|| {
                     format!("admitting ZFS native writer on {}", self.image.display())
                 })?;
+        self.key.load_into_engine(cx, &engine, &components)?;
         Ok((engine, components))
     }
 
@@ -157,6 +184,8 @@ pub enum WriteCommand {
         /// Reconcile split uberblock copies after complete writer admission.
         #[arg(long)]
         reconcile_torn_uberblocks: bool,
+        #[command(flatten)]
+        key: KeyArgs,
     },
     /// Create a new regular file in a ZPL head dataset and publish a committed TXG.
     TxCreate {
@@ -340,6 +369,30 @@ pub enum WriteCommand {
         /// Initial property assignment `name=value` (repeatable).
         #[arg(long = "prop")]
         props: Vec<String>,
+        /// Optional native encryption suite (`off`, `on`, `inherit`, `aes-{128,192,256}-{gcm,ccm}`).
+        #[arg(long)]
+        encryption: Option<String>,
+        /// Optional `keylocation` property text (defaults to `"prompt"` for new encryption roots).
+        #[arg(long)]
+        keylocation: Option<String>,
+        /// Optional PBKDF2-HMAC-SHA1 iteration count for `keyformat=passphrase` (`>= 100000`).
+        #[arg(long)]
+        pbkdf2iters: Option<u64>,
+        #[command(flatten)]
+        new_key: NewKeyArgs,
+    },
+    /// Atomically rotate the wrapping key (and optional `keylocation`) of an encrypted root dataset.
+    TxChangeKey {
+        #[command(flatten)]
+        pool: WritePoolArgs,
+        #[command(flatten)]
+        new_key: NewKeyArgs,
+        /// Optional replacement `keylocation` property text.
+        #[arg(long)]
+        new_keylocation: Option<String>,
+        /// Optional PBKDF2-HMAC-SHA1 iteration count when rotating to `keyformat=passphrase`.
+        #[arg(long)]
+        pbkdf2iters: Option<u64>,
     },
     /// Create a writable clone dataset `<target_dataset>` from `<dataset>@<origin_snap>`.
     TxClone {
@@ -529,6 +582,8 @@ pub enum WriteCommand {
         /// Optional path to write structured JSON transport audit entries upon shutdown.
         #[arg(long)]
         audit_json: Option<PathBuf>,
+        #[command(flatten)]
+        key: KeyArgs,
     },
     /// First-party safe-Rust NBD block client for interacting with `zvol-serve-nbd`.
     ZvolNbdClient {
@@ -643,7 +698,7 @@ fn parse_size_or_u64(raw: &str) -> Result<u64> {
 }
 
 fn parse_property_set_value(name: &str, raw: &str) -> Result<ZfsPropertySetValue> {
-    if name.contains(':') {
+    if name.contains(':') || name == "keylocation" {
         return Ok(ZfsPropertySetValue::Text(raw.as_bytes().to_vec()));
     }
     let norm = raw.trim().to_ascii_lowercase();
@@ -673,9 +728,45 @@ fn parse_property_set_value(name: &str, raw: &str) -> Result<ZfsPropertySetValue
         },
         "checksum" => match norm.as_str() {
             "on" | "1" => 1,
+            "fletcher2" | "6" => 6,
             "fletcher4" | "7" => 7,
             "sha256" | "8" => 8,
-            _ => bail!("checksum property expects `on`, `fletcher4`, or `sha256`, got `{raw}`"),
+            "sha512" | "11" => 11,
+            _ => bail!(
+                "checksum property expects `on`, `fletcher2`, `fletcher4`, `sha256`, or `sha512`, got `{raw}`"
+            ),
+        },
+        "compression" => match norm.as_str() {
+            "inherit" | "0" => 0,
+            "on" | "1" => 1,
+            "off" | "2" => 2,
+            "gzip-1" | "5" => 5,
+            "gzip-2" | "6" => 6,
+            "gzip-3" | "7" => 7,
+            "gzip-4" | "8" => 8,
+            "gzip-5" | "9" => 9,
+            "gzip" | "gzip-6" | "10" => 10,
+            "gzip-7" | "11" => 11,
+            "gzip-8" | "12" => 12,
+            "gzip-9" | "13" => 13,
+            "zle" | "14" => 14,
+            "lz4" | "15" => 15,
+            "zstd" | "16" => (3_u64 << 7) | 16,
+            other => {
+                if let Some(level_str) = other.strip_prefix("zstd-") {
+                    let level: u64 = level_str
+                        .parse()
+                        .with_context(|| format!("invalid zstd compression level `{raw}`"))?;
+                    if !(1..=19).contains(&level) {
+                        bail!("zstd compression level must be in 1..=19, got `{raw}`");
+                    }
+                    (level << 7) | 16
+                } else {
+                    bail!(
+                        "compression property expects `off`, `on`, `zle`, `lz4`, `gzip[-1..9]`, or `zstd[-1..19]`, got `{raw}`"
+                    );
+                }
+            }
         },
         "quota" | "refquota" | "reservation" | "refreservation" | "recordsize" => {
             parse_size_or_u64(raw)?
@@ -683,6 +774,17 @@ fn parse_property_set_value(name: &str, raw: &str) -> Result<ZfsPropertySetValue
         _ => parse_size_or_u64(raw)?,
     };
     Ok(ZfsPropertySetValue::Number(num))
+}
+
+fn parse_encryption_suite(raw: &str) -> Result<ZioEncrypt> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "inherit" => Ok(ZioEncrypt::Inherit),
+        other => ZioEncrypt::from_name(other).map_err(|_| {
+            anyhow::anyhow!(
+                "invalid `--encryption` value `{raw}`: expected `off`, `on`, `inherit`, or `aes-{{128,192,256}}-{{gcm,ccm}}`"
+            )
+        }),
+    }
 }
 
 fn parse_prop_assignments(raw_props: &[String]) -> Result<Vec<(String, ZfsPropertySetValue)>> {
@@ -846,6 +948,7 @@ impl WriteCommand {
                 allow_write,
                 dataset,
                 reconcile_torn_uberblocks,
+                key,
             } => {
                 if !target.offline_image || !allow_write {
                     bail!("writable ZFS mounts require --offline-image and --allow-write");
@@ -876,6 +979,7 @@ impl WriteCommand {
                     },
                 )
                 .context("admitting the native ZFS mount writer")?;
+                key.load_into_engine(cx, &engine, &components)?;
                 let fs = ffs_zfs::ZfsFs::with_writer_options(
                     cx,
                     engine,
@@ -1159,17 +1263,75 @@ impl WriteCommand {
                 pool,
                 child_name,
                 props,
+                encryption,
+                keylocation,
+                pbkdf2iters,
+                new_key,
             } => {
                 let parsed_props = parse_prop_assignments(&props)?;
+                let loaded_new_key = new_key.load_material()?;
+                if encryption.is_none()
+                    && (loaded_new_key.is_some() || keylocation.is_some() || pbkdf2iters.is_some())
+                {
+                    bail!(
+                        "--new-key-file/--new-key-hex-file/--new-passphrase-file/--keylocation/--pbkdf2iters require --encryption"
+                    );
+                }
                 let (mut engine, components) = pool.open_engine(cx)?;
-                let outcome = engine.create_dataset(
+                let outcome = if let Some(enc_raw) = encryption {
+                    let suite = parse_encryption_suite(&enc_raw)?;
+                    if suite.is_active() && loaded_new_key.is_none() {
+                        bail!(
+                            "creating an encrypted root dataset requires --new-key-file, --new-key-hex-file, or --new-passphrase-file"
+                        );
+                    }
+                    let enc_opts = ZfsEncryptionCreateOptions {
+                        suite,
+                        key_material: loaded_new_key,
+                        keylocation: keylocation.map(String::into_bytes),
+                        pbkdf2_iters: pbkdf2iters,
+                        extra_entropy: Vec::new(),
+                    };
+                    engine.create_encrypted_dataset(
+                        cx,
+                        &components,
+                        child_name.as_bytes(),
+                        &parsed_props,
+                        &enc_opts,
+                        pool.zpl_timestamp(),
+                    )
+                } else {
+                    engine.create_dataset(
+                        cx,
+                        &components,
+                        child_name.as_bytes(),
+                        &parsed_props,
+                        pool.zpl_timestamp(),
+                    )
+                };
+                emit_tx_outcome("tx_create_dataset", &pool.dataset, &engine, outcome)
+            }
+            Self::TxChangeKey {
+                pool,
+                new_key,
+                new_keylocation,
+                pbkdf2iters,
+            } => {
+                let Some(new_material) = new_key.load_material()? else {
+                    bail!(
+                        "tx-change-key requires --new-key-file, --new-key-hex-file, or --new-passphrase-file"
+                    );
+                };
+                let (mut engine, components) = pool.open_engine(cx)?;
+                let outcome = engine.change_key(
                     cx,
                     &components,
-                    child_name.as_bytes(),
-                    &parsed_props,
-                    pool.zpl_timestamp(),
+                    &new_material,
+                    new_keylocation.as_deref().map(str::as_bytes),
+                    pbkdf2iters,
+                    &[],
                 );
-                emit_tx_outcome("tx_create_dataset", &pool.dataset, &engine, outcome)
+                emit_tx_outcome("tx_change_key", &pool.dataset, &engine, outcome)
             }
             Self::TxClone {
                 pool,
@@ -1475,6 +1637,7 @@ impl WriteCommand {
                 sha256,
                 once,
                 audit_json,
+                key,
             } => {
                 if !target.offline_image {
                     bail!("zvol-serve-nbd requires --offline-image");
@@ -1534,6 +1697,7 @@ impl WriteCommand {
                             target.image.display()
                         )
                     })?;
+                    key.load_into_engine(cx, &engine, &components)?;
                     let mgr = ZfsVolumeManager::new(engine);
                     let session =
                         mgr.open_writable_session(cx, &components, policy, !no_discard, checksum)?;
@@ -1569,6 +1733,7 @@ impl WriteCommand {
                         target.slot as usize,
                         target.pool_guid,
                     )?;
+                    key.load_into_objects(cx, &mut objects, &components)?;
                     let zvol =
                         objects.zvol(cx, &components, snapshot.as_deref().map(str::as_bytes))?;
                     let txg = zvol.info().pool_txg;
@@ -1777,10 +1942,12 @@ mod tests {
             allow_write,
             dataset,
             reconcile_torn_uberblocks,
+            key,
         }) = args.command
         else {
             panic!("mount-write must dispatch to the explicit native writer");
         };
+        assert!(key.is_empty());
         assert!(target.offline_image && allow_write && reconcile_torn_uberblocks);
         assert_eq!(target.image, PathBuf::from("primary.img"));
         assert_eq!(target.members, vec![PathBuf::from("mirror.img")]);
@@ -2118,6 +2285,101 @@ mod tests {
         assert_eq!(
             parse_property_set_value("logbias", "throughput").unwrap(),
             ZfsPropertySetValue::Number(1)
+        );
+        assert_eq!(
+            parse_property_set_value("compression", "lz4").unwrap(),
+            ZfsPropertySetValue::Number(15)
+        );
+        assert_eq!(
+            parse_property_set_value("compression", "zstd-5").unwrap(),
+            ZfsPropertySetValue::Number((5 << 7) | 16)
+        );
+        assert_eq!(
+            parse_property_set_value("checksum", "sha512").unwrap(),
+            ZfsPropertySetValue::Number(11)
+        );
+        assert_eq!(
+            parse_property_set_value("keylocation", "file:///keys/root.key").unwrap(),
+            ZfsPropertySetValue::Text(b"file:///keys/root.key".to_vec())
+        );
+        assert!(parse_property_set_value("compression", "zstd-25").is_err());
+
+        // Encrypted dataset creation and key rotation require explicit authority and parse cleanly.
+        assert!(
+            Cli::try_parse_from(
+                [
+                    "ffs-zfs",
+                    "tx-create-dataset",
+                    "leaf.img",
+                    "vault",
+                    "--encryption",
+                    "aes-256-gcm",
+                    "--keylocation",
+                    "prompt",
+                    "--new-key-file",
+                    "/tmp/raw.key",
+                ]
+                .into_iter()
+                .chain(auth),
+            )
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(
+                [
+                    "ffs-zfs",
+                    "tx-change-key",
+                    "leaf.img",
+                    "--key-file",
+                    "/tmp/old.key",
+                    "--new-passphrase-file",
+                    "/tmp/new.pass",
+                    "--new-keylocation",
+                    "prompt",
+                    "--pbkdf2iters",
+                    "100000",
+                ]
+                .into_iter()
+                .chain(auth),
+            )
+            .is_ok()
+        );
+        // Without --allow-write, tx-change-key fails clap parsing.
+        assert!(
+            Cli::try_parse_from([
+                "ffs-zfs",
+                "tx-change-key",
+                "leaf.img",
+                "--offline-image",
+                "--pool-guid",
+                "123",
+                "--label",
+                "0",
+                "--slot",
+                "2",
+                "--dataset",
+                "data",
+                "--new-key-file",
+                "/tmp/new.key",
+            ])
+            .is_err()
+        );
+        // Conflicting new-key sources rejected by clap.
+        assert!(
+            Cli::try_parse_from(
+                [
+                    "ffs-zfs",
+                    "tx-change-key",
+                    "leaf.img",
+                    "--new-key-file",
+                    "/tmp/a.key",
+                    "--new-key-hex-file",
+                    "/tmp/b.hex",
+                ]
+                .into_iter()
+                .chain(auth),
+            )
+            .is_err()
         );
     }
 
