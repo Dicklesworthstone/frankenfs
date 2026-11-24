@@ -980,8 +980,8 @@ def native_format_and_resize_cases(
                 f"ffs-ntfs check {tag} was not clean/non-mutating")
         require(digest(img) == before_chk, f"ffs-ntfs check mutated {tag}")
 
-        # Cross-verify formatted image with independent ntfs-3g tools.
-        ls_out = command("ntfsls", "-a", img).decode("utf-8", errors="strict")
+        # Cross-verify formatted image with independent ntfs-3g tools (`-s` includes `$`-prefixed system files).
+        ls_out = command("ntfsls", "-a", "-s", img).decode("utf-8", errors="strict")
         require("$MFT" in ls_out and "$Extend" in ls_out, f"ntfsls missing system files on {tag}")
         if has_ntfsinfo:
             info_out = command("ntfsinfo", "-m", img).decode("utf-8", errors="replace")
