@@ -79,6 +79,24 @@ enum AuxiliaryOwnership {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum XattrOwnershipFault {
+    DirectoryParent,
+    DirectoryPublic,
+    DirectoryLinks,
+    DirectorySize,
+    DirectoryNested,
+    ValueParent,
+    ValuePublic,
+    ValueLinks,
+    ValueAlias,
+    DuplicateValue,
+    DotName,
+    ValueNested,
+    ValueExternalAcl,
+    OversizedValue,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SaSpillFixture {
     None,
     Opaque,
@@ -132,6 +150,8 @@ struct PoolFixtureSpec {
     root_properties: Vec<(&'static [u8], u64)>,
     data_properties: Vec<(&'static [u8], u64)>,
     auxiliary_ownership: Option<(u64, AuxiliaryOwnership)>,
+    auxiliary_xattr_fault: Option<XattrOwnershipFault>,
+    auxiliary_xattr_owner_ids: Option<(u64, u64)>,
 }
 
 impl Default for PoolFixtureSpec {
@@ -174,6 +194,8 @@ impl Default for PoolFixtureSpec {
             root_properties: Vec::new(),
             data_properties: Vec::new(),
             auxiliary_ownership: None,
+            auxiliary_xattr_fault: None,
+            auxiliary_xattr_owner_ids: None,
         }
     }
 }
@@ -1210,11 +1232,12 @@ fn build_zpl_objectset(
         };
         let (attribute, layout, payload) = match auxiliary {
             AuxiliaryOwnership::XattrDirectory | AuxiliaryOwnership::CapabilityXattr => {
+                let fault = spec.auxiliary_xattr_fault;
                 let value = b"private value survives namespace changes";
                 let mut padded = value.to_vec();
                 padded.resize((1_usize << spec.ashift).max(512), 0);
                 let value_bp = arena.alloc_block(&padded, 19, 0, birth, order);
-                let value_meta = Metadata {
+                let mut value_meta = Metadata {
                     mode: (Kind::Regular.to_tag() << 12) | 0o600,
                     kind: Kind::Regular,
                     size: value.len() as u64,
@@ -1224,44 +1247,84 @@ fn build_zpl_objectset(
                     inline_symlink: None,
                     ..metadata
                 };
+                if let Some((uid, gid)) = spec.auxiliary_xattr_owner_ids {
+                    value_meta.uid = uid;
+                    value_meta.gid = gid;
+                }
+                match fault {
+                    Some(XattrOwnershipFault::ValueParent) => value_meta.parent = owner,
+                    Some(XattrOwnershipFault::ValuePublic) => value_meta.flags = 0,
+                    Some(XattrOwnershipFault::ValueLinks) => value_meta.links = 2,
+                    Some(XattrOwnershipFault::OversizedValue) => value_meta.size = 65_537,
+                    _ => {}
+                }
+                let mut value_bonus = value_meta.encode_legacy(None, order).unwrap();
+                if fault == Some(XattrOwnershipFault::ValueNested) {
+                    value_bonus[104..112].copy_from_slice(&order.encode(13));
+                }
+                if fault == Some(XattrOwnershipFault::ValueExternalAcl) {
+                    value_bonus[176..184].copy_from_slice(&order.encode(13));
+                }
                 let value_node = make_dnode(
                     19,
                     padded.len(),
                     vec![value_bp],
                     17,
-                    value_meta.encode_legacy(None, order).unwrap(),
+                    value_bonus,
                     None,
                     acct_flags,
                     order,
                 );
                 write_dnode_at(&mut table, 14, &value_node).unwrap();
-                let name: &[u8] = if auxiliary == AuxiliaryOwnership::CapabilityXattr {
+                let name: &[u8] = if fault == Some(XattrOwnershipFault::DotName) {
+                    b"."
+                } else if auxiliary == AuxiliaryOwnership::CapabilityXattr {
                     b"security.capability"
                 } else {
                     b"user.retained"
                 };
-                let entries = mzap(
-                    &[(name, encode_directory_reference(14, Kind::Regular).unwrap())],
-                    0xA113,
-                    order,
-                );
+                let value_object = if fault == Some(XattrOwnershipFault::ValueAlias) {
+                    owner
+                } else {
+                    14
+                };
+                let value_reference =
+                    encode_directory_reference(value_object, Kind::Regular).unwrap();
+                let mut pairs = vec![(name, value_reference)];
+                if fault == Some(XattrOwnershipFault::DuplicateValue) {
+                    pairs.push((b"user.aliased", value_reference));
+                }
+                let entries = mzap(&pairs, 0xA113, order);
                 let directory_bp = arena.alloc_block(&entries, 20, 0, birth, order);
-                let directory_meta = Metadata {
+                let mut directory_meta = Metadata {
                     mode: (Kind::Directory.to_tag() << 12) | 0o700,
                     kind: Kind::Directory,
-                    size: 3,
+                    size: pairs.len() as u64 + 2,
                     parent: owner,
                     links: 2,
                     flags: 1,
                     inline_symlink: None,
                     ..metadata
                 };
+                match fault {
+                    Some(XattrOwnershipFault::DirectoryParent) => {
+                        directory_meta.parent = owner + 1;
+                    }
+                    Some(XattrOwnershipFault::DirectoryPublic) => directory_meta.flags = 0,
+                    Some(XattrOwnershipFault::DirectoryLinks) => directory_meta.links = 3,
+                    Some(XattrOwnershipFault::DirectorySize) => directory_meta.size += 1,
+                    _ => {}
+                }
+                let mut directory_bonus = directory_meta.encode_legacy(None, order).unwrap();
+                if fault == Some(XattrOwnershipFault::DirectoryNested) {
+                    directory_bonus[104..112].copy_from_slice(&order.encode(14));
+                }
                 let directory_node = make_dnode(
                     20,
                     entries.len(),
                     vec![directory_bp],
                     17,
-                    directory_meta.encode_legacy(None, order).unwrap(),
+                    directory_bonus,
                     None,
                     acct_flags,
                     order,
@@ -4653,7 +4716,7 @@ fn snapshotted_dataset_cow_preserves_historical_lzjb_snapshot_with_bpobj_and_dea
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn final_reclamation_refuses_auxiliary_ownership_without_leaking_native_objects() {
+fn final_reclamation_releases_private_xattrs_and_refuses_external_acls() {
     let cx = Cx::for_testing();
     let dataset = [b"data".to_vec()];
     let timestamp = Timestamp {
@@ -4714,21 +4777,33 @@ fn final_reclamation_refuses_auxiliary_ownership_without_leaking_native_objects(
                     .iter()
                     .map(FaultableMemberDevice::durable_snapshot)
                     .collect();
-                assert_native_write_refused(&mut engine, &devices, libc::EOPNOTSUPP, |writer| {
-                    writer.unlink_entry(&cx, &dataset, 2, name, directory, timestamp)
-                });
-                assert_native_write_refused(&mut engine, &devices, libc::EOPNOTSUPP, |writer| {
-                    writer.rename_entry(
-                        &cx,
-                        &dataset,
-                        2,
-                        b"replacement",
-                        2,
-                        name,
-                        Some(replacement),
-                        timestamp,
-                    )
-                });
+                if auxiliary == AuxiliaryOwnership::ExternalAcl {
+                    assert_native_write_refused(
+                        &mut engine,
+                        &devices,
+                        libc::EOPNOTSUPP,
+                        |writer| {
+                            writer.unlink_entry(&cx, &dataset, 2, name, directory, timestamp)
+                        },
+                    );
+                    assert_native_write_refused(
+                        &mut engine,
+                        &devices,
+                        libc::EOPNOTSUPP,
+                        |writer| {
+                            writer.rename_entry(
+                                &cx,
+                                &dataset,
+                                2,
+                                b"replacement",
+                                2,
+                                name,
+                                Some(replacement),
+                                timestamp,
+                            )
+                        },
+                    );
+                }
                 for (device, bytes) in devices.iter().zip(&before) {
                     let media = device.state.lock().unwrap();
                     assert_eq!(&media.durable, bytes);
@@ -4817,10 +4892,45 @@ fn final_reclamation_refuses_auxiliary_ownership_without_leaking_native_objects(
                         built.snap_hello_expected
                     );
                 }
-                assert_native_write_refused(&mut reopened, &fresh, libc::EOPNOTSUPP, |writer| {
-                    writer.unlink_entry(&cx, &dataset, 2, b"preserved", directory, timestamp)
-                });
-                assert_pool_scrub_and_allocation_clean(&cx, &fresh, built.pool_guid, Some(slot));
+                if auxiliary == AuxiliaryOwnership::XattrDirectory {
+                    reopened
+                        .unlink_entry(&cx, &dataset, 2, b"preserved", directory, timestamp)
+                        .into_result()
+                        .unwrap();
+                    let mut head = reopened
+                        .open_read_objects(&cx)
+                        .unwrap()
+                        .zpl(&cx, &dataset)
+                        .unwrap();
+                    for object in [owner, 13, 14] {
+                        assert!(matches!(
+                            head.stat(&cx, object),
+                            Err(FfsError::NotFound(_))
+                        ));
+                    }
+                    let mut snapshot = head.open_snapshot(&cx, b"before").unwrap();
+                    assert_eq!(
+                        snapshot.getxattr(&cx, owner, "user.retained").unwrap(),
+                        Some(b"private value survives namespace changes".to_vec())
+                    );
+                } else {
+                    assert_native_write_refused(
+                        &mut reopened,
+                        &fresh,
+                        libc::EOPNOTSUPP,
+                        |writer| {
+                            writer.unlink_entry(
+                                &cx, &dataset, 2, b"preserved", directory, timestamp,
+                            )
+                        },
+                    );
+                }
+                assert_pool_scrub_and_allocation_clean(
+                    &cx,
+                    &fresh,
+                    built.pool_guid,
+                    Some(reopened.committed_slot()),
+                );
             }
         }
     }

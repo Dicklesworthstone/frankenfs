@@ -62,7 +62,6 @@ pub struct ZfsObjectIdentity {
 
 // Native persistent ZPL flags (OpenZFS zfs-2.3.0, sys/zfs_znode.h).
 // Dataset `readonly` is a separate, inherited DSL property.
-#[allow(dead_code)]
 const ZFS_XATTR: u64 = 0x1;
 const ZFS_INHERIT_ACE: u64 = 0x2;
 const ZFS_ACL_TRIVIAL: u64 = 0x4;
@@ -1247,7 +1246,7 @@ fn read_unlinked_set(
     Ok((object, node, ceiling, entries))
 }
 
-fn admit_unlinked_file(loaded: &LoadedZplNode, registry: Option<&SaRegistry>) -> Result<()> {
+fn admit_unlinked_file(loaded: &LoadedZplNode, registry: Option<&SaRegistry>) -> Result<u64> {
     if loaded.metadata.kind != Kind::Regular {
         return Err(unsupported(
             "native orphan reclamation currently requires a regular file",
@@ -1256,7 +1255,7 @@ fn admit_unlinked_file(loaded: &LoadedZplNode, registry: Option<&SaRegistry>) ->
     admit_zpl_reclamation(loaded, registry)
 }
 
-fn admit_zpl_reclamation(loaded: &LoadedZplNode, registry: Option<&SaRegistry>) -> Result<()> {
+fn admit_zpl_reclamation(loaded: &LoadedZplNode, registry: Option<&SaRegistry>) -> Result<u64> {
     let ownership = match loaded.dnode.bonus_type() {
         DMU_OT_ZNODE => ffs_ondisk::zfs_zpl::ReclamationOwnership::legacy(
             loaded.dnode.bonus(),
@@ -1270,11 +1269,6 @@ fn admit_zpl_reclamation(loaded: &LoadedZplNode, registry: Option<&SaRegistry>) 
             .map_err(|e| parse_err(&e))?,
         _ => return Err(unsupported("unsupported orphan bonus representation")),
     };
-    if ownership.xattr_directory != 0 {
-        return Err(unsupported(
-            "ZPL reclamation with a native xattr directory is unavailable",
-        ));
-    }
     if ownership.external_acl_object != 0 {
         return Err(unsupported(
             "ZPL reclamation with an external ACL object is unavailable",
@@ -1283,7 +1277,114 @@ fn admit_zpl_reclamation(loaded: &LoadedZplNode, registry: Option<&SaRegistry>) 
     // load_zpl_node validates the native project attribute and its presence
     // flag. Retention and final retirement charge their deltas to that loaded
     // owner, including nonzero project IDs.
-    Ok(())
+    Ok(ownership.xattr_directory)
+}
+
+/// Preflight the complete admitted private ownership graph before retaining or
+/// retiring its owner. Private values must be regular files, with no public hard
+/// links or recursive private directories. Parent, flag and link checks are
+/// ownership evidence; following a raw object number cannot authorize its free.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn private_xattr_reclamation(
+    cx: &Cx,
+    view: &mut Objects,
+    meta: &Dnode,
+    ceiling: u64,
+    dirty: &BTreeMap<u64, Vec<u8>>,
+    registry: Option<&SaRegistry>,
+    owner: u64,
+    loaded: &LoadedZplNode,
+    order: Endian,
+) -> Result<Vec<(u64, LoadedZplNode)>> {
+    let directory = admit_zpl_reclamation(loaded, registry)?;
+    if directory == 0 {
+        return Ok(Vec::new());
+    }
+    if directory == owner {
+        return Err(corrupt("private xattr directory aliases its owner"));
+    }
+    let (node, node_ceiling) =
+        read_staged_or_committed_dnode(cx, view, meta, ceiling, dirty, directory, order)?;
+    let private_dir = decode_zpl_node(cx, view, node, node_ceiling, registry)?;
+    if private_dir.dnode.object_type() != DMU_OT_DIRECTORY_CONTENTS
+        || private_dir.metadata.kind != Kind::Directory
+        || private_dir.metadata.flags & ZFS_XATTR == 0
+        || private_dir.metadata.parent != owner
+        || private_dir.metadata.links != 2
+    {
+        return Err(corrupt(
+            "private xattr directory has ambiguous native ownership",
+        ));
+    }
+    if admit_zpl_reclamation(&private_dir, registry)? != 0 {
+        return Err(corrupt(
+            "private xattr directory owns another xattr directory",
+        ));
+    }
+    let entries = view.zap_values(cx, directory)?;
+    if entries.len() > XATTR_COUNT {
+        return Err(unsupported(
+            "xattr reclamation exceeds 4096 private values",
+        ));
+    }
+    if private_dir.metadata.size != entries.len() as u64 + 2 {
+        return Err(corrupt(
+            "private xattr directory size disagrees with its entries",
+        ));
+    }
+    let mut objects = BTreeSet::from([owner, directory]);
+    let mut names = BTreeSet::new();
+    let mut private = Vec::with_capacity(entries.len() + 1);
+    for entry in entries {
+        checkpoint(cx)?;
+        if entry.integer_bytes != 8
+            || entry.name.is_empty()
+            || entry.name.len() > XATTR_NAME_BYTES
+            || entry.name.contains(&0)
+            || entry.name.contains(&b'/')
+            || entry.name == b"."
+            || entry.name == b".."
+            || !names.insert(entry.name.clone())
+        {
+            return Err(corrupt("invalid or duplicate private xattr name"));
+        }
+        let (object, kind) =
+            directory_reference(entry.scalar().map_err(|error| parse_err(&error))?)
+                .map_err(|error| parse_err(&error))?;
+        if !objects.insert(object) || kind.is_some_and(|kind| kind != Kind::Regular) {
+            return Err(corrupt(
+                "private xattr value aliases another owner or has the wrong type",
+            ));
+        }
+        let (node, node_ceiling) =
+            read_staged_or_committed_dnode(cx, view, meta, ceiling, dirty, object, order)?;
+        let value = decode_zpl_node(cx, view, node, node_ceiling, registry)?;
+        if value.dnode.object_type() != DMU_OT_PLAIN_FILE_CONTENTS
+            || value.metadata.kind != Kind::Regular
+            || value.metadata.flags & ZFS_XATTR == 0
+            || value.metadata.parent != directory
+            || value.metadata.links != 1
+        {
+            return Err(corrupt(
+                "private xattr value has ambiguous native ownership",
+            ));
+        }
+        if value.metadata.size > XATTR_BYTES as u64 {
+            return Err(unsupported(
+                "private xattr value exceeds the 64 KiB reclamation profile",
+            ));
+        }
+        if admit_zpl_reclamation(&value, registry)? != 0 {
+            return Err(corrupt(
+                "private xattr value owns another xattr directory",
+            ));
+        }
+        private.push((object, value));
+    }
+    // Values retire before their private directory. Physical frees still pass
+    // through the dataset deadlist, so immutable snapshots retain their blocks.
+    private.push((directory, private_dir));
+    Ok(private)
 }
 
 fn retain_unlinked_target(
@@ -1338,6 +1439,17 @@ pub(super) fn pending_unlinks(
             return Err(corrupt("native unlinked set references a live ZPL object"));
         }
         admit_unlinked_file(&loaded, context.sa_registry.as_ref())?;
+        private_xattr_reclamation(
+            cx,
+            &mut view,
+            &context.os.meta,
+            context.old_os_bp.birth(),
+            &BTreeMap::new(),
+            context.sa_registry.as_ref(),
+            object,
+            &loaded,
+            context.os.meta.order(),
+        )?;
         pending.push(ZfsUnlinkedObject {
             object,
             generation: loaded.metadata.generation,
@@ -3519,6 +3631,21 @@ fn retire_or_decrement_zpl_target(
     } else {
         target_loaded.metadata.links.saturating_sub(1)
     };
+    let private = if rem_links == 0 {
+        private_xattr_reclamation(
+            cx,
+            os_view,
+            zpl_meta_base,
+            zpl_ceiling,
+            zpl_dirty_dnodes,
+            sa_registry,
+            target_obj,
+            target_loaded,
+            order,
+        )?
+    } else {
+        Vec::new()
+    };
     if rem_links > 0 || retain_unlinked {
         let mut next_meta = target_loaded.metadata.clone();
         next_meta.links = rem_links;
@@ -3582,12 +3709,50 @@ fn retire_or_decrement_zpl_target(
         );
     }
 
-    // The data tree and SA spill do not own private xattr directories or legacy
-    // external ACL objects. Require their cleanup support before final unlink,
-    // replacement, or reap. Nonfinal decrements above preserve these owners.
-    admit_zpl_reclamation(target_loaded, sa_registry)?;
+    for (object, loaded) in private {
+        retire_zpl_object(
+            cx,
+            os_view,
+            zpl_meta_base,
+            zpl_ceiling,
+            zpl_dirty_dnodes,
+            object,
+            &loaded,
+            order,
+            zpl_retired,
+            quota_deltas,
+        )?;
+    }
+    retire_zpl_object(
+        cx,
+        os_view,
+        zpl_meta_base,
+        zpl_ceiling,
+        zpl_dirty_dnodes,
+        target_obj,
+        target_loaded,
+        order,
+        zpl_retired,
+        quota_deltas,
+    )
+}
 
-    // Links == 0: retire all leaf, indirect, and spill blocks, update quota, and free dnode slot!
+/// Retire a validated native object through the normal dataset COW, deadlist
+/// and owner-accounting path. Each private object is charged to its own decoded
+/// owners rather than assuming that its uid, gid or project was inherited.
+#[allow(clippy::too_many_arguments)]
+fn retire_zpl_object(
+    cx: &Cx,
+    os_view: &mut Objects,
+    zpl_meta_base: &Dnode,
+    zpl_ceiling: u64,
+    zpl_dirty_dnodes: &mut BTreeMap<u64, Vec<u8>>,
+    target_obj: u64,
+    target_loaded: &LoadedZplNode,
+    order: Endian,
+    zpl_retired: &mut Vec<BlockPointer>,
+    quota_deltas: &mut Vec<QuotaDelta>,
+) -> Result<()> {
     collect_non_hole_bps_from(
         cx,
         os_view,
