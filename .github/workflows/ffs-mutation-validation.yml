@@ -1,11 +1,11 @@
-name: Filesystem mutation validation
+name: Inline directory mutation validation
 on:
   push:
-    branches: [validation/ffs-mutations-20261124]
+    branches: [validation/ffs-inline-20261124]
 permissions:
   contents: read
 concurrency:
-  group: ffs-mutations-20261124
+  group: ffs-inline-20261124
   cancel-in-progress: true
 env:
   CARGO_TERM_COLOR: never
@@ -21,6 +21,7 @@ env:
     crates/ffs-zfs/tests/persistence_prefix.rs
     crates/ffs-zfs/tests/persistence_prefix/writable_fs.rs
     crates/ffs-zfs/tests/persistence_prefix/setid.rs
+    crates/ffs-core/src/lib.rs
   FFS_VALIDATION_WORKFLOW: .github/workflows/ffs-mutation-validation.yml
 jobs:
   prepare:
@@ -153,8 +154,10 @@ jobs:
         run: cargo check --locked --workspace --all-targets
       - name: Workspace strict Clippy gate
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
-      - name: ZFS library and persistence regressions
-        run: cargo test --locked -p ffs-zfs -- --test-threads=1
+      - name: Inline directory and native ext4 regressions
+        run: cargo test --locked -p ffs-core --lib ext4_inline_ -- --nocapture --test-threads=1
+      - name: Sharded allocator inline directory regressions
+        run: cargo test --locked -p ffs-core --features bhh0i_sharded_alloc --lib ext4_inline_ -- --nocapture --test-threads=1
       - name: Confirm tested source stayed unchanged
         run: |
           set -euo pipefail
