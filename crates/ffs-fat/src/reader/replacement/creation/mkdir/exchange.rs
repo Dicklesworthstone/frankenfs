@@ -17,7 +17,28 @@ use std::collections::BTreeMap;
 
 struct Sector {
     original: Vec<u8>,
+    retired: Vec<u8>,
+    staged: Vec<u8>,
     updated: Vec<u8>,
+}
+
+#[derive(Clone, Copy)]
+enum Phase {
+    Original,
+    Retired,
+    Staged,
+    Published,
+}
+
+impl Sector {
+    fn bytes(&self, phase: Phase) -> &[u8] {
+        match phase {
+            Phase::Original => &self.original,
+            Phase::Retired => &self.retired,
+            Phase::Staged => &self.staged,
+            Phase::Published => &self.updated,
+        }
+    }
 }
 
 /// At most two short entries and two native parent entries. Coalescing is
@@ -45,6 +66,8 @@ impl Publication {
             let mut bytes = vec![0; size as usize];
             volume.read_exact(cx, start, &mut bytes)?;
             slot.insert(Sector {
+                retired: bytes.clone(),
+                staged: bytes.clone(),
                 updated: bytes.clone(),
                 original: bytes,
             });
@@ -56,24 +79,42 @@ impl Publication {
             bail!("exchange record changed or overlaps another prepared update");
         }
         sector.updated[within..within + 32].copy_from_slice(updated);
+        sector.staged[within..within + 32].copy_from_slice(updated);
         Ok(())
     }
 
-    fn verify(&self, cx: &Cx, volume: &FatVolume, published: bool) -> Result<()> {
+    fn hide_binding(&mut self, volume: &FatVolume, offset: u64) -> Result<()> {
+        let size = u64::from(volume.geometry.sector_bytes());
+        let sector = self
+            .0
+            .get_mut(&(offset / size * size))
+            .context("missing exchange binding")?;
+        let within = (offset % size) as usize;
+        sector.retired[within] = 0xE5;
+        sector.staged[within] = 0xE5;
+        Ok(())
+    }
+
+    fn verify(&self, cx: &Cx, volume: &FatVolume, phase: Phase) -> Result<()> {
         let mut bytes = vec![0; volume.geometry.sector_bytes() as usize];
         for (&offset, sector) in &self.0 {
             super::checkpoint(cx)?;
             volume.read_exact(cx, offset, &mut bytes)?;
-            let expected = if published {
-                &sector.updated
-            } else {
-                &sector.original
-            };
-            if &bytes != expected {
+            if bytes != sector.bytes(phase) {
                 bail!("exchange sector failed exact readback at {offset}");
             }
         }
         Ok(())
+    }
+
+    fn transition(&self, cx: &Cx, volume: &FatVolume, old: Phase, new: Phase) -> Result<()> {
+        for (&offset, sector) in &self.0 {
+            if sector.bytes(old) != sector.bytes(new) {
+                write_volume(cx, volume, offset, sector.bytes(new))?;
+            }
+        }
+        volume.device.sync(cx)?;
+        self.verify(cx, volume, new)
     }
 }
 
@@ -256,7 +297,9 @@ impl FatVolume {
         publication.add(cx, self, to_slot.offset, &to_slot.bytes, &to_updated)?;
         stage_parent(cx, self, &mut publication, &from_entry, from_dir, to_dir)?;
         stage_parent(cx, self, &mut publication, &to_entry, to_dir, from_dir)?;
-        publication.verify(cx, self, false)?;
+        publication.hide_binding(self, from_slot.offset)?;
+        publication.hide_binding(self, to_slot.offset)?;
+        publication.verify(cx, self, Phase::Original)?;
         super::checkpoint(cx)?;
         report["unchanged"] = false.into();
         report["metadata_sectors"] = publication.0.len().into();
@@ -270,13 +313,16 @@ impl FatVolume {
             set_dirty(cx, self, true)?;
             self.device.sync(cx)?;
             verify_state(cx, self, true)?;
-            publication.verify(cx, self, false)?;
-            phase = "publishing exchanged bindings and native parents";
-            for (&offset, sector) in &publication.0 {
-                write_volume(cx, self, offset, &sector.updated)?;
-            }
-            self.device.sync(cx)?;
-            publication.verify(cx, self, true)?;
+            publication.verify(cx, self, Phase::Original)?;
+            // A sector write can tear inside either object's head, length or
+            // type. Remove both names before editing either object or its '..'.
+            // Only the name marker changes when exposing each complete record.
+            phase = "retiring both exchange bindings";
+            publication.transition(cx, self, Phase::Original, Phase::Retired)?;
+            phase = "staging exchanged objects and native parents";
+            publication.transition(cx, self, Phase::Retired, Phase::Staged)?;
+            phase = "exposing verified exchange bindings";
+            publication.transition(cx, self, Phase::Staged, Phase::Published)?;
             phase = "verifying exchanged objects and allocation";
             let at_from = self.lookup(cx, from_dir, &from_leaf)?;
             let at_to = self.lookup(cx, to_dir, &to_leaf)?;

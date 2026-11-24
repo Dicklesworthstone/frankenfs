@@ -266,7 +266,7 @@ fn full_fat16_root_and_data_area_need_no_temporary_name_or_cluster() {
         .iter()
         .filter(|event| matches!(event, Event::Write(at, _) if *at == root_sector))
         .count();
-    assert_eq!(updates, 1, "same-sector names must be coalesced");
+    assert_eq!(updates, 3, "coalesce both names once per publication phase");
     for (at, (&old, &new)) in before.iter().zip(&state.pending).enumerate() {
         if old != new {
             assert!(offsets.iter().any(|&offset| {
@@ -456,8 +456,9 @@ fn every_write_sync_cut_preserves_payload_and_only_admits_complete_exchanges() {
     let cx = Cx::for_testing();
     mkdir_in_volume(&cx, &volume, "/other", NOW, false).unwrap();
     create_in_volume(&cx, &volume, "/other/dest.bin", b"destination", NOW, false).unwrap();
-    let (_, left_chain, _) = object(&volume, "/left.bin");
-    let (_, right_chain, _) = object(&volume, "/other/dest.bin");
+    let (left, left_chain, _) = object(&volume, "/left.bin");
+    let (right, right_chain, _) = object(&volume, "/other/dest.bin");
+    let slots = [left.offset, right.offset].map(|at| BASE + at as usize);
     let baseline = initial.snapshot();
     let successful = Device::new(baseline.clone());
     successful
@@ -467,7 +468,7 @@ fn every_write_sync_cut_preserves_payload_and_only_admits_complete_exchanges() {
     let finished = successful.snapshot();
     let operations = successful.0.lock().unwrap().events.len();
     for cut in 1..=operations {
-        for tear in [0, 1, 31, 511, 512] {
+        for tear in [0, 1, 31, 511, 512, slots[0] % 512 + 28, slots[1] % 512 + 28] {
             let device = Device::new(baseline.clone());
             let fs = device.open();
             {
@@ -494,6 +495,17 @@ fn every_write_sync_cut_preserves_payload_and_only_admits_complete_exchanges() {
                     let end = start + volume.geometry.cluster_bytes() as usize;
                     assert_eq!(&bytes[start..end], &baseline[start..end]);
                 }
+                // Inspect dirty snapshots too. Their live bindings must never
+                // combine the old length with the exchanged object's head.
+                for start in slots {
+                    let record = &bytes[start..start + 32];
+                    assert!(
+                        record[0] == 0xE5
+                            || record == &baseline[start..start + 32]
+                            || record == &finished[start..start + 32],
+                        "mixed live binding: cut={cut}, tear={tear}, retain={retain}"
+                    );
+                }
                 let reopened = FatVolume::from_device(
                     &cx,
                     Box::new(Device::new(bytes.clone())),
@@ -513,7 +525,7 @@ fn every_write_sync_cut_preserves_payload_and_only_admits_complete_exchanges() {
 }
 
 #[test]
-fn dropped_marker_or_metadata_writes_and_cancellation_never_report_success() {
+fn dropped_exchange_writes_fail_and_cancellation_observes_the_commit_boundary() {
     let initial = formatted("fat16");
     let baseline = initial.snapshot();
     let success = Device::new(baseline.clone());
@@ -522,6 +534,12 @@ fn dropped_marker_or_metadata_writes_and_cancellation_never_report_success() {
         .rename_exchange(&Cx::for_testing(), "/left.bin", "/right.bin", false)
         .unwrap();
     let events = success.0.lock().unwrap().events.clone();
+    // NativeMutation masks cancellation from the first final clean-marker
+    // write through its last durability acknowledgment.
+    let clean_start = events
+        .iter()
+        .rposition(|event| matches!(event, Event::Write(at, _) if *at == BASE as u64))
+        .unwrap();
     for (index, event) in events.iter().enumerate() {
         if let Event::Write(_, bytes) = event {
             assert_eq!(*bytes, 512);
@@ -539,14 +557,17 @@ fn dropped_marker_or_metadata_writes_and_cancellation_never_report_success() {
         let device = Device::new(baseline.clone());
         let volume = device.open();
         device.0.lock().unwrap().cancel = Some(index + 1);
-        assert!(
-            volume
-                .rename_exchange(&Cx::for_testing(), "/left.bin", "/right.bin", false)
-                .is_err(),
-            "cancel {}",
-            index + 1
-        );
-        assert_eq!(device.0.lock().unwrap().events.len(), index + 1);
+        let cx = Cx::for_testing();
+        let result = volume.rename_exchange(&cx, "/left.bin", "/right.bin", false);
+        if index < clean_start {
+            assert!(result.is_err(), "cancel {}", index + 1);
+            assert_eq!(device.0.lock().unwrap().events.len(), index + 1);
+        } else {
+            result.unwrap();
+            assert_eq!(device.snapshot(), success.snapshot());
+            assert_eq!(device.0.lock().unwrap().events.len(), events.len());
+            assert!(super::super::checkpoint(&cx).is_err());
+        }
     }
 }
 
