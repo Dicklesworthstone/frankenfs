@@ -2,6 +2,63 @@
 
 Created by CC agent 2026-04-22. Import when bead database clears.
 
+## Current execution — 2026-11-23, ZFS project trees and initialized growth
+
+Started at `dada405ac8fa0b3d6acd4019c7e0360570d9cd89`; substantive increments
+toward `bd-jdned`, whose native-interchange/shared-reference acceptance and
+`bd-uetvl` dependency remain open. Tracker issue statuses and dependencies are
+unchanged. This execution note remains here because the shared filesystem has
+no free space for a safe tracker database/export update.
+
+- [x] Read the comprehensive native-format plan, original porting priorities,
+  repository rules, Beads and actual backend paths before selecting work. FAT
+  mutations and SSI already exist; select missing native ZFS behavior.
+- [x] Inspect the local source-aware queue and verify no dependency cycles.
+  Do not claim or close the blocked broad native writer milestone.
+- [x] Implement project-inheriting regular-file/directory creation, canonical
+  native SA metadata/layout publication and owner accounting; retain default
+  symlink ownership and enforce link/rename/exchange project boundaries.
+- [x] Refuse inheritable ACL creation, incomplete project accounting and all six
+  referenced owner-limit quota tables until their missing semantics are implemented.
+- [x] Correct native trivial-ACL class precedence and variable ACE counts in
+  SA and legacy encoders. Add independent exhaustive mode/access tests.
+- [x] Initialize existing allocated bytes exposed by write/truncate growth,
+  including compressed tails, record expansion and very large sparse gaps.
+- [x] Add 4 codec and 14 persistence regression functions across the ACL, project,
+  quota-profile and file-growth changes, with cold reopen, snapshot, accounting
+  and dropped/reordered publication-cut checks. Authored tests are not executions.
+- [x] Reproduce the old ACL overgrant with the exact production helper and
+  identical independent evaluator: baseline 0 pass/1 fail at mode 0001; candidate
+  1 pass/0 fail/0 ignored. This is isolated helper-unit proof.
+- [x] Execute all 20 unchanged ZPL module tests in a focused harness with exact
+  production dependencies: candidate 20 pass/0 fail/0 ignore/5 unrelated filtered;
+  baseline with identical tests 17 pass/3 fail. The baseline failures expose
+  incomplete project child metadata, incorrect ACE counts and owner overgrant.
+- [x] Correct chmod's unconditional native execute/search shortcut. Execute the
+  exact production branch with unchanged probes: candidate 3 pass/0 fail;
+  baseline 2 pass/1 fail. Check 512 permission modes against 5 prior flag states.
+  Add the cold-reopen file/directory/SA-spill/snapshot persistence regression.
+- [x] Ordinary candidate `cargo check --offline --locked -p ffs-ondisk --lib`
+  and `cargo clippy --offline --locked -p ffs-ondisk --lib -- -D warnings`
+  both pass. These do not replace workspace or transaction validation.
+- [x] Full candidate workspace formatting and diff whitespace checks pass.
+  Exact ACL, project, chmod and final growth UBS static scans exit 0 with 0 critical findings;
+  warnings reviewed. Their Cargo/build/lint phases were not evaluated.
+- [ ] Full owning and ZFS persistence test suites, workspace all-targets check
+  and strict Clippy: incomplete. The baseline's 16 ZPL tests passed before
+  changes; candidate lib-test builds and all-targets metadata checking received
+  rustc SIGKILL without a completed result. ZFS integration-target checking
+  was SIGKILLed in asupersync before reaching ZFS source. Other builds were interrupted by
+  exhausted storage, a resource-guard stop and repeated executor disconnections.
+- [x] Independently review native semantics, fixed SA offsets, quota/ACL
+  admission, growth initialization and regression oracles. Publish meaningful
+  units through GitHub directly to main: ACL `f12eddc5e4`, project `cdcb090daa6`,
+  chmod `ac0dd64d4c`, and the growth implementation with this note. Every update
+  uses a checked parent/expected ref; the legacy compatibility ref is synchronized.
+  No PR and no broad Bead closure.
+- [ ] Native OpenZFS interchange, mounted-syscall and full writer/ownership
+  lifecycle qualification remain required by the original plan.
+
 ## Current execution — 2026-11-04, native engine fuzzing
 
 Owner IvoryGate; existing P1 `bd-2tzok`, claimed only after the local source-aware
@@ -2823,7 +2880,7 @@ the operator's broad SSH/skill instruction, and neither proposal has run.
   Workspace check and strict default/feature Clippy pass; final formatting0.
   Installed UBS5.5.26 refuses its mismatched shared assets on local/hz3. A
   separate cache downloads the same version's pinned assets, preserving every
-  checksum/rule: four one-file scans exit0,0critical (core15929warnings/3205info,
+  checksum/rule: four one-file scans exit 0, 0 critical (core15929warnings/3205info,
   sharded115/31, store137/46, ops86/61). No global scanner assets are changed.
   Remaining runtime execution has hit admitted-capacity/pressure refusals.
   A longer-wait RCH --job attempt unexpectedly used the worker root target;

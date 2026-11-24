@@ -256,22 +256,19 @@ impl Metadata {
             raw[176..264].fill(0);
             let aces =
                 encode_trivial_nfsv4_aces(checked.mode, checked.kind == Kind::Directory, order);
+            let size = aces.len() as u32;
+            let count = (aces.len() / 8) as u16;
             let (size_b, ver_b, cnt_b) = match order {
-                Endian::Little => (
-                    24_u32.to_le_bytes(),
-                    1_u16.to_le_bytes(),
-                    3_u16.to_le_bytes(),
-                ),
-                Endian::Big => (
-                    24_u32.to_be_bytes(),
-                    1_u16.to_be_bytes(),
-                    3_u16.to_be_bytes(),
-                ),
+                Endian::Little => (size.to_le_bytes(), 1_u16.to_le_bytes(), count.to_le_bytes()),
+                Endian::Big => (size.to_be_bytes(), 1_u16.to_be_bytes(), count.to_be_bytes()),
             };
             raw[184..188].copy_from_slice(&size_b);
             raw[188..190].copy_from_slice(&ver_b);
             raw[190..192].copy_from_slice(&cnt_b);
-            raw[192..216].copy_from_slice(&aces);
+            raw[192..264]
+                .get_mut(..aces.len())
+                .ok_or_else(|| invalid("trivial ACL exceeds legacy inline payload"))?
+                .copy_from_slice(&aces);
         }
         if let Some(target) = &checked.inline_symlink {
             raw[LEGACY_BYTES..LEGACY_BYTES + target.len()].copy_from_slice(target);
@@ -692,7 +689,10 @@ impl SaRegistry {
         if update_trivial_dacl {
             let aces =
                 encode_trivial_nfsv4_aces(checked.mode, checked.kind == Kind::Directory, order);
-            map.insert(b"ZPL_DACL_COUNT".to_vec(), order.encode(3).to_vec());
+            map.insert(
+                b"ZPL_DACL_COUNT".to_vec(),
+                order.encode((aces.len() / 8) as u64).to_vec(),
+            );
             map.insert(b"ZPL_DACL_ACES".to_vec(), aces);
         }
         Ok(())
@@ -962,8 +962,15 @@ impl SaRegistry {
         Ok(ids)
     }
 
-    /// Encode a fresh SA bonus with explicit `inherited_project_id`, registering
-    /// `ZPL_PROJID` + a layout in `reg_entries`/`layout_entries` if needed.
+    /// Encode a fresh regular-file or directory SA bonus with an explicit
+    /// project owner. Register the complete core/ACL/project layout as needed;
+    /// a parent's split bonus/spill layout is not a complete child template.
+    ///
+    /// Only byte order comes from `template_bonus`. Fresh fields follow native
+    /// `zfs_mknode` order, including the fixed offsets used by quota accounting.
+    /// Native xattr/ACL ownership references and unrelated parent attributes
+    /// never belong to the new object. The caller persists changed registration
+    /// and layout ZAPs in the same TXG as the child's dnode.
     pub fn encode_new_with_project(
         &mut self,
         reg_entries: &mut Vec<Entry>,
@@ -975,51 +982,63 @@ impl SaRegistry {
         let Some(proj_id) = inherited_project_id else {
             return self.encode_new_from_template(template_bonus, metadata);
         };
-        if metadata.inline_symlink.is_some() {
+        if !matches!(metadata.kind, Kind::Regular | Kind::Directory)
+            || metadata.inline_symlink.is_some()
+        {
             return Err(invalid(
-                "inline symlink creation requires a symlink SA layout",
+                "project ownership on creation requires a regular file or directory",
             ));
         }
-        let (order, template_layout) = self.parse_buffer_header(template_bonus)?;
-        let mut template_decoded = Attributes {
-            values: BTreeMap::new(),
-        };
-        self.decode_into(template_bonus, &mut template_decoded)?;
-        let proj_attr_id = self.ensure_attribute(reg_entries, b"ZPL_PROJID", 8, 0)?;
-
-        let mut base_ids = self
-            .layouts
-            .get(&template_layout)
-            .cloned()
-            .unwrap_or_default();
-        // Remove any variable/spill-only xattr or symlink attributes copied from template_layout.
-        base_ids.retain(|id| {
-            self.attributes.get(id).is_some_and(|r| {
-                !matches!(
-                    r.name.as_slice(),
-                    b"ZPL_DXATTR" | b"ZPL_XATTR" | b"ZPL_SYMLINK"
-                )
-            })
-        });
-        if !base_ids.contains(&proj_attr_id) {
-            base_ids.push(proj_attr_id);
-        }
-        let chosen_layout = self.ensure_layout(layout_entries, &base_ids)?;
-
+        let (order, _) = self.parse_buffer_header(template_bonus)?;
+        let mut metadata = metadata.clone();
+        // The presence bit and attribute must agree so initial accounting and
+        // subsequent mutations/reopen all resolve exactly the same owner.
+        metadata.flags |= 0x0000_8000_0000_0000;
         let mut map = BTreeMap::<Vec<u8>, Vec<u8>>::new();
+        Self::apply_metadata_to_map(&mut map, &metadata, order, true)?;
         map.insert(b"ZPL_PROJID".to_vec(), order.encode(proj_id).to_vec());
-        map.insert(b"ZPL_RDEV".to_vec(), order.encode(0).to_vec());
-        map.insert(b"ZPL_PAD".to_vec(), vec![0_u8; 32]);
-        let znode_acl = template_decoded
-            .values
-            .get(b"ZPL_ZNODE_ACL".as_slice())
-            .filter(|a| a.bytes.len() == 88)
-            .map_or_else(|| vec![0_u8; 88], |a| a.bytes.clone());
-        map.insert(b"ZPL_ZNODE_ACL".to_vec(), znode_acl);
-        Self::apply_metadata_to_map(&mut map, metadata, order, true)?;
+        // OpenZFS zpl_get_file_info reads quota owners at fixed offsets after
+        // the SA header. A valid registered layout alone does not establish
+        // native interoperability: even a split parent's order cannot be copied.
+        let native_order: [&[u8]; 15] = [
+            b"ZPL_MODE",
+            b"ZPL_SIZE",
+            b"ZPL_GEN",
+            b"ZPL_UID",
+            b"ZPL_GID",
+            b"ZPL_PARENT",
+            b"ZPL_FLAGS",
+            b"ZPL_ATIME",
+            b"ZPL_MTIME",
+            b"ZPL_CTIME",
+            b"ZPL_CRTIME",
+            b"ZPL_LINKS",
+            b"ZPL_PROJID",
+            b"ZPL_DACL_COUNT",
+            b"ZPL_DACL_ACES",
+        ];
+        let mut ids = Vec::with_capacity(native_order.len());
+        for name in native_order {
+            let value = map
+                .get(name)
+                .ok_or_else(|| invalid("new ZPL SA attribute is missing"))?;
+            let (length, swap) = if name == b"ZPL_DACL_ACES" {
+                (0, 4)
+            } else {
+                (
+                    u16::try_from(value.len())
+                        .map_err(|_| invalid("new ZPL SA attribute exceeds u16 length"))?,
+                    0,
+                )
+            };
+            ids.push(self.ensure_attribute(reg_entries, name, length, swap)?);
+        }
+        let chosen_layout = self.ensure_layout(layout_entries, &ids)?;
         let encoded = self.pack_layout(chosen_layout, &map, order)?;
         let verified = self.decode(&encoded, None)?;
-        let _ = verified.metadata()?;
+        if verified.metadata()? != metadata || verified.project_id()? != proj_id {
+            return Err(invalid("new ZPL project metadata did not round-trip"));
+        }
         Ok(encoded)
     }
 
@@ -1093,7 +1112,10 @@ impl SaRegistry {
             let _ = self.ensure_attribute(reg_entries, b"ZPL_DACL_ACES", 0, 4)?;
             spill_map.remove(b"ZPL_DACL_COUNT".as_slice());
             spill_map.remove(b"ZPL_DACL_ACES".as_slice());
-            bonus_map.insert(b"ZPL_DACL_COUNT".to_vec(), order.encode(3).to_vec());
+            bonus_map.insert(
+                b"ZPL_DACL_COUNT".to_vec(),
+                order.encode((aces.len() / 8) as u64).to_vec(),
+            );
             bonus_map.insert(b"ZPL_DACL_ACES".to_vec(), aces);
             if let Some(zacl) = bonus_map
                 .get_mut(b"ZPL_ZNODE_ACL".as_slice())
@@ -1199,17 +1221,14 @@ fn encode_trivial_nfsv4_aces(mode: u64, is_dir: bool, order: Endian) -> Vec<u8> 
     const ACE_WRITE_OWNER: u32 = 0x0008_0000;
     const ACE_SYNCHRONIZE: u32 = 0x0010_0000;
 
-    let perm_mask = |rwx: u64, is_owner: bool| -> u32 {
-        let mut m = ACE_READ_ACL | ACE_READ_ATTRIBUTES | ACE_READ_NAMED_ATTRS | ACE_SYNCHRONIZE;
-        if is_owner {
-            m |= ACE_WRITE_ACL | ACE_WRITE_OWNER | ACE_WRITE_ATTRIBUTES | ACE_WRITE_NAMED_ATTRS;
-        }
+    let data_mask = |rwx: u64| -> u32 {
+        let mut m = 0;
         if rwx & 0o4 != 0 {
             m |= ACE_READ_DATA;
         }
         if rwx & 0o2 != 0 {
             m |= ACE_WRITE_DATA | ACE_APPEND_DATA;
-            if is_dir && (mode & 0o1000 == 0 || is_owner) {
+            if is_dir {
                 m |= ACE_DELETE_CHILD;
             }
         }
@@ -1219,21 +1238,36 @@ fn encode_trivial_nfsv4_aces(mode: u64, is_dir: bool, order: Endian) -> Vec<u8> 
         m
     };
 
-    let aces: [(u16, u32); 3] = [
-        (0x1000, perm_mask((mode >> 6) & 7, true)),
-        (0x2040, perm_mask((mode >> 3) & 7, false)),
-        (0x4000, perm_mask(mode & 7, false)),
+    let owner = data_mask((mode >> 6) & 7);
+    let group = data_mask((mode >> 3) & 7);
+    let everyone = data_mask(mode & 7);
+    let read_metadata = ACE_READ_ACL | ACE_READ_ATTRIBUTES | ACE_READ_NAMED_ATTRS | ACE_SYNCHRONIZE;
+    let write_metadata =
+        ACE_WRITE_ACL | ACE_WRITE_OWNER | ACE_WRITE_ATTRIBUTES | ACE_WRITE_NAMED_ATTRS;
+    // OpenZFS zfs-2.3.0 acl_trivial_access_masks/zfs_acl_chmod: preserve
+    // POSIX class precedence even when the owner also matches the group.
+    // Sticky-directory ownership is checked separately from ACL grants.
+    let aces: [(u16, u16, u32); 6] = [
+        (0, 0x1000, owner & everyone & !group),
+        (1, 0x1000, (group | everyone) & !owner),
+        (1, 0x2040, everyone & !group),
+        (0, 0x1000, owner | read_metadata | write_metadata),
+        (0, 0x2040, group | read_metadata),
+        (0, 0x4000, everyone | read_metadata),
     ];
-    let mut out = Vec::with_capacity(24);
-    for (flags, access_mask) in aces {
+    let mut out = Vec::with_capacity(aces.len() * 8);
+    for (ace_type, flags, access_mask) in aces {
+        if access_mask == 0 {
+            continue;
+        }
         match order {
             Endian::Little => {
-                out.extend_from_slice(&0_u16.to_le_bytes());
+                out.extend_from_slice(&ace_type.to_le_bytes());
                 out.extend_from_slice(&flags.to_le_bytes());
                 out.extend_from_slice(&access_mask.to_le_bytes());
             }
             Endian::Big => {
-                out.extend_from_slice(&0_u16.to_be_bytes());
+                out.extend_from_slice(&ace_type.to_be_bytes());
                 out.extend_from_slice(&flags.to_be_bytes());
                 out.extend_from_slice(&access_mask.to_be_bytes());
             }

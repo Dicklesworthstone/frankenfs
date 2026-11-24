@@ -4,6 +4,16 @@
 //! mirror-split-flush / post-commit-cancel schedules, upfront `ENOSPC`, negative
 //! admission controls, and OpenZFS `zdb` leak/checksum oracle verification.
 
+#[path = "persistence_prefix/creation_project.rs"]
+mod creation_project;
+#[path = "persistence_prefix/growth.rs"]
+mod growth;
+#[path = "persistence_prefix/permissions.rs"]
+mod permissions;
+#[path = "persistence_prefix/projects.rs"]
+mod projects;
+#[path = "persistence_prefix/quota_profile.rs"]
+mod quota_profile;
 #[path = "persistence_prefix/writable_fs.rs"]
 mod writable_fs;
 #[path = "persistence_prefix/zvol.rs"]
@@ -95,6 +105,8 @@ struct PoolFixtureSpec {
     project_accounting: bool,
     sa_project_id: Option<u64>,
     malformed_project_id: bool,
+    directory_projects: BTreeMap<u64, u64>,
+    owner_quota_objects: Vec<(&'static [u8], u64)>,
     deadlist_mode: DeadlistMode,
     preallocate_nearly_full: bool,
     pool_state: u64,
@@ -105,6 +117,7 @@ struct PoolFixtureSpec {
     additional_read_features: Vec<(&'static [u8], u64)>,
     additional_write_features: Vec<(&'static [u8], u64)>,
     zpl_flags: BTreeMap<u64, u64>,
+    hello_size: Option<u64>,
     hello_mode: u16,
     root_ids: (u64, u64),
     hello_ownership: Option<ffs_ondisk::zfs_zpl::ReclamationOwnership>,
@@ -128,6 +141,8 @@ impl Default for PoolFixtureSpec {
             project_accounting: false,
             sa_project_id: None,
             malformed_project_id: false,
+            directory_projects: BTreeMap::new(),
+            owner_quota_objects: Vec::new(),
             deadlist_mode: DeadlistMode::None,
             preallocate_nearly_full: false,
             pool_state: 1,
@@ -138,6 +153,7 @@ impl Default for PoolFixtureSpec {
             additional_read_features: Vec::new(),
             additional_write_features: Vec::new(),
             zpl_flags: BTreeMap::new(),
+            hello_size: None,
             hello_mode: 0o644,
             root_ids: (0, 0),
             hello_ownership: None,
@@ -813,6 +829,34 @@ fn build_zpl_objectset(
     if spec.zpl_version == 5 {
         master_pairs.push((b"SA_ATTRS", 8));
     }
+    for &(key, object) in &spec.owner_quota_objects {
+        master_pairs.push((key, object));
+        if object == 0 {
+            continue;
+        }
+        // OpenZFS DMU_OT_USERGROUP_QUOTA is 40. Real limit ZAPs distinguish
+        // unsupported quota admission from a corrupt dangling master pointer.
+        let slot = usize::try_from(object).unwrap();
+        assert!(slot >= 11 && spec.auxiliary_ownership.is_none());
+        assert!(
+            ffs_ondisk::zfs_dmu::dnode_at(&table, slot, order)
+                .unwrap()
+                .is_none()
+        );
+        let quota_raw = mzap(&[(b"0", 1), (b"2a", 1), (b"3e8", 1)], 0x5151, order);
+        let quota_bp = arena.alloc_block(&quota_raw, 40, 0, birth, order);
+        let quota_dn = make_dnode(
+            40,
+            quota_bp.logical_bytes(),
+            vec![quota_bp],
+            0,
+            Vec::new(),
+            None,
+            0,
+            order,
+        );
+        write_dnode_at(&mut table, slot, &quota_dn).expect("write owner quota dn");
+    }
     let master_raw = mzap(&master_pairs, 0x55, order);
     let master_bp = arena.alloc_block(&master_raw, 21, 0, birth, order);
     let master_dn = make_dnode(
@@ -907,7 +951,7 @@ fn build_zpl_objectset(
         let hello_meta = Metadata {
             kind: Kind::Regular,
             mode: (Kind::Regular.to_tag() << 12) | u64::from(spec.hello_mode),
-            size: snap_hello_bytes.len() as u64,
+            size: spec.hello_size.unwrap_or(snap_hello_bytes.len() as u64),
             links: 1,
             parent: 2,
             uid: 1000,
@@ -1026,16 +1070,25 @@ fn build_zpl_objectset(
             parent: 2,
             uid: 0,
             gid: 0,
-            flags: 0x408 | spec.zpl_flags.get(&6).copied().unwrap_or(0),
+            flags: 0x408
+                | spec.zpl_flags.get(&6).copied().unwrap_or(0)
+                | if spec.directory_projects.contains_key(&6) {
+                    0x0000_8000_0000_0000
+                } else {
+                    0
+                },
             generation: birth,
             times: [ts; 4],
             inline_symlink: None,
         };
-        let (sbt, sbbytes, _) = encode_zpl_bonus_for_fixture(
+        let (sbt, sbbytes, sspill) = encode_zpl_bonus_for_fixture(
             &sub_meta,
             spec.zpl_version,
             sa_reg.as_ref(),
-            SaSpillFixture::None,
+            spec.directory_projects
+                .get(&6)
+                .copied()
+                .map_or(SaSpillFixture::None, SaSpillFixture::Project),
             arena,
             birth,
             order,
@@ -1046,7 +1099,7 @@ fn build_zpl_objectset(
             vec![sub_bp],
             sbt,
             sbbytes,
-            None,
+            sspill,
             acct_flags,
             order,
         );
@@ -1272,16 +1325,25 @@ fn build_zpl_objectset(
         parent: 2,
         uid: spec.root_ids.0,
         gid: spec.root_ids.1,
-        flags: 0x408 | spec.zpl_flags.get(&2).copied().unwrap_or(0),
+        flags: 0x408
+            | spec.zpl_flags.get(&2).copied().unwrap_or(0)
+            | if spec.directory_projects.contains_key(&2) {
+                0x0000_8000_0000_0000
+            } else {
+                0
+            },
         generation: birth,
         times: [ts; 4],
         inline_symlink: None,
     };
-    let (rbt, rbbytes, _) = encode_zpl_bonus_for_fixture(
+    let (rbt, rbbytes, rspill) = encode_zpl_bonus_for_fixture(
         &root_meta,
         spec.zpl_version,
         sa_reg.as_ref(),
-        SaSpillFixture::None,
+        spec.directory_projects
+            .get(&2)
+            .copied()
+            .map_or(SaSpillFixture::None, SaSpillFixture::Project),
         arena,
         birth,
         order,
@@ -1292,7 +1354,7 @@ fn build_zpl_objectset(
         vec![root_bp],
         rbt,
         rbbytes,
-        None,
+        rspill,
         acct_flags,
         order,
     );

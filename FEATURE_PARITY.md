@@ -3474,8 +3474,9 @@ the existing regular file's native link count atomically within one admitted,
 case-sensitive ZPL v4/v5 head dataset. Metadata updates preserve data pointers,
 generation, ownership and mtime while updating ctime and the native parent
 hint. Directory, symlink and cross-dataset links are outside this write surface.
-Native immutable/append-only flags and unsupported project inheritance are
-checked before backing writes. Cancellation after every required
+Native immutable/append-only flags and project-profile admission are checked
+before backing writes; the later project-inheritance increment below admits
+matching owners and rejects cross-project destinations. Cancellation after every required
 uberblock/member barrier preserves the committed token and live writer state;
 incomplete publication retains the uncertain outcome.
 
@@ -3552,8 +3553,8 @@ Existing-node quota changes now use the checked project ID belonging to the
 native owner when its ZFS_PROJID flag is set, rather than charging every mutation
 to project 0. This covers changed SA spill allocation, file range writes and
 resize, directory changes, hard links, moves and final reclamation. New children
-default to project 0 when project inheritance is absent; inherited project
-creation remains explicitly unsupported. Nonfinal unlink accounts for any
+default to project 0 when project inheritance is absent; the later bounded
+project-inheritance increment below adds inherited creation. Nonfinal unlink accounts for any
 changed spill allocation as well as preserving the surviving owner's metadata.
 
 Regressions exercise inline/data boundaries, maximum-length and non-UTF-8
@@ -3572,6 +3573,153 @@ runs exposed an existing ZFS statfs lifecycle assertion, three NTFS persistence
 failures, Clippy diagnostics, and an AArch64-only harness probe build failure;
 those runs therefore do not establish an all-green workspace. These fixtures
 also do not establish native OpenZFS interchange or a real mounted syscall result.
+
+## ZFS initialized file growth across allocated tails (2026-11-23)
+
+Write and truncate growth no longer treat physical allocation past logical EOF
+as initialized file content. A shared bounded range helper visits only allocated
+leaves, turns fully exposed zeroed blocks into holes and reads only partial
+boundary blocks. The existing sparse-range editor uses the same helper.
+Write gaps and truncate growth publish these changes through the existing COW,
+snapshot deadlist and owner-accounting path.
+
+Single-block record expansion copies only bytes below the old EOF. Partially
+overwritten records also retain only previously visible bytes before applying
+the new payload; stale compressed tails cannot enter the enlarged logical file.
+The native engine's existing zero-payload size-extension path uses the same
+initialization. The FsOps empty-write no-op behavior is unchanged.
+
+Four regression sources cover checksum-valid nonzero compressed allocation
+beyond EOF, v4/v5 metadata, single/mirrored storage, record-size transitions,
+zero-length files with existing allocation, a sparse gap over 32 TiB, snapshot
+contents, allocation/scrub checks and every recorded mirrored write/truncate
+publication cut with dropped/reordered volatile writes. These are storage-model
+regressions; they do not establish native OpenZFS or mounted qualification.
+
+The complete candidate passed workspace `cargo fmt --check` and
+`git diff --check`. The exact three growth source/test files also passed a
+targeted UBS static scan (exit 0, 0 critical, reviewed warnings); build/lint phases
+were explicitly not evaluated by that scan. Integration runtime and mandatory
+workspace compilation/strict Clippy remain limited by the recorded shared
+environment failures. No unexecuted persistence regression is counted as a pass.
+
+## ZFS project inheritance and owner-limit admission (2026-11-23)
+
+The native writer now supports inherited project ownership on regular-file and
+directory creation in an admitted ZPL v5 SA project tree. Both the project ID
+and inheritance flag propagate through newly created directories and files.
+Symlinks use project 0; a non-inheriting parent does not confer its own project
+ID. Fresh SA metadata includes a complete native core/ACL/project layout, uses
+OpenZFS zfs-2.3.0 zfs_mknode field order and registers missing attributes/layouts
+in the same TXG as namespace insertion and owner usage changes. Parent xattrs,
+external ACL ownership and unrelated attributes are not copied into the child.
+
+Hard links require destination/project agreement and preserve the target's
+flags. Rename preserves project ownership while acquiring the destination's
+inheritance flag. Both exchange destinations are checked; this deliberately
+refuses the reverse mismatch that the pinned native implementation's one-sided
+check permits. Existing identities, snapshots and usage owners remain stable.
+Cross-project insertions return EXDEV before backing writes.
+
+Admission requires the active native project_quota feature, all three complete
+accounting flags and embedded user/group/project accounting objects. Newly
+created regular files/directories with inheritable parent ACEs remain refused.
+The central native writer also refuses any nonzero master-node reference to
+userquota@, groupquota@, projectquota@, userobjquota@, groupobjquota@ or
+projectobjquota@. Maintaining used counters does not enforce limits; even an
+empty referenced limit table remains outside this bounded profile. Ordinary
+dataset reads remain available. Project reassignment, ACL inheritance and
+complete quota enforcement remain roadmap work.
+
+Two codec regressions cover split-parent metadata, fresh independent layout
+registration, absent-project preservation and raw native quota-reader offsets
+in both byte orders. Nine persistence regression sources cover nested creation,
+owner counters through write/truncate/unlink, matching and mismatched namespace
+operations, symlink ownership, stale references, fresh durable reopen, snapshots,
+six native owner-limit profiles and mirrored publication cuts with dropped or
+reordered writes. These authored tests do not establish native interchange,
+mounted qualification or completion of bd-jdned/bd-uetvl.
+
+The complete candidate passed workspace `cargo fmt --check` and
+`git diff --check`. UBS v5.5.26 scanned the exact seven project source/test
+files with exit 0, no critical findings and no failed modules; warnings were
+reviewed (test assertions/locks/clones and existing production code). This was
+static-only analysis. The ordinary candidate ZPL unit-test build and owning
+all-targets check both ended with rustc SIGKILL before a completed result.
+The ZFS integration-target check was also killed in asupersync before reaching
+the changed ZFS crate. The mandatory full workspace check, workspace strict
+Clippy and ZFS persistence runtime remain incomplete. Direct-to-main commits
+record the existing emergency gate exception; native OpenZFS/mounted
+qualification and the original broader Bead acceptance remain open.
+
+Subsequent focused validation compiled the complete unchanged ZPL module and
+its complete test module in an isolated harness using exact production
+Endian/Entry/error definitions, the real NvList source and the real ffs-types
+dependency. All 20 selected module tests passed (0 failed, 0 ignored, 5 unrelated
+NvList tests filtered). The identical test source against baseline production
+passed 17 and failed 3, reproducing incomplete split-parent child metadata,
+incorrect ACE counts and the mode 0001 owner-execute overgrant. This is module
+unit execution, not full-crate, ZFS transaction or native interchange evidence.
+The exact candidate also passed ordinary production-only
+`cargo check --offline --locked -p ffs-ondisk --lib` and
+`cargo clippy --offline --locked -p ffs-ondisk --lib -- -D warnings`.
+
+## ZFS chmod native execute shortcut (2026-11-23)
+
+Native POSIX mode updates no longer mark every object as having no execute
+denials. OpenZFS trusts ZFS_NO_EXECS_DENIED before checking the mode or ACL in
+its fast execute/search path. When chmod rebuilds a trivial ACL, the writer now
+clears this flag and sets it only if owner, group and other all have execute
+permission (`mode & 0111 == 0111`). This preserves the optimization for
+universally executable modes without bypassing restrictive modes. Existing
+mode-0777 symlink creation and set-ID-only ACL preservation remain unchanged.
+
+A persistence regression exercises regular files/directories, legacy/SA
+metadata, SA spill, restrictive modes and repeated grant/revoke transitions
+through fresh durable reopen. It checks mode and fast-execute flag agreement,
+unrelated flags, file contents and the original snapshot. Its runtime remains
+unexecuted because the ZFS build is blocked by the dependency SIGKILL recorded
+above; the isolated codec suite does not validate transaction execution.
+
+The exact chmod branch also ran in a focused Rust harness using real Metadata
+and unchanged probe assertions. Three probes pass on the candidate; the same
+probes yield 2 passes/1 failure on the baseline (mode 0000 incorrectly sets the
+shortcut). The probes check 512 modes against 5 prior flag states, unrelated-bit
+preservation, absent mode and preserved-ACL paths. This is branch-unit evidence,
+not transaction or native kernel execution.
+
+Workspace formatting passed after the shortcut fix. The exact three-file
+security scope passed UBS static analysis with exit 0 and no critical findings;
+reviewed production warning sites were already present in the baseline.
+
+## ZFS mode-preserving trivial ACL encoding (2026-11-23)
+
+Native trivial NFSv4 ACL generation now preserves POSIX owner, owning-group and
+other permission precedence, including owners who also belong to the owning
+group. Ordered owner/group deny entries and an earlier owner allow entry prevent
+asymmetric modes such as 0040 or 0604 from granting a later class's permissions.
+Directory DELETE_CHILD follows the write bit; sticky-directory ownership checks
+remain separate. This corrects generated ACL bytes, not the still-unimplemented
+general native ACL evaluation or inheritance surface.
+
+Both SA encoders now store the actual ACE count. Legacy znode rebuilding stores
+the corresponding byte length and count and copies the variable-length ACL into
+its bounded inline payload. Regression sources independently evaluate all 512
+permission modes, both byte orders, file/directory and sticky cases, all four
+owner/group membership combinations and compound permission requests. A second
+test checks fresh SA, rebuilt SA and legacy count/payload agreement.
+
+Validation used the pinned nightly compiler on the unchanged production helper
+and the identical exhaustive evaluator in a standalone Rust test harness. The
+baseline helper failed (0 passed, 1 failed: mode 0001 overgranted owner execute);
+the corrected helper passed (1 passed, 0 failed, 0 ignored). This is exact-helper
+unit evidence, not full-crate or native OpenZFS qualification. The two complete
+candidate files passed pinned rustfmt; targeted UBS static analysis returned
+exit 0 with no critical findings (reviewed warnings remain). Full owning-crate
+tests, workspace compilation and strict Clippy did not complete: shared storage
+exhaustion, resource-guard termination and repeated executor disconnections
+interrupted the builds. The commit records the repository's emergency gate
+exception; no unavailable check is reported as passed.
 
 ## NTFS logged EA mutation and large-stream truncation
 
