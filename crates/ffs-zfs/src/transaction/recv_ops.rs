@@ -2451,11 +2451,11 @@ impl ZfsTransactionEngine {
                                         .max(payload.len()),
                                     0,
                                 );
-                                staged_writes.push(StagedBlockWrite {
-                                    bucket: WriteBucket::ChildBlocks,
-                                    dva_offset: dva.offset,
-                                    bytes: padded,
-                                });
+                                staged_writes.push(StagedBlockWrite::from_dva(
+                                    WriteBucket::ChildBlocks,
+                                    dva,
+                                    padded,
+                                ));
                                 StagedLeafUpdate::Prebuilt(bp)
                             } else if rec.compressiontype != 0 && rec.compressiontype != 2 {
                                 let dva = alloc.allocate(payload.len())?;
@@ -2480,11 +2480,11 @@ impl ZfsTransactionEngine {
                                         .max(payload.len()),
                                     0,
                                 );
-                                staged_writes.push(StagedBlockWrite {
-                                    bucket: WriteBucket::ChildBlocks,
-                                    dva_offset: dva.offset,
-                                    bytes: padded,
-                                });
+                                staged_writes.push(StagedBlockWrite::from_dva(
+                                    WriteBucket::ChildBlocks,
+                                    dva,
+                                    padded,
+                                ));
                                 StagedLeafUpdate::Prebuilt(bp)
                             } else {
                                 StagedLeafUpdate::Plaintext(payload.clone())
@@ -2621,11 +2621,11 @@ impl ZfsTransactionEngine {
                                     .max(payload.len()),
                                 0,
                             );
-                            staged_writes.push(StagedBlockWrite {
-                                bucket: WriteBucket::ChildBlocks,
-                                dva_offset: dva.offset,
-                                bytes: padded,
-                            });
+                            staged_writes.push(StagedBlockWrite::from_dva(
+                                WriteBucket::ChildBlocks,
+                                dva,
+                                padded,
+                            ));
                             d.spill = Some(bp);
                         }
                     }
@@ -2722,11 +2722,11 @@ impl ZfsTransactionEngine {
                                 mac: rng.mac,
                             })
                             .map_err(|e| parse_err(&e))?;
-                            staged_writes.push(StagedBlockWrite {
-                                bucket: WriteBucket::DatasetMetadata,
-                                dva_offset: dva.offset,
-                                bytes: blk_bytes,
-                            });
+                            staged_writes.push(StagedBlockWrite::from_dva(
+                                WriteBucket::DatasetMetadata,
+                                dva,
+                                blk_bytes,
+                            ));
                             StagedLeafUpdate::Prebuilt(bp)
                         } else {
                             StagedLeafUpdate::Plaintext(blk_bytes)

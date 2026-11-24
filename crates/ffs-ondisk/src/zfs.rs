@@ -5,9 +5,13 @@
 //! Sources: OpenZFS spa.h, vdev_impl.h, uberblock_impl.h, zio_checksum.c.
 
 pub mod crypto;
+pub mod draid;
+pub mod features;
 pub mod gang;
+pub mod indirect;
 pub mod nvlist;
 pub mod raidz;
+pub mod scan;
 pub mod send_stream;
 
 use ffs_types::ParseError;
@@ -828,6 +832,10 @@ pub struct Uberblock {
     pub guid_sum: u64,
     pub timestamp: u64,
     pub root: BlockPointer,
+    /// OpenZFS `ub_checkpoint_txg` (offset 200): TXG of active pool checkpoint, or `0`.
+    pub checkpoint_txg: u64,
+    /// OpenZFS `ub_raidz_reflow_info` (offset 208): packed RAIDZ expansion reflow state/offset.
+    pub raidz_reflow_info: u64,
 }
 impl Uberblock {
     pub fn parse(raw: &[u8], vdev_offset: u64) -> Result<Self, ParseError> {
@@ -866,6 +874,8 @@ impl Uberblock {
             guid_sum: order.u64(raw, 24)?,
             timestamp: order.u64(raw, 32)?,
             root,
+            checkpoint_txg: order.u64(raw, 200)?,
+            raidz_reflow_info: order.u64(raw, 208)?,
         })
     }
 
@@ -919,6 +929,8 @@ impl Uberblock {
         raw[176..184].copy_from_slice(&self.order.encode(mmp_magic));
         raw[184..192].copy_from_slice(&self.order.encode(0));
         raw[192..200].copy_from_slice(&self.order.encode(mmp_config & !0xffff));
+        raw[200..208].copy_from_slice(&self.order.encode(self.checkpoint_txg));
+        raw[208..216].copy_from_slice(&self.order.encode(self.raidz_reflow_info));
         stamp_label_checksum(&mut raw, vdev_offset, self.order)?;
         let _ = Self::parse(&raw, vdev_offset)?;
         Ok(raw)
@@ -1414,6 +1426,8 @@ mod embedded_tests {
                         guid_sum: 0x1234_5678_9abc_def0,
                         timestamp: 1_731_000_000,
                         root: bp.clone(),
+                        checkpoint_txg: 70,
+                        raidz_reflow_info: (1_u64 << 55) | 16,
                     };
                     let vdev_offset = UBERBLOCK_RING_OFFSET + 3 * 4096;
                     let slot = ub
@@ -1428,6 +1442,8 @@ mod embedded_tests {
                     assert_eq!(parsed_ub.txg, 78);
                     assert_eq!(parsed_ub.guid_sum, ub.guid_sum);
                     assert_eq!(parsed_ub.root, bp);
+                    assert_eq!(parsed_ub.checkpoint_txg, 70);
+                    assert_eq!(parsed_ub.raidz_reflow_info, (1_u64 << 55) | 16);
                     let mmp = UberblockMmpInfo::parse(&slot, vdev_offset).unwrap();
                     assert!(!mmp.has_active_mmp());
 

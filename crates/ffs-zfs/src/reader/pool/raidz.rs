@@ -11,7 +11,10 @@ use super::super::{
     unsupported,
 };
 use super::Pool;
+use super::draid::draid_column_hypotheses;
+use super::vdev::ExpandedRaidzMeta;
 use ffs_ondisk::zfs::gang::{GangHeader, HEADER_BYTES};
+use ffs_ondisk::zfs::raidz::expand::ExpandedRaidzMap;
 use ffs_ondisk::zfs::raidz::parity::RaidzParityMap;
 use ffs_ondisk::zfs::raidz::{Raidz1Map, RaidzColumn};
 use std::collections::BTreeSet;
@@ -371,6 +374,219 @@ impl Pool {
             stripe.map.parity(),
             columns.failures.join("; ")
         )))
+    }
+
+    /// Verified read through an expanded RAIDZ (`org.openzfs:raidz_expansion`)
+    /// group using `bp.birth()` to resolve `logical_width` and `ub_raidz_reflow_info`
+    /// for pre-reflow / straddling / post-reflow / scratch placement.
+    pub(super) fn read_expanded_raidz_block_inner(
+        &self,
+        cx: &Cx,
+        config: &VdevConfig,
+        bp: &BlockPointer,
+        group: &RaidzGroup,
+        expanded: &ExpandedRaidzMeta,
+        raw_only: bool,
+    ) -> Result<BlockRead> {
+        checkpoint(cx)?;
+        let exp_cfg = expanded.to_ondisk(config.ashift, group.parity)?;
+        let logical_width = exp_cfg.logical_width_for_birth(bp.birth());
+        let psize = if bp.gang() {
+            HEADER_BYTES
+        } else {
+            bp.physical_bytes()
+        };
+        let dvas = if bp.gang() {
+            bp.gang_dvas(&super::gang::header_allocations(config, bp)?)
+        } else {
+            bp.data_dvas()
+        }
+        .map_err(|error| parse(&error))?;
+
+        let mut failures = Vec::new();
+        for (copy_index, dva) in dvas.iter().enumerate() {
+            checkpoint(cx)?;
+            if dva.vdev != config.id {
+                return Err(unsupported(
+                    "foreign-vdev DVA on expanded RAIDZ top-level vdev",
+                ));
+            }
+            let map = ExpandedRaidzMap::new(&exp_cfg, dva.offset, psize, logical_width)
+                .map_err(|error| parse(&error))?;
+            let mut row_bufs: Vec<Vec<Option<Vec<u8>>>> = Vec::with_capacity(map.rows().len());
+            let mut row_missing: Vec<Vec<usize>> = Vec::with_capacity(map.rows().len());
+            let mut over_budget = false;
+
+            for row in map.rows() {
+                let mut cols: Vec<Option<Vec<u8>>> = vec![None; row.cols.len()];
+                let mut missing = Vec::new();
+                for (c_idx, col) in row.cols.iter().enumerate().skip(row.parity) {
+                    if col.bytes == 0 {
+                        continue;
+                    }
+                    checkpoint(cx)?;
+                    let leaf_off = col.leaf_byte_offset().map_err(|e| parse(&e))?;
+                    let member = &group.members[col.child_id];
+                    match self.read_raidz_member(cx, member, leaf_off, col.bytes) {
+                        Ok(bytes) => cols[c_idx] = Some(bytes),
+                        Err(FfsError::Cancelled) => return Err(FfsError::Cancelled),
+                        Err(err) => {
+                            missing.push(c_idx);
+                            failures.push(format!("expanded child {}: {err}", col.child_id));
+                        }
+                    }
+                }
+                if missing.len() > row.parity {
+                    over_budget = true;
+                    break;
+                }
+                row_bufs.push(cols);
+                row_missing.push(missing);
+            }
+            if over_budget {
+                continue;
+            }
+
+            // Fast path when all data sectors read cleanly.
+            if row_missing.iter().all(Vec::is_empty) {
+                let empty: Vec<&[usize]> = vec![&[]; map.rows().len()];
+                let slices: Vec<Vec<Option<&[u8]>>> = row_bufs
+                    .iter()
+                    .map(|r| r.iter().map(Option::as_deref).collect())
+                    .collect();
+                if let Ok(physical) = map.assemble(&slices, &empty)
+                    && let Ok(bytes) = super::super::decode_or_verify(bp, physical, raw_only)
+                {
+                    return Ok(complete_expanded_read(
+                        group, dva, &map, copy_index, bytes, false, &empty,
+                    ));
+                }
+            }
+
+            // Read parity sectors for every row and test bounded per-row recovery.
+            for (r_idx, row) in map.rows().iter().enumerate() {
+                for (c_idx, col) in row.cols.iter().enumerate().take(row.parity) {
+                    checkpoint(cx)?;
+                    let leaf_off = col.leaf_byte_offset().map_err(|e| parse(&e))?;
+                    let member = &group.members[col.child_id];
+                    match self.read_raidz_member(cx, member, leaf_off, col.bytes) {
+                        Ok(bytes) => row_bufs[r_idx][c_idx] = Some(bytes),
+                        Err(FfsError::Cancelled) => return Err(FfsError::Cancelled),
+                        Err(err) => {
+                            row_missing[r_idx].push(c_idx);
+                            failures.push(format!("expanded parity {}: {err}", col.child_id));
+                        }
+                    }
+                }
+            }
+
+            // First try exact known-missing recovery across all rows.
+            let known_refs: Vec<&[usize]> = row_missing.iter().map(Vec::as_slice).collect();
+            let slices: Vec<Vec<Option<&[u8]>>> = row_bufs
+                .iter()
+                .map(|r| r.iter().map(Option::as_deref).collect())
+                .collect();
+            if row_missing.iter().all(|m| m.len() <= group.parity)
+                && let Ok(physical) = map.assemble(&slices, &known_refs)
+                && let Ok(bytes) = super::super::decode_or_verify(bp, physical, raw_only)
+            {
+                return Ok(complete_expanded_read(
+                    group,
+                    dva,
+                    &map,
+                    copy_index,
+                    bytes,
+                    true,
+                    &known_refs,
+                ));
+            }
+
+            // Single-row corruption hypothesis fallback (e.g., silent bitflip on 1..=parity columns).
+            let mut single_row_ok = None;
+            'outer: for r_idx in 0..map.rows().len() {
+                let row = &map.rows()[r_idx];
+                for hyp in draid_column_hypotheses(row.cols.len(), row.parity, &row_missing[r_idx])
+                {
+                    checkpoint(cx)?;
+                    let mut erased_refs = known_refs.clone();
+                    erased_refs[r_idx] = hyp.as_slice();
+                    if let Ok(physical) = map.assemble(&slices, &erased_refs)
+                        && let Ok(bytes) = super::super::decode_or_verify(bp, physical, raw_only)
+                    {
+                        let mut owned_erased: Vec<Vec<usize>> = row_missing.clone();
+                        owned_erased[r_idx] = hyp;
+                        single_row_ok = Some((bytes, owned_erased));
+                        break 'outer;
+                    }
+                }
+            }
+            if let Some((bytes, owned_erased)) = single_row_ok {
+                let refs: Vec<&[usize]> = owned_erased.iter().map(Vec::as_slice).collect();
+                return Ok(complete_expanded_read(
+                    group, dva, &map, copy_index, bytes, true, &refs,
+                ));
+            }
+            failures.push(format!("expanded DVA {copy_index}: verification failed"));
+        }
+        Err(corrupt(format!(
+            "all ZFS expanded RAIDZ block copies failed: {}",
+            failures.join("; ")
+        )))
+    }
+}
+
+fn complete_expanded_read(
+    group: &RaidzGroup,
+    dva: &Dva,
+    map: &ExpandedRaidzMap,
+    copy_index: usize,
+    bytes: Vec<u8>,
+    parity_read: bool,
+    erased_per_row: &[&[usize]],
+) -> BlockRead {
+    let mut columns = Vec::new();
+    let mut reconstructed_children = Vec::new();
+    let mut first_offset = DATA_OFFSET;
+    let mut report_member = 0_usize;
+    let mut found = false;
+    for (r_idx, row) in map.rows().iter().enumerate() {
+        for (c_idx, col) in row.cols.iter().enumerate() {
+            if col.bytes == 0 {
+                continue;
+            }
+            let member = &group.members[col.child_id];
+            let phys_off = col.leaf_byte_offset().unwrap_or(DATA_OFFSET + col.offset);
+            if !found && col.data_offset.is_some() {
+                first_offset = phys_off;
+                if member.supplied_index != super::missing_raidz::ABSENT_RAIDZ_INDEX {
+                    report_member = member.supplied_index;
+                }
+                found = true;
+            }
+            if erased_per_row[r_idx].contains(&c_idx) && col.data_offset.is_some() {
+                reconstructed_children.push(col.child_id);
+            }
+            columns.push(RaidzColumnInfo {
+                child_id: col.child_id,
+                member_guid: member.guid,
+                physical_offset: phys_off,
+                bytes: col.bytes,
+                parity: c_idx < row.parity,
+            });
+        }
+    }
+    BlockRead {
+        bytes,
+        physical_offset: first_offset,
+        copy_index,
+        member_index: report_member,
+        raidz: Some(RaidzReadInfo {
+            dva_offset: dva.offset,
+            allocated_bytes: map.allocated_bytes(),
+            columns,
+            parity_read,
+            reconstructed_children,
+        }),
     }
 }
 

@@ -223,6 +223,56 @@ def run_negative_controls(
             ),
             b"--allow-write",
         )
+        assert_refused_without_mutation(
+            probe,
+            lambda p: subprocess.run(
+                [
+                    str(binary),
+                    "pool-expand",
+                    str(p),
+                    "--new-member",
+                    str(p),
+                    "--offline-image",
+                    "--pool-guid",
+                    "1",
+                    "--label",
+                    "0",
+                    "--slot",
+                    "0",
+                ],
+                capture_output=True,
+                timeout=30,
+                check=False,
+                env={**os.environ, "LC_ALL": "C"},
+            ),
+            b"--allow-write",
+        )
+        assert_refused_without_mutation(
+            probe,
+            lambda p: subprocess.run(
+                [
+                    str(binary),
+                    "pool-remove",
+                    str(p),
+                    "--remove-vdev",
+                    "1",
+                    "--target-vdev",
+                    "0",
+                    "--offline-image",
+                    "--pool-guid",
+                    "1",
+                    "--label",
+                    "0",
+                    "--slot",
+                    "0",
+                ],
+                capture_output=True,
+                timeout=30,
+                check=False,
+                env={**os.environ, "LC_ALL": "C"},
+            ),
+            b"--allow-write",
+        )
         binary_checked = True
 
     return {

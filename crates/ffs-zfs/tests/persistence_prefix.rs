@@ -14,12 +14,16 @@ mod growth;
 mod mixed_order;
 #[path = "persistence_prefix/permissions.rs"]
 mod permissions;
+#[path = "persistence_prefix/pool_lifecycle.rs"]
+mod pool_lifecycle;
 #[path = "persistence_prefix/projects.rs"]
 mod projects;
 #[path = "persistence_prefix/quota_profile.rs"]
 mod quota_profile;
 #[path = "persistence_prefix/send_recv.rs"]
 mod send_recv;
+#[path = "persistence_prefix/topology_advanced.rs"]
+mod topology_advanced;
 #[path = "persistence_prefix/writable_fs.rs"]
 mod writable_fs;
 #[path = "persistence_prefix/zvol.rs"]
@@ -2576,6 +2580,8 @@ fn build_clean_zfs_pool(spec: &PoolFixtureSpec) -> BuiltPool {
         guid_sum,
         timestamp: 1_700_000_000,
         root: mos_root_bp,
+        checkpoint_txg: 0,
+        raidz_reflow_info: 0,
     };
     let l_offsets = label_offsets(spec.image_bytes).unwrap();
     let mut members = Vec::with_capacity(spec.mirror_width);

@@ -406,6 +406,8 @@ impl Fixture {
                     guid_sum: 1122,
                     timestamp: 1,
                     root: root_pointer,
+                    checkpoint_txg: 0,
+                    raidz_reflow_info: 0,
                 },
                 data: root,
                 physical_offset: DATA_OFFSET,

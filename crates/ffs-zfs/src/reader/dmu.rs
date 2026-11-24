@@ -596,7 +596,10 @@ impl Objects {
             return Err(corrupt("selected object set is not the MOS"));
         }
         let config = root.config;
-        let pool = pool.retain_striped_topology(cx, &config)?;
+        let reflow_info = root.uberblock.raidz_reflow_info;
+        let pool = pool
+            .retain_striped_topology(cx, &config)?
+            .retain_advanced_topology(cx, &config, reflow_info)?;
         checkpoint(cx)?;
         let mut view = Self {
             pool,
@@ -613,8 +616,58 @@ impl Objects {
         // Keep this view private until its complete native feature catalogs
         // admit reads. Every explicit/automatic leaf/group open joins here.
         view.admit_features(cx)?;
+        // When `com.delphix:device_removal` is active in the labels, eagerly
+        // load MOS indirect mapping tables so subsequent dataset/object reads
+        // resolve removed-vdev DVAs transparently.
+        if view
+            .config
+            .read_features
+            .iter()
+            .any(|f| f == "com.delphix:device_removal")
+            && let Ok(mos_cfg) = view.load_mos_config_nvlist(cx)
+        {
+            let indirect_maps = crate::reader::pool::indirect::IndirectVdevMap::load_from_mos(
+                cx, &mut view, &mos_cfg,
+            )?;
+            view.pool.set_indirect_maps(indirect_maps);
+        }
         checkpoint(cx)?;
         Ok(view)
+    }
+
+    /// Load and parse the MOS `"config"` packed nvlist object (if present).
+    pub fn load_mos_config_nvlist(&mut self, cx: &Cx) -> Result<ffs_ondisk::zfs::nvlist::NvList> {
+        checkpoint(cx)?;
+        let directory = self.zap_values(cx, 1)?;
+        let config_row = directory
+            .iter()
+            .find(|row| row.name == b"config")
+            .ok_or_else(|| corrupt("MOS directory missing config entry"))?;
+        let config_id = config_row.scalar().map_err(|e| parse(&e))?;
+        let obj = self.load(cx, config_id)?;
+        if obj.node.object_type() != 3 || obj.node.bonus_type() != 4 || obj.node.bonus().len() != 8
+        {
+            return Err(corrupt("MOS config is not a packed nvlist with size bonus"));
+        }
+        let length = obj
+            .node
+            .order()
+            .u64(obj.node.bonus(), 0)
+            .map_err(|e| parse(&e))?;
+        if !(1..=ffs_ondisk::zfs::LABEL_CONFIG_BYTES as u64).contains(&length) {
+            return Err(unsupported("MOS config nvlist length out of bounds"));
+        }
+        let mut bytes = Vec::with_capacity(length as usize);
+        let bsize = obj.node.data_bytes() as u64;
+        let blocks = length.div_ceil(bsize);
+        for bid in 0..blocks {
+            let blk = self
+                .data_block(cx, &obj, bid)?
+                .ok_or_else(|| corrupt("MOS config contains a hole"))?;
+            let need = (length - bytes.len() as u64).min(bsize) as usize;
+            bytes.extend_from_slice(&blk.bytes[..need]);
+        }
+        ffs_ondisk::zfs::nvlist::NvList::parse_exact(&bytes).map_err(|e| parse(&e))
     }
 
     /// Decode a dataset root `DMU_OT_OBJSET` block pointer from the MOS.

@@ -19,6 +19,8 @@ struct Admission {
     config: VdevConfig,
     supplied_guids: Vec<u64>,
     guid_sum: u64,
+    draid_group: Option<super::draid::DraidGroup>,
+    expanded_raidz: Option<super::vdev::ExpandedRaidzMeta>,
 }
 
 struct Candidate {
@@ -83,6 +85,8 @@ fn admit_single(labels: &[(usize, Label)], pool_guid: u64) -> Result<Admission> 
         supplied_guids: vec![selected.top_guid],
         guid_sum: pool_guid.wrapping_add(selected.top_guid),
         config: selected,
+        draid_group: None,
+        expanded_raidz: None,
     })
 }
 
@@ -117,10 +121,14 @@ fn admit_group(labels: &[Vec<(usize, Label)>], pool_guid: u64) -> Result<Admissi
         }
         supplied_guids.push(guid);
     }
+    let draid_group = selected.build_draid_group(&supplied_guids, &[])?;
+    let expanded_raidz = selected.expanded_raidz.clone();
     Ok(Admission {
         config: selected.mapped(&supplied_guids)?,
         supplied_guids,
         guid_sum,
+        draid_group,
+        expanded_raidz,
     })
 }
 
@@ -183,6 +191,8 @@ fn admit_stripe(labels: &[Vec<(usize, Label)>], pool_guid: u64) -> Result<Admiss
         config,
         supplied_guids,
         guid_sum,
+        draid_group: None,
+        expanded_raidz: None,
     })
 }
 
@@ -306,6 +316,8 @@ impl Pool {
                     config: topology.config.clone(),
                     supplied_guids: topology.supplied_guids.clone(),
                     guid_sum: topology.guid_sum,
+                    draid_group: None,
+                    expanded_raidz: None,
                 };
                 owner.top_levels = Some(topology);
                 admission
@@ -314,13 +326,33 @@ impl Pool {
                 admit_stripe(&labels, pool_guid)?
             }
         } else {
-            admit_group(&labels, pool_guid)?
+            let admission = admit_group(&labels, pool_guid)?;
+            if let Some(ref dg) = admission.draid_group {
+                owner.draid_group = Some(Arc::new(dg.clone()));
+            }
+            if let Some(ref exp) = admission.expanded_raidz {
+                owner.expanded_raidz = Some(Arc::new(exp.clone()));
+            }
+            admission
         };
         let candidates = self.import_candidates(cx, &labels, &admission)?;
         let mut last_error = corrupt("no valid active ZFS uberblock candidates in ring");
         for candidate in candidates {
             checkpoint(cx)?;
             let ub = candidate.uberblock;
+            if let Some(ref exp) = admission.expanded_raidz {
+                let mut updated = exp.clone();
+                if ub.raidz_reflow_info != 0
+                    && let Ok(info) = ffs_ondisk::zfs::raidz::expand::RaidzReflowInfo::decode(
+                        ub.raidz_reflow_info,
+                    )
+                {
+                    updated.reflow_offset_synced = info.offset;
+                    updated.reflow_offset_next = info.offset;
+                    updated.use_scratch = info.use_scratch();
+                }
+                owner.expanded_raidz = Some(Arc::new(updated));
+            }
             match owner.read_block(cx, &admission.config, &ub.root) {
                 Ok(block) => {
                     if block.bytes.len() < 1024

@@ -201,14 +201,17 @@ impl Objects {
             for feature in features {
                 checkpoint(cx)?;
                 let active = scalar(&feature)? != 0;
+                if active && feature.name == b"com.delphix:log_spacemap" {
+                    return Err(unsupported(
+                        "current allocation needs unflushed log-space-map accounting",
+                    ));
+                }
                 if active
-                    && matches!(
-                        feature.name.as_slice(),
-                        b"com.delphix:log_spacemap" | b"com.delphix:zpool_checkpoint"
-                    )
+                    && feature.name == b"com.delphix:zpool_checkpoint"
+                    && !directory.iter().any(|row| row.name == b"pool_checkpoint")
                 {
                     return Err(unsupported(
-                        "current allocation needs unflushed log-space-map or pool-checkpoint accounting",
+                        "current allocation needs pool-checkpoint accounting",
                     ));
                 }
                 v2 |= active && feature.name == b"com.delphix:spacemap_v2";
@@ -505,10 +508,23 @@ impl Objects {
                 "MOS allocation tree differs from the admitted topology",
             ));
         }
-        let mut tops = Vec::with_capacity(count);
+        let mut tops = Vec::with_capacity(children.len());
         for (index, child) in children.iter().enumerate() {
             checkpoint(cx)?;
-            admit_vdev_state(child)?;
+            let ty = child.text("type");
+            if matches!(ty, Some("hole" | "indirect"))
+                || child.unsigned("is_hole").unwrap_or(0) != 0
+            {
+                // Removed / indirect / hole top-level slots have no metaslabs.
+                continue;
+            }
+            let allow_adv = ty == Some("draid")
+                || child.fields.contains_key("raidz_expand_txgs")
+                || child.fields.contains_key("allocation_bias")
+                || child.unsigned("is_log").unwrap_or(0) != 0;
+            if !allow_adv {
+                admit_vdev_state(child)?;
+            }
             if child
                 .fields
                 .get("nonallocating")
@@ -518,17 +534,23 @@ impl Objects {
                     "nonallocating vdev state needs separate accounting",
                 ));
             }
-            let (guid, ashift, asize) = striped.map_or(
+            let (guid, ashift, asize) = if let Some(group) = striped {
+                let member = &group.members[index];
+                (member.guid, member.ashift, member.allocated_bytes)
+            } else if children.len() == 1 {
                 (
                     self.config.top_guid,
                     self.config.ashift,
                     self.config.allocated_bytes,
-                ),
-                |group| {
-                    let member = &group.members[index];
-                    (member.guid, member.ashift, member.allocated_bytes)
-                },
-            );
+                )
+            } else {
+                (
+                    integer(child, "guid")?,
+                    u8::try_from(integer(child, "ashift")?)
+                        .map_err(|_| corrupt("ashift overflow"))?,
+                    integer(child, "asize")?,
+                )
+            };
             if integer(child, "id")? != index as u64
                 || integer(child, "guid")? != guid
                 || integer(child, "ashift")? != u64::from(ashift)
@@ -538,18 +560,27 @@ impl Objects {
                     "MOS metaslab geometry differs from admitted label geometry",
                 ));
             }
-            if striped.is_some() || self.pool.leaves().len() == 1 {
-                physical_leaf(child)?;
+            if ty == Some("draid") {
+                let _ = crate::reader::pool::vdev::parse_draid_tree_config(child)?;
+            } else if striped.is_some()
+                || self.pool.leaves().len() == 1
+                || matches!(ty, Some("file" | "disk"))
+            {
+                if !allow_adv {
+                    physical_leaf(child)?;
+                }
             } else {
                 let Some(Value::Lists(leaves)) = child.fields.get("children") else {
                     return Err(corrupt("MOS redundant allocation tree has no leaves"));
                 };
-                if leaves.len() != self.pool.leaves().len() {
+                if leaves.len() != self.pool.leaves().len() && children.len() == 1 {
                     return Err(corrupt("MOS allocation tree has a different member count"));
                 }
                 let mut guids = BTreeSet::from([self.config.pool_guid, guid]);
                 for (id, leaf) in leaves.iter().enumerate() {
-                    physical_leaf(leaf)?;
+                    if !allow_adv {
+                        physical_leaf(leaf)?;
+                    }
                     let member = integer(leaf, "guid")?;
                     if integer(leaf, "id")? != id as u64 || member == 0 || !guids.insert(member) {
                         return Err(corrupt("MOS allocation leaf IDs or GUIDs are not unique"));
@@ -567,7 +598,7 @@ impl Objects {
                             "MOS RAIDZ allocation layout disagrees with selected mapping",
                         ));
                     }
-                } else {
+                } else if children.len() == 1 {
                     if child.text("type") != Some("mirror") {
                         return Err(corrupt("MOS allocation tree is not the selected mirror"));
                     }

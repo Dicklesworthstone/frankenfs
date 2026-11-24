@@ -7,9 +7,12 @@
 //! [`ZfsTransactionEngine`] with explicit [`ZfsWriteOptions`] (never `import_active`
 //! or force-import).
 
+mod checkpoint;
 mod dmu_cow;
 mod dsl_ops;
+mod lifecycle;
 mod recv_ops;
+mod scan;
 mod zpl_ops;
 mod zvol_ops;
 
@@ -20,8 +23,8 @@ use asupersync::Cx;
 use ffs_block::ByteDevice;
 use ffs_error::{FfsError, Result};
 use ffs_ondisk::zfs::{
-    BlockPointer, DATA_OFFSET, Endian, UBERBLOCK_RING_BYTES, UBERBLOCK_RING_OFFSET, Uberblock,
-    UberblockMmpInfo,
+    BlockPointer, DATA_OFFSET, Endian, LABEL_CONFIG_BYTES, LABEL_CONFIG_OFFSET,
+    UBERBLOCK_RING_BYTES, UBERBLOCK_RING_OFFSET, Uberblock, UberblockMmpInfo, stamp_label_checksum,
 };
 use ffs_ondisk::zfs_dmu::ObjectSet;
 use ffs_ondisk::zfs_zpl::Timestamp;
@@ -34,6 +37,7 @@ use crate::reader::dmu::allocation::AllocationLimits;
 use crate::reader::dmu::scrub::ScrubLimits;
 use crate::{Leaf, Pool};
 
+pub use self::checkpoint::{ZfsCheckpointInfo, ZfsRewindReport};
 use self::dmu_cow::{
     MosFeatureState, PoolSpaceAllocator, StagedBlockWrite, WriteBucket,
     finalize_mos_and_space_maps_to_convergence, zap_optional_u64, zap_required_u64,
@@ -44,9 +48,15 @@ pub use self::dsl_ops::{
     ZfsBookmarkInfo, ZfsEncryptionCreateOptions, ZfsHoldInfo, ZfsPropertySetValue,
     list_bookmarks_in_mos, list_holds_in_mos,
 };
+pub use self::lifecycle::{
+    ZfsCreateVdevKind, ZfsCreateVdevSpec, ZfsExpandRaidzReport, ZfsLifecycleReport,
+    ZfsPoolCreateReport, ZfsPoolCreateSpec, ZfsRemoveVdevReport, ZfsTrimReport, create_pool_files,
+    create_pool_on_devices, export_pool_leaves, import_pool_leaves,
+};
 pub use self::recv_ops::{
     ZfsRecvReport, ZfsRecvRequest, ZfsResumeState, inspect_receive_resume_state_in_mos,
 };
+pub use self::scan::{ZfsScanLimits, ZfsScanReport};
 pub use self::zpl_ops::{
     ZfsDataChecksum, ZfsFileRangeOperation, ZfsObjectIdentity, ZfsPosixSetAttr, ZfsSetAttr,
     ZfsUnlinkedObject, ZfsXattrSetMode,
@@ -109,7 +119,23 @@ pub struct ZfsWriteOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ZfsTopologyKind {
     SingleLeaf,
-    Mirror { width: usize },
+    Mirror {
+        width: usize,
+    },
+    Raidz {
+        parity: usize,
+        width: usize,
+    },
+    Draid {
+        parity: usize,
+        ndata: usize,
+        children: usize,
+        nspares: usize,
+        ngroups: usize,
+    },
+    MultiVdev {
+        top_levels: usize,
+    },
 }
 
 /// Storage, topology, and pool identity bound into every [`ZfsDurableToken`].
@@ -215,6 +241,11 @@ impl<T> ZfsTxOutcome<T> {
         matches!(self, Self::Committed { .. })
     }
 
+    #[must_use]
+    pub const fn is_not_committed(&self) -> bool {
+        matches!(self, Self::NotCommitted(_))
+    }
+
     pub fn into_result(self) -> Result<(T, ZfsDurableToken)> {
         match self {
             Self::Committed { value, token } => Ok((value, token)),
@@ -260,6 +291,44 @@ pub enum ZfsPersistenceStage {
         member_index: usize,
         wave: u8,
     },
+    LabelConfigWrite {
+        member_index: usize,
+        label: usize,
+    },
+    LabelConfigBarrier {
+        member_index: usize,
+        wave: u8,
+    },
+    ScanHealWrite {
+        member_index: usize,
+    },
+    ScanHealBarrier {
+        member_index: usize,
+    },
+    TrimDiscard {
+        member_index: usize,
+    },
+    ReflowChunkWrite {
+        member_index: usize,
+    },
+    ReflowChunkBarrier {
+        member_index: usize,
+    },
+    RemovalCopyWrite {
+        member_index: usize,
+    },
+    RemovalCopyBarrier {
+        member_index: usize,
+    },
+    CheckpointUberblockWrite {
+        member_index: usize,
+        label: usize,
+        slot: usize,
+    },
+    CheckpointUberblockBarrier {
+        member_index: usize,
+        wave: u8,
+    },
     BeforeAcknowledge,
     AckPublished,
 }
@@ -299,20 +368,14 @@ pub struct ZfsAdmissionReport {
     pub free_bytes: u64,
 }
 
-/// Admitted write-only feature GUIDs in `features_for_write` (`count > 0` allowed).
+/// Admitted write-only feature GUIDs in `features_for_write` (`count > 0` allowed),
+/// delegated to the single pinned OpenZFS 2.4.0 manifest in `ffs-ondisk`.
 fn is_admitted_active_write_feature(guid: &str) -> bool {
-    matches!(
-        guid,
-        "com.delphix:async_destroy"
-            | "com.delphix:empty_bpobj"
-            | "com.delphix:spacemap_histogram"
-            | "com.delphix:enabled_txg"
-            | "com.delphix:spacemap_v2"
-            | "com.delphix:bookmarks"
-            | "com.joyent:filesystem_limits"
-            | "org.zfsonlinux:userobj_accounting"
-            | "org.zfsonlinux:project_quota"
-    )
+    ffs_ondisk::zfs::features::is_admitted_active_write_feature(guid)
+}
+
+fn is_admitted_active_read_feature_for_write(guid: &str) -> bool {
+    ffs_ondisk::zfs::features::is_admitted_active_read_feature_for_write(guid)
 }
 
 /// Explicitly admitted synchronous ZFS TXG writer over a single leaf or complete N-way mirror.
@@ -366,9 +429,9 @@ impl ZfsTransactionEngine {
                 "ZFS writer requires a non-zero pool_guid and label in 0..4".into(),
             ));
         }
-        if paths.is_empty() || paths.len() > 8 {
+        if paths.is_empty() || paths.len() > 255 {
             return Err(unsupported(
-                "ZFS native writer requires 1 leaf or 2..=8 mirror member files",
+                "ZFS native writer requires 1..=255 member files",
             ));
         }
         let mut leaves = Vec::with_capacity(paths.len());
@@ -397,9 +460,9 @@ impl ZfsTransactionEngine {
                 "ZFS writer requires a non-zero pool_guid and label in 0..4".into(),
             ));
         }
-        if devices.is_empty() || devices.len() > 8 {
+        if devices.is_empty() || devices.len() > 255 {
             return Err(unsupported(
-                "ZFS native writer requires 1 leaf or 2..=8 mirror devices",
+                "ZFS native writer requires 1..=255 member devices",
             ));
         }
         let mut leaves = Vec::with_capacity(devices.len());
@@ -440,7 +503,7 @@ impl ZfsTransactionEngine {
                 "ZFS writer requires a non-zero pool_guid and label in 0..4".into(),
             ));
         }
-        let pool = Pool::from_leaves(leaves)?;
+        let pool = Pool::from_wide_leaves(leaves)?;
         if pool.has_missing_members() {
             return Err(unsupported(
                 "degraded ZFS pools with missing members are refused for writes",
@@ -449,7 +512,7 @@ impl ZfsTransactionEngine {
         let members = pool.leaves();
 
         // 1. Validate all 4 labels across all members: require `state == 1` (EXPORTED),
-        // `vdev_children == 1`, `multihost == 0`, and standalone leaf or mirror topology.
+        // `multihost == 0`, and admitted leaf/mirror/RAIDZ/dRAID/multi-vdev topology.
         let mut member_guids = Vec::with_capacity(members.len());
         let mut label_offsets_per_member = Vec::with_capacity(members.len());
         let first_l0 = members[0].label(cx, options.label)?;
@@ -461,7 +524,13 @@ impl ZfsTransactionEngine {
             ));
         }
 
-        let topology = if members.len() == 1 {
+        let vdev_children_count = first_l0.config.unsigned("vdev_children").unwrap_or(1);
+        let topology = if vdev_children_count > 1 {
+            ZfsTopologyKind::MultiVdev {
+                top_levels: usize::try_from(vdev_children_count)
+                    .map_err(|_| corrupt("vdev_children overflow"))?,
+            }
+        } else if members.len() == 1 {
             let tree = first_l0
                 .config
                 .list("vdev_tree")
@@ -479,13 +548,39 @@ impl ZfsTransactionEngine {
                 .config
                 .list("vdev_tree")
                 .ok_or_else(|| corrupt("missing vdev_tree"))?;
-            if tree.text("type") != Some("mirror") {
-                return Err(unsupported(
-                    "multi-device ZFS native writer only admits complete mirrors (RAIDZ/striped refused)",
-                ));
-            }
-            ZfsTopologyKind::Mirror {
-                width: members.len(),
+            match tree.text("type") {
+                Some("mirror") => ZfsTopologyKind::Mirror {
+                    width: members.len(),
+                },
+                Some("raidz") => {
+                    let parity = usize::try_from(
+                        tree.unsigned("nparity")
+                            .ok_or_else(|| corrupt("RAIDZ missing nparity"))?,
+                    )
+                    .map_err(|_| corrupt("RAIDZ nparity overflow"))?;
+                    if !(1..=3).contains(&parity) || members.len() <= parity {
+                        return Err(unsupported("unsupported RAIDZ parity or width"));
+                    }
+                    ZfsTopologyKind::Raidz {
+                        parity,
+                        width: members.len(),
+                    }
+                }
+                Some("draid") => {
+                    let cfg = crate::reader::pool::vdev::parse_draid_tree_config(tree)?;
+                    ZfsTopologyKind::Draid {
+                        parity: cfg.nparity,
+                        ndata: cfg.ndata,
+                        children: cfg.children,
+                        nspares: cfg.nspares,
+                        ngroups: cfg.ngroups,
+                    }
+                }
+                _ => {
+                    return Err(unsupported(
+                        "multi-device ZFS native writer requires complete mirror, RAIDZ, dRAID, or multi-vdev topology",
+                    ));
+                }
             }
         };
 
@@ -514,10 +609,8 @@ impl ZfsTransactionEngine {
                         "ZFS native writer requires an cleanly exported pool (state == 1); active pools are never force-imported",
                     ));
                 }
-                if lbl.config.unsigned("vdev_children") != Some(1) {
-                    return Err(unsupported(
-                        "striped multi-top-vdev pools are outside initial synchronous writer admission",
-                    ));
+                if lbl.config.unsigned("vdev_children") != Some(vdev_children_count) {
+                    return Err(corrupt("member labels disagree on vdev_children count"));
                 }
                 if lbl.config.unsigned("multihost").unwrap_or(0) != 0 {
                     return Err(unsupported(
@@ -540,7 +633,13 @@ impl ZfsTransactionEngine {
             label_offsets_per_member.push(l_offsets);
         }
 
-        let guid_sum = if members.len() == 1 {
+        let guid_sum = if vdev_children_count > 1 {
+            // For multi-top-vdev pools, read authoritative guid_sum from the selected uberblock
+            // and verify against PoolTopology once MOS config is loaded below.
+            let sel_lbl = members[0].label(cx, options.label)?;
+            let sel_ub = members[0].uberblock(cx, &sel_lbl, options.slot)?;
+            sel_ub.guid_sum
+        } else if members.len() == 1 {
             options.pool_guid.wrapping_add(top_guid)
         } else {
             member_guids
@@ -675,6 +774,11 @@ impl ZfsTransactionEngine {
                     .map_err(|_| corrupt("non-UTF8 read feature GUID"))?
                     .to_owned();
                 let count = entry.scalar().map_err(|e| parse_err(&e))?;
+                if count != 0 && !is_admitted_active_read_feature_for_write(&name) {
+                    return Err(unsupported(format!(
+                        "active ZFS read feature {name} (refcount={count}) is not admitted for native writes"
+                    )));
+                }
                 mos_features.read_features.insert(name, count);
             }
             let wf_id = zap_required_u64(&dir_entries, b"features_for_write")?;
@@ -746,12 +850,17 @@ impl ZfsTransactionEngine {
         }
 
         // 5. Load metaslab space maps and verify accounting before any recovery write.
-        let allocator = PoolSpaceAllocator::load(
+        let mut allocator = PoolSpaceAllocator::load(
             cx,
             &mut mos,
             &mos_features.write_features,
             &vcfg.read_features,
         )?;
+        allocator.checkpoint_txg = current_uberblock.checkpoint_txg;
+        if allocator.checkpoint_txg != 0 {
+            allocator.checkpoint_deferred_frees =
+                checkpoint::load_deferred_frees_from_mos(cx, &mut mos)?;
+        }
 
         // 6. Only a fully admitted writer may reconcile the selected ring copies.
         if options.reconcile_torn_uberblocks {
@@ -2382,6 +2491,25 @@ impl ZfsTransactionEngine {
             &mut Vec<StagedBlockWrite>,
         ) -> Result<(T, u64)>,
     ) -> ZfsTxOutcome<T> {
+        self.execute_staged_txg_with_mos(cx, op_name, None, &[], stage_fn)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn execute_staged_txg_with_mos<T>(
+        &mut self,
+        cx: &Cx,
+        op_name: &str,
+        pre_opened_mos: Option<Objects>,
+        pre_commit_writes: &[(usize, u64, Vec<u8>)],
+        stage_fn: impl FnOnce(
+            &mut Objects,
+            &mut BTreeMap<u64, Vec<u8>>,
+            &mut MosFeatureState,
+            &mut PoolSpaceAllocator,
+            u64,
+            &mut Vec<StagedBlockWrite>,
+        ) -> Result<(T, u64)>,
+    ) -> ZfsTxOutcome<T> {
         if self.poisoned_uncertain {
             return ZfsTxOutcome::NotCommitted(unsupported(
                 "ZFS writer handle experienced an Uncertain Uberblock outcome; reopen fresh engine to reconcile",
@@ -2396,9 +2524,12 @@ impl ZfsTransactionEngine {
         let target_slot = (new_txg as usize) % self.slots_per_label;
 
         // 1. Stage the entire COW DMU + space-map convergence in memory BEFORE any device write!
-        let mut mos = match self.open_read_objects(cx) {
-            Ok(m) => m,
-            Err(err) => return ZfsTxOutcome::NotCommitted(err),
+        let mut mos = match pre_opened_mos {
+            Some(m) => m,
+            None => match self.open_read_objects(cx) {
+                Ok(m) => m,
+                Err(err) => return ZfsTxOutcome::NotCommitted(err),
+            },
         };
         let mut draft_alloc = self.allocator.clone();
         let mut draft_features = self.mos_features.clone();
@@ -2416,6 +2547,27 @@ impl ZfsTransactionEngine {
             Ok(val) => val,
             Err(err) => return ZfsTxOutcome::NotCommitted(err),
         };
+
+        // Persist newly deferred pre-checkpoint frees into MOS `"vdev_checkpoint_sm"`
+        // so reopening after any foreground write/unlink still protects & reclaims them.
+        if draft_alloc.checkpoint_txg != 0
+            && draft_alloc.checkpoint_deferred_frees.len()
+                > self.allocator.checkpoint_deferred_frees.len()
+            && op_name != "zfs_checkpoint_create"
+            && op_name != "zfs_checkpoint_discard"
+            && !mos_dirty_dnodes.contains_key(&1)
+            && let Err(err) = checkpoint::persist_deferred_frees_into_mos(
+                cx,
+                &mut mos,
+                &mut mos_dirty_dnodes,
+                &mut draft_alloc,
+                self.order,
+                new_txg,
+                &mut base_staged,
+            )
+        {
+            return ZfsTxOutcome::NotCommitted(err);
+        }
 
         let (new_root_bp, mut converged_alloc, converged_features, staged_writes) =
             match finalize_mos_and_space_maps_to_convergence(
@@ -2446,8 +2598,26 @@ impl ZfsTransactionEngine {
             Err(e) => return ZfsTxOutcome::NotCommitted(parse_err(&e)),
         };
 
-        // 2. Persist strictly child-before-parent across all members BEFORE touching Uberblocks!
+        // 2. Persist any pre-commit topology reflow writes + strictly child-before-parent
+        //    blocks across all members BEFORE touching Uberblocks!
         let member_count = self.pool.leaves().len();
+        if !pre_commit_writes.is_empty() {
+            for (m_idx, phys_off, bytes) in pre_commit_writes {
+                if *m_idx >= member_count {
+                    return ZfsTxOutcome::NotCommitted(corrupt(
+                        "pre-commit write member index out of bounds",
+                    ));
+                }
+                if let Err(err) = self.pool.leaves()[*m_idx].write_raw(cx, *phys_off, bytes) {
+                    return ZfsTxOutcome::NotCommitted(err);
+                }
+            }
+            for m_idx in 0..member_count {
+                if let Err(err) = self.pool.leaves()[m_idx].sync_raw(cx) {
+                    return ZfsTxOutcome::NotCommitted(err);
+                }
+            }
+        }
         for bucket in [
             WriteBucket::ChildBlocks,
             WriteBucket::DatasetMetadata,
@@ -2462,35 +2632,10 @@ impl ZfsTransactionEngine {
                 continue;
             }
             for w in &bucket_writes {
-                let phys_off = DATA_OFFSET + w.dva_offset;
-                for m_idx in 0..member_count {
-                    let write_stage = match bucket {
-                        WriteBucket::ChildBlocks => ZfsPersistenceStage::ChildBlocksWrite {
-                            member_index: m_idx,
-                        },
-                        WriteBucket::DatasetMetadata => ZfsPersistenceStage::DatasetMetadataWrite {
-                            member_index: m_idx,
-                        },
-                        WriteBucket::MosSpaceMap => ZfsPersistenceStage::MosSpaceMapWrite {
-                            member_index: m_idx,
-                        },
-                        WriteBucket::MosRoot => ZfsPersistenceStage::MosRootWrite {
-                            member_index: m_idx,
-                        },
-                    };
-                    if let Err(err) = self.emit_event(
-                        op_name,
-                        write_stage,
-                        new_txg,
-                        m_idx,
-                        phys_off,
-                        w.bytes.len(),
-                    ) {
-                        return ZfsTxOutcome::NotCommitted(err);
-                    }
-                    if let Err(err) = self.pool.leaves()[m_idx].write_raw(cx, phys_off, &w.bytes) {
-                        return ZfsTxOutcome::NotCommitted(err);
-                    }
+                if let Err(err) =
+                    self.write_staged_block_to_topology(cx, op_name, new_txg, bucket, w)
+                {
+                    return ZfsTxOutcome::NotCommitted(err);
                 }
             }
             for m_idx in 0..member_count {
@@ -2528,6 +2673,8 @@ impl ZfsTransactionEngine {
             guid_sum: self.storage_identity.guid_sum,
             timestamp: next_ts,
             root: new_root_bp,
+            checkpoint_txg: self.current_uberblock.checkpoint_txg,
+            raidz_reflow_info: self.current_uberblock.raidz_reflow_info,
         };
         let sw_version =
             self.current_software_version
@@ -2682,5 +2829,192 @@ impl ZfsTransactionEngine {
             value: result_typed,
             token,
         }
+    }
+
+    /// Fan out a single staged logical/physical block write onto every target
+    /// physical member according to this pool's active topology (SingleLeaf,
+    /// Mirror, RAIDZ1/2/3, dRAID1/2/3, or MultiVdev).
+    fn write_staged_block_to_topology(
+        &mut self,
+        cx: &Cx,
+        op_name: &str,
+        new_txg: u64,
+        bucket: WriteBucket,
+        w: &StagedBlockWrite,
+    ) -> Result<()> {
+        let stage_for = |member_index: usize| match bucket {
+            WriteBucket::ChildBlocks => ZfsPersistenceStage::ChildBlocksWrite { member_index },
+            WriteBucket::DatasetMetadata => {
+                ZfsPersistenceStage::DatasetMetadataWrite { member_index }
+            }
+            WriteBucket::MosSpaceMap => ZfsPersistenceStage::MosSpaceMapWrite { member_index },
+            WriteBucket::MosRoot => ZfsPersistenceStage::MosRootWrite { member_index },
+        };
+        match &self.allocator.write_topology {
+            dmu_cow::AllocatorWriteTopology::LeafOrMirror => {
+                let phys_off = DATA_OFFSET + w.dva_offset;
+                if matches!(
+                    self.storage_identity.topology,
+                    ZfsTopologyKind::MultiVdev { .. }
+                ) {
+                    // Target the physical member(s) owning `w.vdev_id`.
+                    let targets: Vec<usize> = self
+                        .pool
+                        .pool_topology()
+                        .and_then(|t| t.top_vdev(w.vdev_id))
+                        .map_or_else(
+                            || vec![(w.vdev_id as usize).min(self.pool.leaves().len() - 1)],
+                            |top| top.supplied_indices.iter().flatten().copied().collect(),
+                        );
+                    for m_idx in targets {
+                        self.emit_event(
+                            op_name,
+                            stage_for(m_idx),
+                            new_txg,
+                            m_idx,
+                            phys_off,
+                            w.bytes.len(),
+                        )?;
+                        self.pool.leaves()[m_idx].write_raw(cx, phys_off, &w.bytes)?;
+                    }
+                } else {
+                    let member_count = self.pool.leaves().len();
+                    for m_idx in 0..member_count {
+                        self.emit_event(
+                            op_name,
+                            stage_for(m_idx),
+                            new_txg,
+                            m_idx,
+                            phys_off,
+                            w.bytes.len(),
+                        )?;
+                        self.pool.leaves()[m_idx].write_raw(cx, phys_off, &w.bytes)?;
+                    }
+                }
+            }
+            dmu_cow::AllocatorWriteTopology::Raidz { parity, width } => {
+                let ashift = self.allocator.ashift;
+                let (columns, payloads) = if *parity == 1 {
+                    let map = ffs_ondisk::zfs::raidz::Raidz1Map::new_wide(
+                        w.dva_offset,
+                        w.bytes.len(),
+                        ashift,
+                        *width,
+                    )
+                    .map_err(|e| parse_err(&e))?;
+                    let payloads = map.encode(&w.bytes).map_err(|e| parse_err(&e))?;
+                    (map.columns().to_vec(), payloads)
+                } else {
+                    let map = ffs_ondisk::zfs::raidz::parity::RaidzParityMap::new_wide(
+                        w.dva_offset,
+                        w.bytes.len(),
+                        ashift,
+                        *width,
+                        *parity,
+                    )
+                    .map_err(|e| parse_err(&e))?;
+                    let payloads = map.encode(&w.bytes).map_err(|e| parse_err(&e))?;
+                    (map.columns().to_vec(), payloads)
+                };
+                for (col, payload) in columns.iter().zip(&payloads) {
+                    if payload.is_empty() {
+                        continue;
+                    }
+                    let phys_off = DATA_OFFSET + col.offset;
+                    let m_idx = col.child_id;
+                    self.emit_event(
+                        op_name,
+                        stage_for(m_idx),
+                        new_txg,
+                        m_idx,
+                        phys_off,
+                        payload.len(),
+                    )?;
+                    self.pool.leaves()[m_idx].write_raw(cx, phys_off, payload)?;
+                }
+            }
+            dmu_cow::AllocatorWriteTopology::Draid(draid_cfg) => {
+                let map =
+                    ffs_ondisk::zfs::draid::DraidMap::new(draid_cfg, w.dva_offset, w.bytes.len())
+                        .map_err(|e| parse_err(&e))?;
+                let encoded_rows = map.encode_rows(&w.bytes).map_err(|e| parse_err(&e))?;
+                for (row, row_payloads) in map.rows().iter().zip(&encoded_rows) {
+                    for (col, payload) in row.columns.iter().zip(row_payloads) {
+                        if payload.is_empty() {
+                            continue;
+                        }
+                        let phys_off = DATA_OFFSET + col.offset;
+                        let m_idx = col.child_id;
+                        self.emit_event(
+                            op_name,
+                            stage_for(m_idx),
+                            new_txg,
+                            m_idx,
+                            phys_off,
+                            payload.len(),
+                        )?;
+                        self.pool.leaves()[m_idx].write_raw(cx, phys_off, payload)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Rewrite all 4 vdev label configuration blocks (`112 KiB` XDR nvlist +
+    /// offset-salted SHA-256 `zio_eck_t`) across all members in 2 synchronized
+    /// waves (`L0..L1 -> sync -> L2..L3 -> sync`).
+    pub(super) fn publish_labels_2wave(
+        &mut self,
+        cx: &Cx,
+        op_name: &str,
+        txg: u64,
+        encoded_nvlists_per_member: &[Vec<u8>],
+    ) -> Result<()> {
+        let member_count = self.pool.leaves().len();
+        if encoded_nvlists_per_member.len() != member_count {
+            return Err(corrupt("label payload count disagrees with member count"));
+        }
+        for (wave, labels) in [(1_u8, [0_usize, 1]), (2_u8, [2_usize, 3])] {
+            for (m_idx, packed) in encoded_nvlists_per_member.iter().enumerate() {
+                if packed.len() > LABEL_CONFIG_BYTES - 40 {
+                    return Err(corrupt("encoded label nvlist exceeds 112 KiB label area"));
+                }
+                for l_idx in labels {
+                    let cfg_off = self.label_offsets_per_member[m_idx][l_idx] + LABEL_CONFIG_OFFSET;
+                    let mut raw = vec![0_u8; LABEL_CONFIG_BYTES];
+                    raw[..packed.len()].copy_from_slice(packed);
+                    stamp_label_checksum(&mut raw, cfg_off, self.order)
+                        .map_err(|e| parse_err(&e))?;
+                    self.emit_event(
+                        op_name,
+                        ZfsPersistenceStage::LabelConfigWrite {
+                            member_index: m_idx,
+                            label: l_idx,
+                        },
+                        txg,
+                        m_idx,
+                        cfg_off,
+                        raw.len(),
+                    )?;
+                    self.pool.leaves()[m_idx].write_raw(cx, cfg_off, &raw)?;
+                }
+            }
+            for m_idx in 0..member_count {
+                self.emit_event(
+                    op_name,
+                    ZfsPersistenceStage::LabelConfigBarrier {
+                        member_index: m_idx,
+                        wave,
+                    },
+                    txg,
+                    m_idx,
+                    0,
+                    0,
+                )?;
+                self.pool.leaves()[m_idx].sync_raw(cx)?;
+            }
+        }
+        Ok(())
     }
 }

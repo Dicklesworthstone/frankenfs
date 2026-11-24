@@ -173,6 +173,50 @@ def run_negative_controls(
             ),
             b"Error",
         )
+        assert_refused_without_mutation(
+            probe,
+            lambda p: subprocess.run(
+                [
+                    str(binary),
+                    "pool-create",
+                    str(p),
+                    "--offline-image",
+                    "--pool-name",
+                    "denied",
+                    "--pool-guid",
+                    "1",
+                ],
+                capture_output=True,
+                timeout=30,
+                check=False,
+                env={**os.environ, "LC_ALL": "C"},
+            ),
+            b"--allow-write",
+        )
+        assert_refused_without_mutation(
+            probe,
+            lambda p: subprocess.run(
+                [
+                    str(binary),
+                    "pool-checkpoint",
+                    str(p),
+                    "--action",
+                    "create",
+                    "--offline-image",
+                    "--pool-guid",
+                    "1",
+                    "--label",
+                    "0",
+                    "--slot",
+                    "0",
+                ],
+                capture_output=True,
+                timeout=30,
+                check=False,
+                env={**os.environ, "LC_ALL": "C"},
+            ),
+            b"--allow-write",
+        )
         binary_checked = True
 
     return {
@@ -820,6 +864,106 @@ def main() -> None:
                     command("zpool", "export", pool)
                 if tx_active:
                     command("zpool", "export", tx_pool)
+        # OpenZFS 2.4 native pool-create, dRAID, indirect device-removal, allocation classes,
+        # and pool checkpoint cross-verification against zdb/zpool.
+        adv_dir = root / "openzfs-2-4-topology"
+        adv_dir.mkdir()
+        native_img = adv_dir / "ffs_created.img"
+        with native_img.open("xb") as stream:
+            stream.truncate(16 * 1024 * 1024)
+        created_pool_name = "ffs_mk_" + secrets.token_hex(4)
+        created_doc = json.loads(
+            command(
+                binary,
+                "pool-create",
+                native_img,
+                "--offline-image",
+                "--allow-write",
+                "--pool-name",
+                created_pool_name,
+                "--pool-guid",
+                "8844221100",
+                "--ashift",
+                "12",
+            )
+        )
+        require(
+            created_doc["report"]["pool_name"] == created_pool_name,
+            "ffs-zfs pool-create report mismatch",
+        )
+        command("zdb", "-lu", native_img)
+        created_bccm = command(
+            "zdb", "-e", "-p", adv_dir, "-bccm", created_pool_name
+        ).decode("utf-8", errors="replace")
+        require(
+            "No leaks (block sum matches space maps exactly)" in created_bccm,
+            "zdb -bccm rejected ffs-zfs pool-create native pool",
+        )
+
+        # Native OpenZFS 2.4 dRAID1 + checkpoint scratch pool verified offline by ffs-zfs!
+        draid_dir = adv_dir / "draid1"
+        draid_dir.mkdir()
+        draid_imgs = []
+        for idx in range(4):
+            img = draid_dir / f"d{idx}.img"
+            with img.open("xb") as stream:
+                stream.truncate(128 * 1024 * 1024)
+            draid_imgs.append(img)
+        draid_pool = "ffs_draid_" + secrets.token_hex(6)
+        draid_active = False
+        try:
+            command(
+                "zpool",
+                "create",
+                "-m",
+                "none",
+                "-o",
+                "cachefile=none",
+                "-o",
+                "ashift=12",
+                draid_pool,
+                "draid1:2d:4c:1s",
+                *draid_imgs,
+            )
+            draid_active = True
+            draid_guid = (
+                command("zpool", "get", "-H", "-o", "value", "guid", draid_pool)
+                .decode()
+                .strip()
+            )
+            command("zpool", "checkpoint", draid_pool)
+            command("zpool", "export", draid_pool)
+            draid_active = False
+            d_inv = json.loads(command(binary, "inspect", draid_imgs[0], "--offline-image"))
+            d_lbl = next(row for row in d_inv["labels"] if row["label"] == 0)
+            d_sel = max(d_lbl["candidates"], key=lambda row: (row["txg"], row["timestamp"]))
+            d_members = []
+            for extra in draid_imgs[1:]:
+                d_members.extend(["--draid-member", extra])
+            d_heads = json.loads(
+                command(
+                    binary,
+                    "datasets",
+                    draid_imgs[0],
+                    *d_members,
+                    "--offline-image",
+                    "--label",
+                    "0",
+                    "--slot",
+                    str(d_sel["slot"]),
+                    "--pool-guid",
+                    draid_guid,
+                )
+            )
+            require(
+                d_heads["pool_guid"] == draid_guid,
+                "ffs-zfs failed to inspect OpenZFS 2.4 dRAID1 + checkpoint pool",
+            )
+        finally:
+            if draid_active:
+                command("zpool", "export", draid_pool)
+
+        report["openzfs_2_4_topology_verified"] = True
         report["status"] = "passed"
     except Exception as error:
         report.update(status="failed", error=str(error))

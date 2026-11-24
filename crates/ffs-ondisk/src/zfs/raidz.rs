@@ -7,6 +7,7 @@
 //! RAIDZ2/3 P/Q/R reconstruction. No writes, topology discovery or checksum
 //! authority live here; the caller must verify the assembled original PSIZE.
 
+pub mod expand;
 pub mod parity;
 
 use super::{MAX_BLOCK_BYTES, invalid};
@@ -39,13 +40,27 @@ pub struct Raidz1Map {
 }
 
 impl Raidz1Map {
+    /// Ordinary RAIDZ1 map bounded to the original 8-child profile.
     pub fn new(
         dva_offset: u64,
         physical_bytes: usize,
         ashift: u8,
         width: usize,
     ) -> Result<Self, ParseError> {
-        if !(2..=8).contains(&width)
+        if !(2..=8).contains(&width) {
+            return Err(invalid("unsupported RAIDZ1 width, ashift or physical size"));
+        }
+        Self::new_wide(dva_offset, physical_bytes, ashift, width)
+    }
+
+    /// Wide RAIDZ1 map admitting widths up to OpenZFS's 255-child limit.
+    pub fn new_wide(
+        dva_offset: u64,
+        physical_bytes: usize,
+        ashift: u8,
+        width: usize,
+    ) -> Result<Self, ParseError> {
+        if !(2..=255).contains(&width)
             || !(9..=16).contains(&ashift)
             || physical_bytes == 0
             || physical_bytes > MAX_BLOCK_BYTES
@@ -136,6 +151,44 @@ impl Raidz1Map {
     #[must_use]
     pub fn columns(&self) -> &[RaidzColumn] {
         &self.columns
+    }
+
+    /// Encode `physical` bytes into per-column RAIDZ1 stripe payloads (P parity
+    /// followed by data columns and empty buffers for skip-only columns).
+    pub fn encode(&self, physical: &[u8]) -> Result<Vec<Vec<u8>>, ParseError> {
+        if physical.len() != self.physical_bytes {
+            return Err(invalid("RAIDZ1 encode physical length mismatch"));
+        }
+        let mut padded = Vec::new();
+        padded
+            .try_reserve_exact(self.aligned_bytes)
+            .map_err(|_| invalid("RAIDZ1 encode allocation failed"))?;
+        padded.extend_from_slice(physical);
+        padded.resize(self.aligned_bytes, 0);
+
+        let mut parity_buf = Vec::new();
+        parity_buf
+            .try_reserve_exact(self.columns[0].bytes)
+            .map_err(|_| invalid("RAIDZ1 encode parity allocation failed"))?;
+        parity_buf.resize(self.columns[0].bytes, 0);
+
+        let mut out = Vec::with_capacity(self.columns.len());
+        out.push(Vec::new());
+        for column in self.columns.iter().skip(1) {
+            if let Some(start) = column.data_offset {
+                let slice = padded
+                    .get(start..start + column.bytes)
+                    .ok_or_else(|| invalid("RAIDZ1 encode data offset out of bounds"))?;
+                for (p, &d) in parity_buf.iter_mut().zip(slice) {
+                    *p ^= d;
+                }
+                out.push(slice.to_vec());
+            } else {
+                out.push(vec![0; column.bytes]);
+            }
+        }
+        out[0] = parity_buf;
+        Ok(out)
     }
 
     /// Assemble original PSIZE, optionally treating one data column as erased.

@@ -3724,6 +3724,8 @@ mod bd_tqrnc {
             guid_sum,
             timestamp: 1_700_000_000,
             root: mos_root_bp,
+            checkpoint_txg: 0,
+            raidz_reflow_info: 0,
         };
         let l_offsets = label_offsets(image_bytes).unwrap();
         let mut members = Vec::with_capacity(mirror_width);

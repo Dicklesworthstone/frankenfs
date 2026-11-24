@@ -19,6 +19,8 @@ fn candidate(missing: Vec<u64>) -> CandidateArgs {
         members: Vec::new(),
         missing_mirror_members: Vec::new(),
         missing_raidz_members: missing,
+        draid_members: Vec::new(),
+        missing_draid_members: Vec::new(),
     }
 }
 

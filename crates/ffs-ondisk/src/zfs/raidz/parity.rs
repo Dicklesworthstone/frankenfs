@@ -20,6 +20,7 @@ pub struct RaidzParityMap {
 }
 
 impl RaidzParityMap {
+    /// Ordinary RAIDZ2/3 map bounded to the original 8-child profile.
     pub fn new(
         dva_offset: u64,
         physical_bytes: usize,
@@ -27,8 +28,24 @@ impl RaidzParityMap {
         width: usize,
         parity: usize,
     ) -> Result<Self, ParseError> {
+        if !(2..=3).contains(&parity) || !(parity + 1..=8).contains(&width) {
+            return Err(invalid(
+                "unsupported RAIDZ2/3 width, parity, ashift or physical size",
+            ));
+        }
+        Self::new_wide(dva_offset, physical_bytes, ashift, width, parity)
+    }
+
+    /// Wide RAIDZ2/3 map admitting widths up to OpenZFS's 255-child limit.
+    pub fn new_wide(
+        dva_offset: u64,
+        physical_bytes: usize,
+        ashift: u8,
+        width: usize,
+        parity: usize,
+    ) -> Result<Self, ParseError> {
         if !(2..=3).contains(&parity)
-            || !(parity + 1..=8).contains(&width)
+            || !(parity + 1..=255).contains(&width)
             || !(9..=16).contains(&ashift)
             || physical_bytes == 0
             || physical_bytes > MAX_BLOCK_BYTES
@@ -125,6 +142,47 @@ impl RaidzParityMap {
         &self.columns
     }
 
+    /// Encode `physical` bytes (length == `physical_bytes`) into per-column
+    /// stripe payloads (P/Q/R parity columns followed by data columns, with any
+    /// skip-only trailing columns returning empty `Vec`s).
+    pub fn encode(&self, physical: &[u8]) -> Result<Vec<Vec<u8>>, ParseError> {
+        if physical.len() != self.physical_bytes {
+            return Err(invalid("RAIDZ2/3 encode physical length mismatch"));
+        }
+        let mut padded = Vec::new();
+        padded
+            .try_reserve_exact(self.aligned_bytes)
+            .map_err(|_| invalid("RAIDZ2/3 encode allocation failed"))?;
+        padded.extend_from_slice(physical);
+        padded.resize(self.aligned_bytes, 0);
+
+        let mut data_cols = Vec::with_capacity(self.active_columns - self.parity);
+        for column in &self.columns[self.parity..self.active_columns] {
+            let start = column
+                .data_offset
+                .ok_or_else(|| invalid("missing RAIDZ2/3 data offset during encode"))?;
+            let end = start + column.bytes;
+            let slice = padded
+                .get(start..end)
+                .ok_or_else(|| invalid("RAIDZ2/3 data offset out of bounds"))?;
+            data_cols.push(slice);
+        }
+        let parity_bytes = self.columns[0].bytes;
+        let parity_cols = encode_pqr_parity(&data_cols, self.parity, parity_bytes)?;
+
+        let mut out = Vec::with_capacity(self.columns.len());
+        for p in parity_cols {
+            out.push(p);
+        }
+        for d in data_cols {
+            out.push(d.to_vec());
+        }
+        for column in &self.columns[self.active_columns..] {
+            out.push(vec![0; column.bytes]);
+        }
+        Ok(out)
+    }
+
     /// Assemble original PSIZE, excluding the named native column ordinals.
     /// Erasures may include corrupt-but-readable data or parity. Missing
     /// parity need not be listed, but every missing data column must be. The
@@ -138,7 +196,7 @@ impl RaidzParityMap {
         if columns.len() != self.columns.len() || erased.len() > self.parity {
             return Err(invalid("invalid RAIDZ2/3 reconstruction column set"));
         }
-        let mut excluded = [false; 8];
+        let mut excluded = vec![false; self.active_columns];
         for &index in erased {
             if index >= self.active_columns || excluded[index] {
                 return Err(invalid(
@@ -149,7 +207,9 @@ impl RaidzParityMap {
         }
         for (index, (column, bytes)) in self.columns.iter().zip(columns).enumerate() {
             if bytes.is_some_and(|bytes| bytes.len() != column.bytes)
-                || (column.data_offset.is_some() && bytes.is_none() && !excluded[index])
+                || (column.data_offset.is_some()
+                    && bytes.is_none()
+                    && !excluded.get(index).copied().unwrap_or(false))
             {
                 return Err(invalid("missing or incorrectly sized RAIDZ2/3 column"));
             }
@@ -157,7 +217,17 @@ impl RaidzParityMap {
         let missing: Vec<_> = (self.parity..self.active_columns)
             .filter(|&index| excluded[index])
             .collect();
-        let recovered = self.reconstruct(columns, excluded, &missing)?;
+        let col_bytes: Vec<usize> = self.columns[..self.active_columns]
+            .iter()
+            .map(|c| c.bytes)
+            .collect();
+        let recovered = reconstruct_pqr(
+            &columns[..self.active_columns],
+            self.active_columns,
+            self.parity,
+            &col_bytes,
+            erased,
+        )?;
         let mut physical = Vec::new();
         physical
             .try_reserve_exact(self.physical_bytes)
@@ -181,88 +251,11 @@ impl RaidzParityMap {
         }
         Ok(physical)
     }
-
-    fn reconstruct(
-        &self,
-        columns: &[Option<&[u8]>],
-        excluded: [bool; 8],
-        missing: &[usize],
-    ) -> Result<Vec<Vec<u8>>, ParseError> {
-        let count = missing.len();
-        if count == 0 {
-            return Ok(Vec::new());
-        }
-        let rows: Vec<_> = (0..self.parity)
-            .filter(|&index| !excluded[index] && columns[index].is_some())
-            .take(count)
-            .collect();
-        if rows.len() != count {
-            return Err(invalid(
-                "insufficient RAIDZ2/3 parity for required data erasures",
-            ));
-        }
-        let mut matrix = [[0; 3]; 3];
-        for (row, &parity_row) in rows.iter().enumerate() {
-            for (column, &data_column) in missing.iter().enumerate() {
-                matrix[row][column] = self.coefficient(parity_row, data_column);
-            }
-        }
-        let inverse = invert(matrix, count)?;
-        let mut recovered = Vec::with_capacity(count);
-        for (slot, &target_column) in missing.iter().enumerate() {
-            // Combine equations once. The byte loop then uses fixed 256-entry
-            // multiplication tables, not Gaussian elimination or GF division.
-            let mut weights = [0; 8];
-            for (row, &parity_row) in rows.iter().enumerate() {
-                let factor = inverse[slot][row];
-                weights[parity_row] ^= factor;
-                for column in self.parity..self.active_columns {
-                    if !excluded[column] {
-                        weights[column] ^= multiply(factor, self.coefficient(parity_row, column));
-                    }
-                }
-            }
-            let length = self.columns[target_column].bytes;
-            let mut data = Vec::new();
-            data.try_reserve_exact(length)
-                .map_err(|_| invalid("RAIDZ2/3 reconstruction allocation failed"))?;
-            data.resize(length, 0);
-            for (column, &weight) in weights[..self.active_columns].iter().enumerate() {
-                if weight == 0 {
-                    continue;
-                }
-                let source = columns[column]
-                    .ok_or_else(|| invalid("required RAIDZ2/3 reconstruction source is missing"))?;
-                if weight == 1 {
-                    for (target, byte) in data.iter_mut().zip(source) {
-                        *target ^= byte;
-                    }
-                } else {
-                    let mut table = [0; 256];
-                    for (input, value) in (0_u8..=255).zip(&mut table) {
-                        *value = multiply(weight, input);
-                    }
-                    for (target, &byte) in data.iter_mut().zip(source) {
-                        *target ^= table[usize::from(byte)];
-                    }
-                }
-            }
-            recovered.push(data);
-        }
-        Ok(recovered)
-    }
-
-    fn coefficient(&self, parity_row: usize, data_column: usize) -> u8 {
-        let exponent = parity_row * (self.active_columns - 1 - data_column);
-        let mut value = 1;
-        for _ in 0..exponent {
-            value = multiply(value, 2);
-        }
-        value
-    }
 }
 
-fn multiply(mut left: u8, mut right: u8) -> u8 {
+/// GF(2^8) multiplication modulo OpenZFS's primitive polynomial `0x11d`.
+#[must_use]
+pub fn gf_multiply(mut left: u8, mut right: u8) -> u8 {
     let mut value = 0;
     while right != 0 {
         if right & 1 != 0 {
@@ -272,6 +265,172 @@ fn multiply(mut left: u8, mut right: u8) -> u8 {
         right >>= 1;
     }
     value
+}
+
+/// Compute `2^exponent` in GF(2^8) (`0x11d`). Because `2` has multiplicative
+/// order `255` in GF(2^8), `exponent` is reduced modulo `255`.
+#[must_use]
+pub fn gf_pow2(exponent: usize) -> u8 {
+    let mut exp = exponent % 255;
+    let mut result = 1_u8;
+    let mut base = 2_u8;
+    while exp != 0 {
+        if exp & 1 != 0 {
+            result = gf_multiply(result, base);
+        }
+        base = gf_multiply(base, base);
+        exp >>= 1;
+    }
+    result
+}
+
+/// OpenZFS RAIDZ/dRAID Vandermonde parity coefficient for `parity_row`
+/// (`0 = P, 1 = Q, 2 = R`) and column `data_column` (`parity..active_columns`).
+#[must_use]
+pub fn pqr_coefficient(parity_row: usize, data_column: usize, active_columns: usize) -> u8 {
+    let exponent = parity_row * (active_columns - 1 - data_column);
+    gf_pow2(exponent)
+}
+
+/// Compute `parity` (`1..=3`) P/Q/R parity columns of length `parity_bytes`
+/// from `data_cols` (`1..=254` columns; shorter data columns are implicitly
+/// zero-padded up to `parity_bytes`).
+pub fn encode_pqr_parity(
+    data_cols: &[&[u8]],
+    parity: usize,
+    parity_bytes: usize,
+) -> Result<Vec<Vec<u8>>, ParseError> {
+    if !(1..=3).contains(&parity) || data_cols.is_empty() || data_cols.len() + parity > 255 {
+        return Err(invalid("invalid P/Q/R parity geometry"));
+    }
+    for col in data_cols {
+        if col.len() > parity_bytes {
+            return Err(invalid("data column exceeds parity column length"));
+        }
+    }
+    let active_columns = parity + data_cols.len();
+    let mut out = Vec::with_capacity(parity);
+    for parity_row in 0..parity {
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(parity_bytes)
+            .map_err(|_| invalid("P/Q/R parity allocation failed"))?;
+        buf.resize(parity_bytes, 0);
+        for (dc, data) in data_cols.iter().enumerate() {
+            let weight = pqr_coefficient(parity_row, parity + dc, active_columns);
+            if weight == 1 {
+                for (target, &byte) in buf.iter_mut().zip(*data) {
+                    *target ^= byte;
+                }
+            } else {
+                let mut table = [0_u8; 256];
+                for (input, value) in (0_u8..=255).zip(&mut table) {
+                    *value = gf_multiply(weight, input);
+                }
+                for (target, &byte) in buf.iter_mut().zip(*data) {
+                    *target ^= table[usize::from(byte)];
+                }
+            }
+        }
+        out.push(buf);
+    }
+    Ok(out)
+}
+
+/// Reconstruct all erased data columns (`parity..active_columns`) for a P/Q/R
+/// stripe (`parity` in `1..=3`, `active_columns` in `parity + 1..=255`).
+///
+/// Returns reconstructed data columns in ascending order of erased data column
+/// indices (`(parity..active_columns).filter(|i| erased.contains(i))`).
+pub fn reconstruct_pqr(
+    columns: &[Option<&[u8]>],
+    active_columns: usize,
+    parity: usize,
+    col_bytes: &[usize],
+    erased: &[usize],
+) -> Result<Vec<Vec<u8>>, ParseError> {
+    if !(1..=3).contains(&parity)
+        || !(parity + 1..=255).contains(&active_columns)
+        || columns.len() < active_columns
+        || col_bytes.len() < active_columns
+        || erased.len() > parity
+    {
+        return Err(invalid("invalid P/Q/R reconstruction parameters"));
+    }
+    let mut excluded = vec![false; active_columns];
+    for &index in erased {
+        if index >= active_columns || excluded[index] {
+            return Err(invalid("duplicate or out-of-range P/Q/R erasure"));
+        }
+        excluded[index] = true;
+    }
+    let missing: Vec<_> = (parity..active_columns)
+        .filter(|&index| excluded[index])
+        .collect();
+    let count = missing.len();
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let rows: Vec<_> = (0..parity)
+        .filter(|&index| !excluded[index] && columns[index].is_some())
+        .take(count)
+        .collect();
+    if rows.len() != count {
+        return Err(invalid(
+            "insufficient P/Q/R parity for required data erasures",
+        ));
+    }
+    let mut matrix = [[0_u8; 3]; 3];
+    for (row, &parity_row) in rows.iter().enumerate() {
+        for (column, &data_column) in missing.iter().enumerate() {
+            matrix[row][column] = pqr_coefficient(parity_row, data_column, active_columns);
+        }
+    }
+    let inverse = invert(matrix, count)?;
+    let mut recovered = Vec::with_capacity(count);
+    for (slot, &target_column) in missing.iter().enumerate() {
+        let mut weights = vec![0_u8; active_columns];
+        for (row, &parity_row) in rows.iter().enumerate() {
+            let factor = inverse[slot][row];
+            weights[parity_row] ^= factor;
+            for column in parity..active_columns {
+                if !excluded[column] {
+                    weights[column] ^=
+                        gf_multiply(factor, pqr_coefficient(parity_row, column, active_columns));
+                }
+            }
+        }
+        let length = col_bytes[target_column];
+        let mut data = Vec::new();
+        data.try_reserve_exact(length)
+            .map_err(|_| invalid("P/Q/R reconstruction allocation failed"))?;
+        data.resize(length, 0);
+        for (column, &weight) in weights.iter().enumerate() {
+            if weight == 0 {
+                continue;
+            }
+            let source = columns[column]
+                .ok_or_else(|| invalid("required P/Q/R reconstruction source is missing"))?;
+            if weight == 1 {
+                for (target, &byte) in data.iter_mut().zip(source) {
+                    *target ^= byte;
+                }
+            } else {
+                let mut table = [0_u8; 256];
+                for (input, value) in (0_u8..=255).zip(&mut table) {
+                    *value = gf_multiply(weight, input);
+                }
+                for (target, &byte) in data.iter_mut().zip(source) {
+                    *target ^= table[usize::from(byte)];
+                }
+            }
+        }
+        recovered.push(data);
+    }
+    Ok(recovered)
+}
+
+fn multiply(left: u8, right: u8) -> u8 {
+    gf_multiply(left, right)
 }
 
 fn reciprocal(value: u8) -> u8 {

@@ -3,9 +3,11 @@
 //! device writes, live pool ownership or host path following.
 
 pub mod dmu;
-mod pool;
+pub(crate) mod pool;
 
 pub use pool::Pool;
+pub use pool::indirect::IndirectVdevMap;
+pub use pool::vdev::{AllocClass, PoolTopology, TopVdevDescriptor, TopVdevKind, VdevHealth};
 
 use asupersync::Cx;
 use dmu::supported_label_feature as supported_read_feature;
@@ -75,6 +77,7 @@ impl ByteDevice for ReadOnlyImage {
 struct WritableImage {
     file: File,
     length: u64,
+    discard_device: Option<ffs_block::FileByteDevice>,
 }
 impl ByteDevice for WritableImage {
     fn len_bytes(&self) -> u64 {
@@ -94,6 +97,22 @@ impl ByteDevice for WritableImage {
         checkpoint(cx)?;
         self.file.sync_all()?;
         checkpoint(cx)
+    }
+    fn supports_discard(&self) -> bool {
+        self.discard_device
+            .as_ref()
+            .is_some_and(ByteDevice::supports_discard)
+    }
+    fn discard(&self, cx: &Cx, offset: ByteOffset, len: u64) -> Result<()> {
+        checkpoint(cx)?;
+        self.discard_device.as_ref().map_or_else(
+            || {
+                Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                    libc::EOPNOTSUPP,
+                )))
+            },
+            |dev| dev.discard(cx, offset, len),
+        )
     }
 }
 
@@ -164,21 +183,20 @@ impl VdevConfig {
 }
 
 fn admit_vdev_state(tree: &NvList) -> Result<()> {
-    for name in [
-        "is_log",
-        "is_spare",
+    admit_vdev_state_with_mode(tree, false)
+}
+
+fn admit_vdev_state_with_mode(tree: &NvList, allow_advanced: bool) -> Result<()> {
+    let strictly_refused = [
         "not_present",
         "offline",
         "faulted",
         "removed",
         "removing",
         "degraded",
-        "is_hole",
-        "resilver_txg",
-        "rebuild_txg",
-        "resilver_defer",
         "unspare",
-    ] {
+    ];
+    for name in strictly_refused {
         if let Some(value) = tree.fields.get(name)
             && !matches!(value, Value::Unsigned(0))
         {
@@ -187,20 +205,47 @@ fn admit_vdev_state(tree: &NvList) -> Result<()> {
             )));
         }
     }
-    if [
-        "allocation_bias",
-        "indirect_object",
-        "indirect_births",
-        "prev_indirect_vdev",
-        "raidz_expanding",
-        "raidz_expand_txgs",
-    ]
-    .iter()
-    .any(|name| tree.fields.contains_key(*name))
-    {
-        return Err(unsupported(
-            "special allocation, indirect and expanded RAIDZ mappings are not admitted",
-        ));
+    if !allow_advanced {
+        for name in [
+            "is_log",
+            "is_spare",
+            "is_hole",
+            "resilver_txg",
+            "rebuild_txg",
+            "resilver_defer",
+        ] {
+            if let Some(value) = tree.fields.get(name)
+                && !matches!(value, Value::Unsigned(0))
+            {
+                return Err(unsupported(format!(
+                    "ZFS vdev state {name} is not admitted"
+                )));
+            }
+        }
+        if [
+            "allocation_bias",
+            "indirect_object",
+            "indirect_births",
+            "prev_indirect_vdev",
+            "raidz_expanding",
+            "raidz_expand_txgs",
+        ]
+        .iter()
+        .any(|name| tree.fields.contains_key(*name))
+        {
+            return Err(unsupported(
+                "special allocation, indirect and expanded RAIDZ mappings are not admitted",
+            ));
+        }
+    } else if let Some(bias) = tree.fields.get("allocation_bias") {
+        match bias {
+            Value::String(s) if matches!(s.as_str(), "special" | "dedup") => {}
+            _ => {
+                return Err(unsupported(
+                    "unsupported ZFS allocation_bias value in vdev_tree",
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -266,7 +311,29 @@ impl Label {
         let tree = config
             .list("vdev_tree")
             .ok_or_else(|| corrupt("missing vdev tree"))?;
-        admit_vdev_state(tree)?;
+        let has_multi_vdev_class = allow_striped_top_vdevs
+            && vdev_children > 1
+            && (tree.fields.contains_key("allocation_bias")
+                || tree.unsigned("is_log").unwrap_or(0) != 0);
+        let allow_advanced = has_multi_vdev_class
+            || read_features.iter().any(|f| {
+                matches!(
+                    f.as_str(),
+                    "org.openzfs:draid"
+                        | "org.openzfs:raidz_expansion"
+                        | "com.delphix:device_removal"
+                        | "com.klarasystems:vdev_zaps_v2"
+                )
+            });
+        admit_vdev_state_with_mode(tree, allow_advanced)?;
+        if vdev_children == 1
+            && (tree.fields.contains_key("allocation_bias")
+                || tree.unsigned("is_log").unwrap_or(0) != 0)
+        {
+            return Err(unsupported(
+                "special, dedup, or log vdev cannot be the sole top-level vdev in a pool",
+            ));
+        }
         let top_guid = integer(config, "top_guid")?;
         if top_guid == 0 || top_guid == pool_guid || integer(tree, "guid")? != top_guid {
             return Err(corrupt("top-level vdev GUIDs disagree"));
@@ -411,7 +478,7 @@ impl RootBlock {
 }
 
 impl Leaf {
-    pub(crate) fn open_writable(
+    pub fn open_writable(
         cx: &Cx,
         path: &Path,
         base: u64,
@@ -433,13 +500,35 @@ impl Leaf {
             .map_err(|error| FfsError::Io(std::io::Error::other(error)))?;
         let size = metadata.len();
         let dev_ino = Some((metadata.dev(), metadata.ino()));
+        let discard_device = ffs_block::FileByteDevice::open(path).ok();
         let leaf = Self::from_device(
             cx,
-            Box::new(WritableImage { file, length: size }),
+            Box::new(WritableImage {
+                file,
+                length: size,
+                discard_device,
+            }),
             base,
             length.unwrap_or_else(|| size.saturating_sub(base)),
         )?;
         Ok((leaf, dev_ino))
+    }
+    #[must_use]
+    pub(crate) const fn length_bytes(&self) -> u64 {
+        self.length
+    }
+    #[must_use]
+    pub(crate) fn supports_discard_raw(&self) -> bool {
+        self.device.supports_discard()
+    }
+    pub(crate) fn discard_raw(&self, cx: &Cx, offset: u64, len: u64) -> Result<()> {
+        checkpoint(cx)?;
+        if offset.checked_add(len).is_none_or(|end| end > self.length) {
+            return Err(corrupt("ZFS discard exceeds selected leaf"));
+        }
+        self.device
+            .discard(cx, ByteOffset(self.base + offset), len)?;
+        checkpoint(cx)
     }
     pub(crate) fn read_raw(&self, cx: &Cx, offset: u64, size: usize) -> Result<Vec<u8>> {
         self.read(cx, offset, size)

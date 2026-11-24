@@ -71,8 +71,58 @@ pub(super) enum WriteBucket {
 #[derive(Debug, Clone)]
 pub(super) struct StagedBlockWrite {
     pub bucket: WriteBucket,
+    pub vdev_id: u32,
     pub dva_offset: u64,
+    pub allocated_bytes: u64,
     pub bytes: Vec<u8>,
+}
+
+impl StagedBlockWrite {
+    #[must_use]
+    pub(super) fn from_dva(bucket: WriteBucket, dva: Dva, bytes: Vec<u8>) -> Self {
+        Self {
+            bucket,
+            vdev_id: dva.vdev,
+            dva_offset: dva.offset,
+            allocated_bytes: dva.allocated_bytes,
+            bytes,
+        }
+    }
+}
+
+/// Physical allocation geometry for a writable top-level vdev.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum AllocatorWriteTopology {
+    LeafOrMirror,
+    Raidz { parity: usize, width: usize },
+    Draid(ffs_ondisk::zfs::draid::DraidConfig),
+}
+
+impl AllocatorWriteTopology {
+    /// Return `(allocated_bytes, byte_alignment)` for a block of `physical_bytes`.
+    pub(super) fn asize_and_align(&self, physical_bytes: usize, ashift: u8) -> Result<(u64, u64)> {
+        let sector = 1_u64 << ashift;
+        match self {
+            Self::LeafOrMirror => {
+                let asize = (physical_bytes as u64).div_ceil(sector) * sector;
+                Ok((asize, sector))
+            }
+            Self::Raidz { parity, width } => {
+                let data_sectors = (physical_bytes as u64).div_ceil(sector);
+                let ndata = (*width - *parity) as u64;
+                let rows = data_sectors.div_ceil(ndata);
+                let occupied = data_sectors + (*parity as u64) * rows;
+                let alloc_sectors = occupied.next_multiple_of((*parity + 1) as u64);
+                Ok((alloc_sectors * sector, sector))
+            }
+            Self::Draid(cfg) => {
+                let aligned = (physical_bytes as u64).next_multiple_of(sector);
+                let asize = cfg.psize_to_asize(aligned).map_err(|e| parse_err(&e))?;
+                let align = (cfg.groupwidth() as u64) << cfg.ashift;
+                Ok((asize, align))
+            }
+        }
+    }
 }
 
 /// Exact OpenZFS `dmu_ot[type].ot_metadata` classification (`libzpool.so.7`).
@@ -211,13 +261,17 @@ impl MetaslabState {
 
 #[derive(Clone)]
 pub(super) struct PoolSpaceAllocator {
+    pub vdev_id: u32,
     pub ashift: u8,
     pub metaslab_shift: u8,
     pub metaslab_array_obj: u64,
+    pub write_topology: AllocatorWriteTopology,
     pub spacemap_v2_present: bool,
     pub spacemap_v2_active: bool,
     pub spacemap_histogram_present: bool,
     pub hole_birth_active: bool,
+    pub checkpoint_txg: u64,
+    pub checkpoint_deferred_frees: Vec<(u32, Range<u64>)>,
     pub metaslabs: Vec<MetaslabState>,
 }
 
@@ -254,17 +308,43 @@ impl PoolSpaceAllocator {
         let Some(Value::Lists(children)) = root_tree.fields.get("children") else {
             return Err(corrupt("MOS config vdev_tree has no children"));
         };
-        if children.len() != 1 {
-            return Err(unsupported(
-                "native ZFS writer requires a single top-level vdev",
-            ));
-        }
-        let top = &children[0];
+        // Pick the first allocating concrete top-level vdev (skipping hole/indirect/log).
+        let (vdev_id, top) = children
+            .iter()
+            .enumerate()
+            .find(|(_, c)| {
+                !matches!(c.text("type"), Some("hole" | "indirect"))
+                    && c.unsigned("is_hole").unwrap_or(0) == 0
+                    && c.unsigned("is_log").unwrap_or(0) == 0
+                    && c.unsigned("nonallocating").unwrap_or(0) == 0
+            })
+            .ok_or_else(|| unsupported("pool has no allocating top-level data vdev"))?;
+        let vdev_id = u32::try_from(vdev_id).map_err(|_| corrupt("vdev ID overflow"))?;
         let ashift = u8::try_from(
             top.unsigned("ashift")
                 .ok_or_else(|| corrupt("missing vdev ashift"))?,
         )
         .map_err(|_| corrupt("vdev ashift overflow"))?;
+        let write_topology = match top.text("type") {
+            Some("raidz") => {
+                let parity = usize::try_from(
+                    top.unsigned("nparity")
+                        .ok_or_else(|| corrupt("RAIDZ missing nparity"))?,
+                )
+                .map_err(|_| corrupt("RAIDZ nparity overflow"))?;
+                let Some(Value::Lists(kids)) = top.fields.get("children") else {
+                    return Err(corrupt("RAIDZ missing children"));
+                };
+                AllocatorWriteTopology::Raidz {
+                    parity,
+                    width: kids.len(),
+                }
+            }
+            Some("draid") => AllocatorWriteTopology::Draid(
+                crate::reader::pool::vdev::parse_draid_tree_config(top)?,
+            ),
+            _ => AllocatorWriteTopology::LeafOrMirror,
+        };
         let metaslab_shift = u8::try_from(
             top.unsigned("metaslab_shift")
                 .ok_or_else(|| corrupt("missing metaslab_shift"))?,
@@ -392,13 +472,17 @@ impl PoolSpaceAllocator {
         }
 
         Ok(Self {
+            vdev_id,
             ashift,
             metaslab_shift,
             metaslab_array_obj,
+            write_topology,
             spacemap_v2_present,
             spacemap_v2_active,
             spacemap_histogram_present,
             hole_birth_active,
+            checkpoint_txg: 0,
+            checkpoint_deferred_frees: Vec::new(),
             metaslabs,
         })
     }
@@ -417,12 +501,12 @@ impl PoolSpaceAllocator {
             .sum()
     }
 
-    /// Allocate one physical block extent of `physical_bytes` rounded up to `1 << ashift`.
-    /// Prefers already-initialized metaslabs first so uninitialized metaslabs stay untouched
-    /// unless all initialized metaslabs lack a contiguous extent.
+    /// Allocate one physical block extent of `physical_bytes` honoring the top-level
+    /// vdev's exact native allocation size and alignment (Leaf/Mirror/RAIDZ/dRAID).
     pub fn allocate(&mut self, physical_bytes: usize) -> Result<Dva> {
-        let sector = 1_u64 << self.ashift;
-        let asize = (physical_bytes as u64).div_ceil(sector) * sector;
+        let (asize, align) = self
+            .write_topology
+            .asize_and_align(physical_bytes, self.ashift)?;
         if asize == 0 {
             return Err(corrupt("zero-sized ZFS allocation request"));
         }
@@ -431,7 +515,7 @@ impl PoolSpaceAllocator {
                 if (ms.object != 0) != prefer_initialized {
                     continue;
                 }
-                if let Some(range) = ms.allocatable_map.find_free_extent(asize, sector) {
+                if let Some(range) = ms.allocatable_map.find_free_extent(asize, align) {
                     ms.allocatable_map
                         .apply(MapType::Allocate, range.clone())
                         .map_err(|e| parse_err(&e))?;
@@ -440,7 +524,7 @@ impl PoolSpaceAllocator {
                         .map_err(|e| parse_err(&e))?;
                     push_coalesced_range(&mut ms.txg_allocs, range.clone());
                     return Ok(Dva {
-                        vdev: 0,
+                        vdev: self.vdev_id,
                         offset: range.start,
                         allocated_bytes: asize,
                         gang: false,
@@ -454,6 +538,9 @@ impl PoolSpaceAllocator {
     /// Free DVAs of an unshared block (`bp.birth() > ds_prev_snap_txg`).
     /// Blocks born in earlier TXGs are freed ONLY in `final_map` (deferred COW safety:
     /// never reused within `new_txg` before the Uberblock commits).
+    /// When a pool checkpoint is active (`checkpoint_txg != 0`), blocks born at or
+    /// before `checkpoint_txg` are deferred into `checkpoint_deferred_frees` so the
+    /// checkpointed MOS state remains 100% intact until discard or rewind.
     pub fn free_block_dvas(&mut self, bp: &BlockPointer, new_txg: u64) -> Result<SpaceDelta> {
         if bp.hole() || bp.embedded() {
             return Ok(SpaceDelta::default());
@@ -467,8 +554,16 @@ impl PoolSpaceAllocator {
         let dvas = bp.data_dvas().map_err(|e| parse_err(&e))?;
         let ms_size = 1_u64 << self.metaslab_shift;
         for dva in dvas {
-            if dva.vdev != 0 || dva.gang {
-                return Err(unsupported("cannot free foreign-vdev or gang DVA"));
+            if dva.gang {
+                return Err(unsupported("cannot free gang DVA"));
+            }
+            let range = dva.offset..(dva.offset + dva.allocated_bytes);
+            if self.checkpoint_txg != 0 && bp.birth() <= self.checkpoint_txg {
+                self.checkpoint_deferred_frees.push((dva.vdev, range));
+                continue;
+            }
+            if dva.vdev != self.vdev_id {
+                return Err(unsupported("cannot free foreign-vdev DVA"));
             }
             let ms_id = usize::try_from(dva.offset / ms_size)
                 .map_err(|_| corrupt("DVA metaslab index overflow"))?;
@@ -476,7 +571,6 @@ impl PoolSpaceAllocator {
                 .metaslabs
                 .get_mut(ms_id)
                 .ok_or_else(|| corrupt("DVA falls outside metaslab table"))?;
-            let range = dva.offset..(dva.offset + dva.allocated_bytes);
             if bp.birth() == new_txg {
                 ms.allocatable_map
                     .apply(MapType::Free, range.clone())
@@ -495,6 +589,26 @@ impl PoolSpaceAllocator {
         Ok(delta)
     }
 
+    /// Replay deferred checkpoint frees back into metaslab space maps during
+    /// `checkpoint_discard`.
+    pub fn release_deferred_free(&mut self, vdev_id: u32, range: Range<u64>) -> Result<()> {
+        if vdev_id != self.vdev_id {
+            return Ok(());
+        }
+        let ms_size = 1_u64 << self.metaslab_shift;
+        let ms_id = usize::try_from(range.start / ms_size)
+            .map_err(|_| corrupt("deferred free metaslab index overflow"))?;
+        let ms = self
+            .metaslabs
+            .get_mut(ms_id)
+            .ok_or_else(|| corrupt("deferred free outside metaslab table"))?;
+        ms.final_map
+            .apply(MapType::Free, range.clone())
+            .map_err(|e| parse_err(&e))?;
+        push_coalesced_range(&mut ms.txg_frees, range);
+        Ok(())
+    }
+
     /// Free explicit non-regular DVAs (e.g. an unclaimed head-owned ZIL tail
     /// block whose checksum algorithm is `ZILOG`/`ZILOG2`).
     pub fn free_raw_dvas(
@@ -505,8 +619,16 @@ impl PoolSpaceAllocator {
     ) -> Result<()> {
         let ms_size = 1_u64 << self.metaslab_shift;
         for dva in dvas {
-            if dva.vdev != 0 || dva.gang {
-                return Err(unsupported("cannot free foreign-vdev or gang DVA"));
+            if dva.gang {
+                return Err(unsupported("cannot free gang DVA"));
+            }
+            let range = dva.offset..(dva.offset + dva.allocated_bytes);
+            if self.checkpoint_txg != 0 && birth_txg <= self.checkpoint_txg {
+                self.checkpoint_deferred_frees.push((dva.vdev, range));
+                continue;
+            }
+            if dva.vdev != self.vdev_id {
+                return Err(unsupported("cannot free foreign-vdev DVA"));
             }
             let ms_id = usize::try_from(dva.offset / ms_size)
                 .map_err(|_| corrupt("DVA metaslab index overflow"))?;
@@ -514,7 +636,6 @@ impl PoolSpaceAllocator {
                 .metaslabs
                 .get_mut(ms_id)
                 .ok_or_else(|| corrupt("DVA falls outside metaslab table"))?;
-            let range = dva.offset..(dva.offset + dva.allocated_bytes);
             if birth_txg == new_txg {
                 ms.allocatable_map
                     .apply(MapType::Free, range.clone())
@@ -1044,11 +1165,7 @@ pub(super) fn write_dataset_block(
                 mac,
             })
             .map_err(|e| parse_err(&e))?;
-            staged_writes.push(StagedBlockWrite {
-                bucket,
-                dva_offset: dva.offset,
-                bytes: phys,
-            });
+            staged_writes.push(StagedBlockWrite::from_dva(bucket, dva, phys));
             return Ok(bp);
         }
         if dmu_ot_is_encrypted(object_type) {
@@ -1082,11 +1199,7 @@ pub(super) fn write_dataset_block(
                 mac,
             })
             .map_err(|e| parse_err(&e))?;
-            staged_writes.push(StagedBlockWrite {
-                bucket,
-                dva_offset: dva.offset,
-                bytes: ct,
-            });
+            staged_writes.push(StagedBlockWrite::from_dva(bucket, dva, ct));
             return Ok(bp);
         }
         // Authenticated-only level-0 non-objset block (e.g. userused/groupused/projectused).
@@ -1110,11 +1223,7 @@ pub(super) fn write_dataset_block(
             mac,
         })
         .map_err(|e| parse_err(&e))?;
-        staged_writes.push(StagedBlockWrite {
-            bucket,
-            dva_offset: dva.offset,
-            bytes: comp,
-        });
+        staged_writes.push(StagedBlockWrite::from_dva(bucket, dva, comp));
         return Ok(bp);
     }
 
@@ -1132,11 +1241,7 @@ pub(super) fn write_dataset_block(
         fill,
     })
     .map_err(|e| parse_err(&e))?;
-    staged_writes.push(StagedBlockWrite {
-        bucket,
-        dva_offset: dva.offset,
-        bytes: logical.to_vec(),
-    });
+    staged_writes.push(StagedBlockWrite::from_dva(bucket, dva, logical.to_vec()));
     Ok(bp)
 }
 
@@ -1182,11 +1287,11 @@ pub(super) fn write_dataset_objset_block(
             mac: [0_u8; ZIO_DATA_MAC_LEN],
         })
         .map_err(|e| parse_err(&e))?;
-        staged_writes.push(StagedBlockWrite {
-            bucket: WriteBucket::DatasetMetadata,
-            dva_offset: os_dva.offset,
-            bytes: os_bytes,
-        });
+        staged_writes.push(StagedBlockWrite::from_dva(
+            WriteBucket::DatasetMetadata,
+            os_dva,
+            os_bytes,
+        ));
         return Ok(bp);
     }
 
@@ -1205,11 +1310,11 @@ pub(super) fn write_dataset_objset_block(
         fill,
     })
     .map_err(|e| parse_err(&e))?;
-    staged_writes.push(StagedBlockWrite {
-        bucket: WriteBucket::DatasetMetadata,
-        dva_offset: os_dva.offset,
-        bytes: os_bytes,
-    });
+    staged_writes.push(StagedBlockWrite::from_dva(
+        WriteBucket::DatasetMetadata,
+        os_dva,
+        os_bytes,
+    ));
     Ok(bp)
 }
 
@@ -1256,11 +1361,11 @@ pub(super) fn write_dataset_objset_block_raw_protected(
         mac: [0_u8; ZIO_DATA_MAC_LEN],
     })
     .map_err(|e| parse_err(&e))?;
-    staged_writes.push(StagedBlockWrite {
-        bucket: WriteBucket::DatasetMetadata,
-        dva_offset: os_dva.offset,
-        bytes: os_bytes,
-    });
+    staged_writes.push(StagedBlockWrite::from_dva(
+        WriteBucket::DatasetMetadata,
+        os_dva,
+        os_bytes,
+    ));
     Ok(bp)
 }
 
@@ -1624,11 +1729,11 @@ pub(super) fn cow_update_dnode_with_staged_leaves(
                         mac,
                     })
                     .map_err(|e| parse_err(&e))?;
-                    staged_writes.push(StagedBlockWrite {
-                        bucket: spec.indirect_bucket,
-                        dva_offset: dva.offset,
-                        bytes: raw_block,
-                    });
+                    staged_writes.push(StagedBlockWrite::from_dva(
+                        spec.indirect_bucket,
+                        dva,
+                        raw_block,
+                    ));
                     bp
                 } else {
                     write_dataset_block(
@@ -3174,7 +3279,7 @@ pub(super) fn finalize_mos_and_space_maps_to_convergence(
         // 3. Reserve DVAs for every planned space-map leaf/indirect block, every dirty MOS
         // dnode table block + MOS indirects, and the MOS `ObjectSet` root block, and retire
         // all replaced committed blocks so `alloc` reaches its COMPLETE end-of-TXG state!
-        let mut sm_placeholders: BTreeMap<usize, Vec<(u64, usize)>> = BTreeMap::new();
+        let mut sm_placeholders: BTreeMap<usize, Vec<(u32, u64, u64, usize)>> = BTreeMap::new();
         for (&ms_id, &(bsize, first_dirty, num_blocks)) in &planned_sm {
             let sm_obj = alloc.metaslabs[ms_id].object;
             let existing = if base_alloc.metaslabs[ms_id].object != 0 {
@@ -3236,7 +3341,7 @@ pub(super) fn finalize_mos_and_space_maps_to_convergence(
                 ms_id,
                 staged[start_idx..]
                     .iter()
-                    .map(|w| (w.dva_offset, w.bytes.len()))
+                    .map(|w| (w.vdev_id, w.dva_offset, w.allocated_bytes, w.bytes.len()))
                     .collect(),
             );
             staged.truncate(start_idx);
@@ -3280,9 +3385,9 @@ pub(super) fn finalize_mos_and_space_maps_to_convergence(
         for rbp in &dummy_meta_out.retired_bps {
             alloc.free_block_dvas(rbp, new_txg)?;
         }
-        let meta_reserved_dvas: Vec<(u64, usize)> = staged[meta_start_idx..]
+        let meta_reserved_dvas: Vec<(u32, u64, u64, usize)> = staged[meta_start_idx..]
             .iter()
-            .map(|w| (w.dva_offset, w.bytes.len()))
+            .map(|w| (w.vdev_id, w.dva_offset, w.allocated_bytes, w.bytes.len()))
             .collect();
         staged.truncate(meta_start_idx);
 
@@ -3454,14 +3559,14 @@ pub(super) fn finalize_mos_and_space_maps_to_convergence(
             fill: mos_fill,
         })
         .map_err(|e| parse_err(&e))?;
-        staged.push(StagedBlockWrite {
-            bucket: WriteBucket::MosRoot,
-            dva_offset: mos_root_dva.offset,
-            bytes: mos_root_bytes,
-        });
+        staged.push(StagedBlockWrite::from_dva(
+            WriteBucket::MosRoot,
+            mos_root_dva,
+            mos_root_bytes,
+        ));
 
         // Self-audit: verify zero DVA overlap within staged writes!
-        verify_disjoint_staged_writes(&staged, alloc.ashift)?;
+        verify_disjoint_staged_writes(&staged)?;
         features.reset_dirty();
 
         return Ok((new_root_bp, alloc, features, staged));
@@ -3530,18 +3635,14 @@ fn plan_spacemap_blocks(
     Ok((bsize, first_dirty, num_blocks))
 }
 
-fn verify_disjoint_staged_writes(staged: &[StagedBlockWrite], ashift: u8) -> Result<()> {
-    let sector = 1_u64 << ashift;
-    let mut intervals: Vec<(u64, u64)> = staged
+fn verify_disjoint_staged_writes(staged: &[StagedBlockWrite]) -> Result<()> {
+    let mut intervals: Vec<(u32, u64, u64)> = staged
         .iter()
-        .map(|w| {
-            let asize = (w.bytes.len() as u64).div_ceil(sector) * sector;
-            (w.dva_offset, w.dva_offset + asize)
-        })
+        .map(|w| (w.vdev_id, w.dva_offset, w.dva_offset + w.allocated_bytes))
         .collect();
-    intervals.sort_unstable_by_key(|&(s, _)| s);
+    intervals.sort_unstable_by_key(|&(v, s, _)| (v, s));
     for pair in intervals.windows(2) {
-        if pair[0].1 > pair[1].0 {
+        if pair[0].0 == pair[1].0 && pair[0].2 > pair[1].1 {
             return Err(corrupt("internal ZFS TXG staged DVA overlap detected"));
         }
     }
@@ -3551,24 +3652,28 @@ fn verify_disjoint_staged_writes(staged: &[StagedBlockWrite], ashift: u8) -> Res
 /// Replays pre-reserved DVAs deterministically when encoding finalized space-map and
 /// MOS dnode blocks after convergence.
 struct FixedDvaReplay<'a> {
-    reserved: &'a [(u64, usize)],
+    reserved: &'a [(u32, u64, u64, usize)],
     cursor: usize,
-    ashift: u8,
+    _ashift: u8,
     hole_birth_active: bool,
 }
 
 impl<'a> FixedDvaReplay<'a> {
-    const fn new(reserved: &'a [(u64, usize)], ashift: u8, hole_birth_active: bool) -> Self {
+    const fn new(
+        reserved: &'a [(u32, u64, u64, usize)],
+        ashift: u8,
+        hole_birth_active: bool,
+    ) -> Self {
         Self {
             reserved,
             cursor: 0,
-            ashift,
+            _ashift: ashift,
             hole_birth_active,
         }
     }
 
     fn take_dva(&mut self, physical_bytes: usize) -> Result<Dva> {
-        let &(offset, expected_len) = self
+        let &(vdev, offset, allocated_bytes, expected_len) = self
             .reserved
             .get(self.cursor)
             .ok_or_else(|| corrupt("converged DVA replay exhausted reserved queue"))?;
@@ -3578,12 +3683,10 @@ impl<'a> FixedDvaReplay<'a> {
                 "converged DVA replay physical size disagrees with reservation",
             ));
         }
-        let sector = 1_u64 << self.ashift;
-        let asize = (physical_bytes as u64).div_ceil(sector) * sector;
         Ok(Dva {
-            vdev: 0,
+            vdev,
             offset,
-            allocated_bytes: asize,
+            allocated_bytes,
             gang: false,
         })
     }
@@ -3682,11 +3785,11 @@ impl<'a> FixedDvaReplay<'a> {
                 })
                 .map_err(|e| parse_err(&e))?;
                 born.add_assign(SpaceDelta::from_bp(&bp)?)?;
-                staged_writes.push(StagedBlockWrite {
-                    bucket: spec.leaf_bucket,
-                    dva_offset: dva.offset,
-                    bytes: payload.clone(),
-                });
+                staged_writes.push(StagedBlockWrite::from_dva(
+                    spec.leaf_bucket,
+                    dva,
+                    payload.clone(),
+                ));
                 bp
             } else {
                 make_hole_bp(
@@ -3813,11 +3916,11 @@ impl<'a> FixedDvaReplay<'a> {
                     })
                     .map_err(|e| parse_err(&e))?;
                     born.add_assign(SpaceDelta::from_bp(&bp)?)?;
-                    staged_writes.push(StagedBlockWrite {
-                        bucket: spec.indirect_bucket,
-                        dva_offset: dva.offset,
-                        bytes: raw_block,
-                    });
+                    staged_writes.push(StagedBlockWrite::from_dva(
+                        spec.indirect_bucket,
+                        dva,
+                        raw_block,
+                    ));
                     bp
                 };
                 next_updates.insert(parent_idx, new_ind_bp);

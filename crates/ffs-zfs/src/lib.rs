@@ -44,19 +44,25 @@ pub use filesystem::{ZfsFs, ZfsMountWriteOptions};
 pub use reader::dmu::Objects;
 pub use reader::dmu::zpl::Zpl;
 pub use reader::dmu::zvol::{VolumeInfo, Zvol};
-pub use reader::{Label, Leaf, Pool, RootBlock};
+pub use reader::{
+    AllocClass, IndirectVdevMap, Label, Leaf, Pool, PoolTopology, RootBlock, TopVdevDescriptor,
+    TopVdevKind, VdevHealth,
+};
 pub use send_recv::{
     ZfsRecvReport, ZfsRecvRequest, ZfsResumeState, ZfsSendFrom, ZfsSendReport, ZfsSendRequest,
     inspect_receive_resume_state_in_mos, send_stream,
 };
 pub use transaction::{
     DEFAULT_VOLBLOCKSIZE, MAX_VOLBLOCKSIZE, MAX_ZVOL_IO_BYTES, ZVOL_LOGICAL_SECTOR_BYTES,
-    ZfsAdmissionReport, ZfsBookmarkInfo, ZfsCommitReceipt, ZfsDataChecksum, ZfsDurableToken,
-    ZfsEncryptionCreateOptions, ZfsFileRangeOperation, ZfsHoldInfo, ZfsObjectIdentity,
-    ZfsPersistenceEvent, ZfsPersistenceStage, ZfsPosixSetAttr, ZfsPropertySetValue, ZfsSetAttr,
-    ZfsStorageIdentity, ZfsTopologyKind, ZfsTransactionEngine, ZfsTxOutcome, ZfsUnlinkedObject,
-    ZfsWriteOptions, ZfsXattrSetMode, ZfsZvolCreateOptions, ZfsZvolInfo, list_bookmarks_in_mos,
-    list_holds_in_mos,
+    ZfsAdmissionReport, ZfsBookmarkInfo, ZfsCheckpointInfo, ZfsCommitReceipt, ZfsCreateVdevKind,
+    ZfsCreateVdevSpec, ZfsDataChecksum, ZfsDurableToken, ZfsEncryptionCreateOptions,
+    ZfsExpandRaidzReport, ZfsFileRangeOperation, ZfsHoldInfo, ZfsLifecycleReport,
+    ZfsObjectIdentity, ZfsPersistenceEvent, ZfsPersistenceStage, ZfsPoolCreateReport,
+    ZfsPoolCreateSpec, ZfsPosixSetAttr, ZfsPropertySetValue, ZfsRemoveVdevReport, ZfsRewindReport,
+    ZfsScanLimits, ZfsScanReport, ZfsSetAttr, ZfsStorageIdentity, ZfsTopologyKind,
+    ZfsTransactionEngine, ZfsTrimReport, ZfsTxOutcome, ZfsUnlinkedObject, ZfsWriteOptions,
+    ZfsXattrSetMode, ZfsZvolCreateOptions, ZfsZvolInfo, create_pool_files, create_pool_on_devices,
+    export_pool_leaves, import_pool_leaves, list_bookmarks_in_mos, list_holds_in_mos,
 };
 pub use zvol_nbd::{
     NbdExportInfo, NbdServerConfig, ZfsVolumeManager, ZfsZvolNbdClient, ZfsZvolNbdServer,

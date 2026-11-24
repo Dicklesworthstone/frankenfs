@@ -422,6 +422,8 @@ fn fixture(
             guid_sum: 3,
             timestamp: 1,
             root: bp,
+            checkpoint_txg: 0,
+            raidz_reflow_info: 0,
         },
         data,
         physical_offset: DATA_OFFSET,
@@ -539,4 +541,57 @@ fn numbered_pool_versions_do_not_invent_feature_catalog_reads() {
     root.uberblock.version = 28;
     assert!(Objects::from_root(&Cx::for_testing(), pool, root).is_ok());
     assert!(reads.lock().unwrap().is_empty());
+}
+
+#[test]
+fn openzfs_2_4_topology_features_admitted_and_oracle_or_dynamic_gang_refused() {
+    let cx = Cx::for_testing();
+    for mos_feat in [
+        "org.openzfs:draid",
+        "org.openzfs:raidz_expansion",
+        "com.delphix:device_removal",
+        "com.klarasystems:vdev_zaps_v2",
+    ] {
+        assert!(crate::reader::supported_read_feature(
+            mos_feat,
+            &Value::Boolean(true)
+        ));
+        let labels = vec![mos_feat.to_owned()];
+        assert!(admit(&cx, &[entry(mos_feat, 1)], &[], &labels).is_ok());
+        // Missing from label must still fail because these are ZFEATURE_FLAG_MOS.
+        assert!(admit(&cx, &[entry(mos_feat, 1)], &[], &[]).is_err());
+    }
+    // Dynamic gang headers (2.4 MOS feature) must remain hard-refused when active.
+    assert!(!crate::reader::supported_read_feature(
+        "com.klarasystems:dynamic_gang_header",
+        &Value::Boolean(true)
+    ));
+    assert!(matches!(
+        admit(
+            &cx,
+            &[entry("com.klarasystems:dynamic_gang_header", 1)],
+            &[],
+            &["com.klarasystems:dynamic_gang_header".to_owned()],
+        ),
+        Err(FfsError::UnsupportedFeature(_))
+    ));
+    // Proprietary com.oracle:* features must be refused in BOTH catalogs (even count=0).
+    for count in [0, 1] {
+        assert!(matches!(
+            admit(&cx, &[entry("com.oracle:encryption", count)], &[], &[]),
+            Err(FfsError::UnsupportedFeature(_))
+        ));
+        assert!(matches!(
+            admit(&cx, &[], &[entry("com.oracle:some_write_feat", count)], &[]),
+            Err(FfsError::UnsupportedFeature(_))
+        ));
+    }
+    // Proprietary Oracle pool versions (29..=4999) are hard-refused.
+    let (pool, mut root, _) = fixture(Endian::Little, 0, 0, None);
+    root.config.version = 37;
+    root.uberblock.version = 37;
+    assert!(matches!(
+        Objects::from_root(&cx, pool, root),
+        Err(FfsError::UnsupportedFeature(_))
+    ));
 }

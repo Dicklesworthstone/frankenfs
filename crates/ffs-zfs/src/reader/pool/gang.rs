@@ -326,6 +326,13 @@ impl Pool {
         pointer: &BlockPointer,
     ) -> Result<Vec<(Dva, u64)>> {
         checkpoint(cx)?;
+        if let Some(draid) = self.draid_group() {
+            return self.draid_maps(cx, config, pointer, draid).map(|maps| {
+                maps.into_iter()
+                    .map(|(dva, map)| (dva, map.allocated_bytes()))
+                    .collect()
+            });
+        }
         if let Some(group) = &config.raidz_members {
             if group.parity != 0 {
                 return self.raidz_maps(cx, config, pointer, group).map(|maps| {
@@ -565,6 +572,9 @@ impl Pool {
         pointer: &BlockPointer,
     ) -> Result<BlockRead> {
         checkpoint(cx)?;
+        if let Some(draid) = self.draid_group() {
+            return self.read_draid_block_inner(cx, config, pointer, draid, false);
+        }
         if let Some(group) = &config.raidz_members {
             if group.parity != 0 {
                 // The stripe verifier recognizes gang headers and uses their

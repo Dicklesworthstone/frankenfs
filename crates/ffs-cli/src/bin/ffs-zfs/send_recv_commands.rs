@@ -401,8 +401,10 @@ impl SendRecvCommand {
                     slot,
                     pool_guid,
                     members,
+                    draid_members: Vec::new(),
                     missing_mirror_members: Vec::new(),
                     missing_raidz_members: Vec::new(),
+                    missing_draid_members: Vec::new(),
                 };
                 let components = parse_dataset_components(&dataset)?;
                 let mut mos = candidate.objects(cx)?;

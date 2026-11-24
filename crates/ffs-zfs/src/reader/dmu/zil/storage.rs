@@ -180,12 +180,49 @@ fn plans(
     pointer: &Pointer,
     state: &mut ReadState,
 ) -> Result<Vec<CopyPlan>> {
-    if pool.leaves().is_empty() || pool.leaves().len() > 8 {
+    if pool.leaves().is_empty() || pool.leaves().len() > 255 {
         return Err(corrupt("invalid ZIL storage set"));
     }
     let mut plans = Vec::new();
     for dva in &pointer.dvas {
         checkpoint(cx)?;
+        // Dedicated SLOG (`is_log`) or multi-class top-level routing via PoolTopology.
+        if let Some(topo) = pool.pool_topology()
+            && let Some(top) = topo.top_vdev(dva.vdev)
+            && matches!(
+                top.kind,
+                crate::reader::TopVdevKind::Leaf | crate::reader::TopVdevKind::Mirror
+            )
+        {
+            if !(9..=16).contains(&top.ashift) {
+                return Err(corrupt("invalid ZIL top-level ashift"));
+            }
+            let mut found = false;
+            for slot in &top.supplied_indices {
+                let Some(member) = *slot else {
+                    continue;
+                };
+                found = true;
+                let leaf = pool
+                    .leaves()
+                    .get(member)
+                    .ok_or_else(|| corrupt("ZIL top-level replica has no supplied member"))?;
+                leaf.validate_dva_for_vdev(top.ashift, top.asize, dva.vdev, &pointer.bp, dva)?;
+                plans.push(CopyPlan::Replica(Extent {
+                    member,
+                    offset: dva.offset,
+                    allocated: dva.allocated_bytes,
+                    bytes: pointer.bp.physical_bytes(),
+                }));
+            }
+            if !found {
+                return Err(unsupported(format!(
+                    "required ZIL {:?} vdev {} has no surviving supplied device",
+                    top.alloc_class, dva.vdev
+                )));
+            }
+            continue;
+        }
         if let Some(group) = &config.raidz_members {
             if group.parity != 0 {
                 plans.push(raidz_plan(pool, config, pointer, group, dva)?);

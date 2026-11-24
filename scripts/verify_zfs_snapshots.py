@@ -238,6 +238,49 @@ def run_negative_controls(
             env={**os.environ, "LC_ALL": "C"},
         )
         require(bad_tok.returncode != 0 and bad_tok.stdout == b"", "corrupt resume token must fail closed")
+        assert_refused_without_mutation(
+            probe,
+            lambda p: subprocess.run(
+                [
+                    str(binary),
+                    "pool-checkpoint",
+                    str(p),
+                    "--action",
+                    "rewind",
+                    "--offline-image",
+                    "--pool-guid",
+                    "1",
+                    "--label",
+                    "0",
+                    "--slot",
+                    "0",
+                ],
+                capture_output=True,
+                timeout=30,
+                check=False,
+                env={**os.environ, "LC_ALL": "C"},
+            ),
+            b"--allow-write",
+        )
+        draid_conflict = subprocess.run(
+            [
+                str(binary),
+                "root",
+                str(probe),
+                "--offline-image",
+                "--auto-import",
+                "--missing-draid-member",
+                "1001",
+            ],
+            capture_output=True,
+            timeout=30,
+            check=False,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+        require(
+            draid_conflict.returncode != 0 and draid_conflict.stdout == b"",
+            "--missing-draid-member + --auto-import must fail closed",
+        )
         binary_checked = True
 
     return {

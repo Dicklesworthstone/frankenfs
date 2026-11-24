@@ -3,6 +3,7 @@
 
 mod allocation_commands;
 mod file_commands;
+mod pool_commands;
 mod properties_commands;
 mod send_recv_commands;
 mod write_commands;
@@ -300,14 +301,45 @@ struct CandidateArgs {
     #[arg(
         long = "missing-raidz-member",
         value_name = "GUID",
-        conflicts_with_all = ["auto_import", "replay_zil", "missing_mirror_members"]
+        conflicts_with_all = ["auto_import", "replay_zil", "missing_mirror_members", "missing_draid_members"]
     )]
     missing_raidz_members: Vec<u64>,
+    /// Additional immutable images for wide dRAID / multi-vdev pools (`2..=255` total leaves).
+    #[arg(
+        long = "draid-member",
+        visible_aliases = ["wide-member"],
+        value_name = "IMAGE"
+    )]
+    draid_members: Vec<PathBuf>,
+    /// Explicitly absent child GUID of one exported dRAID1/2/3 group (read-only; `1..=nparity` missing).
+    #[arg(
+        long = "missing-draid-member",
+        value_name = "GUID",
+        conflicts_with_all = ["auto_import", "replay_zil", "missing_mirror_members", "missing_raidz_members"]
+    )]
+    missing_draid_members: Vec<u64>,
 }
 impl CandidateArgs {
     fn open(&self, cx: &Cx) -> Result<Pool> {
         if self.members.len() > 7 {
             bail!("at most seven additional member images are supported");
+        }
+        let total_extra = self.members.len() + self.draid_members.len();
+        if total_extra > 254 {
+            bail!("at most 254 additional wide member images are supported");
+        }
+        if !self.missing_draid_members.is_empty() {
+            Pool::check_draid_survivors(total_extra + 1, &self.missing_draid_members)?;
+            if !self.missing_mirror_members.is_empty()
+                || !self.missing_raidz_members.is_empty()
+                || self.auto_import
+                || self.replay_zil
+                || self.pool_guid == 0
+            {
+                bail!(
+                    "missing dRAID members require explicit pool/candidate selection without mirror/RAIDZ declarations, import or replay"
+                );
+            }
         }
         if !self.missing_raidz_members.is_empty() {
             Pool::check_raidz_survivors(self.members.len() + 1, &self.missing_raidz_members)?;
@@ -329,15 +361,23 @@ impl CandidateArgs {
                 );
             }
         }
-        let mut leaves = Vec::with_capacity(self.members.len() + 1);
+        let mut leaves = Vec::with_capacity(total_extra + 1);
         leaves.push(self.image.open(cx)?);
-        for path in &self.members {
+        for path in self.members.iter().chain(&self.draid_members) {
             leaves.push(
                 Leaf::open(cx, path, self.image.offset, self.image.length)
                     .with_context(|| format!("opening ZFS member {}", path.display()))?,
             );
         }
-        if !self.missing_raidz_members.is_empty() {
+        if !self.missing_draid_members.is_empty() {
+            let pool = Pool::from_draid_survivors(cx, leaves, self.missing_draid_members.clone())
+                .context("admitting explicitly missing ZFS dRAID members")?;
+            eprintln!(
+                "explicit missing-dRAID extraction: pool_guid={} label={} slot={} absent_guids={:?}; selected committed view only, not newest-state authority, log recovery or pool import",
+                self.pool_guid, self.label, self.slot, self.missing_draid_members
+            );
+            Ok(pool)
+        } else if !self.missing_raidz_members.is_empty() {
             let pool = Pool::from_raidz_survivors(cx, leaves, self.missing_raidz_members.clone())
                 .context("admitting explicitly missing ZFS RAIDZ members")?;
             eprintln!(
@@ -345,9 +385,7 @@ impl CandidateArgs {
                 self.pool_guid, self.label, self.slot, self.missing_raidz_members
             );
             Ok(pool)
-        } else if self.missing_mirror_members.is_empty() {
-            Pool::from_leaves(leaves).context("opening explicitly supplied ZFS members")
-        } else {
+        } else if !self.missing_mirror_members.is_empty() {
             let pool = Pool::from_mirror_survivors(cx, leaves, self.missing_mirror_members.clone())
                 .context("admitting explicitly missing ZFS mirror members")?;
             eprintln!(
@@ -355,6 +393,10 @@ impl CandidateArgs {
                 self.pool_guid, self.label, self.slot, self.missing_mirror_members
             );
             Ok(pool)
+        } else if !self.draid_members.is_empty() {
+            Pool::from_wide_leaves(leaves).context("opening explicitly supplied wide ZFS members")
+        } else {
+            Pool::from_leaves(leaves).context("opening explicitly supplied ZFS members")
         }
     }
 
@@ -381,7 +423,10 @@ impl CandidateArgs {
     }
 
     fn reject_hidden_images(&self, mountpoint: &Path) -> Result<()> {
-        for path in std::iter::once(&self.image.image).chain(&self.members) {
+        for path in std::iter::once(&self.image.image)
+            .chain(&self.members)
+            .chain(&self.draid_members)
+        {
             if path.canonicalize()?.starts_with(mountpoint) {
                 bail!("ZFS mountpoint would hide a backing image");
             }
@@ -395,6 +440,8 @@ enum Command {
     Allocation(allocation_commands::AllocationCommand),
     #[command(flatten)]
     File(file_commands::FileCommand),
+    #[command(flatten)]
+    Pool(pool_commands::PoolCommand),
     #[command(flatten)]
     Properties(properties_commands::PropertyCommand),
     #[command(flatten)]
@@ -468,6 +515,7 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Allocation(command) => command.run(&cx)?,
         Command::File(command) => command.run(&cx)?,
+        Command::Pool(command) => command.run(&cx)?,
         Command::Properties(command) => command.run(&cx)?,
         Command::SendRecv(command) => command.run(&cx)?,
         Command::Write(command) => command.run(&cx)?,
@@ -888,6 +936,8 @@ mod tests {
             members: vec![PathBuf::from("unopened-member.img"); 8],
             missing_mirror_members: Vec::new(),
             missing_raidz_members: Vec::new(),
+            draid_members: Vec::new(),
+            missing_draid_members: Vec::new(),
         };
         let Err(error) = candidate.open(&Cx::for_testing()) else {
             panic!("an oversized member set must fail before image I/O");
@@ -930,6 +980,8 @@ mod tests {
             members: vec![outside],
             missing_mirror_members: Vec::new(),
             missing_raidz_members: Vec::new(),
+            draid_members: Vec::new(),
+            missing_draid_members: Vec::new(),
         };
         let mountpoint = mountpoint.canonicalize().unwrap();
         candidate.reject_hidden_images(&mountpoint).unwrap();
@@ -1056,12 +1108,57 @@ mod tests {
                 members: vec![PathBuf::from("unopened-mirror-member.img"); count],
                 missing_mirror_members: missing,
                 missing_raidz_members: Vec::new(),
+                draid_members: Vec::new(),
+                missing_draid_members: Vec::new(),
             };
             let Err(error) = candidate.open(&Cx::for_testing()) else {
                 panic!("invalid mirror selection must fail before image I/O");
             };
             assert!(error.to_string().contains(reason), "{error}");
         }
+    }
+
+    #[test]
+    fn missing_draid_cli_enforces_explicit_identity_and_bounds() {
+        let parsed = Cli::try_parse_from([
+            "ffs-zfs",
+            "root",
+            "d0.img",
+            "--offline-image",
+            "--pool-guid",
+            "123",
+            "--label",
+            "0",
+            "--slot",
+            "4",
+            "--draid-member",
+            "d1.img",
+            "--draid-member",
+            "d2.img",
+            "--missing-draid-member",
+            "2001",
+        ])
+        .unwrap();
+        let Command::Root { candidate } = parsed.command else {
+            panic!("root");
+        };
+        assert_eq!(
+            candidate.draid_members,
+            [PathBuf::from("d1.img"), PathBuf::from("d2.img")]
+        );
+        assert_eq!(candidate.missing_draid_members, [2001]);
+        assert!(
+            Cli::try_parse_from([
+                "ffs-zfs",
+                "root",
+                "d0.img",
+                "--offline-image",
+                "--auto-import",
+                "--missing-draid-member",
+                "2001",
+            ])
+            .is_err()
+        );
     }
 }
 
