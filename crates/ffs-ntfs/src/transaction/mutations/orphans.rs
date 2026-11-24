@@ -22,7 +22,7 @@ use ffs_ondisk::ntfs::usn::{
 };
 use ffs_ondisk::ntfs::{DATA, NtfsReference, NtfsValue};
 
-pub(crate) const ORPHAN_STREAM_NAME: &str = "$FrankenFS.Orphan";
+pub const ORPHAN_STREAM_NAME: &str = "$FrankenFS.Orphan";
 const ORPHAN_NAME_PREFIX: &str = ".ffs-unlinked-";
 const ORPHAN_MAGIC: &[u8; 16] = b"FFS_NTFS_ORPHAN\0";
 const ORPHAN_VERSION: u64 = 1;

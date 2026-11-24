@@ -237,7 +237,10 @@ fn ntfs_orphan_open_handles_survive_and_writable_reopen_reaps() {
             Some(0),
             "final close must free DATA and catalog allocations without leaks"
         );
-        assert!(owned_files(&cx, &closed).is_empty());
+        assert_eq!(
+            owned_files(&cx, &closed),
+            [] as [(ffs_ondisk::ntfs::NtfsReference, Vec<u16>); 0]
+        );
         drop(closed);
 
         // Reopen the earlier durable prefix as if the process died before its
@@ -290,7 +293,10 @@ fn ntfs_orphan_open_handles_survive_and_writable_reopen_reaps() {
                 .record(&cx, target.record, Some(target.sequence))
                 .is_err()
         );
-        assert!(owned_files(&cx, &engine).is_empty());
+        assert_eq!(
+            owned_files(&cx, &engine),
+            [] as [(ffs_ondisk::ntfs::NtfsReference, Vec<u16>); 0]
+        );
         let after = crashed.snapshot_durable_only();
         let writes = crashed.write_bytes_total();
         let unchanged = NtfsFs::from_engine(&cx, engine, 1000, 1000).unwrap();
@@ -366,7 +372,19 @@ fn ntfs_orphan_retention_and_replacement_recover_at_native_barriers() {
         assert_eq!(fs.getattr(&cx, &mut scope, old.ino).unwrap().nlink, 0);
         drop(fs);
         let cuts = std::mem::take(&mut *cuts.lock().unwrap());
-        assert_eq!(cuts.len(), 4);
+        assert!(
+            cuts.len() >= 4
+                && [
+                    NtfsPersistenceStage::DirtyRestartBarrier,
+                    NtfsPersistenceStage::LogCommitBarrier,
+                    NtfsPersistenceStage::TargetMetadataBarrier,
+                    NtfsPersistenceStage::AckPublished,
+                ]
+                .iter()
+                .all(|expected| cuts.iter().any(|(stage, _)| stage == expected)),
+            "expected all 4 barrier stages in cuts, got {:?}",
+            cuts.iter().map(|(s, _)| *s).collect::<Vec<_>>()
+        );
         for (stage, image) in cuts {
             let committed = stage != NtfsPersistenceStage::DirtyRestartBarrier;
             let crashed = FaultInjectingNtfsDevice::new(image);
@@ -401,7 +419,10 @@ fn ntfs_orphan_retention_and_replacement_recover_at_native_barriers() {
             drop(fs);
             let reopened = engine_for(&cx, &crashed);
             reopened.check_clean_consistency(&cx).unwrap();
-            assert!(owned_files(&cx, &reopened).is_empty());
+            assert_eq!(
+                owned_files(&cx, &reopened),
+                [] as [(ffs_ondisk::ntfs::NtfsReference, Vec<u16>); 0]
+            );
             let before = crashed.snapshot_durable_only();
             let writes = crashed.write_bytes_total();
             drop(NtfsFs::from_engine(&cx, reopened, 1000, 1000).unwrap());
@@ -433,14 +454,27 @@ fn ntfs_orphan_cleanup_recovers_at_native_barriers_and_sync_failures() {
             captured
                 .lock()
                 .unwrap()
-                .push(backing.snapshot_durable_only());
+                .push((event.stage, backing.snapshot_durable_only()));
         }
         Ok(())
     })));
     drop(NtfsFs::from_engine(&cx, engine, 1000, 1000).unwrap());
     let sync_count = device.state.lock().unwrap().sync_calls;
-    let mut cuts = std::mem::take(&mut *cuts.lock().unwrap());
-    assert_eq!(cuts.len(), 4);
+    let stage_cuts = std::mem::take(&mut *cuts.lock().unwrap());
+    assert!(
+        stage_cuts.len() >= 4
+            && [
+                NtfsPersistenceStage::DirtyRestartBarrier,
+                NtfsPersistenceStage::LogCommitBarrier,
+                NtfsPersistenceStage::TargetMetadataBarrier,
+                NtfsPersistenceStage::AckPublished,
+            ]
+            .iter()
+            .all(|expected| stage_cuts.iter().any(|(stage, _)| stage == expected)),
+        "expected all 4 barrier stages in cleanup cuts, got {:?}",
+        stage_cuts.iter().map(|(s, _)| *s).collect::<Vec<_>>()
+    );
+    let mut cuts: Vec<Vec<u8>> = stage_cuts.into_iter().map(|(_, image)| image).collect();
     assert!(sync_count > 0);
     for fail_at in 1..=sync_count {
         let device = FaultInjectingNtfsDevice::new(retained_image.clone());
@@ -454,7 +488,10 @@ fn ntfs_orphan_cleanup_recovers_at_native_barriers_and_sync_failures() {
         drop(NtfsFs::from_engine(&cx, engine_for(&cx, &crashed), 1000, 1000).unwrap());
         let engine = engine_for(&cx, &crashed);
         engine.check_clean_consistency(&cx).unwrap();
-        assert!(owned_files(&cx, &engine).is_empty());
+        assert_eq!(
+            owned_files(&cx, &engine),
+            [] as [(ffs_ondisk::ntfs::NtfsReference, Vec<u16>); 0]
+        );
         assert!(
             engine
                 .volume_view(&cx)

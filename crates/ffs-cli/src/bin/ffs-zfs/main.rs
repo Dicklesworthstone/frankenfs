@@ -4,6 +4,7 @@
 mod allocation_commands;
 mod file_commands;
 mod properties_commands;
+mod send_recv_commands;
 mod write_commands;
 
 use anyhow::{Context, Result, bail};
@@ -59,12 +60,11 @@ pub fn load_key_material_from_files(
         (None, Some(path), None) => {
             let mut raw = std::fs::read(path)
                 .with_context(|| format!("reading hex ZFS key file {}", path.display()))?;
-            let text = match std::str::from_utf8(&raw) {
-                Ok(s) => s.trim().to_owned(),
-                Err(_) => {
-                    scrub_bytes(&mut raw);
-                    bail!("hex ZFS key file {} is not valid UTF-8", path.display());
-                }
+            let text = if let Ok(s) = std::str::from_utf8(&raw) {
+                s.trim().to_owned()
+            } else {
+                scrub_bytes(&mut raw);
+                bail!("hex ZFS key file {} is not valid UTF-8", path.display());
             };
             scrub_bytes(&mut raw);
             if text.len() != ZFS_WRAPPING_KEY_LEN * 2 || !text.is_ascii() {
@@ -398,6 +398,8 @@ enum Command {
     #[command(flatten)]
     Properties(properties_commands::PropertyCommand),
     #[command(flatten)]
+    SendRecv(send_recv_commands::SendRecvCommand),
+    #[command(flatten)]
     Write(write_commands::WriteCommand),
     /// Inventory checksum-valid configurations and uberblock candidates, not pool authority.
     Inspect {
@@ -467,6 +469,7 @@ fn main() -> Result<()> {
         Command::Allocation(command) => command.run(&cx)?,
         Command::File(command) => command.run(&cx)?,
         Command::Properties(command) => command.run(&cx)?,
+        Command::SendRecv(command) => command.run(&cx)?,
         Command::Write(command) => command.run(&cx)?,
         Command::Inspect { image } => {
             let leaf = image.open(&cx)?;

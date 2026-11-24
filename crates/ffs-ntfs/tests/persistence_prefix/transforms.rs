@@ -2113,7 +2113,7 @@ fn raw_chunk_wof_device(
 
     // Native XPRESS4K supports raw chunks. Every entry except the last gives
     // the next chunk's payload-relative offset, followed by the chunk bytes.
-    assert!(!wof_initial.is_empty());
+    assert_ne!(wof_initial, b"");
     let mut backing = Vec::new();
     for chunk in 1..wof_initial.len().div_ceil(4096) {
         backing.extend_from_slice(&u32::try_from(chunk * 4096).unwrap().to_le_bytes());
@@ -2392,7 +2392,7 @@ fn ntfs_wof_multichunk_writes_preserve_untouched_plaintext_and_zero_gaps() {
         assert!(volume.reparse_point(&cx, &record).unwrap().is_none());
         let streams = volume.data_streams(&cx, &record).unwrap();
         assert_eq!(streams.len(), 1);
-        assert!(streams[0].name.is_empty());
+        assert_eq!(streams[0].name, [] as [u16; 0]);
         reopened.check_clean_consistency(&cx).unwrap();
     }
 }

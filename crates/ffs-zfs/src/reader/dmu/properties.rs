@@ -239,7 +239,8 @@ impl Spec {
                 false,
                 Index::None,
             ),
-            "context" | "fscontext" | "defcontext" | "rootcontext" => (
+            "context" | "fscontext" | "defcontext" | "rootcontext" | "keylocation"
+            | "keystatus" => (
                 DefaultValue::Text(b"none"),
                 false,
                 true,
@@ -271,23 +272,7 @@ impl Spec {
                 true,
                 Index::None,
             ),
-            "keylocation" => (
-                DefaultValue::Text(b"none"),
-                false,
-                true,
-                true,
-                true,
-                Index::None,
-            ),
             "encryptionroot" => (DefaultValue::User, false, true, true, true, Index::None),
-            "keystatus" => (
-                DefaultValue::Text(b"none"),
-                false,
-                true,
-                true,
-                true,
-                Index::None,
-            ),
             _ => {
                 return Err(unsupported(format!(
                     "property {name} needs a computed value, platform default, or an unimplemented native schema"
@@ -729,17 +714,22 @@ impl Objects {
                             stored_source: Some(PropertySource::Local),
                             received: None,
                         },
-                        ("encryptionroot", Some(info)) => Property {
-                            name: name.clone(),
-                            value: Some(PropertyValue::Text(
-                                info.encryption_root_components.join(&b'/'),
-                            )),
-                            source: origin_source,
-                            setpoint: Some(info.encryption_root_components.clone()),
-                            setpoint_snapshot: None,
-                            stored_source: Some(PropertySource::Local),
-                            received: None,
-                        },
+                        ("encryptionroot", Some(info)) => {
+                            let mut full = self.pool_name(cx)?.into_bytes();
+                            for part in &info.encryption_root_components {
+                                full.push(b'/');
+                                full.extend_from_slice(part);
+                            }
+                            Property {
+                                name: name.clone(),
+                                value: Some(PropertyValue::Text(full)),
+                                source: origin_source,
+                                setpoint: Some(info.encryption_root_components.clone()),
+                                setpoint_snapshot: None,
+                                stored_source: Some(PropertySource::Local),
+                                received: None,
+                            }
+                        }
                         ("keystatus", info) => {
                             let status = self
                                 .keyring()

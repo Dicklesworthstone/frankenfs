@@ -22,8 +22,9 @@ use crate::crypto::{
     ZfsDatasetCryptoInfo, ZfsKeyMaterial, ZfsKeyRing, ZfsKeyStatus, parse_dsl_crypto_key_zap,
 };
 use ffs_ondisk::zfs::crypto::{
-    DSL_DIR_CRYPTO_KEY_OBJ, UnwrappedDslKey, bp_crypt_mac, compute_authenticated_block_mac,
-    compute_indirect_block_mac, ct_eq, decrypt_regular_block, verify_objset_macs,
+    DSL_DATASET_IVSET_GUID, DSL_DIR_CRYPTO_KEY_OBJ, UnwrappedDslKey, bp_crypt_mac,
+    compute_authenticated_block_mac, compute_indirect_block_mac, ct_eq, decrypt_regular_block,
+    verify_objset_macs,
 };
 use ffs_ondisk::zfs::decompress;
 use ffs_ondisk::zfs_dmu::{
@@ -54,6 +55,17 @@ struct Object {
 pub(crate) struct DatasetCryptoContext {
     pub(crate) info: ZfsDatasetCryptoInfo,
     pub(crate) raw_scrub_only: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RecvStagingDataset {
+    pub(crate) directory_object: u64,
+    pub(crate) head_object: u64,
+    pub(crate) is_pct_recv_child: bool,
+    pub(crate) prev_snap_obj: u64,
+    pub(crate) prev_snap_txg: u64,
+    pub(crate) objectset_kind: u64,
+    pub(crate) head_zap: Vec<ffs_ondisk::zfs_zap::Entry>,
 }
 
 /// Root/configuration ownership never leaves this object. Cache keys include
@@ -106,6 +118,21 @@ impl Objects {
     #[must_use]
     pub const fn pool_guid(&self) -> u64 {
         self.config.pool_guid
+    }
+
+    /// Return the pool name recorded in the member labels, falling back to `"pool"`.
+    pub fn pool_name(&self, cx: &Cx) -> Result<String> {
+        if let Some(leaf) = self.pool.leaves().first() {
+            for idx in 0..4 {
+                if let Ok(lbl) = leaf.label(cx, idx)
+                    && let Some(name) = lbl.config.text("name")
+                    && !name.is_empty()
+                {
+                    return Ok(name.to_owned());
+                }
+            }
+        }
+        Ok("pool".to_owned())
     }
 
     #[must_use]
@@ -362,6 +389,204 @@ impl Objects {
             keyring: self.keyring.clone(),
             crypto: self.crypto.clone(),
         }
+    }
+
+    #[must_use]
+    pub(crate) const fn config(&self) -> &VdevConfig {
+        &self.config
+    }
+
+    /// Read and physically verify (checksum/protected physical checksum) a block's
+    /// on-disk bytes WITHOUT decompressing or decrypting — used by `--compressed`
+    /// and keyless `--raw` native sends.
+    pub(crate) fn read_verified_physical_block(
+        &self,
+        cx: &Cx,
+        bp: &BlockPointer,
+    ) -> Result<Vec<u8>> {
+        checkpoint(cx)?;
+        Ok(self.pool.read_raw_block(cx, &self.config, bp)?.bytes)
+    }
+
+    /// Read and validate an indirect block (`level > 0`), verifying indirect MACs
+    /// when inside an encrypted dataset.
+    pub(crate) fn read_indirect_block(
+        &mut self,
+        cx: &Cx,
+        bp: &BlockPointer,
+        kind: u8,
+        level: u8,
+        size: usize,
+        ceiling: u64,
+    ) -> Result<Option<(Vec<u8>, Endian, u64)>> {
+        Ok(self
+            .checked(cx, bp, kind, level, size, ceiling)?
+            .map(|b| ((*b.bytes).clone(), b.order, b.birth)))
+    }
+
+    /// Read and verify a logical level-0 block (decrypting if keyed, decompressing
+    /// if compressed).
+    pub(crate) fn read_logical_block(
+        &mut self,
+        cx: &Cx,
+        bp: &BlockPointer,
+        kind: u8,
+        size: usize,
+        ceiling: u64,
+    ) -> Result<Option<(Vec<u8>, Endian, u64)>> {
+        Ok(self
+            .checked(cx, bp, kind, 0, size, ceiling)?
+            .map(|b| ((*b.bytes).clone(), b.order, b.birth)))
+    }
+
+    /// Read `com.datto:ivset_guid` from a zapified `dsl_dataset` object (`DMU_OTN_ZAP_METADATA=196`).
+    pub(crate) fn dataset_ivset_guid(&mut self, cx: &Cx, ds_obj: u64) -> Result<Option<u64>> {
+        let node = self.object(cx, ds_obj)?;
+        if node.object_type() != 196 {
+            return Ok(None);
+        }
+        for entry in self.zap_values(cx, ds_obj)? {
+            if entry.name == DSL_DATASET_IVSET_GUID {
+                return Ok(Some(entry.scalar().map_err(|error| parse(&error))?));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Inspect whether a `DS_FLAG_INCONSISTENT` dataset is a genuine private resumable
+    /// receive staging dataset (`%recv` child or zapified `com.delphix:resume_toguid`).
+    fn is_resumable_recv_staging(
+        &mut self,
+        cx: &Cx,
+        components: &[Vec<u8>],
+        head_obj: u64,
+        head_node: &Dnode,
+    ) -> Result<bool> {
+        if components.last().is_some_and(|c| c == b"%recv") {
+            return Ok(true);
+        }
+        if head_node.object_type() != 196 {
+            return Ok(false);
+        }
+        for entry in self.zap_values(cx, head_obj)? {
+            if entry.name == b"com.delphix:resume_toguid" {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Locate an active private resumable receive staging dataset for `target_components`:
+    /// either `target/%recv` (for an incremental receive into an existing dataset) OR
+    /// `target` itself when marked `DS_FLAG_INCONSISTENT` with `com.delphix:resume_toguid`
+    /// (for a new full receive).
+    pub(crate) fn find_recv_staging_dataset(
+        &mut self,
+        cx: &Cx,
+        target_components: &[Vec<u8>],
+    ) -> Result<Option<RecvStagingDataset>> {
+        checkpoint(cx)?;
+        let pool_dir = self.zap(cx, 1)?;
+        let root_dd = pool_dir
+            .iter()
+            .find(|entry| entry.name == b"root_dataset")
+            .ok_or_else(|| corrupt("MOS object directory lacks root_dataset"))?
+            .value;
+
+        let mut cur_dd = root_dd;
+        for comp in target_components {
+            let dir_obj = self.load(cx, cur_dd)?;
+            let children_zap = dir_obj
+                .node
+                .order()
+                .u64(dir_obj.node.bonus(), 32)
+                .map_err(|e| parse(&e))?;
+            if children_zap == 0 {
+                return Ok(None);
+            }
+            let Some(child_entry) = self
+                .zap(cx, children_zap)?
+                .into_iter()
+                .find(|e| e.name.as_slice() == comp.as_slice())
+            else {
+                return Ok(None);
+            };
+            cur_dd = child_entry.value;
+        }
+
+        // First check for hidden `%recv` child under `cur_dd` (incremental receive staging).
+        let target_dir = self.load(cx, cur_dd)?;
+        let target_children = target_dir
+            .node
+            .order()
+            .u64(target_dir.node.bonus(), 32)
+            .map_err(|e| parse(&e))?;
+        let mut candidate = if target_children != 0
+            && let Some(recv_child) = self
+                .zap(cx, target_children)?
+                .into_iter()
+                .find(|e| e.name == b"%recv")
+        {
+            Some((recv_child.value, true))
+        } else {
+            None
+        };
+
+        // Otherwise check whether `cur_dd` itself is an inconsistent full-receive target.
+        if candidate.is_none() {
+            let head_obj = target_dir
+                .node
+                .order()
+                .u64(target_dir.node.bonus(), 8)
+                .map_err(|e| parse(&e))?;
+            if head_obj != 0 {
+                let ds = self.load(cx, head_obj)?;
+                let flags = ds
+                    .node
+                    .order()
+                    .u64(ds.node.bonus(), 120)
+                    .map_err(|e| parse(&e))?;
+                if flags & 0x1 != 0
+                    && self.is_resumable_recv_staging(cx, target_components, head_obj, &ds.node)?
+                {
+                    candidate = Some((cur_dd, false));
+                }
+            }
+        }
+
+        let Some((stage_dd, is_pct_recv_child)) = candidate else {
+            return Ok(None);
+        };
+        let stage_dir = self.load(cx, stage_dd)?;
+        let dir_order = stage_dir.node.order();
+        let head_obj = dir_order
+            .u64(stage_dir.node.bonus(), 8)
+            .map_err(|e| parse(&e))?;
+        if head_obj == 0 {
+            return Err(corrupt("staging receive DSL directory has no head dataset"));
+        }
+        let ds = self.load(cx, head_obj)?;
+        let ds_order = ds.node.order();
+        let prev_snap_obj = ds_order.u64(ds.node.bonus(), 8).map_err(|e| parse(&e))?;
+        let prev_snap_txg = ds_order.u64(ds.node.bonus(), 16).map_err(|e| parse(&e))?;
+        let root_bp =
+            BlockPointer::parse(&ds.node.bonus()[128..256], ds_order).map_err(|e| parse(&e))?;
+        let raw_os = self.read_dataset_objset_block(cx, &root_bp, ds.ceiling, None, true)?;
+        let os = ObjectSet::parse(&raw_os.bytes, raw_os.order).map_err(|e| parse(&e))?;
+        let head_zap = if ds.node.object_type() == 196 {
+            self.zap_values(cx, head_obj)?
+        } else {
+            Vec::new()
+        };
+        Ok(Some(RecvStagingDataset {
+            directory_object: stage_dd,
+            head_object: head_obj,
+            is_pct_recv_child,
+            prev_snap_obj,
+            prev_snap_txg,
+            objectset_kind: os.kind,
+            head_zap,
+        }))
     }
 
     pub(crate) fn from_root(cx: &Cx, pool: Pool, root: RootBlock) -> Result<Self> {
@@ -837,7 +1062,18 @@ impl Objects {
                     ));
                 }
                 let flags = order.u64(n.bonus(), 120).map_err(|error| parse(&error))?;
-                if flags & !0x1_0006 != 0 {
+                if flags & !0x1_0007 != 0 {
+                    return Err(unsupported(
+                        "inconsistent, deferred or unknown dataset state",
+                    ));
+                }
+                if flags & 0x1 != 0 {
+                    if self.is_resumable_recv_staging(cx, &components, head, n)? {
+                        // Hide incomplete resumable receive staging datasets (`%recv` or
+                        // `com.delphix:resume_toguid`) from live namespace reads so zero
+                        // partial state leaks while sibling datasets remain readable.
+                        continue;
+                    }
                     return Err(unsupported(
                         "inconsistent, deferred or unknown dataset state",
                     ));

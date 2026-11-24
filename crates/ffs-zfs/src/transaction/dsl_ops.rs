@@ -213,7 +213,7 @@ pub(super) struct DslStageResult {
     pub new_root_key: Option<(u64, UnwrappedDslKey)>,
 }
 
-fn reject_busy(detail: impl Into<String>) -> FfsError {
+pub(super) fn reject_busy(detail: impl Into<String>) -> FfsError {
     FfsError::RequestRejected {
         errno: libc::EBUSY,
         detail: detail.into(),
@@ -586,7 +586,7 @@ pub(super) fn write_zap_dnode_in_mos(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn free_mos_object_completely(
+pub(super) fn free_mos_object_completely(
     cx: &Cx,
     mos: &mut Objects,
     mos_meta: &Dnode,
@@ -900,7 +900,7 @@ fn free_bpobj_containers_recursive(
 /// Free ONLY the MOS deadlist/bpobj container metadata (maintaining `com.delphix:empty_bpobj`
 /// refcounts) without freeing the ZPL DVAs listed inside the deadlist.
 #[allow(clippy::too_many_arguments)]
-fn free_deadlist_containers(
+pub(super) fn free_deadlist_containers(
     cx: &Cx,
     mos: &mut Objects,
     mos_meta: &Dnode,
@@ -1160,7 +1160,7 @@ pub(super) fn allocate_fresh_deadlist(
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ObjectSetWalkMode {
+pub(super) enum ObjectSetWalkMode {
     MeasureOnly,
     FreeToAllocator,
 }
@@ -1170,7 +1170,7 @@ enum ObjectSetWalkMode {
 /// Supports encrypted datasets keylessly (using physical checksums + indirect SHA-512 MACs
 /// + plaintext dnode core/BP layout) so locked destroy works natively.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn walk_objectset_above_txg(
+pub(super) fn walk_objectset_above_txg(
     cx: &Cx,
     mos: &mut Objects,
     os_bp: &BlockPointer,
@@ -2088,28 +2088,7 @@ pub(super) fn stage_create_snapshot(
             collision: 0,
         });
     }
-    if !snap_zap_entries.is_empty() {
-        features.increment_read("com.delphix:extensible_dataset", new_txg)?;
-        write_zap_dnode_in_mos(
-            cx,
-            mos,
-            &mos_meta,
-            mos_ceiling,
-            mos_dirty_dnodes,
-            alloc,
-            snap_ds_obj,
-            None,
-            DMU_OTN_ZAP_METADATA,
-            DMU_OT_DSL_DATASET,
-            snap_bonus,
-            &snap_zap_entries,
-            0,
-            false,
-            order,
-            new_txg,
-            staged_writes,
-        )?;
-    } else {
+    if snap_zap_entries.is_empty() {
         let snap_dn = Dnode::from_spec(DnodeSpec {
             object_type: DMU_OT_DSL_DATASET,
             bonus_type: DMU_OT_DSL_DATASET,
@@ -2136,6 +2115,27 @@ pub(super) fn stage_create_snapshot(
             mos_dirty_dnodes,
             snap_ds_obj,
             &snap_dn,
+        )?;
+    } else {
+        features.increment_read("com.delphix:extensible_dataset", new_txg)?;
+        write_zap_dnode_in_mos(
+            cx,
+            mos,
+            &mos_meta,
+            mos_ceiling,
+            mos_dirty_dnodes,
+            alloc,
+            snap_ds_obj,
+            None,
+            DMU_OTN_ZAP_METADATA,
+            DMU_OT_DSL_DATASET,
+            snap_bonus,
+            &snap_zap_entries,
+            0,
+            false,
+            order,
+            new_txg,
+            staged_writes,
         )?;
     }
 
@@ -3738,8 +3738,8 @@ fn build_fresh_zpl_objectset(
     let empty_meta = Dnode::from_spec(DnodeSpec {
         object_type: DMU_OT_DNODE,
         bonus_type: 0,
-        checksum_type: 7,
-        compress_type: 2,
+        checksum_type: 0,
+        compress_type: 0,
         flags: DNODE_FLAG_USED_BYTES,
         order,
         levels: 1,
@@ -4104,7 +4104,7 @@ fn build_fresh_zpl_objectset(
             object_type: DMU_OT_DNODE,
             bonus_type: 0,
             checksum_type: 7,
-            compress_type: 2,
+            compress_type: 0,
             user_flags: 0,
             indirect_shift: 17,
             data_bytes: DNODE_BLOCK_BYTES,
@@ -5204,28 +5204,7 @@ fn stage_create_clone(
             collision: 0,
         });
     }
-    if !clone_head_zap.is_empty() {
-        features.increment_read("com.delphix:extensible_dataset", new_txg)?;
-        write_zap_dnode_in_mos(
-            cx,
-            mos,
-            &mos_meta,
-            mos_ceiling,
-            mos_dirty_dnodes,
-            alloc,
-            clone_head_obj,
-            None,
-            DMU_OTN_ZAP_METADATA,
-            DMU_OT_DSL_DATASET,
-            head_bonus,
-            &clone_head_zap,
-            0,
-            false,
-            order,
-            new_txg,
-            staged_writes,
-        )?;
-    } else {
+    if clone_head_zap.is_empty() {
         let clone_head_dn = Dnode::from_spec(DnodeSpec {
             object_type: DMU_OT_DSL_DATASET,
             bonus_type: DMU_OT_DSL_DATASET,
@@ -5252,6 +5231,27 @@ fn stage_create_clone(
             mos_dirty_dnodes,
             clone_head_obj,
             &clone_head_dn,
+        )?;
+    } else {
+        features.increment_read("com.delphix:extensible_dataset", new_txg)?;
+        write_zap_dnode_in_mos(
+            cx,
+            mos,
+            &mos_meta,
+            mos_ceiling,
+            mos_dirty_dnodes,
+            alloc,
+            clone_head_obj,
+            None,
+            DMU_OTN_ZAP_METADATA,
+            DMU_OT_DSL_DATASET,
+            head_bonus,
+            &clone_head_zap,
+            0,
+            false,
+            order,
+            new_txg,
+            staged_writes,
         )?;
     }
 
@@ -5715,7 +5715,7 @@ fn stage_rename_dataset(
     Ok(target_head_obj)
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn stage_destroy_dataset(
     cx: &Cx,
     mos: &mut Objects,
@@ -5733,6 +5733,40 @@ pub(super) fn stage_destroy_dataset(
     }
     let leaf_name = dataset.last().expect("nonempty");
     let (dd_obj, head_obj, _) = resolve_dataset_ids(cx, mos, dataset)?;
+    let dataset_crypto = mos.dataset_crypto_info(cx, dataset)?;
+    stage_destroy_dataset_by_ids(
+        cx,
+        mos,
+        dd_obj,
+        head_obj,
+        leaf_name,
+        dataset_crypto.as_ref(),
+        mos_dirty_dnodes,
+        features,
+        empty_bpobj_id,
+        alloc,
+        order,
+        new_txg,
+        staged_writes,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(super) fn stage_destroy_dataset_by_ids(
+    cx: &Cx,
+    mos: &mut Objects,
+    dd_obj: u64,
+    head_obj: u64,
+    leaf_name: &[u8],
+    dataset_crypto: Option<&ZfsDatasetCryptoInfo>,
+    mos_dirty_dnodes: &mut BTreeMap<u64, Vec<u8>>,
+    features: &mut MosFeatureState,
+    empty_bpobj_id: Option<u64>,
+    alloc: &mut PoolSpaceAllocator,
+    order: Endian,
+    new_txg: u64,
+    staged_writes: &mut Vec<StagedBlockWrite>,
+) -> Result<u64> {
     let mos_meta = mos.meta_dnode().clone();
     let mos_ceiling = mos.root_birth_txg();
 
@@ -5782,8 +5816,7 @@ pub(super) fn stage_destroy_dataset(
         return Err(reject_busy("ZFS dataset has snapshots"));
     }
 
-    let dataset_crypto = mos.dataset_crypto_info(cx, dataset)?;
-    if let Some(ref c_info) = dataset_crypto
+    if let Some(c_info) = dataset_crypto
         && c_info.encryption_root_ddobj == dd_obj
         && c_info.record.refcount > 1
     {
@@ -5817,7 +5850,7 @@ pub(super) fn stage_destroy_dataset(
         mos,
         &head_bp,
         head_ceil,
-        dataset_crypto.as_ref(),
+        dataset_crypto,
         origin_txg,
         ObjectSetWalkMode::FreeToAllocator,
         alloc,
@@ -5919,7 +5952,7 @@ pub(super) fn stage_destroy_dataset(
     let p_cz = order.u64(p_dn.bonus(), 32).map_err(|e| parse_err(&e))?;
     let (p_cz_dn, p_cz_ceil) = mos.object_with_ceiling(cx, p_cz)?;
     let mut p_entries = mos.zap_values(cx, p_cz)?;
-    p_entries.retain(|e| &e.name != leaf_name);
+    p_entries.retain(|e| e.name != leaf_name);
     write_zap_dnode_in_mos(
         cx,
         mos,
@@ -6007,7 +6040,7 @@ pub(super) fn stage_destroy_dataset(
     }
 
     // 5b. Decrement `DSL_CRYPTO_REFCOUNT` (or free `dsl_crypto_key` + decrement `com.datto:encryption` at 0).
-    if let Some(ref c_info) = dataset_crypto {
+    if let Some(c_info) = dataset_crypto {
         let remaining = adjust_dsl_crypto_key_refcount(
             cx,
             mos,
@@ -6698,7 +6731,7 @@ pub(super) fn apply_properties_batch_on_ids(
                         }
                     }
                     "compression" => {
-                        let is_zstd = num & 127 == 16 && matches!(num >> 7, 0 | 1..=19);
+                        let is_zstd = num & 127 == 16 && matches!(num >> 7, 0..=19);
                         if !matches!(num, 0 | 1 | 2 | 5..=15) && !is_zstd {
                             return Err(unsupported(format!(
                                 "unsupported ZFS compression property index {num}"

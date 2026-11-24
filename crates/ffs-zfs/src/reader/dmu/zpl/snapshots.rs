@@ -34,6 +34,7 @@ pub struct Snapshot {
     pub objectset_kind: u64,
 }
 
+#[derive(Clone)]
 pub(crate) struct SnapshotRoot {
     pub(crate) info: Snapshot,
     pub(crate) root: BlockPointer,
@@ -343,6 +344,102 @@ impl Objects {
             ));
         }
         checkpoint(cx)
+    }
+
+    /// Return all named snapshots ordered oldest-to-newest by `creation_txg`,
+    /// used by incremental `-I` intermediary send streams.
+    pub(crate) fn snapshot_chain(
+        &mut self,
+        cx: &Cx,
+        components: &[Vec<u8>],
+    ) -> Result<Vec<SnapshotRoot>> {
+        let mut chain = self.snapshot_roots(cx, components)?;
+        chain.sort_unstable_by_key(|row| row.info.creation_txg);
+        Ok(chain)
+    }
+
+    /// Open a snapshot's `ObjectSet` + DMU `Objects` view for either ZPL (`kind == 2`)
+    /// or ZVOL (`kind == 3`). When `raw_keyless == true`, encrypted snapshots open in
+    /// keyless raw-read mode (verifying physical checksums & indirect MACs without
+    /// requiring the wrapping key) and return the 32-byte `os_portable_mac`.
+    pub(crate) fn open_snapshot_objectset(
+        &mut self,
+        cx: &Cx,
+        components: &[Vec<u8>],
+        selected: &SnapshotRoot,
+        raw_keyless: bool,
+    ) -> Result<(
+        ObjectSet,
+        Self,
+        Option<crate::crypto::ZfsDatasetCryptoInfo>,
+        [u8; 32],
+    )> {
+        if !matches!(selected.info.objectset_kind, 2 | 3) {
+            return Err(unsupported(
+                "send streams require a ZPL filesystem or ZVOL snapshot",
+            ));
+        }
+        let crypto_info = self.dataset_crypto_info(cx, components)?;
+        let (block, crypto_ctx) = if let Some(info) = crypto_info.clone() {
+            if raw_keyless {
+                let block = self.read_dataset_objset_block(
+                    cx,
+                    &selected.root,
+                    selected.info.creation_txg,
+                    None,
+                    true,
+                )?;
+                (
+                    block,
+                    Some(std::sync::Arc::new(super::super::DatasetCryptoContext {
+                        info,
+                        raw_scrub_only: true,
+                    })),
+                )
+            } else {
+                let key = self
+                    .keyring
+                    .get(info.encryption_root_ddobj)
+                    .ok_or(FfsError::PermissionDenied)?;
+                let block = self.read_dataset_objset_block(
+                    cx,
+                    &selected.root,
+                    selected.info.creation_txg,
+                    Some(&key),
+                    false,
+                )?;
+                (
+                    block,
+                    Some(std::sync::Arc::new(super::super::DatasetCryptoContext {
+                        info,
+                        raw_scrub_only: false,
+                    })),
+                )
+            }
+        } else {
+            (
+                self.read_dataset_objset_block(
+                    cx,
+                    &selected.root,
+                    selected.info.creation_txg,
+                    None,
+                    false,
+                )?,
+                None,
+            )
+        };
+        let mut portable_mac = [0_u8; 32];
+        if block.bytes.len() >= 752 {
+            portable_mac.copy_from_slice(&block.bytes[720..752]);
+        }
+        let os = ObjectSet::parse(&block.bytes, block.order).map_err(|error| parse(&error))?;
+        let view = self.open_objectset_view_with_crypto(
+            os.meta.clone(),
+            selected.root.birth(),
+            selected.info.creation_txg,
+            crypto_ctx,
+        );
+        Ok((os, view, crypto_info, portable_mac))
     }
 
     /// Exact stored-name selection, not case-folded alias selection. A missing

@@ -337,7 +337,7 @@ impl AesKeySchedule {
         for i in 0..16 {
             s[i] ^= self.round_keys[0][i];
         }
-        for r in 1..self.rounds {
+        for rk in self.round_keys.iter().take(self.rounds).skip(1) {
             // SubBytes
             for b in &mut s {
                 *b = AES_SBOX[usize::from(*b)];
@@ -372,7 +372,6 @@ impl AesKeySchedule {
                 s[c + 3] = a3 ^ xor_all ^ xtime(a3 ^ a0);
             }
             // AddRoundKey
-            let rk = &self.round_keys[r];
             for i in 0..16 {
                 s[i] ^= rk[i];
             }
@@ -537,8 +536,7 @@ fn ccm_cbcmac(
             let l = u16::try_from(aad.len()).map_err(|_| invalid("CCM AAD length overflow"))?;
             hdr[0..2].copy_from_slice(&l.to_be_bytes());
             2
-        } else if aad.len() <= u32::MAX as usize {
-            let l = u32::try_from(aad.len()).map_err(|_| invalid("CCM AAD length overflow"))?;
+        } else if let Ok(l) = u32::try_from(aad.len()) {
             hdr[0] = 0xFF;
             hdr[1] = 0xFE;
             hdr[2..6].copy_from_slice(&l.to_be_bytes());
@@ -670,7 +668,7 @@ pub fn aead_decrypt(
 // ── SHA-1 + PBKDF2-HMAC-SHA1 (OpenZFS passphrase key derivation) ────────────
 
 fn sha1_digest(data: &[u8]) -> [u8; 20] {
-    let mut h: [u32; 5] = [
+    let mut state: [u32; 5] = [
         0x6745_2301,
         0xEFCD_AB89,
         0x98BA_DCFE,
@@ -686,10 +684,10 @@ fn sha1_digest(data: &[u8]) -> [u8; 20] {
     }
     padded.extend_from_slice(&bit_len.to_be_bytes());
 
-    let mut w = [0_u32; 80];
-    for block in padded.chunks_exact(64) {
+    let mut schedule = [0_u32; 80];
+    for block in padded.as_chunks::<64>().0 {
         for i in 0..16 {
-            w[i] = u32::from_be_bytes([
+            schedule[i] = u32::from_be_bytes([
                 block[i * 4],
                 block[i * 4 + 1],
                 block[i * 4 + 2],
@@ -697,36 +695,37 @@ fn sha1_digest(data: &[u8]) -> [u8; 20] {
             ]);
         }
         for i in 16..80 {
-            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+            schedule[i] = (schedule[i - 3] ^ schedule[i - 8] ^ schedule[i - 14] ^ schedule[i - 16])
+                .rotate_left(1);
         }
-        let [mut a, mut b, mut c, mut d, mut e] = h;
-        for (i, &wi) in w.iter().enumerate() {
-            let (f, k) = match i {
-                0..=19 => ((b & c) | ((!b) & d), 0x5A82_7999_u32),
-                20..=39 => (b ^ c ^ d, 0x6ED9_EBA1_u32),
-                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1B_BCDC_u32),
-                _ => (b ^ c ^ d, 0xCA62_C1D6_u32),
+        let [mut va, mut vb, mut vc, mut vd, mut ve] = state;
+        for (i, &wi) in schedule.iter().enumerate() {
+            let (func, k_const) = match i {
+                0..=19 => ((vb & vc) | ((!vb) & vd), 0x5A82_7999_u32),
+                20..=39 => (vb ^ vc ^ vd, 0x6ED9_EBA1_u32),
+                40..=59 => ((vb & vc) | (vb & vd) | (vc & vd), 0x8F1B_BCDC_u32),
+                _ => (vb ^ vc ^ vd, 0xCA62_C1D6_u32),
             };
-            let temp = a
+            let temp = va
                 .rotate_left(5)
-                .wrapping_add(f)
-                .wrapping_add(e)
-                .wrapping_add(k)
+                .wrapping_add(func)
+                .wrapping_add(ve)
+                .wrapping_add(k_const)
                 .wrapping_add(wi);
-            e = d;
-            d = c;
-            c = b.rotate_left(30);
-            b = a;
-            a = temp;
+            ve = vd;
+            vd = vc;
+            vc = vb.rotate_left(30);
+            vb = va;
+            va = temp;
         }
-        h[0] = h[0].wrapping_add(a);
-        h[1] = h[1].wrapping_add(b);
-        h[2] = h[2].wrapping_add(c);
-        h[3] = h[3].wrapping_add(d);
-        h[4] = h[4].wrapping_add(e);
+        state[0] = state[0].wrapping_add(va);
+        state[1] = state[1].wrapping_add(vb);
+        state[2] = state[2].wrapping_add(vc);
+        state[3] = state[3].wrapping_add(vd);
+        state[4] = state[4].wrapping_add(ve);
     }
     let mut out = [0_u8; 20];
-    for (i, word) in h.iter().enumerate() {
+    for (i, word) in state.iter().enumerate() {
         out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
     }
     out
@@ -1265,7 +1264,7 @@ pub fn compute_indirect_block_mac(
         return Err(invalid("indirect block length is not a multiple of 128"));
     }
     let mut hasher = Sha512::new();
-    for chunk in uncompressed_indirect.chunks_exact(128) {
+    for chunk in uncompressed_indirect.as_chunks::<128>().0 {
         let bp = BlockPointer::parse(chunk, order)?;
         hasher.update(blkptr_auth_buf(&bp, version));
     }
@@ -1466,18 +1465,101 @@ pub fn decrypt_dnode_block(
     let iv = bp_crypt_iv(bp);
     let mac = bp_crypt_mac(bp);
     let mut dk = derive_block_data_key(key.active_master_key(), key.suite, &salt)?;
-    let mut enc_pt = aead_decrypt(key.suite, &dk, &iv, &parts.aad, &enc_ct, &mac)?;
+    let mut plain_spans = aead_decrypt(key.suite, &dk, &iv, &parts.aad, &enc_ct, &mac)?;
     scrub_bytes(&mut dk);
 
     let mut out = ciphertext.to_vec();
     let mut cursor = 0_usize;
     for &(lo, hi) in &parts.enc_spans {
         let len = hi - lo;
-        out[lo..hi].copy_from_slice(&enc_pt[cursor..cursor + len]);
+        out[lo..hi].copy_from_slice(&plain_spans[cursor..cursor + len]);
         cursor += len;
     }
-    scrub_bytes(&mut enc_pt);
+    scrub_bytes(&mut plain_spans);
     Ok(out)
+}
+
+/// Extract raw on-disk bonus bytes (still encrypted when `bonus_type` is an encrypted
+/// object type) for a single dnode slot inside a 16 KiB `DMU_OT_DNODE` block, supporting
+/// keyless raw (`zfs send -w`) stream generation.
+pub fn extract_raw_dnode_bonus(
+    raw_block: &[u8],
+    slot: usize,
+    order: Endian,
+) -> Result<Option<(usize, Vec<u8>)>, ParseError> {
+    if raw_block.len() != DNODE_BLOCK_BYTES || slot >= DNODE_BLOCK_BYTES / DNODE_BYTES {
+        return Err(invalid("invalid dnode block or slot index"));
+    }
+    let base = slot * DNODE_BYTES;
+    if raw_block[base] == 0 {
+        return Ok(None);
+    }
+    let extra_slots = usize::from(raw_block[base + 12]);
+    let total_slots = DNODE_BLOCK_BYTES / DNODE_BYTES;
+    if slot + 1 + extra_slots > total_slots {
+        return Err(invalid("dnode extra_slots exceeds 16 KiB dnode block"));
+    }
+    let dnode_size = (1 + extra_slots) * DNODE_BYTES;
+    let nblkptr = usize::from(raw_block[base + 3]);
+    let has_spill = (raw_block[base + 7] & DNODE_FLAG_SPILL_BLKPTR) != 0;
+    let bonus_start = 64 + nblkptr * 128;
+    let bonus_end = dnode_size - if has_spill { 128 } else { 0 };
+    if nblkptr == 0 || nblkptr > 3 || bonus_start > bonus_end {
+        return Err(invalid("invalid dnode nblkptr or bonus geometry"));
+    }
+    let bonus_len = usize::from(match order {
+        Endian::Little => u16::from_le_bytes([raw_block[base + 10], raw_block[base + 11]]),
+        Endian::Big => u16::from_be_bytes([raw_block[base + 10], raw_block[base + 11]]),
+    });
+    if bonus_len == 0 {
+        return Ok(Some((0, Vec::new())));
+    }
+    let bonus_type = raw_block[base + 4];
+    let raw_len = if dmu_ot_is_encrypted(bonus_type) {
+        bonus_end - bonus_start
+    } else {
+        bonus_len.min(bonus_end - bonus_start)
+    };
+    Ok(Some((
+        raw_len,
+        raw_block[base + bonus_start..base + bonus_start + raw_len].to_vec(),
+    )))
+}
+
+/// Write exact raw (possibly encrypted) bonus bytes into a dnode slot inside a 16 KiB
+/// `DMU_OT_DNODE` block during keyless raw (`zfs recv`) stream ingestion.
+pub fn write_raw_dnode_bonus(
+    raw_block: &mut [u8],
+    slot: usize,
+    raw_bonus: &[u8],
+) -> Result<(), ParseError> {
+    if raw_block.len() != DNODE_BLOCK_BYTES || slot >= DNODE_BLOCK_BYTES / DNODE_BYTES {
+        return Err(invalid("invalid dnode block or slot index"));
+    }
+    let base = slot * DNODE_BYTES;
+    if raw_block[base] == 0 {
+        return Err(invalid("cannot write raw bonus into free dnode slot"));
+    }
+    let extra_slots = usize::from(raw_block[base + 12]);
+    let total_slots = DNODE_BLOCK_BYTES / DNODE_BYTES;
+    if slot + 1 + extra_slots > total_slots {
+        return Err(invalid("dnode extra_slots exceeds 16 KiB dnode block"));
+    }
+    let dnode_size = (1 + extra_slots) * DNODE_BYTES;
+    let nblkptr = usize::from(raw_block[base + 3]);
+    let has_spill = (raw_block[base + 7] & DNODE_FLAG_SPILL_BLKPTR) != 0;
+    let bonus_start = 64 + nblkptr * 128;
+    let bonus_end = dnode_size - if has_spill { 128 } else { 0 };
+    if nblkptr == 0 || nblkptr > 3 || bonus_start > bonus_end {
+        return Err(invalid("invalid dnode nblkptr or bonus geometry"));
+    }
+    let capacity = bonus_end - bonus_start;
+    if raw_bonus.len() > capacity {
+        return Err(invalid("raw bonus payload exceeds dnode bonus capacity"));
+    }
+    raw_block[base + bonus_start..base + bonus_end].fill(0);
+    raw_block[base + bonus_start..base + bonus_start + raw_bonus.len()].copy_from_slice(raw_bonus);
+    Ok(())
 }
 
 // ── `objset_phys_t` Portable & Local HMACs (`zio_crypt_do_objset_hmacs`) ────
@@ -1657,7 +1739,7 @@ fn push_lz4_ext_len(out: &mut Vec<u8>, mut rem: usize) {
 fn compress_lz4_payload(input: &[u8]) -> Vec<u8> {
     const HASH_BITS: usize = 12;
     const HASH_SIZE: usize = 1 << HASH_BITS;
-    let mut table = [0_usize; HASH_SIZE];
+    let mut table = vec![0_usize; HASH_SIZE];
     let mut out = Vec::with_capacity(input.len() + 16);
     let len = input.len();
     let mut anchor = 0_usize;
@@ -1841,7 +1923,7 @@ mod tests {
         let k1 = [0_u8; 16];
         let iv1 = [0_u8; 12];
         let (ct1, tag1) = aes_gcm_encrypt(&k1, &iv1, &[], &[]).unwrap();
-        assert!(ct1.is_empty());
+        assert_eq!(ct1, b"");
         assert_eq!(
             tag1.as_slice(),
             hex_to_bytes("58e2fccefa7e3061367f1d57a4e7455a").as_slice()
@@ -2033,8 +2115,8 @@ mod tests {
     #[test]
     fn compression_roundtrip_all_codecs() {
         let mut block = vec![0_u8; 4096];
-        for i in 0..512 {
-            block[i] = (i % 13) as u8;
+        for (i, byte) in block.iter_mut().enumerate().take(512) {
+            *byte = (i % 13) as u8;
         }
         for (alg, lvl) in [(2, None), (14, None), (15, None), (6, None), (16, Some(3))] {
             let (phys, actual_alg) = compress_block(&block, alg, lvl, 512).unwrap();

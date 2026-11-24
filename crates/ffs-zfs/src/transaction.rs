@@ -9,6 +9,7 @@
 
 mod dmu_cow;
 mod dsl_ops;
+mod recv_ops;
 mod zpl_ops;
 mod zvol_ops;
 
@@ -42,6 +43,9 @@ use self::dsl_ops::{DslMutation, stage_dsl_mutation};
 pub use self::dsl_ops::{
     ZfsBookmarkInfo, ZfsEncryptionCreateOptions, ZfsHoldInfo, ZfsPropertySetValue,
     list_bookmarks_in_mos, list_holds_in_mos,
+};
+pub use self::recv_ops::{
+    ZfsRecvReport, ZfsRecvRequest, ZfsResumeState, inspect_receive_resume_state_in_mos,
 };
 pub use self::zpl_ops::{
     ZfsDataChecksum, ZfsFileRangeOperation, ZfsObjectIdentity, ZfsPosixSetAttr, ZfsSetAttr,

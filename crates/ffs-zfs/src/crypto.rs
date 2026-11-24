@@ -262,16 +262,13 @@ impl ZfsKeyRing {
     /// Report `ZfsKeyStatus` for a dataset whose encryption root is `encryption_root_ddobj`.
     #[must_use]
     pub fn key_status(&self, encryption_root_ddobj: Option<u64>) -> ZfsKeyStatus {
-        match encryption_root_ddobj {
-            None => ZfsKeyStatus::None,
-            Some(root) => {
-                if self.get(root).is_some() {
-                    ZfsKeyStatus::Available
-                } else {
-                    ZfsKeyStatus::Unavailable
-                }
+        encryption_root_ddobj.map_or(ZfsKeyStatus::None, |root| {
+            if self.get(root).is_some() {
+                ZfsKeyStatus::Available
+            } else {
+                ZfsKeyStatus::Unavailable
             }
-        }
+        })
     }
 
     /// List all currently loaded encryption-root DSL directory object IDs.

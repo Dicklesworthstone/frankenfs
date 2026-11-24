@@ -1213,6 +1213,68 @@ pub(super) fn write_dataset_objset_block(
     Ok(bp)
 }
 
+/// Write a protected `DMU_OT_OBJSET` root block with explicit `(portable_mac, local_mac)`,
+/// enabling keyless raw encrypted (`zfs recv`) ingestion without needing the wrapping key.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn write_dataset_objset_block_raw_protected(
+    os: &mut ObjectSet,
+    alloc: &mut PoolSpaceAllocator,
+    checksum_type: u8,
+    order: Endian,
+    new_txg: u64,
+    portable_mac: [u8; 32],
+    local_mac: [u8; 32],
+    staged_writes: &mut Vec<StagedBlockWrite>,
+) -> Result<BlockPointer> {
+    let effective_cksum = if matches!(checksum_type, 6..=8 | 11) {
+        checksum_type
+    } else {
+        7
+    };
+    let fill = os.meta_fill();
+    if os.physical_bytes() < 2048 {
+        os.ensure_min_physical_bytes(4096)
+            .map_err(|e| parse_err(&e))?;
+    }
+    os.set_macs(portable_mac, local_mac)
+        .map_err(|e| parse_err(&e))?;
+    let os_bytes = os.encode(order).map_err(|e| parse_err(&e))?;
+    let os_dva = alloc.allocate(os_bytes.len())?;
+    let bp = BlockPointer::new_protected(&ProtectedBlockSpec {
+        dvas: &[os_dva],
+        physical: &os_bytes,
+        logical_bytes: os_bytes.len(),
+        compression: 2,
+        checksum_type: effective_cksum,
+        object_type: DMU_OT_OBJSET,
+        level: 0,
+        payload_order: order,
+        birth: new_txg,
+        fill,
+        salt: None,
+        iv: None,
+        mac: [0_u8; ZIO_DATA_MAC_LEN],
+    })
+    .map_err(|e| parse_err(&e))?;
+    staged_writes.push(StagedBlockWrite {
+        bucket: WriteBucket::DatasetMetadata,
+        dva_offset: os_dva.offset,
+        bytes: os_bytes,
+    });
+    Ok(bp)
+}
+
+/// Leaf block update entry for [`cow_update_dnode_with_staged_leaves`].
+#[derive(Debug, Clone)]
+pub(super) enum StagedLeafUpdate {
+    /// Punch a hole at this block ID.
+    Hole,
+    /// Encode/compress/encrypt logical bytes and allocate a new leaf block.
+    Plaintext(Vec<u8>),
+    /// Attach an already-allocated (compressed, embedded, or keyless raw encrypted) `BlockPointer`.
+    Prebuilt(BlockPointer),
+}
+
 /// Bottom-up COW update of one dnode's data and indirect blocks (unencrypted/MOS).
 pub(super) fn cow_update_dnode(
     cx: &Cx,
@@ -1226,7 +1288,7 @@ pub(super) fn cow_update_dnode(
 }
 
 /// Bottom-up COW update of one dnode's data and indirect blocks with optional dataset encryption.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn cow_update_dnode_with_crypto(
     cx: &Cx,
     view: &mut Objects,
@@ -1234,10 +1296,49 @@ pub(super) fn cow_update_dnode_with_crypto(
     spec: DnodeCowSpec<'_>,
     dirty_leaves: &BTreeMap<u64, Option<Vec<u8>>>,
     object_id: u64,
+    crypto: Option<&mut DatasetWriteCrypto>,
+    staged_writes: &mut Vec<StagedBlockWrite>,
+) -> Result<DnodeCowOutput> {
+    let converted: BTreeMap<u64, StagedLeafUpdate> = dirty_leaves
+        .iter()
+        .map(|(&k, v)| {
+            let upd = v.as_ref().map_or(StagedLeafUpdate::Hole, |bytes| {
+                StagedLeafUpdate::Plaintext(bytes.clone())
+            });
+            (k, upd)
+        })
+        .collect();
+    cow_update_dnode_with_staged_leaves(
+        cx,
+        view,
+        alloc,
+        spec,
+        &converted,
+        object_id,
+        crypto,
+        None,
+        staged_writes,
+    )
+}
+
+/// Bottom-up COW update supporting logical plaintext, holes, and prebuilt (compressed,
+/// embedded, or keyless raw encrypted) leaf `BlockPointer`s with optional keyless
+/// SHA-512 indirect MAC computation (`raw_protected = Some((crypto_version, min_levels))`).
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(super) fn cow_update_dnode_with_staged_leaves(
+    cx: &Cx,
+    view: &mut Objects,
+    alloc: &mut PoolSpaceAllocator,
+    spec: DnodeCowSpec<'_>,
+    dirty_leaves: &BTreeMap<u64, StagedLeafUpdate>,
+    object_id: u64,
     mut crypto: Option<&mut DatasetWriteCrypto>,
+    raw_protected: Option<(u64, u8)>,
     staged_writes: &mut Vec<StagedBlockWrite>,
 ) -> Result<DnodeCowOutput> {
     checkpoint(cx)?;
+    let raw_protected_version = raw_protected.map(|(ver, _)| ver);
+    let min_levels = raw_protected.map_or(1_u8, |(_, ml)| ml.clamp(1, 7));
     let mut retired_bps = Vec::new();
     let mut born = SpaceDelta::default();
     let effective_cksum = if matches!(spec.checksum_type, 6..=8 | 11) {
@@ -1267,9 +1368,9 @@ pub(super) fn cow_update_dnode_with_crypto(
     let indirect_bytes = 1_usize << spec.indirect_shift;
     let fanout = (indirect_bytes / 128) as u64;
     let old_levels = spec.existing.map_or(1_u8, |(n, _)| n.levels());
-    let mut levels = old_levels;
+    let mut levels = old_levels.max(min_levels);
     let mut preserved_single_block0 = None;
-    if spec.max_block == 0 && levels > 1 {
+    if spec.max_block == 0 && levels > 1 && min_levels == 1 {
         // Shrinking back to single-block: retire all old indirect blocks (`level >= 1`)
         // and preserve existing level-0 block 0 when not rewritten in `dirty_leaves`.
         if let Some((old_node, old_ceiling)) = spec.existing {
@@ -1304,59 +1405,65 @@ pub(super) fn cow_update_dnode_with_crypto(
     if let Some(bp0) = preserved_single_block0 {
         current_updates.insert(0, bp0);
     }
-    for (&block_id, maybe_bytes) in dirty_leaves {
+    for (&block_id, leaf_update) in dirty_leaves {
         checkpoint(cx)?;
         if block_id > spec.max_block {
             continue;
         }
+        let is_non_hole = !matches!(leaf_update, StagedLeafUpdate::Hole);
         if let Some((old_node, old_ceiling)) = spec.existing
             && let Some((old_bp, _)) =
                 lookup_existing_bp_at_level(cx, view, old_node, old_ceiling, 0, block_id)?
         {
-            admit_rewritten_dnode_leaf(
-                spec.object_type,
-                maybe_bytes.is_some(),
-                &old_bp,
-                spec.order,
-            )?;
+            if matches!(
+                leaf_update,
+                StagedLeafUpdate::Plaintext(_) | StagedLeafUpdate::Hole
+            ) {
+                admit_rewritten_dnode_leaf(spec.object_type, is_non_hole, &old_bp, spec.order)?;
+            }
             retired_bps.push(old_bp);
         }
-        let new_bp = if let Some(payload) = maybe_bytes {
-            if payload.len() != spec.data_bytes {
-                return Err(corrupt(
-                    "dirty DMU leaf block size disagrees with dn_datablkszsec",
-                ));
+        let new_bp = match leaf_update {
+            StagedLeafUpdate::Plaintext(payload) => {
+                if payload.len() != spec.data_bytes {
+                    return Err(corrupt(
+                        "dirty DMU leaf block size disagrees with dn_datablkszsec",
+                    ));
+                }
+                let fill = if spec.object_type == DMU_OT_DNODE {
+                    count_allocated_dnodes(payload, spec.order).map_err(|e| parse_err(&e))?
+                } else {
+                    1
+                };
+                let bp = write_dataset_block(
+                    alloc,
+                    payload,
+                    object_id,
+                    block_id,
+                    spec.object_type,
+                    0,
+                    effective_cksum,
+                    spec.order,
+                    spec.new_txg,
+                    fill,
+                    spec.leaf_bucket,
+                    crypto.as_deref_mut(),
+                    staged_writes,
+                )?;
+                born.add_assign(SpaceDelta::from_bp(&bp)?)?;
+                bp
             }
-            let fill = if spec.object_type == DMU_OT_DNODE {
-                count_allocated_dnodes(payload, spec.order).map_err(|e| parse_err(&e))?
-            } else {
-                1
-            };
-            let bp = write_dataset_block(
-                alloc,
-                payload,
-                object_id,
-                block_id,
-                spec.object_type,
-                0,
-                effective_cksum,
-                spec.order,
-                spec.new_txg,
-                fill,
-                spec.leaf_bucket,
-                crypto.as_deref_mut(),
-                staged_writes,
-            )?;
-            born.add_assign(SpaceDelta::from_bp(&bp)?)?;
-            bp
-        } else {
-            make_hole_bp(
+            StagedLeafUpdate::Prebuilt(bp) => {
+                born.add_assign(SpaceDelta::from_bp(bp)?)?;
+                bp.clone()
+            }
+            StagedLeafUpdate::Hole => make_hole_bp(
                 spec.data_bytes,
                 spec.object_type,
                 0,
                 spec.new_txg,
                 alloc.hole_birth_active,
-            )?
+            )?,
         };
         current_updates.insert(block_id, new_bp);
     }
@@ -1495,21 +1602,51 @@ pub(super) fn cow_update_dnode_with_crypto(
                     alloc.hole_birth_active,
                 )?
             } else {
-                let bp = write_dataset_block(
-                    alloc,
-                    &raw_block,
-                    object_id,
-                    parent_idx,
-                    spec.object_type,
-                    parent_level,
-                    effective_cksum,
-                    spec.order,
-                    spec.new_txg,
-                    fill_sum,
-                    spec.indirect_bucket,
-                    crypto.as_deref_mut(),
-                    staged_writes,
-                )?;
+                let bp = if crypto.is_none()
+                    && let Some(enc_ver) = raw_protected_version
+                {
+                    let mac = compute_indirect_block_mac(&raw_block, spec.order, enc_ver)
+                        .map_err(|e| parse_err(&e))?;
+                    let dva = alloc.allocate(raw_block.len())?;
+                    let bp = BlockPointer::new_protected(&ProtectedBlockSpec {
+                        dvas: &[dva],
+                        physical: &raw_block,
+                        logical_bytes: raw_block.len(),
+                        compression: 2,
+                        checksum_type: effective_cksum,
+                        object_type: spec.object_type,
+                        level: parent_level,
+                        payload_order: spec.order,
+                        birth: spec.new_txg,
+                        fill: fill_sum,
+                        salt: None,
+                        iv: None,
+                        mac,
+                    })
+                    .map_err(|e| parse_err(&e))?;
+                    staged_writes.push(StagedBlockWrite {
+                        bucket: spec.indirect_bucket,
+                        dva_offset: dva.offset,
+                        bytes: raw_block,
+                    });
+                    bp
+                } else {
+                    write_dataset_block(
+                        alloc,
+                        &raw_block,
+                        object_id,
+                        parent_idx,
+                        spec.object_type,
+                        parent_level,
+                        effective_cksum,
+                        spec.order,
+                        spec.new_txg,
+                        fill_sum,
+                        spec.indirect_bucket,
+                        crypto.as_deref_mut(),
+                        staged_writes,
+                    )?
+                };
                 born.add_assign(SpaceDelta::from_bp(&bp)?)?;
                 bp
             };
@@ -1579,7 +1716,11 @@ pub(super) fn cow_update_dnode_with_crypto(
     let dnode = Dnode::from_spec(DnodeSpec {
         object_type: spec.object_type,
         bonus_type: spec.bonus_type,
-        checksum_type: spec.existing.map_or(0, |(n, _)| n.checksum_type()),
+        checksum_type: if raw_protected_version.is_some() {
+            spec.checksum_type
+        } else {
+            spec.existing.map_or(0, |(n, _)| n.checksum_type())
+        },
         compress_type: spec.compress_type,
         flags,
         order: spec.order,

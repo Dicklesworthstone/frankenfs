@@ -27,22 +27,22 @@ use super::{KeyArgs, json, load_key_material_from_files};
 #[derive(Debug, Default, Args)]
 pub struct NewKeyArgs {
     /// Host file containing an exact 32-byte raw wrapping key (`keyformat=raw`).
-    #[arg(long, conflicts_with_all = ["new_key_hex_file", "new_passphrase_file"])]
-    pub new_key_file: Option<PathBuf>,
+    #[arg(long = "new-key-file", conflicts_with_all = ["hex_key", "passphrase"])]
+    pub raw_key: Option<PathBuf>,
     /// Host file containing 64 ASCII hexadecimal digits (`keyformat=hex`).
-    #[arg(long, conflicts_with_all = ["new_key_file", "new_passphrase_file"])]
-    pub new_key_hex_file: Option<PathBuf>,
+    #[arg(long = "new-key-hex-file", conflicts_with_all = ["raw_key", "passphrase"])]
+    pub hex_key: Option<PathBuf>,
     /// Host file containing a passphrase (`keyformat=passphrase`, single trailing newline stripped).
-    #[arg(long, conflicts_with_all = ["new_key_file", "new_key_hex_file"])]
-    pub new_passphrase_file: Option<PathBuf>,
+    #[arg(long = "new-passphrase-file", conflicts_with_all = ["raw_key", "hex_key"])]
+    pub passphrase: Option<PathBuf>,
 }
 
 impl NewKeyArgs {
     fn load_material(&self) -> Result<Option<ZfsKeyMaterial>> {
         load_key_material_from_files(
-            self.new_key_file.as_deref(),
-            self.new_key_hex_file.as_deref(),
-            self.new_passphrase_file.as_deref(),
+            self.raw_key.as_deref(),
+            self.hex_key.as_deref(),
+            self.passphrase.as_deref(),
         )
     }
 }
@@ -119,7 +119,7 @@ pub struct WritePoolArgs {
 }
 
 impl WritePoolArgs {
-    fn open_engine(&self, cx: &Cx) -> Result<(ZfsTransactionEngine, Vec<Vec<u8>>)> {
+    pub(super) fn open_engine(&self, cx: &Cx) -> Result<(ZfsTransactionEngine, Vec<Vec<u8>>)> {
         if self.members.len() > 7 {
             bail!("at most seven additional member images are supported");
         }
@@ -638,7 +638,7 @@ pub enum NbdClientOp {
     Flush,
 }
 
-fn parse_dataset_components(dataset: &str) -> Result<Vec<Vec<u8>>> {
+pub fn parse_dataset_components(dataset: &str) -> Result<Vec<Vec<u8>>> {
     if dataset.is_empty() {
         return Ok(Vec::new());
     }

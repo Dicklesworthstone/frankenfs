@@ -7,7 +7,7 @@ mod orphans;
 mod sparse;
 
 pub use ea::NtfsEaSetMode;
-pub(crate) use orphans::ORPHAN_STREAM_NAME;
+pub use orphans::ORPHAN_STREAM_NAME;
 
 use std::collections::{BTreeMap, BTreeSet};
 

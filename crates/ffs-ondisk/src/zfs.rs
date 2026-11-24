@@ -8,6 +8,7 @@ pub mod crypto;
 pub mod gang;
 pub mod nvlist;
 pub mod raidz;
+pub mod send_stream;
 
 use ffs_types::ParseError;
 use flate2::{Decompress, FlushDecompress, Status};
@@ -23,7 +24,7 @@ pub const DATA_OFFSET: u64 = 4 * 1024 * 1024;
 /// Explicit read-profile bound; not the maximum size of the native format.
 pub const MAX_BLOCK_BYTES: usize = 16 * 1024 * 1024;
 /// Embedded DATA uses every pointer word except properties and logical birth.
-const EMBEDDED_PAYLOAD_BYTES: usize = 14 * 8;
+pub const EMBEDDED_PAYLOAD_BYTES: usize = 14 * 8;
 const ECK_MAGIC: u64 = 0x0210_da7a_b10c_7a11;
 const UBER_MAGIC: u64 = 0x00ba_b10c;
 pub const MMP_MAGIC: u64 = 0x0000_0000_a11c_ea11;
@@ -565,6 +566,100 @@ impl BlockPointer {
             }
         }
         decompress(&payload[..packed], self.compression(), self.logical_bytes())
+    }
+
+    /// Extract the raw (still-compressed) packed payload bytes and `logical_bytes`
+    /// from an embedded `BP_EMBEDDED_TYPE_DATA` pointer without decompressing.
+    pub fn raw_embedded_bytes(&self) -> Result<(Vec<u8>, usize), ParseError> {
+        if !self.embedded()
+            || self.protected()
+            || self.words[6] & (1_u64 << 62) != 0
+            || self.level() != 0
+            || matches!(self.object_type(), 10 | 11)
+            || self.birth() == 0
+        {
+            return Err(invalid("invalid embedded DATA flags, type, level or birth"));
+        }
+        if (self.words[6] >> 40) & 0xff != 0 {
+            return Err(invalid(
+                "reserved or redacted embedded subtype is unsupported",
+            ));
+        }
+        let packed = (((self.words[6] >> 25) & 0x7f) + 1) as usize;
+        if packed > EMBEDDED_PAYLOAD_BYTES || packed > self.logical_bytes() {
+            return Err(invalid(
+                "embedded payload exceeds pointer capacity or logical size",
+            ));
+        }
+        let mut payload = [0_u8; EMBEDDED_PAYLOAD_BYTES];
+        let mut at = 0;
+        for (index, word) in self.words.iter().enumerate() {
+            if index != 6 && index != 10 {
+                payload[at..at + 8].copy_from_slice(&word.to_le_bytes());
+                at += 8;
+            }
+        }
+        Ok((payload[..packed].to_vec(), self.logical_bytes()))
+    }
+
+    /// Encode a `BP_EMBEDDED_TYPE_DATA` block pointer from packed payload bytes
+    /// (`1..=112` bytes), inverse of [`Self::decode_embedded`] and [`Self::raw_embedded_bytes`].
+    pub fn encode_embedded_data(
+        payload: &[u8],
+        logical_bytes: usize,
+        compression: u8,
+        object_type: u8,
+        payload_order: Endian,
+        birth: u64,
+    ) -> Result<Self, ParseError> {
+        if payload.is_empty()
+            || payload.len() > EMBEDDED_PAYLOAD_BYTES
+            || payload.len() > logical_bytes
+            || logical_bytes > MAX_BLOCK_BYTES
+            || matches!(object_type, 10 | 11)
+            || birth == 0
+            || !matches!(compression, 2 | 3 | 5..=16)
+        {
+            return Err(invalid("invalid embedded DATA block parameters"));
+        }
+        let mut padded = [0_u8; EMBEDDED_PAYLOAD_BYTES];
+        padded[..payload.len()].copy_from_slice(payload);
+        let mut words = [0_u64; 16];
+        let mut at = 0;
+        for (index, word) in words.iter_mut().enumerate() {
+            if index != 6 && index != 10 {
+                let chunk: [u8; 8] = [
+                    padded[at],
+                    padded[at + 1],
+                    padded[at + 2],
+                    padded[at + 3],
+                    padded[at + 4],
+                    padded[at + 5],
+                    padded[at + 6],
+                    padded[at + 7],
+                ];
+                *word = u64::from_le_bytes(chunk);
+                at += 8;
+            }
+        }
+        let lsize_m1 = u64::try_from(logical_bytes - 1)
+            .map_err(|_| invalid("embedded logical size overflow"))?;
+        let psize_m1 = u64::try_from(payload.len() - 1)
+            .map_err(|_| invalid("embedded physical size overflow"))?;
+        let byteorder_bit = u64::from(payload_order == Endian::Little) << 63;
+        words[6] = (lsize_m1 & 0x01ff_ffff)
+            | ((psize_m1 & 0x7f) << 25)
+            | (u64::from(compression & 0x7f) << 32)
+            | (1_u64 << 39)
+            | (u64::from(object_type) << 48)
+            | byteorder_bit;
+        words[10] = birth;
+        let bp = Self { words };
+        let (rt, rt_lsize) = bp.raw_embedded_bytes()?;
+        if rt.as_slice() != payload || rt_lsize != logical_bytes {
+            return Err(invalid("embedded DATA roundtrip verification failed"));
+        }
+        Ok(bp)
     }
 
     fn parse_dva_slots(&self, max_slots: usize) -> Result<Vec<Dva>, ParseError> {

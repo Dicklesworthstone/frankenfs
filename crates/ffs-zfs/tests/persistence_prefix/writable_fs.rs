@@ -3022,8 +3022,11 @@ fn cancelled_set_id_data_mutations_preserve_bytes_permissions_and_handle_lifetim
     let fail_next = Arc::new(AtomicBool::new(false));
     let inject = Arc::clone(&fail_next);
     engine.with_fault_hook(move |event| {
-        if matches!(event.stage, ZfsPersistenceStage::ChildBlocksWrite { .. })
-            && inject.swap(false, Ordering::SeqCst)
+        if matches!(
+            event.stage,
+            ZfsPersistenceStage::ChildBlocksWrite { .. }
+                | ZfsPersistenceStage::DatasetMetadataWrite { .. }
+        ) && inject.swap(false, Ordering::SeqCst)
         {
             return Err(FfsError::Cancelled);
         }

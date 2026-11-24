@@ -107,9 +107,9 @@ fn admit_directory_add(
         || parent.dnode.bonus_type() != DMU_OT_SA
         || parent.metadata.flags & ZFS_PROJID == 0
         || context.os.flags & 0x07 != 0x07
-        || !write_features
+        || write_features
             .get("org.zfsonlinux:project_quota")
-            .is_some_and(|&references| references > 0)
+            .is_none_or(|&references| references == 0)
     {
         return Err(unsupported(
             "project inheritance requires ZPL v5 SA and active, complete native project accounting",
@@ -4168,7 +4168,7 @@ fn finalize_dataset_to_mos(
             object_type: DMU_OT_DNODE,
             bonus_type: 0,
             checksum_type: 7,
-            compress_type: 2,
+            compress_type: zpl_meta_base.compress_type(),
             user_flags: 0,
             indirect_shift: zpl_meta_base.indirect_shift(),
             data_bytes: DNODE_BLOCK_BYTES,

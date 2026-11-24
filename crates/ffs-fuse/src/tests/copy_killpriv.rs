@@ -326,9 +326,9 @@ fn copy_killpriv_accepts_absence_and_aborts_data_on_privilege_errors() {
     ] {
         let (fuse, state) = copy_fixture(
             CopyState {
+                capability,
                 mode_error,
                 capability_error,
-                capability,
                 ..CopyState::default()
             },
             false,
@@ -383,7 +383,7 @@ fn copy_killpriv_validates_ranges_and_zero_length_before_backend_changes() {
             assert_eq!(result.unwrap(), 0);
         }
         let state = state.lock().unwrap();
-        assert!(state.events.is_empty());
+        assert_eq!(state.events, [] as [CopyEvent; 0]);
         assert_eq!((state.mode, state.capability), (0o6666, true));
         assert_eq!(state.destination_bytes, b"old-data");
     }

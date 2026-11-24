@@ -31,7 +31,7 @@ fn native_objectset(cx: &Cx, engine: &ZfsTransactionEngine, image: &[u8]) -> Obj
     ObjectSet::parse(&native_block(image, &pointer), pointer.payload_order()).unwrap()
 }
 
-pub(super) fn build_zvol_objectset(
+pub fn build_zvol_objectset(
     arena: &mut RawArena,
     birth: u64,
     objectset_order: Endian,

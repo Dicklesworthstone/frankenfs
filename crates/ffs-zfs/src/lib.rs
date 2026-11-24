@@ -31,6 +31,7 @@ macro_rules! companion_bin_tests {
 pub mod crypto;
 pub mod filesystem;
 pub mod reader;
+pub mod send_recv;
 pub mod transaction;
 pub mod zvol_nbd;
 
@@ -44,6 +45,10 @@ pub use reader::dmu::Objects;
 pub use reader::dmu::zpl::Zpl;
 pub use reader::dmu::zvol::{VolumeInfo, Zvol};
 pub use reader::{Label, Leaf, Pool, RootBlock};
+pub use send_recv::{
+    ZfsRecvReport, ZfsRecvRequest, ZfsResumeState, ZfsSendFrom, ZfsSendReport, ZfsSendRequest,
+    inspect_receive_resume_state_in_mos, send_stream,
+};
 pub use transaction::{
     DEFAULT_VOLBLOCKSIZE, MAX_VOLBLOCKSIZE, MAX_ZVOL_IO_BYTES, ZVOL_LOGICAL_SECTOR_BYTES,
     ZfsAdmissionReport, ZfsBookmarkInfo, ZfsCommitReceipt, ZfsDataChecksum, ZfsDurableToken,

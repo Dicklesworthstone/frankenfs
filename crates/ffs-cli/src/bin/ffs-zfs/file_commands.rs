@@ -236,12 +236,19 @@ impl FileCommand {
                 let pool_guid = pool.pool_guid();
                 let info = pool.dataset_crypto_info(cx, &components)?;
                 let status = pool.key_status(cx, &components)?;
+                let pool_name = pool.pool_name(cx)?;
                 let encryption_root = info.as_ref().map(|c| {
-                    c.encryption_root_components
-                        .iter()
-                        .map(|p| String::from_utf8_lossy(p).into_owned())
-                        .collect::<Vec<_>>()
-                        .join("/")
+                    if c.encryption_root_components.is_empty() {
+                        pool_name.clone()
+                    } else {
+                        let tail = c
+                            .encryption_root_components
+                            .iter()
+                            .map(|p| String::from_utf8_lossy(p).into_owned())
+                            .collect::<Vec<_>>()
+                            .join("/");
+                        format!("{pool_name}/{tail}")
+                    }
                 });
                 cx.checkpoint()
                     .map_err(|_| ffs_error::FfsError::Cancelled)?;

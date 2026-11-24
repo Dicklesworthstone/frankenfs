@@ -18,6 +18,8 @@ mod permissions;
 mod projects;
 #[path = "persistence_prefix/quota_profile.rs"]
 mod quota_profile;
+#[path = "persistence_prefix/send_recv.rs"]
+mod send_recv;
 #[path = "persistence_prefix/writable_fs.rs"]
 mod writable_fs;
 #[path = "persistence_prefix/zvol.rs"]
@@ -1109,7 +1111,7 @@ fn build_zpl_objectset(
             times: [ts; 4],
             inline_symlink: None,
         };
-        let (sbt, sbbytes, sspill) = encode_zpl_bonus_for_fixture(
+        let (sub_bonus_type, sub_bonus_bytes, sub_spill) = encode_zpl_bonus_for_fixture(
             &sub_meta,
             spec.zpl_version,
             sa_reg.as_ref(),
@@ -1125,9 +1127,9 @@ fn build_zpl_objectset(
             20,
             sub_bp.logical_bytes(),
             vec![sub_bp],
-            sbt,
-            sbbytes,
-            sspill,
+            sub_bonus_type,
+            sub_bonus_bytes,
+            sub_spill,
             acct_flags,
             order,
         );
@@ -5290,7 +5292,10 @@ fn rename_exchange_rejects_stale_missing_and_cyclic_entries_before_writes() {
         seconds: 1_715_000_285,
         nanos: 0,
     };
-    let built = build_clean_zfs_pool(&PoolFixtureSpec::default());
+    let built = build_clean_zfs_pool(&PoolFixtureSpec {
+        deadlist_mode: DeadlistMode::NativeDeadlist,
+        ..PoolFixtureSpec::default()
+    });
     let devices: Vec<_> = built
         .members
         .into_iter()
@@ -5398,6 +5403,7 @@ fn rename_exchange_respects_native_flags_on_both_objects_and_parents() {
     ] {
         let built = build_clean_zfs_pool(&PoolFixtureSpec {
             zpl_flags: BTreeMap::from([(object, flag)]),
+            deadlist_mode: DeadlistMode::NativeDeadlist,
             ..PoolFixtureSpec::default()
         });
         let devices: Vec<_> = built

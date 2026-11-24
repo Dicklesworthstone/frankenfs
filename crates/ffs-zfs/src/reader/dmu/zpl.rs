@@ -1066,9 +1066,13 @@ impl Zpl {
             && !private_xattr
             && metadata.kind == Kind::Regular
             && self.is_in_delete_queue(cx, number)?;
+        // Note: OpenZFS `dmu_recv_stream` (and keyless raw `-w` encrypted streams,
+        // whose AEAD-encrypted dnode bonuses are immutable) preserve `ZPL_GEN`
+        // verbatim from the sending pool, so valid cross-pool received objects
+        // legally carry `metadata.generation` greater than the receiving pool's
+        // TXG or `object.ceiling`. Zero generation is rejected by `Metadata`, and
+        // DMU block-pointer birth ceilings stay strictly enforced in `dmu.rs`.
         if (metadata.kind == Kind::Directory) != (node.object_type() == 20)
-            || metadata.generation > object.ceiling
-            || metadata.generation > self.objects.txg
             || (metadata.links == 0 && !valid_zero_links)
         {
             return Err(corrupt(

@@ -321,6 +321,10 @@ fn graph(order: Endian, sa: u8, case: u8, reads: Reads, failure: Option<u64>) ->
     }
     file[24..32].copy_from_slice(&order.encode(5120));
     if case == 4 && sa == 0 {
+        file[192 + 64..192 + 72].copy_from_slice(&order.encode(0));
+    }
+    if case == 33 && sa == 0 {
+        // Cross-pool `zfs recv` preserves the sending pool's higher `zp_gen` (> dst TXG).
         file[192 + 64..192 + 72].copy_from_slice(&order.encode(99));
     }
     if sa == 2 {
@@ -614,13 +618,19 @@ fn symlinks_are_inspected_not_followed_and_path_errors_remain_errors() {
     ));
 }
 #[test]
-fn type_parent_alias_and_future_generation_corruption_fail_whole_listing() {
+fn type_parent_alias_and_zero_generation_corruption_fail_whole_listing() {
     let cx = Cx::for_testing();
     for case in 1..=4 {
         let (leaf, meta) = graph(Endian::Little, 0, case, Arc::default(), None);
         let mut view = mos(&leaf, meta).zpl(&cx, &[]).unwrap();
         assert!(view.list(&cx, view.root).is_err(), "{case}");
     }
+    // Cross-pool `zfs send | zfs recv` (including keyless raw `-w`) legitimately
+    // carries source-pool `zp_gen` values greater than the receiving pool's TXG.
+    let (leaf, meta) = graph(Endian::Little, 0, 33, Arc::default(), None);
+    let mut view = mos(&leaf, meta).zpl(&cx, &[]).unwrap();
+    let (file_meta, _) = view.stat(&cx, 3).unwrap();
+    assert_eq!(file_meta.generation, 99);
 }
 #[test]
 fn spill_corruption_and_data_cancellation_do_not_return_a_successful_prefix() {

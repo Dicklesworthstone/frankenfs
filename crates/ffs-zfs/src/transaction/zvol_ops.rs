@@ -385,7 +385,7 @@ fn finalize_zvol_to_mos(
             object_type: DMU_OT_DNODE,
             bonus_type: 0,
             checksum_type: 7,
-            compress_type: 2,
+            compress_type: zvol_meta_base.compress_type(),
             user_flags: 0,
             indirect_shift: zvol_meta_base.indirect_shift(),
             data_bytes: DNODE_BLOCK_BYTES,
@@ -728,8 +728,8 @@ pub(super) fn stage_create_zvol(
     let empty_meta = Dnode::from_spec(DnodeSpec {
         object_type: DMU_OT_DNODE,
         bonus_type: 0,
-        checksum_type: 7,
-        compress_type: 2,
+        checksum_type: 0,
+        compress_type: 0,
         flags: DNODE_FLAG_USED_BYTES,
         order,
         levels: 1,
@@ -843,7 +843,7 @@ pub(super) fn stage_create_zvol(
             object_type: DMU_OT_DNODE,
             bonus_type: 0,
             checksum_type: 7,
-            compress_type: 2,
+            compress_type: 0,
             user_flags: 0,
             indirect_shift: 17,
             data_bytes: DNODE_BLOCK_BYTES,
@@ -1024,28 +1024,7 @@ pub(super) fn stage_create_zvol(
             collision: 0,
         });
     }
-    if !head_zap.is_empty() {
-        features.increment_read("com.delphix:extensible_dataset", new_txg)?;
-        write_zap_dnode_in_mos(
-            cx,
-            mos,
-            &mos_meta,
-            mos_ceiling,
-            mos_dirty_dnodes,
-            alloc,
-            new_head_obj,
-            None,
-            DMU_OTN_ZAP_METADATA,
-            DMU_OT_DSL_DATASET,
-            head_bonus,
-            &head_zap,
-            0,
-            false,
-            order,
-            new_txg,
-            staged_writes,
-        )?;
-    } else {
+    if head_zap.is_empty() {
         let head_dn = Dnode::from_spec(DnodeSpec {
             object_type: DMU_OT_DSL_DATASET,
             bonus_type: DMU_OT_DSL_DATASET,
@@ -1072,6 +1051,27 @@ pub(super) fn stage_create_zvol(
             mos_dirty_dnodes,
             new_head_obj,
             &head_dn,
+        )?;
+    } else {
+        features.increment_read("com.delphix:extensible_dataset", new_txg)?;
+        write_zap_dnode_in_mos(
+            cx,
+            mos,
+            &mos_meta,
+            mos_ceiling,
+            mos_dirty_dnodes,
+            alloc,
+            new_head_obj,
+            None,
+            DMU_OTN_ZAP_METADATA,
+            DMU_OT_DSL_DATASET,
+            head_bonus,
+            &head_zap,
+            0,
+            false,
+            order,
+            new_txg,
+            staged_writes,
         )?;
     }
 

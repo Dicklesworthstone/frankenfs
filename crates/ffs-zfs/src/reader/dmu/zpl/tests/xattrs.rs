@@ -182,7 +182,8 @@ pub(super) fn augment(
         );
         attrs[120..128].copy_from_slice(&order.encode(u64::from(case != 15 || index != 0)));
         if case == 25 && index == 0 {
-            attrs[64..72].copy_from_slice(&order.encode(41));
+            // Zero generation is invalid; non-zero `zp_gen > pool_txg` is legal on cross-pool `zfs recv`.
+            attrs[64..72].copy_from_slice(&order.encode(0));
         }
         let mut payload = bytes.to_vec();
         payload.resize(payload.len().next_power_of_two().max(512), 0);

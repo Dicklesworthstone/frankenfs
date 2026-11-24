@@ -160,7 +160,7 @@ fn growth_from_zero_eof_reclaims_uninitialized_allocated_blocks() {
         assert_eq!(head.stat(&cx, 4).unwrap().1, 0);
         let mut snapshot = head.open_snapshot(&cx, b"before").unwrap();
         assert_eq!(snapshot.stat(&cx, 4).unwrap().0.size, 0);
-        assert!(snapshot.read(&cx, 4, 0, 4096).unwrap().is_empty());
+        assert_eq!(snapshot.read(&cx, 4, 0, 4096).unwrap(), [] as [u8; 0]);
         assert_pool_scrub_and_allocation_clean(&cx, &devices, POOL_GUID, None);
     }
 }

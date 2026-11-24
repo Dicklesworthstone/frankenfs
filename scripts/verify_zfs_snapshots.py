@@ -182,6 +182,62 @@ def run_negative_controls(
             ),
             b"Error",
         )
+        assert_refused_without_mutation(
+            probe,
+            lambda p: subprocess.run(
+                [
+                    str(binary),
+                    "recv",
+                    str(p),
+                    "--offline-image",
+                    "--pool-guid",
+                    "1",
+                    "--label",
+                    "0",
+                    "--slot",
+                    "0",
+                    "--dataset",
+                    "data/dst",
+                ],
+                capture_output=True,
+                timeout=30,
+                check=False,
+                env={**os.environ, "LC_ALL": "C"},
+            ),
+            b"--allow-write",
+        )
+        assert_refused_without_mutation(
+            probe,
+            lambda p: subprocess.run(
+                [
+                    str(binary),
+                    "recv-abort",
+                    str(p),
+                    "--offline-image",
+                    "--pool-guid",
+                    "1",
+                    "--label",
+                    "0",
+                    "--slot",
+                    "0",
+                    "--dataset",
+                    "data/dst",
+                ],
+                capture_output=True,
+                timeout=30,
+                check=False,
+                env={**os.environ, "LC_ALL": "C"},
+            ),
+            b"--allow-write",
+        )
+        bad_tok = subprocess.run(
+            [str(binary), "recv-token-inspect", "--token", "1-deadbeef-10-00"],
+            capture_output=True,
+            timeout=30,
+            check=False,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+        require(bad_tok.returncode != 0 and bad_tok.stdout == b"", "corrupt resume token must fail closed")
         binary_checked = True
 
     return {
@@ -936,6 +992,205 @@ def main() -> None:
                                 f"keyed encrypted snapshot scrub failed ({s_extra}): {keyed_sc}",
                             )
                         # Locked keyless destroy of encrypted snapshot + dataset so zdb -bccm verifies zero leaks!
+                        # First, prove bidirectional OpenZFS send/receive + keyless raw encrypted (-w) + resumable recv!
+                        sr_dir = directory / "send-recv-oracle"
+                        sr_dir.mkdir()
+                        sr_img = sr_dir / "sr.img"
+                        sr_img.write_bytes(b"\0" * (96 * 1024 * 1024))
+                        sr_pool = f"ffssr_{secrets.token_hex(6)}"
+                        sr_mount = sr_dir / "mnt"
+                        sr_mount.mkdir()
+                        sr_active = False
+                        try:
+                            command("zpool", "create", "-f", "-m", "none", "-R", str(sr_mount), sr_pool, str(sr_img))
+                            sr_active = True
+
+                            # Direction A1: ffs-zfs send (full + incremental) -> OpenZFS zfs recv!
+                            ffs_full_stream = sr_dir / "ffs-data-before.zfs"
+                            ffs_incr_stream = sr_dir / "ffs-data-after.zfs"
+                            send_rep_full = json.loads(command(
+                                binary, "send", writable_img,
+                                "--offline-image", "--pool-guid", tx_pool_guid, "--label", "0",
+                                "--slot", str(cur_slot), "--dataset", "data",
+                                "--snapshot", "before", "--out", ffs_full_stream,
+                            ))
+                            require(send_rep_full["report"]["substreams_sent"] == 1, f"bad ffs send report: {send_rep_full}")
+                            send_rep_incr = json.loads(command(
+                                binary, "send", writable_img,
+                                "--offline-image", "--pool-guid", tx_pool_guid, "--label", "0",
+                                "--slot", str(cur_slot), "--dataset", "data",
+                                "--snapshot", "after", "--from-snapshot", "before",
+                                "--out", ffs_incr_stream,
+                            ))
+                            require(send_rep_incr["report"]["substreams_sent"] == 1, f"bad ffs incr send report: {send_rep_incr}")
+
+                            proc_recv1 = subprocess.run(
+                                ["zfs", "recv", f"{sr_pool}/from_ffs"],
+                                input=ffs_full_stream.read_bytes(),
+                                capture_output=True, timeout=60, check=False,
+                            )
+                            require(proc_recv1.returncode == 0, f"OpenZFS zfs recv of ffs-zfs full stream failed: {proc_recv1.stderr.decode('utf-8', 'replace')}")
+                            proc_recv2 = subprocess.run(
+                                ["zfs", "recv", f"{sr_pool}/from_ffs"],
+                                input=ffs_incr_stream.read_bytes(),
+                                capture_output=True, timeout=60, check=False,
+                            )
+                            require(proc_recv2.returncode == 0, f"OpenZFS zfs recv of ffs-zfs incremental stream failed: {proc_recv2.stderr.decode('utf-8', 'replace')}")
+                            command("zfs", "set", "mountpoint=/from_ffs", f"{sr_pool}/from_ffs")
+                            command("zfs", "mount", f"{sr_pool}/from_ffs")
+                            require((sr_mount / "from_ffs" / "file.bin").read_bytes() == tx_expected["after"]["payload"],
+                                    "OpenZFS mount readback of ffs-zfs incremental stream mismatched @after")
+
+                            # Direction A2: keyless raw encrypted ffs-zfs send -w -> OpenZFS zfs recv + load-key!
+                            ffs_raw_stream = sr_dir / "ffs-enc-raw.zfs"
+                            raw_rep = json.loads(command(
+                                binary, "send", writable_img,
+                                "--offline-image", "--pool-guid", tx_pool_guid, "--label", "0",
+                                "--slot", str(cur_slot), "--dataset", "data/enc_snap",
+                                "--snapshot", "es1", "--raw", "--out", ffs_raw_stream,
+                            ))
+                            require(raw_rep["report"]["raw"] is True, f"raw send flag missing: {raw_rep}")
+                            proc_raw = subprocess.run(
+                                ["zfs", "recv", f"{sr_pool}/enc_from_ffs"],
+                                input=ffs_raw_stream.read_bytes(),
+                                capture_output=True, timeout=60, check=False,
+                            )
+                            require(proc_raw.returncode == 0, f"OpenZFS zfs recv of ffs-zfs raw -w stream failed: {proc_raw.stderr.decode('utf-8', 'replace')}")
+                            command("zfs", "load-key", "-L", f"file://{enc_key_v2}", f"{sr_pool}/enc_from_ffs")
+                            command("zfs", "set", "mountpoint=/enc_from_ffs", f"{sr_pool}/enc_from_ffs")
+                            command("zfs", "mount", f"{sr_pool}/enc_from_ffs")
+                            require((sr_mount / "enc_from_ffs" / "secret.bin").read_bytes() == enc_v1_payload,
+                                    "OpenZFS decrypted readback of ffs-zfs raw -w stream mismatched @es1")
+
+                            # Direction B: OpenZFS zfs send (full, incremental, bookmark, raw -w, ZVOL) -> ffs-zfs recv
+                            # plus interrupted resumable (-s) receive, recv-token-inspect, and recv-abort!
+                            command("zfs", "create", "-o", "mountpoint=/oz_src", "-o", "compression=lz4",
+                                    "-o", "app:origin=openzfs", f"{sr_pool}/oz_src")
+                            oz_v1 = b"OPENZFS_SEND_V1_PAYLOAD_" * 1400
+                            oz_v2 = b"OPENZFS_SEND_V2_UPDATED_" * 1200
+                            (sr_mount / "oz_src" / "alpha.bin").write_bytes(oz_v1)
+                            (sr_mount / "oz_src" / "drop.txt").write_bytes(b"drop-in-o2")
+                            command("zfs", "snapshot", f"{sr_pool}/oz_src@o1")
+                            command("zfs", "bookmark", f"{sr_pool}/oz_src@o1", f"{sr_pool}/oz_src#obm1")
+                            (sr_mount / "oz_src" / "alpha.bin").write_bytes(oz_v2)
+                            (sr_mount / "oz_src" / "drop.txt").unlink()
+                            (sr_mount / "oz_src" / "beta.txt").write_bytes(b"added-in-o2")
+                            command("zfs", "snapshot", f"{sr_pool}/oz_src@o2")
+
+                            oz_full = sr_dir / "oz-full.zfs"
+                            oz_incr = sr_dir / "oz-incr.zfs"
+                            oz_full.write_bytes(command("zfs", "send", "-c", "-e", "-p", f"{sr_pool}/oz_src@o1"))
+                            oz_incr.write_bytes(command("zfs", "send", "-c", "-e", "-i", f"{sr_pool}/oz_src#obm1", f"{sr_pool}/oz_src@o2"))
+
+                            # Raw encrypted OpenZFS source dataset -> keyless ffs-zfs recv!
+                            command(
+                                "zfs", "create", "-o", "mountpoint=/oz_enc",
+                                "-o", "encryption=aes-256-gcm", "-o", "keyformat=raw",
+                                "-o", f"keylocation=file://{enc_key_v2}", f"{sr_pool}/oz_enc",
+                            )
+                            oz_enc_payload = b"OPENZFS_RAW_ENCRYPTED_SEND_" * 800
+                            (sr_mount / "oz_enc" / "vault.bin").write_bytes(oz_enc_payload)
+                            command("zfs", "snapshot", f"{sr_pool}/oz_enc@oe1")
+                            oz_raw = sr_dir / "oz-raw.zfs"
+                            oz_raw.write_bytes(command("zfs", "send", "-w", f"{sr_pool}/oz_enc@oe1"))
+
+                            # Resumable (-s) interrupt -> recv-token-inspect -> OpenZFS zfs send -t -> ffs-zfs recv -s!
+                            oz_trunc = sr_dir / "oz-full-trunc.zfs"
+                            oz_full_bytes = oz_full.read_bytes()
+                            oz_trunc.write_bytes(oz_full_bytes[: max(4096, len(oz_full_bytes) // 2)])
+                            command(
+                                binary, "recv", writable_img,
+                                "--offline-image", "--allow-write", "--pool-guid", tx_pool_guid,
+                                "--label", "0", "--slot", str(cur_slot), "--dataset", "data/oz_resumed",
+                                "--in", oz_trunc, "-s", "--checkpoint-bytes", "4096",
+                                fails=True,
+                            )
+                            # Refresh committed slot from label 0 after resumable checkpoints!
+                            ref_inv = json.loads(command(binary, "inspect", writable_img, "--offline-image"))
+                            ref_lbl = next(r for r in ref_inv["labels"] if r["label"] == 0)
+                            ref_sel = max(
+                                (r for r in ref_lbl["candidates"] if r["txg"] >= ref_lbl["config_txg"]),
+                                key=lambda r: (r["txg"], r["timestamp"]),
+                            )
+                            cur_slot = int(ref_sel["slot"])
+                            cur_txg = int(ref_sel["txg"])
+                            tok_doc = json.loads(command(
+                                binary, "recv-token-inspect", writable_img,
+                                "--offline-image", "--pool-guid", tx_pool_guid, "--label", "0",
+                                "--slot", str(cur_slot), "--dataset", "data/oz_resumed",
+                            ))
+                            resume_state = tok_doc["resume_state"]
+                            require(resume_state is not None and resume_state["token"].startswith("1-"),
+                                    f"expected persisted receive_resume_token, got {tok_doc}")
+                            offline_tok = json.loads(command(
+                                binary, "recv-token-inspect", "--token", resume_state["token"],
+                            ))
+                            require(offline_tok["toguid"] == resume_state["toguid"]
+                                    and offline_tok["object"] == resume_state["object"],
+                                    f"offline recv-token-inspect mismatch: {offline_tok}")
+
+                            # Cross-implementation resume: OpenZFS `zfs send -t <ffs_token>` -> `ffs-zfs recv -s`!
+                            oz_cont = sr_dir / "oz-cont.zfs"
+                            oz_cont.write_bytes(command("zfs", "send", "-t", resume_state["token"]))
+                            res_done = run_ds_tx(
+                                "data/oz_resumed", "recv", writable_img,
+                                "--in", oz_cont, "-s", "--checkpoint-bytes", "4096",
+                            )
+                            require(res_done["report"]["resumed"] is True, f"resumed flag false: {res_done}")
+                            # Now apply OpenZFS bookmark incremental stream (#obm1 -> @o2)!
+                            run_ds_tx("data/oz_resumed", "recv", writable_img, "--in", oz_incr)
+                            oz_opts = [
+                                "--offline-image", "--pool-guid", tx_pool_guid, "--label", "0",
+                                "--slot", str(cur_slot), "--dataset", "data/oz_resumed",
+                            ]
+                            require(command(binary, "read", writable_img, "/alpha.bin", *oz_opts, "--snapshot", "o1") == oz_v1,
+                                    "received OpenZFS @o1 alpha.bin mismatch")
+                            require(command(binary, "read", writable_img, "/alpha.bin", *oz_opts) == oz_v2,
+                                    "received OpenZFS @o2 alpha.bin mismatch")
+                            require(command(binary, "read", writable_img, "/beta.txt", *oz_opts) == b"added-in-o2",
+                                    "received OpenZFS @o2 beta.txt mismatch")
+                            command(binary, "read", writable_img, "/drop.txt", *oz_opts, fails=True)
+
+                            # Receive OpenZFS raw encrypted stream keylessly, then unlock & read with key!
+                            run_ds_tx("data/oz_enc_recv", "recv", writable_img, "--in", oz_raw)
+                            oz_enc_opts = [
+                                "--offline-image", "--pool-guid", tx_pool_guid, "--label", "0",
+                                "--slot", str(cur_slot), "--dataset", "data/oz_enc_recv",
+                            ]
+                            command(binary, "read", writable_img, "/vault.bin", *oz_enc_opts, fails=True)
+                            require(command(binary, "read", writable_img, "/vault.bin", *oz_enc_opts,
+                                            "--key-file", enc_key_v2) == oz_enc_payload,
+                                    "OpenZFS raw encrypted stream received by ffs-zfs failed keyed readback")
+
+                            # Also exercise recv-abort on an interrupted resumable receive!
+                            command(
+                                binary, "recv", writable_img,
+                                "--offline-image", "--allow-write", "--pool-guid", tx_pool_guid,
+                                "--label", "0", "--slot", str(cur_slot), "--dataset", "data/oz_aborted",
+                                "--in", oz_trunc, "-s", "--checkpoint-bytes", "4096",
+                                fails=True,
+                            )
+                            ref_inv2 = json.loads(command(binary, "inspect", writable_img, "--offline-image"))
+                            ref_lbl2 = next(r for r in ref_inv2["labels"] if r["label"] == 0)
+                            ref_sel2 = max(
+                                (r for r in ref_lbl2["candidates"] if r["txg"] >= ref_lbl2["config_txg"]),
+                                key=lambda r: (r["txg"], r["timestamp"]),
+                            )
+                            cur_slot = int(ref_sel2["slot"])
+                            cur_txg = int(ref_sel2["txg"])
+                            abort_doc = run_ds_tx("data/oz_aborted", "recv-abort", writable_img)
+                            require(abort_doc["reclaimed_bytes"] > 0, f"recv-abort reclaimed 0 bytes: {abort_doc}")
+
+                            # Clean up temporary received datasets (plus enc_snap) before zdb -bccm leak check!
+                            run_ds_tx("data/oz_resumed", "tx-destroy-snapshot", writable_img, "o2")
+                            run_ds_tx("data/oz_resumed", "tx-destroy-snapshot", writable_img, "o1")
+                            run_ds_tx("data/oz_resumed", "tx-destroy-dataset", writable_img)
+                            run_ds_tx("data/oz_enc_recv", "tx-destroy-snapshot", writable_img, "oe1")
+                            run_ds_tx("data/oz_enc_recv", "tx-destroy-dataset", writable_img)
+                        finally:
+                            if sr_active:
+                                command("zpool", "export", sr_pool)
+
                         run_ds_tx("data/enc_snap", "tx-destroy-snapshot", writable_img, "es1")
                         run_ds_tx("data/enc_snap", "tx-destroy-dataset", writable_img)
 

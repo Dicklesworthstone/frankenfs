@@ -897,7 +897,7 @@ fn trivial_acl_matches_posix_class_precedence_for_all_modes() {
     // owner class, while NFSv4 ACEs match every applicable principal in order.
     fn grants(raw: &[u8], order: Endian, owner: bool, group: bool, requested: u32) -> bool {
         let mut remaining = requested;
-        for ace in raw.chunks_exact(8) {
+        for &ace in raw.as_chunks::<8>().0 {
             let (kind, flags, mask) = match order {
                 Endian::Little => (
                     u16::from_le_bytes([ace[0], ace[1]]),

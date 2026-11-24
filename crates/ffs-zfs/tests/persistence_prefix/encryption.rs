@@ -18,6 +18,7 @@ use std::collections::BTreeSet;
 
 const OBJSET_PORTABLE_MAC_OFFSET: usize = 720;
 const OBJSET_LOCAL_MAC_OFFSET: usize = 752;
+const NEW_ZPL_ROOT_OBJ: u64 = 3;
 
 fn encryption_pool_spec(mirror_width: usize) -> PoolFixtureSpec {
     PoolFixtureSpec {
@@ -283,7 +284,7 @@ fn encrypted_root_all_six_suites_keyformats_compression_and_inheritance() {
             .create_file(
                 &cx,
                 &ds_path,
-                2,
+                NEW_ZPL_ROOT_OBJ,
                 b"secret.bin",
                 0o640,
                 1000,
@@ -369,7 +370,7 @@ fn encrypted_root_all_six_suites_keyformats_compression_and_inheritance() {
                 .create_file(
                     &cx,
                     &cpath,
-                    2,
+                    NEW_ZPL_ROOT_OBJ,
                     b"inherited.txt",
                     0o644,
                     0,
@@ -519,7 +520,7 @@ fn encrypted_key_lifecycle_change_key_unload_revocation_zvol_and_locked_destroy(
         .create_file(
             &cx,
             &root_ds,
-            2,
+            NEW_ZPL_ROOT_OBJ,
             b"alpha.txt",
             0o644,
             0,
@@ -554,7 +555,7 @@ fn encrypted_key_lifecycle_change_key_unload_revocation_zvol_and_locked_destroy(
         .create_file(
             &cx,
             &child_ds,
-            2,
+            NEW_ZPL_ROOT_OBJ,
             b"c.txt",
             0o644,
             0,
@@ -690,14 +691,9 @@ fn encrypted_key_lifecycle_change_key_unload_revocation_zvol_and_locked_destroy(
         original_bytes
     );
     let mut snap = post_mos.zpl_snapshot(&cx, &root_ds, b"s1").unwrap();
+    let snap_obj = snap.resolve(&cx, b"/alpha.txt").unwrap();
     assert_eq!(
-        snap.read(
-            &cx,
-            snap.resolve(&cx, b"/alpha.txt").unwrap(),
-            0,
-            original_bytes.len()
-        )
-        .unwrap(),
+        snap.read(&cx, snap_obj, 0, original_bytes.len()).unwrap(),
         original_bytes
     );
     let mut zvol = post_mos.zvol(&cx, &zvol_ds, None).unwrap();
@@ -877,8 +873,8 @@ fn encrypted_tamper_rejection_nonce_uniqueness_and_fault_cut_rollback() {
     devices[0].set_fault(DeviceFault::None);
     devices[0].state.lock().unwrap().crash_drop_unsynced();
     let pre_mos = open_pool_objects(&cx, &devices, built.pool_guid, engine.committed_slot());
-    assert!(pre_mos.keyring().loaded_roots().is_empty());
-    assert!(engine.keyring().loaded_roots().is_empty());
+    assert_eq!(pre_mos.keyring().loaded_roots(), [] as [u64; 0]);
+    assert_eq!(engine.keyring().loaded_roots(), [] as [u64; 0]);
 
     // 2. Commit encrypted dataset cleanly and verify multi-TXG nonce uniqueness!
     let (_, _) = engine
@@ -903,7 +899,7 @@ fn encrypted_tamper_rejection_nonce_uniqueness_and_fault_cut_rollback() {
         .create_file(
             &cx,
             &enc_ds,
-            2,
+            NEW_ZPL_ROOT_OBJ,
             b"nonce.bin",
             0o644,
             0,
@@ -1013,7 +1009,9 @@ fn encrypted_tamper_rejection_nonce_uniqueness_and_fault_cut_rollback() {
         assert!(tzpl.read(&cx, file_obj, 0, 4096).is_err());
     }
 
-    // 4c. Flip 1 bit in `objset_phys_t` `os_portable_mac` / `os_local_mac` -> keyed open MUST reject!
+    // 4c. Flip 1 bit in `objset_phys_t` `os_portable_mac` / `os_local_mac`:
+    //     both raw physical checksum verification (on keyless scrub & load_key) AND
+    //     direct HMAC-SHA256 verification (even if unkeyed BP checksum were forged) MUST reject!
     {
         let mut tampered = clean_img.clone();
         let os_dva = os_bp.data_dvas().unwrap()[0];
@@ -1022,10 +1020,44 @@ fn encrypted_tamper_rejection_nonce_uniqueness_and_fault_cut_rollback() {
         tampered[os_off + OBJSET_LOCAL_MAC_OFFSET] ^= 0x08;
         let tdev = vec![FaultableMemberDevice::new(tampered)];
         let mut tmos = open_pool_objects(&cx, &tdev, built.pool_guid, last_slot);
-        tmos.load_key(&cx, &enc_ds, &key1).unwrap();
         assert!(
-            tmos.zpl(&cx, &enc_ds).is_err(),
-            "tampered objset_phys_t MAC must fail closed"
+            tmos.load_key(&cx, &enc_ds, &key1).is_err(),
+            "tampered objset_phys_t must fail closed before dataset open"
+        );
+        // Also verify keyed HMAC layer directly (portable & local MACs independently)
+        // simulating an attacker who forges the unkeyed BP physical checksum.
+        let key = inspect_mos
+            .keyring()
+            .get(crypto.encryption_root_ddobj)
+            .unwrap();
+        let os_phys = &clean_img[os_off..os_off + os_bp.physical_bytes()];
+        let os_raw =
+            ffs_ondisk::zfs::decompress(os_phys, os_bp.compression(), os_bp.logical_bytes())
+                .unwrap();
+        verify_objset_macs(&os_raw, os_bp.payload_order(), &key.hmac_key, key.version).unwrap();
+        let mut bad_portable = os_raw.clone();
+        bad_portable[OBJSET_PORTABLE_MAC_OFFSET] ^= 0x04;
+        assert!(
+            verify_objset_macs(
+                &bad_portable,
+                os_bp.payload_order(),
+                &key.hmac_key,
+                key.version,
+            )
+            .is_err(),
+            "tampered os_portable_mac must fail HMAC authentication"
+        );
+        let mut bad_local = os_raw;
+        bad_local[OBJSET_LOCAL_MAC_OFFSET] ^= 0x08;
+        assert!(
+            verify_objset_macs(
+                &bad_local,
+                os_bp.payload_order(),
+                &key.hmac_key,
+                key.version,
+            )
+            .is_err(),
+            "tampered os_local_mac must fail HMAC authentication"
         );
     }
 
@@ -1206,7 +1238,7 @@ fn encrypted_tamper_rejection_nonce_uniqueness_and_fault_cut_rollback() {
             .create_file(
                 &cx,
                 &tight_ds,
-                2,
+                NEW_ZPL_ROOT_OBJ,
                 b"keep.bin",
                 0o644,
                 0,
@@ -1240,8 +1272,8 @@ fn encrypted_tamper_rejection_nonce_uniqueness_and_fault_cut_rollback() {
             ZfsDataChecksum::Sha256,
         );
         assert!(
-            matches!(oos, ZfsTxOutcome::NotCommitted(FfsError::NoSpace)),
-            "expected NotCommitted(NoSpace) on encrypted refquota exhaustion, got {oos:?}"
+            matches!(oos, ZfsTxOutcome::NotCommitted(ref err) if err.to_errno() == libc::EDQUOT),
+            "expected NotCommitted(EDQUOT) on encrypted refquota exhaustion, got {oos:?}"
         );
         // Existing encrypted payload and key remain 100% intact after refusal!
         let mut post_mos =

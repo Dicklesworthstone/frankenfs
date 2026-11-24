@@ -252,8 +252,7 @@ impl Fletcher4Stream {
         if !bytes.len().is_multiple_of(4) {
             return Err(invalid("unaligned Fletcher4 stream update"));
         }
-        for chunk in bytes.chunks_exact(4) {
-            let raw = [chunk[0], chunk[1], chunk[2], chunk[3]];
+        for &raw in bytes.as_chunks::<4>().0 {
             let word = match self.order {
                 Endian::Little => u32::from_le_bytes(raw),
                 Endian::Big => u32::from_be_bytes(raw),
@@ -322,12 +321,10 @@ impl Fletcher4Stream {
         let pre_record_state = self.state;
         self.update(&header[..DRR_CHECKSUM_OFFSET])?;
         let embedded = read_cksum4(header, DRR_CHECKSUM_OFFSET, self.order)?;
-        if embedded != [0; 4] || require_per_record_cksum {
-            if embedded != self.state {
-                return Err(invalid(
-                    "DMU send stream per-record Fletcher4 checksum mismatch",
-                ));
-            }
+        if (embedded != [0; 4] || require_per_record_cksum) && embedded != self.state {
+            return Err(invalid(
+                "DMU send stream per-record Fletcher4 checksum mismatch",
+            ));
         }
         if record_type == DrrType::End {
             let end_cksum = read_cksum4(header, 8, self.order)?;
@@ -347,8 +344,8 @@ impl Fletcher4Stream {
 #[must_use]
 pub fn fletcher4_varsize_le(bytes: &[u8]) -> [u64; 4] {
     let mut sum = [0_u64; 4];
-    for chunk in bytes.chunks_exact(4) {
-        let word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    for &chunk in bytes.as_chunks::<4>().0 {
+        let word = u32::from_le_bytes(chunk);
         sum[0] = sum[0].wrapping_add(u64::from(word));
         sum[1] = sum[1].wrapping_add(sum[0]);
         sum[2] = sum[2].wrapping_add(sum[1]);
@@ -806,7 +803,7 @@ impl DrrRecord {
                 }
                 let firstobj = order.u64(raw, 8)?;
                 let numslots = order.u64(raw, 16)?;
-                if firstobj % 32 != 0 || numslots == 0 || numslots % 32 != 0 {
+                if !firstobj.is_multiple_of(32) || numslots == 0 || !numslots.is_multiple_of(32) {
                     return Err(invalid(
                         "DRR_OBJECT_RANGE firstobj and numslots must be 32-slot aligned",
                     ));
@@ -958,7 +955,10 @@ impl DrrRecord {
                 write_u32(&mut out, 52, e.psize, order);
             }
             Self::ObjectRange(r) => {
-                if r.firstobj % 32 != 0 || r.numslots == 0 || r.numslots % 32 != 0 {
+                if !r.firstobj.is_multiple_of(32)
+                    || r.numslots == 0
+                    || !r.numslots.is_multiple_of(32)
+                {
                     return Err(invalid(
                         "DRR_OBJECT_RANGE firstobj and numslots must be 32-slot aligned",
                     ));
@@ -1026,7 +1026,7 @@ impl StreamCryptoKeydata {
     /// Encode into an OpenZFS-compatible `NvList` containing `crypt_keydata`,
     /// `to_ivset_guid`, optional `from_ivset_guid`, and `portable_mac`.
     pub fn to_nvlist(&self) -> Result<NvList, ParseError> {
-        if self.wrapped_master_key.len() != self.suite.key_len() {
+        if self.wrapped_master_key.len() != self.suite.key_len()? {
             return Err(invalid("wrapped master key length mismatches cipher suite"));
         }
         let mut kd = BTreeMap::new();
@@ -1106,7 +1106,7 @@ impl StreamCryptoKeydata {
             .try_into()
             .map_err(|_| invalid("crypt_keydata DSL_CRYPTO_MAC must be 16 bytes"))?;
         let wrapped_master_key = nv_bytes(kd, "DSL_CRYPTO_MASTER_KEY_1")?.to_vec();
-        if wrapped_master_key.len() != suite.key_len() {
+        if wrapped_master_key.len() != suite.key_len()? {
             return Err(invalid(
                 "crypt_keydata wrapped master key length mismatches cipher suite",
             ));
@@ -1255,11 +1255,11 @@ impl ReceiveResumeToken {
             .map_err(|_| invalid("resume token checksum is not valid hex"))?;
         let expected_len = usize::from_str_radix(len_str, 16)
             .map_err(|_| invalid("resume token uncompressed length is not valid hex"))?;
-        if expected_len < 20 || expected_len > MAX_RESUME_TOKEN_NVLIST_BYTES {
+        if !(20..=MAX_RESUME_TOKEN_NVLIST_BYTES).contains(&expected_len) {
             return Err(invalid("resume token uncompressed length out of bounds"));
         }
         let compressed = hex_decode(hex_str)?;
-        if compressed.len() < 6 || compressed.len() > MAX_RESUME_TOKEN_NVLIST_BYTES {
+        if !(6..=MAX_RESUME_TOKEN_NVLIST_BYTES).contains(&compressed.len()) {
             return Err(invalid(
                 "resume token compressed payload length out of bounds",
             ));
@@ -1411,7 +1411,7 @@ fn hex_decode(hex: &str) -> Result<Vec<u8>, ParseError> {
     }
     let bytes = hex.as_bytes();
     let mut out = Vec::with_capacity(bytes.len() / 2);
-    for pair in bytes.chunks_exact(2) {
+    for &pair in bytes.as_chunks::<2>().0 {
         let hi = hex_nibble(pair[0])?;
         let lo = hex_nibble(pair[1])?;
         out.push((hi << 4) | lo);
