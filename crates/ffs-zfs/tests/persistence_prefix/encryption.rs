@@ -5,16 +5,18 @@
 use super::*;
 use ffs_core::{FsOps, RequestScope, SetAttrRequest};
 use ffs_ondisk::zfs::crypto::{
-    DSL_CRYPTO_MAC, DSL_DIR_CRYPTO_KEY_OBJ, ZfsKeyFormat, ZioEncrypt, bp_crypt_iv, bp_crypt_salt,
-    decrypt_dnode_block, decrypt_regular_block, encode_crypt_mac_words, encrypt_regular_block,
-    verify_objset_macs,
+    DSL_CRYPTO_MAC, DSL_DATASET_IVSET_GUID, DSL_DIR_CRYPTO_KEY_OBJ, ZfsKeyFormat, ZioEncrypt,
+    bp_crypt_iv, bp_crypt_salt, decrypt_dnode_block, decrypt_regular_block, encode_crypt_mac_words,
+    encrypt_regular_block, verify_objset_macs,
 };
 use ffs_zfs::reader::dmu::properties::PropertyValue;
 use ffs_zfs::{
     ZfsEncryptionCreateOptions, ZfsFs, ZfsKeyMaterial, ZfsKeyStatus, ZfsMountWriteOptions,
-    ZfsPropertySetValue, ZfsXattrSetMode, ZfsZvolCreateOptions,
+    ZfsPropertySetValue, ZfsRecvRequest, ZfsSendFrom, ZfsSendRequest, ZfsXattrSetMode,
+    ZfsZvolCreateOptions, send_stream,
 };
 use std::collections::BTreeSet;
+use std::io::Cursor;
 
 const OBJSET_PORTABLE_MAC_OFFSET: usize = 720;
 const OBJSET_LOCAL_MAC_OFFSET: usize = 752;
@@ -65,6 +67,266 @@ fn hex_key_from_byte(seed: u8) -> String {
 
 fn find_dva_physical_offset(dva: Dva) -> usize {
     usize::try_from(DATA_OFFSET + dva.offset).unwrap()
+}
+
+fn snapshot_ivset_guid(
+    cx: &Cx,
+    mos: &mut ffs_zfs::Objects,
+    dataset: &[Vec<u8>],
+    name: &[u8],
+) -> u64 {
+    let snapshot = mos
+        .snapshots(cx, dataset)
+        .unwrap()
+        .into_iter()
+        .find(|snapshot| snapshot.name == name)
+        .unwrap();
+    let guid = mos
+        .zap(cx, snapshot.object)
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.name == DSL_DATASET_IVSET_GUID)
+        .unwrap()
+        .value;
+    assert_ne!(guid, 0);
+    guid
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn encrypted_snapshots_after_raw_receive_get_fresh_ivsets_and_replicate() {
+    let cx = Cx::for_testing();
+    let timestamp = Timestamp {
+        seconds: 1_736_400_001,
+        nanos: 0,
+    };
+    let material = ZfsKeyMaterial::Raw([0xC2; 32]);
+    let source = vec![b"data".to_vec(), b"origin".to_vec()];
+    let replica = vec![b"data".to_vec(), b"replica".to_vec()];
+    let source_pool = build_clean_zfs_pool(&encryption_pool_spec(1));
+    let source_devices: Vec<_> = source_pool
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut source_engine = open_engine_on_devices(
+        &cx,
+        &source_devices,
+        default_write_opts(source_pool.pool_guid, source_pool.initial_slot),
+    )
+    .unwrap();
+    source_engine
+        .create_encrypted_dataset(
+            &cx,
+            &[b"data".to_vec()],
+            b"origin",
+            &[],
+            &ZfsEncryptionCreateOptions {
+                suite: ZioEncrypt::Aes256Gcm,
+                key_material: Some(material.clone()),
+                keylocation: Some(b"prompt".to_vec()),
+                pbkdf2_iters: None,
+                extra_entropy: b"snapshot-ivset-regression".to_vec(),
+            },
+            timestamp,
+        )
+        .into_result()
+        .unwrap();
+    source_engine.load_key(&cx, &source, &material).unwrap();
+    let (object, _) = source_engine
+        .create_file(
+            &cx,
+            &source,
+            NEW_ZPL_ROOT_OBJ,
+            b"replicated.bin",
+            0o600,
+            0,
+            0,
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    let original = vec![0x64; 8192];
+    source_engine
+        .write_file_data(
+            &cx,
+            &source,
+            object,
+            0,
+            &original,
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    source_engine
+        .create_snapshot(&cx, &source, b"first", timestamp)
+        .into_result()
+        .unwrap();
+    let source_patch = b"source incremental change";
+    let mut second = original.clone();
+    second[17..17 + source_patch.len()].copy_from_slice(source_patch);
+    source_engine
+        .write_file_data(
+            &cx,
+            &source,
+            object,
+            17,
+            source_patch,
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    source_engine
+        .create_snapshot(&cx, &source, b"second", timestamp)
+        .into_result()
+        .unwrap();
+    let mut source_view = open_pool_objects(
+        &cx,
+        &source_devices,
+        source_pool.pool_guid,
+        source_engine.committed_slot(),
+    );
+    let first_ivset = snapshot_ivset_guid(&cx, &mut source_view, &source, b"first");
+    let second_ivset = snapshot_ivset_guid(&cx, &mut source_view, &source, b"second");
+    assert_ne!(first_ivset, second_ivset);
+    let mut full = Vec::new();
+    let mut send = ZfsSendRequest::full(source.clone(), b"first".to_vec());
+    send.raw = true;
+    send_stream(&cx, &mut source_view, &send, &mut full).unwrap();
+    let mut incremental = Vec::new();
+    send.to_snapshot = b"second".to_vec();
+    send.from = Some(ZfsSendFrom::Snapshot(b"first".to_vec()));
+    send_stream(&cx, &mut source_view, &send, &mut incremental).unwrap();
+
+    let replica_pool = build_clean_zfs_pool(&encryption_pool_spec(1));
+    let replica_devices: Vec<_> = replica_pool
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut replica_engine = open_engine_on_devices(
+        &cx,
+        &replica_devices,
+        default_write_opts(replica_pool.pool_guid, replica_pool.initial_slot),
+    )
+    .unwrap();
+    let receive = ZfsRecvRequest::new(replica.clone());
+    for stream in [&full, &incremental] {
+        replica_engine
+            .receive_stream(&cx, &receive, &mut Cursor::new(stream))
+            .into_result()
+            .unwrap();
+    }
+    // Snapshotting a locked replica must assign a fresh identity, even though
+    // its received head still carries the first stream's older nonce domain.
+    replica_engine
+        .create_snapshot(&cx, &replica, b"locked-copy", timestamp)
+        .into_result()
+        .unwrap();
+    let mut replica_view = replica_engine.open_read_objects(&cx).unwrap();
+    assert_eq!(
+        replica_view.key_status(&cx, &replica).unwrap(),
+        ZfsKeyStatus::Unavailable
+    );
+    assert_eq!(
+        snapshot_ivset_guid(&cx, &mut replica_view, &replica, b"first"),
+        first_ivset
+    );
+    assert_eq!(
+        snapshot_ivset_guid(&cx, &mut replica_view, &replica, b"second"),
+        second_ivset
+    );
+    let locked_ivset = snapshot_ivset_guid(&cx, &mut replica_view, &replica, b"locked-copy");
+    assert_ne!(locked_ivset, first_ivset);
+    assert_ne!(locked_ivset, second_ivset);
+
+    replica_engine.load_key(&cx, &replica, &material).unwrap();
+    let local_patch = b"replica becomes the replication source";
+    let mut expected = second.clone();
+    expected[29..29 + local_patch.len()].copy_from_slice(local_patch);
+    replica_engine
+        .write_file_data(
+            &cx,
+            &replica,
+            object,
+            29,
+            local_patch,
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    replica_engine
+        .create_snapshot(&cx, &replica, b"local", timestamp)
+        .into_result()
+        .unwrap();
+    let replica_slot = replica_engine.committed_slot();
+    drop(replica_engine);
+    let durable_replica: Vec<_> = replica_devices
+        .iter()
+        .map(FaultableMemberDevice::fresh_from_durable)
+        .collect();
+    let mut replica_view =
+        open_pool_objects(&cx, &durable_replica, replica_pool.pool_guid, replica_slot);
+    let local_ivset = snapshot_ivset_guid(&cx, &mut replica_view, &replica, b"local");
+    for previous in [first_ivset, second_ivset, locked_ivset] {
+        assert_ne!(local_ivset, previous);
+    }
+    let mut return_stream = Vec::new();
+    let mut send_back = ZfsSendRequest::full(replica.clone(), b"local".to_vec());
+    send_back.raw = true;
+    send_back.from = Some(ZfsSendFrom::Snapshot(b"second".to_vec()));
+    send_stream(&cx, &mut replica_view, &send_back, &mut return_stream).unwrap();
+    source_engine
+        .receive_stream(
+            &cx,
+            &ZfsRecvRequest::new(source.clone()),
+            &mut Cursor::new(&return_stream),
+        )
+        .into_result()
+        .unwrap();
+    let mut source_view = source_engine.open_read_objects(&cx).unwrap();
+    assert_eq!(
+        snapshot_ivset_guid(&cx, &mut source_view, &source, b"local"),
+        local_ivset
+    );
+    replica_view.load_key(&cx, &replica, &material).unwrap();
+    for (view, dataset) in [(&mut source_view, &source), (&mut replica_view, &replica)] {
+        assert_eq!(
+            view.zpl_snapshot(&cx, dataset, b"local")
+                .unwrap()
+                .read(&cx, object, 0, expected.len() + 1)
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            view.zpl_snapshot(&cx, dataset, b"second")
+                .unwrap()
+                .read(&cx, object, 0, second.len() + 1)
+                .unwrap(),
+            second
+        );
+        assert!(
+            view.scrub_dataset(&cx, dataset, None, ScrubLimits::default())
+                .unwrap()
+                .is_clean()
+        );
+    }
+    assert_pool_scrub_and_allocation_clean(
+        &cx,
+        &source_devices,
+        source_pool.pool_guid,
+        Some(source_engine.committed_slot()),
+    );
+    assert_pool_scrub_and_allocation_clean(
+        &cx,
+        &durable_replica,
+        replica_pool.pool_guid,
+        Some(replica_slot),
+    );
 }
 
 /// Read an encrypted file's `(os_bp, l1_bp, l0_bps)` directly from raw disk media bytes using

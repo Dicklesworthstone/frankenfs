@@ -2254,7 +2254,13 @@ pub(super) fn stage_create_snapshot(
 
     let mut head_zap_entries = dataset_feature_entries(cx, mos, head_obj, &head_dn, features)?;
     let head_features = dataset_block_feature_owners(&head_zap_entries, features)?;
-    let inherited_ivset_guid = zap_optional_u64(&head_zap_entries, DSL_DATASET_IVSET_GUID)?;
+    let old_head_ivset_guid = zap_optional_u64(&head_zap_entries, DSL_DATASET_IVSET_GUID)?;
+    // Native IV-set identities belong to snapshots. A received head may retain
+    // an older snapshot's GUID, and imported native heads need not have one.
+    // Derive this snapshot's identity independently of that writable-head state.
+    let snapshot_ivset_guid = mos
+        .dataset_crypto_info(cx, dataset)?
+        .map(|_| derive_unique_guid(pool_guid, new_txg, snap_ds_obj, 14));
     let mut snap_zap_entries = Vec::new();
     for feature in head_features {
         features.increment_read(feature, new_txg)?;
@@ -2265,7 +2271,7 @@ pub(super) fn stage_create_snapshot(
             collision: 0,
         });
     }
-    if let Some(ivset_guid) = inherited_ivset_guid {
+    if let Some(ivset_guid) = snapshot_ivset_guid {
         snap_zap_entries.push(RawZapEntry {
             name: DSL_DATASET_IVSET_GUID.to_vec(),
             integer_bytes: 8,
@@ -2419,16 +2425,16 @@ pub(super) fn stage_create_snapshot(
     )?;
 
     // 4. Update `head` (`ds_prev_snap_obj`, `ds_prev_snap_txg`, `ds_deadlist_obj`, `ds_unique_bytes = 0`).
-    // For encrypted datasets, also rotate `head`'s `com.datto:ivset_guid` so post-snapshot writes
-    // belong to a distinct IV-set from the snapshot.
+    // Our encrypted writers also use the head's GUID as a nonce domain. Rotate
+    // that domain independently of the new snapshot's native IV-set identity.
     let mut head_bonus = head_dn.bonus().to_vec();
     head_bonus[8..16].copy_from_slice(&order.encode(snap_ds_obj));
     head_bonus[16..24].copy_from_slice(&order.encode(new_txg));
     head_bonus[64..72].copy_from_slice(&order.encode(new_head_dl));
     head_bonus[96..104].copy_from_slice(&order.encode(0));
-    if let Some(old_ivset) = inherited_ivset_guid {
+    if let Some(snapshot_ivset) = snapshot_ivset_guid {
         let mut next_ivset = derive_unique_guid(pool_guid, new_txg, head_obj, 11);
-        if next_ivset == old_ivset {
+        while Some(next_ivset) == old_head_ivset_guid || next_ivset == snapshot_ivset {
             next_ivset = next_ivset.wrapping_add(1).max(1);
         }
         head_zap_entries.retain(|e| e.name != DSL_DATASET_IVSET_GUID);
@@ -2438,6 +2444,9 @@ pub(super) fn stage_create_snapshot(
             values: vec![next_ivset],
             collision: 0,
         });
+        if head_dn.object_type() != DMU_OTN_ZAP_METADATA {
+            features.increment_read("com.delphix:extensible_dataset", new_txg)?;
+        }
         write_zap_dnode_in_mos(
             cx,
             mos,
