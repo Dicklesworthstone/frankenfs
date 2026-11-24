@@ -31,12 +31,18 @@ canonical issue graph or claiming closure of blocked broad milestones.
   or tests ran, after earlier dependency kills and repeated executor resets.
 - [x] Identify the six owner byte/object quota tables currently refused by the
   native ZFS writer and the existing per-TXG owner-accounting seam.
-- [ ] Correct owner byte usage to include native dnode allocation on object
+- [x] Correct owner byte usage to include native dnode allocation on object
   creation, reclamation and owner transfer, with checked net arithmetic.
-- [ ] Enforce user/group/project byte/object limits before native publication;
+- [x] Enforce user/group/project byte/object limits before native publication;
   permit reclamation, retain malformed-profile refusal and return EDQUOT.
+- [x] Independently review quota encoding, accounting and publication. Require
+  usage lower bounds from committed objects in touched dnode blocks, including
+  zero-net dimensions; refuse unsupported ObjectSet/commit byte-order mixtures.
+  Preserve native reads and the existing private-xattr mutation boundary.
 - [ ] Execute quota boundary, empty-file, owner-transfer, over-limit reclamation,
   snapshot and cold-reopen controls through the actual transaction engine.
+  Eight integration functions and three quota helper tests are authored;
+  none is reported as executed by this session.
 - [x] Baseline workspace formatting passes. Initial workspace checks were
   terminated by SIGKILL while compiling dependencies under shared-host pressure;
   neither attempt establishes a source-code compiler result.
@@ -51,9 +57,16 @@ canonical issue graph or claiming closure of blocked broad milestones.
   persistence fixture also reproduces on unchanged `f9ce145`; no full-scan pass
   or runtime coverage is claimed.
 - [ ] Complete owning-package tests, workspace/all-target checking and strict
-  Clippy; retain exact commands and observed results below.
-- [ ] Review and publish meaningful increments directly to `main` through
-  GitHub with an expected-head lease; record commit IDs and verification.
+  Clippy. After recovery, `cargo check --workspace --all-targets --locked`
+  also ends with SIGKILL in `asupersync`, before a project-wide source result.
+  Strict Clippy and native transaction runtime remain unverified.
+- [x] Publish FAT directly to `main` as
+  `510116eaa35f2d7b29c84d40e3335c100c69a896` through GitHub with an expected-head
+  lease; verify the remote head and preserve the remaining ZFS work. The actual
+  pre-push script accepts its documented emergency exception with both the
+  commit trailer and `FFS_PRE_PUSH_BYPASS=1`; no gate pass is inferred from it.
+- [x] Prepare the separate ZFS implementation, regression and supported-profile
+  checkpoint; preserve the original broad Bead acceptance and dependencies.
 - [ ] Native OpenZFS and mounted-syscall qualification remain independent:
   this environment has no native filesystem oracle tools or `/dev/fuse`.
 

@@ -1420,8 +1420,240 @@ pub(super) struct QuotaDelta {
     pub uid: u64,
     pub gid: u64,
     pub projid: Option<u64>,
+    /// Change in `dn_used`; each created/deleted/transferred object additionally
+    /// contributes the native 512-byte dnode charge through `objs_delta`.
     pub bytes_delta: i64,
     pub objs_delta: i64,
+}
+
+/// Native per-owner limits, keyed like their matching embedded usage entries.
+/// Object quota tables use the same hexadecimal owner keys as byte quotas;
+/// only the embedded usage table prefixes object counts with `obj-`.
+#[derive(Default)]
+pub(super) struct OwnerQuotaLimits {
+    owners: [BTreeMap<Vec<u8>, u64>; 3],
+    usage: [Option<BTreeMap<Vec<u8>, u64>>; 3],
+    pub(super) active: bool,
+}
+
+impl OwnerQuotaLimits {
+    pub(super) fn validate_dnode_table(
+        &self,
+        os: &ObjectSet,
+        bytes: &[u8],
+        order: Endian,
+    ) -> Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        let required = DNODE_FLAG_USERUSED_ACCOUNTED
+            | if os.flags & 2 != 0 {
+                DNODE_FLAG_USEROBJUSED_ACCOUNTED
+            } else {
+                0
+            };
+        let mut slot = 0;
+        while slot < bytes.len() / DNODE_BYTES {
+            if let Some(node) = dnode_at(bytes, slot, order).map_err(|error| parse_err(&error))? {
+                if matches!(
+                    node.object_type(),
+                    DMU_OT_PLAIN_FILE_CONTENTS | DMU_OT_DIRECTORY_CONTENTS
+                ) && node.flags() & required != required
+                {
+                    return Err(corrupt(
+                        "quota-controlled ZPL object has incomplete owner accounting",
+                    ));
+                }
+                slot += node.slots();
+            } else {
+                slot += 1;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_existing_usage(
+        &self,
+        objects: &[QuotaDelta],
+        track_objects: bool,
+    ) -> Result<()> {
+        // These are absolute charges of preexisting objects in the touched
+        // dnode blocks, not transaction changes. Even a completed accounting
+        // flag cannot justify missing or understated usage for those objects.
+        let minima = aggregate_owner_quota_deltas(objects, track_objects, self.usage[2].is_some())?;
+        for (usage, minima) in self.usage.iter().zip(minima) {
+            if let Some(usage) = usage {
+                for (key, minimum) in minima {
+                    if i128::from(usage.get(&key).copied().unwrap_or(0)) < minimum {
+                        return Err(corrupt(
+                            "native owner usage understates existing owned objects",
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn load_owner_quota_limits(
+    cx: &Cx,
+    os_view: &mut Objects,
+    os: &ObjectSet,
+    master: &[RawZapEntry],
+    order: Endian,
+) -> Result<OwnerQuotaLimits> {
+    let mut limits = OwnerQuotaLimits::default();
+    let mut required_usage = [false; 3];
+    for (name, owner, objects) in [
+        (b"userquota@".as_slice(), 0, false),
+        (b"groupquota@", 1, false),
+        (b"projectquota@", 2, false),
+        (b"userobjquota@", 0, true),
+        (b"groupobjquota@", 1, true),
+        (b"projectobjquota@", 2, true),
+    ] {
+        let Some(object) = zap_optional_u64(master, name)?.filter(|&object| object != 0) else {
+            continue;
+        };
+        limits.active = true;
+        let required_flags = 1 | if objects { 2 } else { 0 } | if owner == 2 { 4 } else { 0 };
+        if os.flags & required_flags != required_flags {
+            return Err(unsupported(
+                "native owner quota requires complete usage accounting",
+            ));
+        }
+        // User and group accounting are initialized together. Project limits
+        // additionally require their own already initialized native object.
+        required_usage[0] = true;
+        required_usage[1] = true;
+        required_usage[2] |= owner == 2;
+        let node = os_view.object(cx, object)?;
+        if node.object_type() != 40 || node.bonus_type() != 0 {
+            return Err(corrupt("native owner quota object has the wrong type"));
+        }
+        for row in os_view.zap_values(cx, object)? {
+            checkpoint(cx)?;
+            let id = parse_owner_quota_key(&row.name)?;
+            let value = row.scalar().map_err(|error| parse_err(&error))?;
+            let key = if objects {
+                format!("obj-{id:x}").into_bytes()
+            } else {
+                row.name
+            };
+            if limits.owners[owner].insert(key, value).is_some() {
+                return Err(corrupt("duplicate native owner quota limit"));
+            }
+        }
+    }
+    for ((offset, required), usage) in [
+        OBJSET_USERUSED_OFFSET,
+        OBJSET_GROUPUSED_OFFSET,
+        OBJSET_PROJECTUSED_OFFSET,
+    ]
+    .into_iter()
+    .zip(required_usage)
+    .zip(&mut limits.usage)
+    {
+        if required {
+            let node = os
+                .embedded_dnode(offset, order)
+                .map_err(|error| parse_err(&error))?
+                .ok_or_else(|| corrupt("native owner quota lacks its usage object"))?;
+            if node.object_type() != 39 {
+                return Err(corrupt("native owner usage object has the wrong type"));
+            }
+            let entries = read_embedded_zap_entries(cx, os_view, &node, os_view.root_birth_txg())?;
+            validate_owner_usage_entries(&entries)?;
+            *usage = Some(
+                entries
+                    .into_iter()
+                    .map(|entry| {
+                        let value = entry.scalar().map_err(|error| parse_err(&error))?;
+                        Ok((entry.name, value))
+                    })
+                    .collect::<Result<_>>()?,
+            );
+        }
+    }
+    Ok(limits)
+}
+
+fn validate_owner_usage_entries(entries: &[RawZapEntry]) -> Result<()> {
+    let mut seen = BTreeSet::new();
+    for entry in entries {
+        let owner = entry.name.strip_prefix(b"obj-").unwrap_or(&entry.name);
+        parse_owner_quota_key(owner)?;
+        entry.scalar().map_err(|error| parse_err(&error))?;
+        if !seen.insert(entry.name.as_slice()) {
+            return Err(corrupt("duplicate native owner usage entry"));
+        }
+    }
+    Ok(())
+}
+
+fn parse_owner_quota_key(key: &[u8]) -> Result<u64> {
+    let text = std::str::from_utf8(key).map_err(|_| corrupt("invalid native owner quota key"))?;
+    let id =
+        u64::from_str_radix(text, 16).map_err(|_| corrupt("invalid native owner quota key"))?;
+    if format!("{id:x}").as_bytes() != key {
+        return Err(corrupt("noncanonical native owner quota key"));
+    }
+    Ok(id)
+}
+
+fn aggregate_owner_quota_deltas(
+    deltas: &[QuotaDelta],
+    track_objects: bool,
+    track_projects: bool,
+) -> Result<[BTreeMap<Vec<u8>, i128>; 3]> {
+    let mut maps: [BTreeMap<Vec<u8>, i128>; 3] = std::array::from_fn(|_| BTreeMap::new());
+    for delta in deltas {
+        // OpenZFS zfs-2.3.0 dmu_objset.c:do_userquota_update charges
+        // DNODE_MIN_SIZE + DN_USED_BYTES, including empty files and ownership
+        // transfers. This is the native minimum charge, not dn_extra_slots.
+        let bytes = i128::from(delta.bytes_delta) + i128::from(delta.objs_delta) * 512;
+        for (map, owner) in maps
+            .iter_mut()
+            .zip([Some(delta.uid), Some(delta.gid), delta.projid])
+            .take(if track_projects { 3 } else { 2 })
+        {
+            let id = owner.ok_or_else(|| corrupt("native quota delta lacks its project owner"))?;
+            for (key, change) in [
+                (format!("{id:x}"), bytes),
+                (
+                    format!("obj-{id:x}"),
+                    if track_objects {
+                        i128::from(delta.objs_delta)
+                    } else {
+                        0
+                    },
+                ),
+            ] {
+                if change != 0 {
+                    let pending = map.entry(key.into_bytes()).or_default();
+                    *pending = pending
+                        .checked_add(change)
+                        .ok_or_else(|| corrupt("native owner quota delta overflow"))?;
+                }
+            }
+        }
+    }
+    Ok(maps)
+}
+
+fn next_owner_usage(current: u64, change: i128, limit: Option<u64>) -> Result<u64> {
+    let next = i128::from(current)
+        .checked_add(change)
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or_else(|| corrupt("native owner usage underflow or overflow"))?;
+    if change > 0 && limit.is_some_and(|limit| next > limit) {
+        return Err(FfsError::RequestRejected {
+            errno: libc::EDQUOT,
+            detail: "native owner byte or object quota would be exceeded".into(),
+        });
+    }
+    Ok(next)
 }
 
 pub(super) fn objectset_user_accounting_flags(os: &ObjectSet, order: Endian) -> Result<u8> {
@@ -1446,6 +1678,7 @@ pub(super) fn apply_objectset_quota_deltas(
     os: &mut ObjectSet,
     alloc: &mut PoolSpaceAllocator,
     deltas: &[QuotaDelta],
+    limits: &OwnerQuotaLimits,
     order: Endian,
     new_txg: u64,
     staged_writes: &mut Vec<StagedBlockWrite>,
@@ -1467,48 +1700,17 @@ pub(super) fn apply_objectset_quota_deltas(
             .map_err(|e| parse_err(&e))?
             .is_some();
 
-    let mut maps: [(usize, BTreeMap<Vec<u8>, i128>); 3] = [
-        (OBJSET_USERUSED_OFFSET, BTreeMap::new()),
-        (OBJSET_GROUPUSED_OFFSET, BTreeMap::new()),
-        (OBJSET_PROJECTUSED_OFFSET, BTreeMap::new()),
-    ];
-    for d in deltas {
-        if d.bytes_delta != 0 {
-            *maps[0]
-                .1
-                .entry(format!("{:x}", d.uid).into_bytes())
-                .or_default() += i128::from(d.bytes_delta);
-            *maps[1]
-                .1
-                .entry(format!("{:x}", d.gid).into_bytes())
-                .or_default() += i128::from(d.bytes_delta);
-            if track_proj && let Some(proj) = d.projid {
-                *maps[2]
-                    .1
-                    .entry(format!("{proj:x}").into_bytes())
-                    .or_default() += i128::from(d.bytes_delta);
-            }
-        }
-        if track_objs && d.objs_delta != 0 {
-            *maps[0]
-                .1
-                .entry(format!("obj-{:x}", d.uid).into_bytes())
-                .or_default() += i128::from(d.objs_delta);
-            *maps[1]
-                .1
-                .entry(format!("obj-{:x}", d.gid).into_bytes())
-                .or_default() += i128::from(d.objs_delta);
-            if track_proj && let Some(proj) = d.projid {
-                *maps[2]
-                    .1
-                    .entry(format!("obj-{proj:x}").into_bytes())
-                    .or_default() += i128::from(d.objs_delta);
-            }
-        }
-    }
-
+    let maps = aggregate_owner_quota_deltas(deltas, track_objs, track_proj)?;
     let min_blk = (1_usize << alloc.ashift).max(512);
-    for (slot_offset, changes) in maps {
+    for ((slot_offset, changes), owner_limits) in [
+        OBJSET_USERUSED_OFFSET,
+        OBJSET_GROUPUSED_OFFSET,
+        OBJSET_PROJECTUSED_OFFSET,
+    ]
+    .into_iter()
+    .zip(maps)
+    .zip(&limits.owners)
+    {
         if changes.is_empty() {
             continue;
         }
@@ -1520,23 +1722,25 @@ pub(super) fn apply_objectset_quota_deltas(
         };
         let mut entries =
             read_embedded_zap_entries(cx, os_view, &emb_dn, os_view.root_birth_txg())?;
+        validate_owner_usage_entries(&entries)?;
         for (key, delta) in changes {
             if delta == 0 {
                 continue;
             }
             if let Some(existing) = entries.iter_mut().find(|e| e.name == key) {
-                let cur = i128::from(existing.scalar().map_err(|e| parse_err(&e))?);
-                let next = u64::try_from((cur + delta).max(0)).unwrap_or(u64::MAX);
+                let cur = existing.scalar().map_err(|e| parse_err(&e))?;
+                let next = next_owner_usage(cur, delta, owner_limits.get(&key).copied())?;
                 if next == 0 {
                     existing.values.clear();
                 } else {
                     existing.values = vec![next];
                 }
-            } else if delta > 0 {
+            } else {
+                let next = next_owner_usage(0, delta, owner_limits.get(&key).copied())?;
                 entries.push(RawZapEntry {
                     name: key,
                     integer_bytes: 8,
-                    values: vec![u64::try_from(delta).unwrap_or(u64::MAX)],
+                    values: vec![next],
                     collision: 0,
                 });
             }
@@ -3236,3 +3440,112 @@ impl<'a> FixedDvaReplay<'a> {
 
 #[allow(dead_code)]
 fn _assert_btree_set_used(_: &BTreeSet<u64>) {}
+
+#[cfg(test)]
+mod owner_quota_tests {
+    use super::*;
+
+    #[test]
+    fn owner_quota_counts_empty_dnodes_and_nets_owner_transfers() {
+        let changes = aggregate_owner_quota_deltas(
+            &[QuotaDelta {
+                uid: 7,
+                gid: 9,
+                projid: Some(42),
+                bytes_delta: 0,
+                objs_delta: 1,
+            }],
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(changes[0], BTreeMap::from([(b"7".to_vec(), 512)]));
+        assert_eq!(changes[1], BTreeMap::from([(b"9".to_vec(), 512)]));
+        assert!(changes[2].is_empty());
+
+        let changes = aggregate_owner_quota_deltas(
+            &[
+                QuotaDelta {
+                    uid: 7,
+                    gid: 9,
+                    projid: Some(42),
+                    bytes_delta: -1024,
+                    objs_delta: -1,
+                },
+                QuotaDelta {
+                    uid: 8,
+                    gid: 9,
+                    projid: Some(42),
+                    bytes_delta: 1024,
+                    objs_delta: 1,
+                },
+            ],
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(changes[0][b"7".as_slice()], -1536);
+        assert_eq!(changes[0][b"8".as_slice()], 1536);
+        assert_eq!(changes[0][b"obj-7".as_slice()], -1);
+        assert_eq!(changes[0][b"obj-8".as_slice()], 1);
+        assert!(changes[1].values().all(|&change| change == 0));
+        assert!(changes[2].values().all(|&change| change == 0));
+    }
+
+    #[test]
+    fn owner_quota_arithmetic_rejects_growth_and_corruption_without_blocking_reclamation() {
+        assert_eq!(next_owner_usage(512, 512, Some(1024)).unwrap(), 1024);
+        assert_eq!(next_owner_usage(1024, -512, Some(1)).unwrap(), 512);
+        assert_eq!(next_owner_usage(1024, 0, Some(1)).unwrap(), 1024);
+        assert_eq!(next_owner_usage(u64::MAX - 1, 1, None).unwrap(), u64::MAX);
+        for (current, change, limit) in [(1024, 1, 1024), (0, 512, 511), (0, 1, 0)] {
+            assert_eq!(
+                next_owner_usage(current, change, Some(limit))
+                    .unwrap_err()
+                    .to_errno(),
+                libc::EDQUOT
+            );
+        }
+        for (current, change) in [(0, -1), (u64::MAX, 1), (1, i128::MAX)] {
+            assert!(matches!(
+                next_owner_usage(current, change, None),
+                Err(FfsError::Corruption { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn owner_quota_native_keys_and_usage_values_fail_closed() {
+        for (key, value) in [
+            (b"0".as_slice(), 0),
+            (b"2a", 42),
+            (b"ffffffffffffffff", u64::MAX),
+        ] {
+            assert_eq!(parse_owner_quota_key(key).unwrap(), value);
+        }
+        for key in [
+            b"".as_slice(),
+            b"00",
+            b"2A",
+            b"+2a",
+            b"obj-2a",
+            b"10000000000000000",
+        ] {
+            assert!(parse_owner_quota_key(key).is_err());
+        }
+        let entry = RawZapEntry {
+            name: b"obj-2a".to_vec(),
+            integer_bytes: 8,
+            values: vec![1],
+            collision: 0,
+        };
+        validate_owner_usage_entries(std::slice::from_ref(&entry)).unwrap();
+        assert!(validate_owner_usage_entries(&[entry.clone(), entry.clone()]).is_err());
+        let mut malformed = entry;
+        malformed.integer_bytes = 4;
+        assert!(validate_owner_usage_entries(std::slice::from_ref(&malformed)).is_err());
+        malformed.integer_bytes = 8;
+        malformed.values.push(2);
+        assert!(validate_owner_usage_entries(&[malformed]).is_err());
+    }
+}

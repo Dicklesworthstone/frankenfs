@@ -705,11 +705,21 @@ offsets, and registry/layout changes publish with namespace and usage counters
 in the same TXG. Hard links and renames into project trees require matching
 project IDs; renames also propagate the destination inheritance flag. Exchange
 conservatively checks both destinations. Project ownership reassignment,
-inheritable ACL propagation, owner quota-limit enforcement and the remaining
-dataset/shared-reference lifecycle are still required. Until limit enforcement
-exists, the native writer refuses datasets referencing any native user, group
-or project byte/object quota table. Creation under inheritable native ACLs also
-remains refused; usage accounting alone is not quota enforcement.
+inheritable ACL propagation and the remaining dataset/shared-reference lifecycle
+are still required. Creation under inheritable native ACLs remains refused.
+
+The native writer now enforces all six user/group/project byte/object limit
+tables against checked per-TXG owner deltas before publication. Native byte
+usage includes the 512-byte dnode charge as well as `dn_used`; creation, final
+reclamation and ownership transfers update both dimensions together. Exact
+limits are allowed; net growth past a limit returns EDQUOT, and net-zero or
+reclaiming changes remain possible above a limit. Absent references and missing
+owner keys are unlimited, but a stored zero limit is enforced as zero. Admission
+requires initialized native accounting, canonical scalar quota keys and usage
+records, and supported ObjectSet/commit byte order. Missing or understated usage
+for objects in touched dnode blocks refuses mutation before backing writes.
+Dataset quotas, quota administration, native interchange and broader lifecycle
+qualification remain separate work; this does not close the writer milestone.
 
 Read snapshots at their selected immutable root. Enumerate datasets, properties,
 clones, and snapshots independently of which dataset is mounted. Parent/child
