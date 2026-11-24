@@ -128,20 +128,34 @@ fn inspect_raw_encrypted_file_bps(
 }
 
 #[test]
-#[allow(clippy::too_many_lines)]
 fn encrypted_fsops_mutations_preserve_inherited_checksum_policy() {
+    assert_encrypted_fsops_inherited_checksum_policy(16_384, 8);
+}
+
+#[test]
+fn encrypted_large_records_activate_native_sha512_and_large_block_ownership() {
+    assert_encrypted_fsops_inherited_checksum_policy(262_144, 11);
+}
+
+#[allow(clippy::too_many_lines)]
+fn assert_encrypted_fsops_inherited_checksum_policy(recordsize: usize, checksum: u8) {
     let cx = Cx::for_testing();
     let parent_ds = vec![b"data".to_vec()];
     let dataset = vec![b"data".to_vec(), b"checksummed".to_vec()];
     let material = ZfsKeyMaterial::Raw([0x5C; 32]);
-    let built = build_clean_zfs_pool(&PoolFixtureSpec {
+    let mut spec = PoolFixtureSpec {
         data_properties: vec![
-            (b"checksum", 8),
-            (b"recordsize", 16_384),
+            (b"checksum", u64::from(checksum)),
+            (b"recordsize", recordsize as u64),
             (b"compression", 15),
         ],
         ..encryption_pool_spec(1)
-    });
+    };
+    spec.additional_read_features.extend([
+        (b"org.open-zfs:large_blocks".as_slice(), 0),
+        (b"org.illumos:sha512".as_slice(), 0),
+    ]);
+    let built = build_clean_zfs_pool(&spec);
     let devices: Vec<_> = built
         .members
         .into_iter()
@@ -187,13 +201,13 @@ fn encrypted_fsops_mutations_preserve_inherited_checksum_policy() {
         )
         .unwrap();
     let payload: Vec<u8> = (0..5_u8)
-        .flat_map(|block| std::iter::repeat_n(0x41 + block, 16_384))
+        .flat_map(|block| std::iter::repeat_n(0x41 + block, recordsize))
         .collect();
     assert_eq!(
         fs.write(&cx, &mut scope, file.ino, 0, &payload).unwrap(),
         payload.len() as u32
     );
-    let retained_len = 4 * 16_384 + 1111;
+    let retained_len = 4 * recordsize + 1111;
     fs.setattr(
         &cx,
         &mut scope,
@@ -235,17 +249,40 @@ fn encrypted_fsops_mutations_preserve_inherited_checksum_policy() {
     let media = durable[0].durable_snapshot();
     let (_, indirect, leaves) =
         inspect_raw_encrypted_file_bps(&cx, &mut mos, &media, &dataset, object);
-    assert_eq!(indirect.checksum_type(), 8);
+    assert_eq!(indirect.checksum_type(), checksum);
     for pointer in leaves {
         assert!(!pointer.hole());
         assert!(pointer.is_encrypted());
-        assert_eq!(pointer.checksum_type(), 8);
+        assert_eq!(pointer.checksum_type(), checksum);
+        assert_eq!(pointer.logical_bytes(), recordsize);
         assert_eq!(pointer.compression(), 15);
     }
     let scrub = mos
         .scrub_dataset(&cx, &dataset, None, ScrubLimits::default())
         .unwrap();
     assert!(scrub.is_clean(), "keyed scrub failed: {scrub:?}");
+    let ownership = open_engine_on_devices(
+        &cx,
+        &durable,
+        default_write_opts(built.pool_guid, token.published_slot()),
+    )
+    .unwrap();
+    for (feature, active) in [
+        (
+            b"org.open-zfs:large_blocks".as_slice(),
+            recordsize > 131_072,
+        ),
+        (b"org.illumos:sha512".as_slice(), checksum == 11),
+    ] {
+        assert_native_dataset_feature(
+            &cx,
+            &ownership,
+            &dataset,
+            feature,
+            active,
+            u64::from(active),
+        );
+    }
     assert_pool_scrub_and_allocation_clean(
         &cx,
         &durable,

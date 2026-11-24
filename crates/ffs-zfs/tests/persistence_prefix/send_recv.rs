@@ -28,6 +28,7 @@ fn send_recv_pool_spec(image_bytes: u64) -> PoolFixtureSpec {
             (b"com.datto:bookmark_v2", 0),
             (b"com.delphix:embedded_data", 0),
             (b"org.open-zfs:large_blocks", 0),
+            (b"org.illumos:sha512", 0),
             (b"org.freebsd:zstd_compress", 0),
         ],
         additional_write_features: vec![(b"com.delphix:bookmarks", 0)],
@@ -78,6 +79,515 @@ fn pool_allocated_bytes(
     let mos = open_mos(cx, devs, pool_guid, slot);
     let alloc = mos.allocation(cx, AllocationLimits::default()).unwrap();
     alloc.allocated_bytes
+}
+
+fn assert_received_feature_owners(
+    cx: &Cx,
+    mos: &mut ffs_zfs::Objects,
+    object: u64,
+    expected: [bool; 2],
+) {
+    let node = mos.object(cx, object).unwrap();
+    let entries = if node.object_type() == 196 {
+        mos.zap(cx, object).unwrap()
+    } else {
+        assert!(!expected.contains(&true), "feature owner is not zapified");
+        Vec::new()
+    };
+    for (feature, active) in [
+        b"org.open-zfs:large_blocks".as_slice(),
+        b"org.illumos:sha512".as_slice(),
+    ]
+    .into_iter()
+    .zip(expected)
+    {
+        assert_eq!(
+            entries
+                .iter()
+                .find(|entry| entry.name == feature)
+                .map(|entry| entry.value),
+            active.then_some(0),
+            "unexpected ownership of {} on dataset object {object}",
+            String::from_utf8_lossy(feature)
+        );
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn receive_feature_owners_survive_checkpoints_resume_abort_and_destruction() {
+    let cx = Cx::for_testing();
+    let timestamp = Timestamp {
+        seconds: 1_730_000_500,
+        nanos: 0,
+    };
+    let source = vec![b"data".to_vec()];
+    let built = build_clean_zfs_pool(&send_recv_pool_spec(64 * 1024 * 1024));
+    let source_devices: Vec<_> = built
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut sender = open_engine_on_devices(
+        &cx,
+        &source_devices,
+        default_write_opts(built.pool_guid, built.initial_slot),
+    )
+    .unwrap();
+    for (name, value) in [("recordsize", 262_144), ("checksum", 11)] {
+        sender
+            .set_property(&cx, &source, name, ZfsPropertySetValue::Number(value))
+            .into_result()
+            .unwrap();
+    }
+    let (object, _) = sender
+        .create_file(
+            &cx,
+            &source,
+            2,
+            b"payload",
+            0o640,
+            1000,
+            1000,
+            timestamp,
+            ZfsDataChecksum::Inherit,
+        )
+        .into_result()
+        .unwrap();
+    let first: Vec<u8> = (0..524_288)
+        .map(|index| u8::try_from(index % 251).unwrap())
+        .collect();
+    sender
+        .write_file_data(
+            &cx,
+            &source,
+            object,
+            0,
+            &first,
+            timestamp,
+            ZfsDataChecksum::Inherit,
+        )
+        .into_result()
+        .unwrap();
+    sender
+        .create_snapshot(&cx, &source, b"s1", timestamp)
+        .into_result()
+        .unwrap();
+    let mut second = first.clone();
+    second[262_144..262_151].copy_from_slice(b"changed");
+    sender
+        .write_file_data(
+            &cx,
+            &source,
+            object,
+            262_144,
+            b"changed",
+            timestamp,
+            ZfsDataChecksum::Inherit,
+        )
+        .into_result()
+        .unwrap();
+    sender
+        .create_snapshot(&cx, &source, b"s2", timestamp)
+        .into_result()
+        .unwrap();
+
+    let mut source_mos = sender.open_read_objects(&cx).unwrap();
+    let mut request = ZfsSendRequest::full(source.clone(), b"s1".to_vec());
+    request.large_blocks = true;
+    let mut full = Vec::new();
+    send_stream(&cx, &mut source_mos, &request, &mut full).unwrap();
+    let mut request = ZfsSendRequest::full(source.clone(), b"s2".to_vec());
+    request.large_blocks = true;
+    request.from = Some(ZfsSendFrom::Snapshot(b"s1".to_vec()));
+    let mut incremental = Vec::new();
+    send_stream(&cx, &mut source_mos, &request, &mut incremental).unwrap();
+    request.large_blocks = false;
+    let mut downconverted_incremental = Vec::new();
+    send_stream(
+        &cx,
+        &mut source_mos,
+        &request,
+        &mut downconverted_incremental,
+    )
+    .unwrap();
+
+    {
+        let missing = b"org.open-zfs:large_blocks".as_slice();
+        let mut specification = send_recv_pool_spec(32 * 1024 * 1024);
+        specification
+            .additional_read_features
+            .retain(|(name, _)| *name != missing);
+        let refused = build_clean_zfs_pool(&specification);
+        let refused_devices: Vec<_> = refused
+            .members
+            .into_iter()
+            .map(FaultableMemberDevice::new)
+            .collect();
+        let mut receiver = open_engine_on_devices(
+            &cx,
+            &refused_devices,
+            default_write_opts(refused.pool_guid, refused.initial_slot),
+        )
+        .unwrap();
+        let destination = vec![b"data".to_vec(), b"unsupported".to_vec()];
+        let request = ZfsRecvRequest::new(destination.clone());
+        let feature = std::str::from_utf8(missing).unwrap();
+        assert!(matches!(
+            receiver.receive_stream(&cx, &request, &mut Cursor::new(&full)),
+            ZfsTxOutcome::NotCommitted(error) if error.to_string().contains(feature)
+        ));
+        assert!(
+            receiver
+                .inspect_receive_resume_state(&cx, &destination)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !receiver
+                .open_read_objects(&cx)
+                .unwrap()
+                .datasets(&cx)
+                .unwrap()
+                .iter()
+                .any(|row| row.components == destination)
+        );
+        assert_pool_scrub_and_allocation_clean(
+            &cx,
+            &refused_devices,
+            refused.pool_guid,
+            Some(receiver.committed_slot()),
+        );
+    }
+
+    let target = build_clean_zfs_pool(&send_recv_pool_spec(64 * 1024 * 1024));
+    let devices: Vec<_> = target
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut receiver = open_engine_on_devices(
+        &cx,
+        &devices,
+        default_write_opts(target.pool_guid, target.initial_slot),
+    )
+    .unwrap();
+    let baseline = dsl_block_feature_counts(&cx, &receiver);
+    assert_eq!(&baseline[..2], &[0, 0]);
+    let destination = vec![b"data".to_vec(), b"received".to_vec()];
+    let mut receive = ZfsRecvRequest::new(destination.clone());
+    receive.resumable = true;
+    receive.checkpoint_bytes = 1;
+
+    // Ordinary uncompressed WRITE records carry plaintext, so receive applies
+    // dn_checksum=inherit (Fletcher4 here), independently of the sender's SHA512
+    // BPs. Only the actually emitted large-block feature becomes owned.
+    for (stream, is_incremental, before_count, after_count, expected) in [
+        (full.as_slice(), false, 0, 2, &first),
+        (incremental.as_slice(), true, 2, 3, &second),
+    ] {
+        let before = dsl_block_feature_counts(&cx, &receiver);
+        assert_eq!(&before[..2], &[before_count, 0]);
+        if is_incremental {
+            let media = snapshot_media_bytes(&devices);
+            assert!(matches!(
+                receiver.receive_stream(&cx, &receive, &mut Cursor::new(&downconverted_incremental)),
+                ZfsTxOutcome::NotCommitted(error) if error.to_string().contains("large-block support")
+            ));
+            assert_media_unchanged(&devices, &media);
+        }
+        // Drop only DRR_END. Every data record reaches a durable checkpoint;
+        // the incomplete owner must exist independently of final publication.
+        let incomplete = &stream[..stream.len() - DMU_REPLAY_RECORD_BYTES];
+        for abort in [true, false] {
+            assert!(matches!(
+                receiver.receive_stream(&cx, &receive, &mut Cursor::new(incomplete)),
+                ZfsTxOutcome::NotCommitted(_)
+            ));
+            let state = receiver
+                .inspect_receive_resume_state(&cx, &destination)
+                .unwrap()
+                .expect("incomplete receive must retain its checkpoint");
+            assert_eq!(state.is_pct_recv_child, is_incremental);
+            assert_eq!(
+                &dsl_block_feature_counts(&cx, &receiver)[..2],
+                &[before_count + 1, 0],
+                "checkpoint lost or double-counted its feature ownership"
+            );
+            if is_incremental {
+                let mut mos = receiver.open_read_objects(&cx).unwrap();
+                assert_eq!(
+                    mos.zpl(&cx, &destination)
+                        .unwrap()
+                        .read(&cx, object, 0, first.len())
+                        .unwrap(),
+                    first
+                );
+            }
+            if abort {
+                receiver
+                    .abort_receive(&cx, &destination)
+                    .into_result()
+                    .unwrap();
+                assert_eq!(dsl_block_feature_counts(&cx, &receiver), before);
+            } else {
+                let mut resume = ZfsSendRequest::full(source.clone(), Vec::new());
+                resume.resume_token = Some(state.token);
+                resume.large_blocks = true;
+                let mut remaining = Vec::new();
+                send_stream(&cx, &mut source_mos, &resume, &mut remaining).unwrap();
+                receiver
+                    .receive_stream(&cx, &receive, &mut Cursor::new(&remaining))
+                    .into_result()
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            &dsl_block_feature_counts(&cx, &receiver)[..2],
+            &[after_count, 0]
+        );
+        assert!(
+            receiver
+                .inspect_receive_resume_state(&cx, &destination)
+                .unwrap()
+                .is_none()
+        );
+        let mut mos = receiver.open_read_objects(&cx).unwrap();
+        let head = mos
+            .datasets(&cx)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.components == destination)
+            .unwrap()
+            .head_object;
+        let head_node = mos.object(&cx, head).unwrap();
+        let snapshot = head_node.order().u64(head_node.bonus(), 8).unwrap();
+        assert_received_feature_owners(&cx, &mut mos, head, [true, false]);
+        assert_received_feature_owners(&cx, &mut mos, snapshot, [true, false]);
+        assert_eq!(
+            mos.zpl(&cx, &destination)
+                .unwrap()
+                .read(&cx, object, 0, expected.len())
+                .unwrap(),
+            *expected
+        );
+    }
+
+    let slot = receiver.committed_slot();
+    drop(receiver);
+    let durable: Vec<_> = devices
+        .iter()
+        .map(FaultableMemberDevice::fresh_from_durable)
+        .collect();
+    let mut reopened =
+        open_engine_on_devices(&cx, &durable, default_write_opts(target.pool_guid, slot)).unwrap();
+    assert_eq!(&dsl_block_feature_counts(&cx, &reopened)[..2], &[3, 0]);
+    reopened
+        .destroy_snapshot(&cx, &destination, b"s1", false)
+        .into_result()
+        .unwrap();
+    assert_eq!(&dsl_block_feature_counts(&cx, &reopened)[..2], &[2, 0]);
+    reopened
+        .destroy_snapshot(&cx, &destination, b"s2", false)
+        .into_result()
+        .unwrap();
+    assert_eq!(&dsl_block_feature_counts(&cx, &reopened)[..2], &[1, 0]);
+    reopened
+        .destroy_dataset(&cx, &destination)
+        .into_result()
+        .unwrap();
+    assert_eq!(dsl_block_feature_counts(&cx, &reopened), baseline);
+    assert_pool_scrub_and_allocation_clean(
+        &cx,
+        &durable,
+        target.pool_guid,
+        Some(reopened.committed_slot()),
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn forced_receive_releases_features_owned_only_by_the_replaced_head() {
+    let cx = Cx::for_testing();
+    let timestamp = Timestamp {
+        seconds: 1_730_000_600,
+        nanos: 0,
+    };
+    let source = vec![b"data".to_vec()];
+    let built = build_clean_zfs_pool(&send_recv_pool_spec(32 * 1024 * 1024));
+    let source_devices: Vec<_> = built
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut sender = open_engine_on_devices(
+        &cx,
+        &source_devices,
+        default_write_opts(built.pool_guid, built.initial_slot),
+    )
+    .unwrap();
+    let (object, _) = sender
+        .create_file(
+            &cx,
+            &source,
+            2,
+            b"kept",
+            0o640,
+            1000,
+            1000,
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    sender
+        .write_file_data(
+            &cx,
+            &source,
+            object,
+            0,
+            b"source version one",
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    sender
+        .create_snapshot(&cx, &source, b"s1", timestamp)
+        .into_result()
+        .unwrap();
+    sender
+        .write_file_data(
+            &cx,
+            &source,
+            object,
+            0,
+            b"source version two",
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    sender
+        .create_snapshot(&cx, &source, b"s2", timestamp)
+        .into_result()
+        .unwrap();
+    let mut source_mos = sender.open_read_objects(&cx).unwrap();
+    let mut request = ZfsSendRequest::full(source.clone(), b"s1".to_vec());
+    request.large_blocks = true;
+    let mut full = Vec::new();
+    send_stream(&cx, &mut source_mos, &request, &mut full).unwrap();
+    let mut request = ZfsSendRequest::full(source, b"s2".to_vec());
+    request.large_blocks = true;
+    request.from = Some(ZfsSendFrom::Snapshot(b"s1".to_vec()));
+    let mut incremental = Vec::new();
+    send_stream(&cx, &mut source_mos, &request, &mut incremental).unwrap();
+
+    let target = build_clean_zfs_pool(&send_recv_pool_spec(32 * 1024 * 1024));
+    let devices: Vec<_> = target
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut receiver = open_engine_on_devices(
+        &cx,
+        &devices,
+        default_write_opts(target.pool_guid, target.initial_slot),
+    )
+    .unwrap();
+    let destination = vec![b"data".to_vec(), b"replace".to_vec()];
+    let mut receive = ZfsRecvRequest::new(destination.clone());
+    receiver
+        .receive_stream(&cx, &receive, &mut Cursor::new(&full))
+        .into_result()
+        .unwrap();
+    assert_eq!(
+        &dsl_block_feature_counts(&cx, &receiver)[..2],
+        &[0, 0],
+        "a stream capability flag alone must not acquire feature ownership"
+    );
+    for (name, value) in [("recordsize", 262_144), ("checksum", 11)] {
+        receiver
+            .set_property(&cx, &destination, name, ZfsPropertySetValue::Number(value))
+            .into_result()
+            .unwrap();
+    }
+    let root = receiver
+        .open_read_objects(&cx)
+        .unwrap()
+        .zpl(&cx, &destination)
+        .unwrap()
+        .resolve(&cx, b"/")
+        .unwrap();
+    let (discarded, _) = receiver
+        .create_file(
+            &cx,
+            &destination,
+            root,
+            b"discarded",
+            0o600,
+            1000,
+            1000,
+            timestamp,
+            ZfsDataChecksum::Inherit,
+        )
+        .into_result()
+        .unwrap();
+    let head_only = vec![0xCE; 262_161];
+    receiver
+        .write_file_data(
+            &cx,
+            &destination,
+            discarded,
+            0,
+            &head_only,
+            timestamp,
+            ZfsDataChecksum::Inherit,
+        )
+        .into_result()
+        .unwrap();
+    let before = dsl_block_feature_counts(&cx, &receiver);
+    assert_eq!(&before[..2], &[1, 1]);
+
+    receive.force = true;
+    receiver
+        .receive_stream(&cx, &receive, &mut Cursor::new(&incremental))
+        .into_result()
+        .unwrap();
+    let after = dsl_block_feature_counts(&cx, &receiver);
+    assert_eq!(
+        &after[..2],
+        &[0, 0],
+        "clone swap retained discarded-head feature ownership"
+    );
+    assert_eq!(
+        after[2], before[2],
+        "an already zapified target retains exactly one extensible owner"
+    );
+    let mut mos = receiver.open_read_objects(&cx).unwrap();
+    let head = mos
+        .datasets(&cx)
+        .unwrap()
+        .into_iter()
+        .find(|row| row.components == destination)
+        .unwrap()
+        .head_object;
+    let head_node = mos.object(&cx, head).unwrap();
+    let snapshot = head_node.order().u64(head_node.bonus(), 8).unwrap();
+    assert_received_feature_owners(&cx, &mut mos, head, [false, false]);
+    assert_received_feature_owners(&cx, &mut mos, snapshot, [false, false]);
+    let mut view = mos.zpl(&cx, &destination).unwrap();
+    assert_eq!(
+        view.read(&cx, object, 0, 64).unwrap(),
+        b"source version two"
+    );
+    assert!(view.resolve(&cx, b"/discarded").is_err());
+    assert_pool_scrub_and_allocation_clean(
+        &cx,
+        &devices,
+        target.pool_guid,
+        Some(receiver.committed_slot()),
+    );
 }
 
 fn stream_with_object_checksum(stream: &[u8], object: u64, checksum: u8) -> Vec<u8> {
@@ -993,7 +1503,14 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
             &cx,
             &[b"data".to_vec()],
             b"vault",
-            &[("compression".to_owned(), ZfsPropertySetValue::Number(15))],
+            &[
+                ("compression".to_owned(), ZfsPropertySetValue::Number(15)),
+                (
+                    "recordsize".to_owned(),
+                    ZfsPropertySetValue::Number(262_144),
+                ),
+                ("checksum".to_owned(), ZfsPropertySetValue::Number(11)),
+            ],
             &ZfsEncryptionCreateOptions {
                 suite: ZioEncrypt::Aes256Gcm,
                 key_material: Some(wrapping_key.clone()),
@@ -1031,11 +1548,11 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
             0,
             0,
             ts,
-            ZfsDataChecksum::Fletcher4,
+            ZfsDataChecksum::Inherit,
         )
         .into_result()
         .unwrap();
-    let sec_e1: Vec<u8> = (0..24 * 1024)
+    let sec_e1: Vec<u8> = (0..320 * 1024)
         .map(|i| u8::try_from((i * 29 + 7) & 0xff).unwrap())
         .collect();
     src_engine
@@ -1046,7 +1563,7 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
             0,
             &sec_e1,
             ts,
-            ZfsDataChecksum::Fletcher4,
+            ZfsDataChecksum::Inherit,
         )
         .into_result()
         .unwrap();
@@ -1055,7 +1572,7 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
         .into_result()
         .unwrap();
 
-    let sec_e2: Vec<u8> = (0..20 * 1024)
+    let sec_e2: Vec<u8> = (0..300 * 1024)
         .map(|i| u8::try_from((i * 53 + 11) & 0xff).unwrap())
         .collect();
     src_engine
@@ -1066,7 +1583,7 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
             0,
             &sec_e2,
             ts,
-            ZfsDataChecksum::Fletcher4,
+            ZfsDataChecksum::Inherit,
         )
         .into_result()
         .unwrap();
@@ -1077,7 +1594,7 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
             sec_obj,
             sec_e2.len() as u64,
             ts,
-            ZfsDataChecksum::Fletcher4,
+            ZfsDataChecksum::Inherit,
         )
         .into_result()
         .unwrap();
@@ -1101,6 +1618,7 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
     let mut raw_e1 = Vec::new();
     let mut req_e1 = ZfsSendRequest::full(vault_src.clone(), b"e1".to_vec());
     req_e1.raw = true;
+    req_e1.large_blocks = true;
     let report_e1 = send_stream(&cx, &mut keyless_src_mos, &req_e1, &mut raw_e1).unwrap();
     assert!(report_e1.raw);
 
@@ -1108,8 +1626,61 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
     let mut req_e2 = ZfsSendRequest::full(vault_src.clone(), b"e2".to_vec());
     req_e2.from = Some(ZfsSendFrom::Snapshot(b"e1".to_vec()));
     req_e2.raw = true;
+    req_e2.large_blocks = true;
     let report_e2 = send_stream(&cx, &mut keyless_src_mos, &req_e2, &mut raw_e2).unwrap();
     assert!(report_e2.raw && report_e2.from_guid == report_e1.to_guid);
+
+    // Raw compressed WRITE records retain the source BP algorithm and logical
+    // geometry. Refuse either missing feature without publishing the dataset.
+    for missing in [
+        b"org.open-zfs:large_blocks".as_slice(),
+        b"org.illumos:sha512".as_slice(),
+    ] {
+        let mut specification = send_recv_pool_spec(32 * 1024 * 1024);
+        specification
+            .additional_read_features
+            .retain(|(name, _)| *name != missing);
+        let refused = build_clean_zfs_pool(&specification);
+        let devices: Vec<_> = refused
+            .members
+            .into_iter()
+            .map(FaultableMemberDevice::new)
+            .collect();
+        let mut receiver = open_engine_on_devices(
+            &cx,
+            &devices,
+            default_write_opts(refused.pool_guid, refused.initial_slot),
+        )
+        .unwrap();
+        let destination = vec![b"data".to_vec(), b"unsupported_raw".to_vec()];
+        let request = ZfsRecvRequest::new(destination.clone());
+        let feature = std::str::from_utf8(missing).unwrap();
+        assert!(matches!(
+            receiver.receive_stream(&cx, &request, &mut Cursor::new(&raw_e1)),
+            ZfsTxOutcome::NotCommitted(error) if error.to_string().contains(feature)
+        ));
+        assert!(
+            receiver
+                .inspect_receive_resume_state(&cx, &destination)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !receiver
+                .open_read_objects(&cx)
+                .unwrap()
+                .datasets(&cx)
+                .unwrap()
+                .iter()
+                .any(|row| row.components == destination)
+        );
+        assert_pool_scrub_and_allocation_clean(
+            &cx,
+            &devices,
+            refused.pool_guid,
+            Some(receiver.committed_slot()),
+        );
+    }
 
     // 3. Receive BOTH raw encrypted streams on a fresh KEYLESS destination pool!
     let dst_built = build_clean_zfs_pool(&send_recv_pool_spec(32 * 1024 * 1024));
@@ -1126,15 +1697,34 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
     .unwrap();
 
     let vault_dst = vec![b"data".to_vec(), b"vault_dst".to_vec()];
-    let (r_e1, _) = dst_engine
-        .receive_stream(
+    let mut receive = ZfsRecvRequest::new(vault_dst.clone());
+    receive.resumable = true;
+    receive.checkpoint_bytes = 1;
+    assert!(matches!(
+        dst_engine.receive_stream(
             &cx,
-            &ZfsRecvRequest::new(vault_dst.clone()),
-            &mut Cursor::new(&raw_e1),
-        )
+            &receive,
+            &mut Cursor::new(&raw_e1[..raw_e1.len() - DMU_REPLAY_RECORD_BYTES]),
+        ),
+        ZfsTxOutcome::NotCommitted(_)
+    ));
+    assert_eq!(&dsl_block_feature_counts(&cx, &dst_engine)[..2], &[1, 1]);
+    let state = dst_engine
+        .inspect_receive_resume_state(&cx, &vault_dst)
+        .unwrap()
+        .expect("raw feature-bearing checkpoint");
+    let mut resume = ZfsSendRequest::full(vault_src.clone(), Vec::new());
+    resume.resume_token = Some(state.token);
+    resume.raw = true;
+    resume.large_blocks = true;
+    let mut resumed_e1 = Vec::new();
+    send_stream(&cx, &mut keyless_src_mos, &resume, &mut resumed_e1).unwrap();
+    let (r_e1, _) = dst_engine
+        .receive_stream(&cx, &receive, &mut Cursor::new(&resumed_e1))
         .into_result()
         .expect("keyless raw recv @e1");
     assert!(r_e1.raw && r_e1.final_snapshot == "e1");
+    assert_eq!(&dsl_block_feature_counts(&cx, &dst_engine)[..2], &[2, 2]);
 
     let (r_e2, tok_e2) = dst_engine
         .receive_stream(
@@ -1145,6 +1735,7 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
         .into_result()
         .expect("keyless raw incremental recv @e2");
     assert!(r_e2.raw && r_e2.final_snapshot == "e2");
+    assert_eq!(&dsl_block_feature_counts(&cx, &dst_engine)[..2], &[3, 3]);
 
     // 4. Verify locked behavior, keyless scrub, and exact keyed decryption + MAC verification!
     let mut dst_mos = open_mos(&cx, &dst_devs, dst_built.pool_guid, tok_e2.published_slot());
@@ -1178,6 +1769,9 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
             .find(|d| d.components == vault_dst)
             .unwrap();
         let head_dn = dst_mos.object(&cx, ds_row.head_object).unwrap();
+        let snapshot = head_dn.order().u64(head_dn.bonus(), 8).unwrap();
+        assert_received_feature_owners(&cx, &mut dst_mos, ds_row.head_object, [true, true]);
+        assert_received_feature_owners(&cx, &mut dst_mos, snapshot, [true, true]);
         let os_bp = BlockPointer::parse(&head_dn.bonus()[128..256], head_dn.order()).unwrap();
         let crypto = dst_mos
             .dataset_crypto_info(&cx, &vault_dst)

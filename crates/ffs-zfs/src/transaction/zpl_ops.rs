@@ -25,20 +25,20 @@ use crate::reader::dmu::{DatasetCryptoContext, Objects};
 
 use super::dmu_cow::{
     DMU_OT_DIRECTORY_CONTENTS, DMU_OT_PLAIN_FILE_CONTENTS, DMU_OT_SA, DMU_OT_ZNODE,
-    DatasetWriteCrypto, DnodeCowOutput, DnodeCowSpec, OwnerQuotaLimits, PoolSpaceAllocator,
-    QuotaDelta, SpaceDelta, StagedBlockWrite, WriteBucket, allocate_object_id,
-    allocated_leaf_blocks_in_range, apply_objectset_quota_deltas, collect_non_hole_bps_from,
-    cow_update_dnode_with_crypto, decode_compression_property, encode_zap_blocks_for_dnode,
-    enqueue_into_dataset_deadlist, load_owner_quota_limits, objectset_user_accounting_flags,
-    put_dnode_in_table, read_staged_or_committed_dnode, remove_dnode_from_table,
-    write_dataset_block, write_dataset_objset_block, zap_optional_u64, zap_required_u64,
+    DatasetFeatureUsage, DatasetWriteCrypto, DnodeCowOutput, DnodeCowSpec, MosFeatureState,
+    OwnerQuotaLimits, PoolSpaceAllocator, QuotaDelta, SpaceDelta, StagedBlockWrite, WriteBucket,
+    allocate_object_id, allocated_leaf_blocks_in_range, apply_objectset_quota_deltas,
+    collect_non_hole_bps_from, cow_update_dnode_with_crypto, decode_compression_property,
+    encode_zap_blocks_for_dnode, enqueue_into_dataset_deadlist, load_owner_quota_limits,
+    objectset_user_accounting_flags, put_dnode_in_table, read_staged_or_committed_dnode,
+    remove_dnode_from_table, write_dataset_block, write_dataset_objset_block, zap_optional_u64,
+    zap_required_u64,
 };
-use super::dsl_ops::DMU_OTN_ZAP_METADATA;
+use super::dsl_ops::{DMU_OTN_ZAP_METADATA, stage_activate_dataset_features};
 use super::{checkpoint, corrupt, parse_err, unsupported};
 
 const DMU_SPILL_BLKID: u64 = u64::MAX - 1;
 
-const DEFAULT_RECORDSIZE: usize = 131_072;
 const MAX_WRITE_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PATH_DEPTH: usize = 256;
 // One 512-byte dnode, minus its 64-byte header, one 128-byte data pointer,
@@ -417,6 +417,7 @@ struct DatasetContext {
     sa_lay_dirty: bool,
     recordsize: usize,
     checksum: u8,
+    new_features: DatasetFeatureUsage,
     unlinked_set: Option<u64>,
     write_crypto: Option<DatasetWriteCrypto>,
 }
@@ -464,19 +465,21 @@ fn validate_component(name: &[u8], utf8_only: bool) -> Result<()> {
     Ok(())
 }
 
-fn admit_existing_sha512_ownership(
+fn admit_sha512_feature(
     cx: &Cx,
     mos: &mut Objects,
     head_object: u64,
     head: &Dnode,
+    existing_use: bool,
 ) -> Result<()> {
-    // First use requires atomic per-dataset feature activation. Until that
-    // lifecycle is supported here, only continue an already-owned native use.
-    if head.object_type() != DMU_OTN_ZAP_METADATA
-        || zap_optional_u64(&mos.zap_values(cx, head_object)?, b"org.illumos:sha512")? != Some(0)
-    {
+    let owner = if head.object_type() == DMU_OTN_ZAP_METADATA {
+        zap_optional_u64(&mos.zap_values(cx, head_object)?, b"org.illumos:sha512")?
+    } else {
+        None
+    };
+    if owner.is_some_and(|value| value != 0) || (existing_use && owner.is_none()) {
         return Err(unsupported(
-            "native SHA512 writes require existing dataset feature ownership",
+            "existing native SHA512 blocks require valid dataset feature ownership",
         ));
     }
     let directory = mos.zap_values(cx, 1)?;
@@ -486,9 +489,9 @@ fn admit_existing_sha512_ownership(
         b"org.illumos:sha512".as_slice(),
         b"com.delphix:extensible_dataset".as_slice(),
     ] {
-        if zap_optional_u64(&features, feature)?.is_none_or(|count| count == 0) {
+        if zap_optional_u64(&features, feature)?.is_none_or(|count| owner.is_some() && count == 0) {
             return Err(unsupported(
-                "native SHA512 writes require active SHA512 and extensible-dataset features",
+                "native SHA512 writes require enabled features and valid existing ownership counts",
             ));
         }
     }
@@ -612,9 +615,7 @@ fn open_head_dataset_context(
         Some(PropertyValue::Number(size))
             if (512..=1_048_576).contains(size) && size.is_power_of_two() =>
         {
-            // recordsize is a maximum. Keep the existing 128 KiB writer ceiling
-            // until large-block dataset feature ownership is supported.
-            (*size as usize).min(DEFAULT_RECORDSIZE)
+            *size as usize
         }
         _ => {
             return Err(corrupt(
@@ -643,7 +644,13 @@ fn open_head_dataset_context(
     if checksum == 11 || old_os_bp.checksum_type() == 11 {
         // Finalization also rewrites the object-set root with its old algorithm,
         // even when a caller requests Fletcher4 or changes only metadata.
-        admit_existing_sha512_ownership(cx, mos, ds_row.head_object, &head_dn)?;
+        admit_sha512_feature(
+            cx,
+            mos,
+            ds_row.head_object,
+            &head_dn,
+            old_os_bp.checksum_type() == 11,
+        )?;
     }
 
     let (write_crypto, view_crypto) = if let (Some(info), Some(key)) = (crypto_info, loaded_key) {
@@ -733,6 +740,7 @@ fn open_head_dataset_context(
             sa_lay_dirty: false,
             recordsize,
             checksum,
+            new_features: DatasetFeatureUsage::default(),
             unlinked_set,
             write_crypto,
         },
@@ -1243,6 +1251,7 @@ fn update_metadata_only_dnode(
     order: Endian,
 ) -> Result<DnodeCowOutput> {
     let mut born = SpaceDelta::default();
+    let mut feature_usage = DatasetFeatureUsage::default();
     let mut retired_bps = Vec::new();
     let mut retired_bytes = 0;
     if loaded.dnode.spill() != spill.as_ref() {
@@ -1252,6 +1261,7 @@ fn update_metadata_only_dnode(
         }
         if let Some(new_spill) = &spill {
             born = SpaceDelta::from_bp(new_spill)?;
+            feature_usage.observe(new_spill);
         }
     }
     let used_bytes = loaded
@@ -1282,6 +1292,7 @@ fn update_metadata_only_dnode(
         dnode,
         born,
         retired_bps,
+        feature_usage,
     })
 }
 
@@ -1840,6 +1851,7 @@ fn stage_unlinked_set_change(
         context.write_crypto.as_mut(),
         staged_writes,
     )?;
+    context.new_features.extend(out.feature_usage);
     born.add_assign(out.born)?;
     retired.extend(out.retired_bps);
     put_dnode_in_table(
@@ -1854,7 +1866,7 @@ fn stage_unlinked_set_change(
 }
 
 /// Stage a single ZPL mutation on `dataset_components` in memory, updating `mos_dirty_dnodes`,
-/// `write_features`, `alloc`, and `staged_writes`, and returning the operation's `u64` result
+/// `features`, `alloc`, and `staged_writes`, and returning the operation's `u64` result
 /// (`new_object_id`, `new_size`, `moved_object`, or `removed_object`).
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) fn stage_zpl_mutation(
@@ -1863,8 +1875,7 @@ pub(super) fn stage_zpl_mutation(
     dataset_components: &[Vec<u8>],
     mutation: &ZplMutation,
     mos_dirty_dnodes: &mut BTreeMap<u64, Vec<u8>>,
-    write_features: &mut BTreeMap<String, u64>,
-    write_features_dirty: &mut bool,
+    features: &mut MosFeatureState,
     empty_bpobj_id: Option<u64>,
     alloc: &mut PoolSpaceAllocator,
     order: Endian,
@@ -1916,7 +1927,7 @@ pub(super) fn stage_zpl_mutation(
             if parent_loaded.metadata.kind != Kind::Directory {
                 return Err(FfsError::NotDirectory);
             }
-            admit_directory_add(&parent_loaded, &ds_ctx, write_features)?;
+            admit_directory_add(&parent_loaded, &ds_ctx, &features.write_features)?;
             let mut entries = read_dir_entries(cx, &mut os_view, *parent_dir, &staged_dirs)?;
             if entries.iter().any(|e| e.name == *name) {
                 return Err(FfsError::Exists);
@@ -1996,6 +2007,7 @@ pub(super) fn stage_zpl_mutation(
                 ds_ctx.write_crypto.as_mut(),
                 staged_writes,
             )?;
+            ds_ctx.new_features.extend(file_out.feature_usage);
             zpl_born.add_assign(file_out.born)?;
             zpl_retired.extend(file_out.retired_bps);
             let mut file_dn = file_out.dnode;
@@ -2089,7 +2101,7 @@ pub(super) fn stage_zpl_mutation(
             if parent_loaded.metadata.kind != Kind::Directory {
                 return Err(FfsError::NotDirectory);
             }
-            admit_directory_add(&parent_loaded, &ds_ctx, write_features)?;
+            admit_directory_add(&parent_loaded, &ds_ctx, &features.write_features)?;
             let mut entries = read_dir_entries(cx, &mut os_view, *parent_dir, &staged_dirs)?;
             if entries.iter().any(|e| e.name == *name) {
                 return Err(FfsError::Exists);
@@ -2151,6 +2163,7 @@ pub(super) fn stage_zpl_mutation(
                 ds_ctx.write_crypto.as_mut(),
                 staged_writes,
             )?;
+            ds_ctx.new_features.extend(dir_out.feature_usage);
             zpl_born.add_assign(dir_out.born)?;
             quota_deltas.push(QuotaDelta {
                 uid: *uid,
@@ -2268,7 +2281,7 @@ pub(super) fn stage_zpl_mutation(
                 return Err(FfsError::NotDirectory);
             }
             reject_flags(&source.metadata, ZFS_IMMUTABLE | ZFS_APPENDONLY)?;
-            admit_directory_add(&parent, &ds_ctx, write_features)?;
+            admit_directory_add(&parent, &ds_ctx, &features.write_features)?;
             admit_project_entry(&parent, &source)?;
             let mut entries = read_dir_entries(cx, &mut os_view, *parent_dir, &staged_dirs)?;
             if entries.iter().any(|entry| entry.name == *name) {
@@ -2328,6 +2341,7 @@ pub(super) fn stage_zpl_mutation(
                 ds_ctx.write_crypto.as_mut(),
                 staged_writes,
             )?;
+            ds_ctx.new_features.extend(source_out.feature_usage);
             zpl_born.add_assign(source_out.born)?;
             zpl_retired.extend(source_out.retired_bps);
             let bytes_delta =
@@ -2491,6 +2505,7 @@ pub(super) fn stage_zpl_mutation(
                     ds_ctx.write_crypto.as_mut(),
                     staged_writes,
                 )?;
+                ds_ctx.new_features.extend(out.feature_usage);
                 zpl_born.add_assign(out.born)?;
                 zpl_retired.extend(out.retired_bps);
                 let bytes_delta =
@@ -2525,8 +2540,7 @@ pub(super) fn stage_zpl_mutation(
                     &zpl_retired,
                     &quota_deltas,
                     mos_dirty_dnodes,
-                    write_features,
-                    write_features_dirty,
+                    features,
                     empty_bpobj_id,
                     alloc,
                     order,
@@ -2678,6 +2692,7 @@ pub(super) fn stage_zpl_mutation(
                 ds_ctx.write_crypto.as_mut(),
                 staged_writes,
             )?;
+            ds_ctx.new_features.extend(out.feature_usage);
             zpl_born.add_assign(out.born)?;
             zpl_retired.extend(out.retired_bps);
             let bytes_delta = signed_bytes_delta(out.dnode.used_bytes(), old_used)?;
@@ -2821,6 +2836,7 @@ pub(super) fn stage_zpl_mutation(
                     ds_ctx.write_crypto.as_mut(),
                     staged_writes,
                 )?;
+                ds_ctx.new_features.extend(out.feature_usage);
                 zpl_born.add_assign(out.born)?;
                 zpl_retired.extend(out.retired_bps);
                 let bytes_delta =
@@ -3031,6 +3047,7 @@ pub(super) fn stage_zpl_mutation(
             } else {
                 update_metadata_only_dnode(&loaded, bonus, spill, order)?
             };
+            ds_ctx.new_features.extend(out.feature_usage);
             zpl_born.add_assign(out.born)?;
             zpl_retired.extend(out.retired_bps);
             if owner_changed {
@@ -3199,7 +3216,7 @@ pub(super) fn stage_zpl_mutation(
             )?;
             let is_dir = src_obj_loaded.metadata.kind == Kind::Directory;
             admit_directory_remove(&src_parent.metadata, &src_obj_loaded.metadata)?;
-            admit_directory_add(&dst_parent, &ds_ctx, write_features)?;
+            admit_directory_add(&dst_parent, &ds_ctx, &features.write_features)?;
             admit_project_entry(&dst_parent, &src_obj_loaded)?;
 
             // Cycle check if moving a directory across parents.
@@ -3508,6 +3525,7 @@ pub(super) fn stage_zpl_mutation(
                 ds_ctx.write_crypto.as_mut(),
                 staged_writes,
             )?;
+            ds_ctx.new_features.extend(m_out.feature_usage);
             zpl_born.add_assign(m_out.born)?;
             zpl_retired.extend(m_out.retired_bps);
             let moved_delta =
@@ -3618,7 +3636,7 @@ pub(super) fn stage_zpl_mutation(
                 // Both names are removed and replaced. In particular, an
                 // append-only parent cannot accept an exchange as an insertion.
                 admit_directory_remove(&parents[index].metadata, &loaded.metadata)?;
-                admit_directory_add(&parents[1 - index], &ds_ctx, write_features)?;
+                admit_directory_add(&parents[1 - index], &ds_ctx, &features.write_features)?;
                 // Preserve project-tree membership in both directions. This
                 // bounded profile also refuses the reverse mismatch that the
                 // pinned native implementation's one-sided check overlooks.
@@ -3775,6 +3793,7 @@ pub(super) fn stage_zpl_mutation(
                     ds_ctx.write_crypto.as_mut(),
                     staged_writes,
                 )?;
+                ds_ctx.new_features.extend(out.feature_usage);
                 zpl_born.add_assign(out.born)?;
                 zpl_retired.extend(out.retired_bps);
                 let bytes_delta =
@@ -4023,8 +4042,7 @@ pub(super) fn stage_zpl_mutation(
         &zpl_retired,
         &quota_deltas,
         mos_dirty_dnodes,
-        write_features,
-        write_features_dirty,
+        features,
         empty_bpobj_id,
         alloc,
         order,
@@ -4364,6 +4382,7 @@ fn stage_sa_xattr_mutation(
     )?;
     let old_used = loaded.dnode.used_bytes();
     let out = update_metadata_only_dnode(&loaded, bonus, spill, order)?;
+    ds_ctx.new_features.extend(out.feature_usage);
     zpl_born.add_assign(out.born)?;
     zpl_retired.extend(out.retired_bps);
     let bytes_delta = signed_bytes_delta(out.dnode.used_bytes(), old_used)?;
@@ -4550,8 +4569,7 @@ fn finalize_dataset_to_mos(
     zpl_retired_initial: &[BlockPointer],
     quota_deltas: &[QuotaDelta],
     mos_dirty_dnodes: &mut BTreeMap<u64, Vec<u8>>,
-    write_features: &mut BTreeMap<String, u64>,
-    write_features_dirty: &mut bool,
+    features: &mut MosFeatureState,
     empty_bpobj_id: Option<u64>,
     alloc: &mut PoolSpaceAllocator,
     order: Endian,
@@ -4668,6 +4686,7 @@ fn finalize_dataset_to_mos(
         ds_ctx.write_crypto.as_mut(),
         staged_writes,
     )?;
+    ds_ctx.new_features.extend(meta_out.feature_usage);
     zpl_born.add_assign(meta_out.born)?;
     zpl_retired.extend(meta_out.retired_bps);
 
@@ -4686,6 +4705,7 @@ fn finalize_dataset_to_mos(
         ds_ctx.write_crypto.as_ref(),
         staged_writes,
     )?;
+    ds_ctx.new_features.observe(&new_os_bp);
     zpl_born.add_assign(SpaceDelta::from_bp(&new_os_bp)?)?;
     zpl_retired.push(ds_ctx.old_os_bp.clone());
 
@@ -4742,8 +4762,8 @@ fn finalize_dataset_to_mos(
             cx,
             mos,
             mos_dirty_dnodes,
-            write_features,
-            write_features_dirty,
+            &mut features.write_features,
+            &mut features.write_dirty,
             empty_bpobj_id,
             ds_ctx.deadlist_obj,
             &snap_bps,
@@ -4820,6 +4840,21 @@ fn finalize_dataset_to_mos(
         mos_dirty_dnodes,
         ds_ctx.head_object,
         &updated_head,
+    )?;
+
+    // Publish feature ownership with the first blocks that require it. The
+    // marker remains owned until this dataset (and each snapshot/clone) dies.
+    stage_activate_dataset_features(
+        cx,
+        mos,
+        ds_ctx.head_object,
+        &ds_ctx.new_features.required_features(),
+        mos_dirty_dnodes,
+        features,
+        alloc,
+        order,
+        new_txg,
+        staged_writes,
     )?;
 
     // Walk `dsl_dir` chain from `directory_object` up to root (`dd_parent_obj == 0`).

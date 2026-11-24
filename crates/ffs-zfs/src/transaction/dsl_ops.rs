@@ -492,6 +492,197 @@ pub(super) fn effective_local_numeric_prop(
     zap_optional_u64(rows, recvd_key.as_bytes())
 }
 
+const EXTENSIBLE_DATASET_FEATURE: &str = "com.delphix:extensible_dataset";
+const DATASET_BLOCK_FEATURES: [&str; 2] = ["org.open-zfs:large_blocks", "org.illumos:sha512"];
+
+fn require_dataset_block_feature(features: &MosFeatureState, feature: &str) -> Result<()> {
+    for required in [feature, EXTENSIBLE_DATASET_FEATURE] {
+        if !features.read_features.contains_key(required) {
+            return Err(unsupported(format!(
+                "ZFS dataset block feature requires enabled pool feature {required}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn dataset_block_feature_owners(
+    rows: &[RawZapEntry],
+    features: &MosFeatureState,
+) -> Result<Vec<&'static str>> {
+    let mut owners = Vec::new();
+    for feature in DATASET_BLOCK_FEATURES {
+        if let Some(value) = zap_optional_u64(rows, feature.as_bytes())? {
+            if value != 0 {
+                return Err(corrupt(format!(
+                    "native dataset feature {feature} requires a zero-valued ownership marker"
+                )));
+            }
+            if features
+                .read_features
+                .get(feature)
+                .is_none_or(|count| *count == 0)
+            {
+                return Err(corrupt(format!(
+                    "native dataset owns {feature} without an active pool feature"
+                )));
+            }
+            owners.push(feature);
+        }
+    }
+    Ok(owners)
+}
+
+pub(super) fn dataset_feature_entries(
+    cx: &Cx,
+    mos: &mut Objects,
+    object: u64,
+    node: &Dnode,
+    features: &MosFeatureState,
+) -> Result<Vec<RawZapEntry>> {
+    if node.bonus_type() != DMU_OT_DSL_DATASET || node.spill().is_some() {
+        return Err(unsupported(
+            "unsupported native dataset bonus or spill layout",
+        ));
+    }
+    if node.object_type() == DMU_OT_DSL_DATASET {
+        if node.pointers().iter().any(|pointer| !pointer.hole()) {
+            return Err(corrupt("non-extensible native dataset has allocated data"));
+        }
+        return Ok(Vec::new());
+    }
+    if node.object_type() != DMU_OTN_ZAP_METADATA {
+        return Err(corrupt("native dataset has an invalid object type"));
+    }
+    if features
+        .read_features
+        .get(EXTENSIBLE_DATASET_FEATURE)
+        .is_none_or(|count| *count == 0)
+    {
+        return Err(corrupt(
+            "zapified native dataset requires an active extensible-dataset feature",
+        ));
+    }
+    let rows = mos.zap_values(cx, object)?;
+    dataset_block_feature_owners(&rows, features)?;
+    Ok(rows)
+}
+
+/// Add missing native ownership markers to an existing or newly created ZAP.
+/// The caller accounts for the ZAP object's extensible-dataset ownership.
+pub(super) fn activate_dataset_block_features(
+    rows: &mut Vec<RawZapEntry>,
+    required_features: &[&str],
+    features: &mut MosFeatureState,
+    new_txg: u64,
+) -> Result<bool> {
+    let owners = dataset_block_feature_owners(rows, features)?;
+    let mut missing = BTreeSet::new();
+    for requested in required_features {
+        let feature = DATASET_BLOCK_FEATURES
+            .into_iter()
+            .find(|feature| feature == requested)
+            .ok_or_else(|| unsupported("unsupported native dataset block feature"))?;
+        require_dataset_block_feature(features, feature)?;
+        if !owners.contains(&feature) {
+            missing.insert(feature);
+        }
+    }
+    let changed = !missing.is_empty();
+    for feature in missing {
+        features.increment_read(feature, new_txg)?;
+        rows.push(RawZapEntry {
+            name: feature.as_bytes().to_vec(),
+            integer_bytes: 8,
+            values: vec![0],
+            collision: 0,
+        });
+    }
+    Ok(changed)
+}
+
+/// Release exactly one dataset's ownership of each feature it actually stores.
+pub(super) fn release_dataset_block_features(
+    rows: &[RawZapEntry],
+    features: &mut MosFeatureState,
+) -> Result<()> {
+    for feature in dataset_block_feature_owners(rows, features)? {
+        features.decrement_read(feature)?;
+    }
+    Ok(())
+}
+
+/// Activate features required by newly born dataset blocks in this same TXG.
+/// The native boolean ownership marker lives on each head/snapshot/clone, and
+/// survives property changes and block retirement until that owner is destroyed.
+/// Call once after the head bonus update, with the complete required feature set.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn stage_activate_dataset_features(
+    cx: &Cx,
+    mos: &mut Objects,
+    head_object: u64,
+    required_features: &[&str],
+    mos_dirty_dnodes: &mut BTreeMap<u64, Vec<u8>>,
+    features: &mut MosFeatureState,
+    alloc: &mut PoolSpaceAllocator,
+    order: Endian,
+    new_txg: u64,
+    staged_writes: &mut Vec<StagedBlockWrite>,
+) -> Result<()> {
+    checkpoint(cx)?;
+    let mos_meta = mos.meta_dnode().clone();
+    let mos_ceiling = mos.root_birth_txg();
+    let (committed, _) = mos.object_with_ceiling(cx, head_object)?;
+    let (head, ceiling) = read_staged_or_committed_dnode(
+        cx,
+        mos,
+        &mos_meta,
+        mos_ceiling,
+        mos_dirty_dnodes,
+        head_object,
+        order,
+    )?;
+    // The staged bonus contains the just-staged data/accounting roots, but
+    // ZAP reads still resolve committed blocks. Never discard an earlier staged
+    // ZAP rewrite by accidentally reloading its old entries from the MOS.
+    if head.object_type() != committed.object_type()
+        || head.pointers() != committed.pointers()
+        || head.levels() != committed.levels()
+        || head.data_bytes() != committed.data_bytes()
+        || head.max_block() != committed.max_block()
+    {
+        return Err(unsupported(
+            "dataset feature activation requires unchanged head ZAP data in this TXG",
+        ));
+    }
+    let mut rows = dataset_feature_entries(cx, mos, head_object, &head, features)?;
+    if !activate_dataset_block_features(&mut rows, required_features, features, new_txg)? {
+        return Ok(());
+    }
+    if head.object_type() != DMU_OTN_ZAP_METADATA {
+        features.increment_read(EXTENSIBLE_DATASET_FEATURE, new_txg)?;
+    }
+    write_zap_dnode_in_mos(
+        cx,
+        mos,
+        &mos_meta,
+        mos_ceiling,
+        mos_dirty_dnodes,
+        alloc,
+        head_object,
+        Some((&head, ceiling)),
+        DMU_OTN_ZAP_METADATA,
+        DMU_OT_DSL_DATASET,
+        head.bonus().to_vec(),
+        &rows,
+        0,
+        false,
+        order,
+        new_txg,
+        staged_writes,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn write_zap_dnode_in_mos(
     cx: &Cx,
@@ -2061,20 +2252,14 @@ pub(super) fn stage_create_snapshot(
         .copy_from_slice(&order.encode((head_flags & 0x1_0006) | DS_FLAG_UNIQUE_ACCURATE));
     snap_bonus[128..256].copy_from_slice(&head_dn.bonus()[128..256]); // identical ObjectSet BP!
 
-    let mut head_zap_entries = if head_dn.object_type() == DMU_OTN_ZAP_METADATA {
-        mos.zap_values(cx, head_obj)?
-    } else {
-        Vec::new()
-    };
-    let head_has_large_blocks = head_zap_entries
-        .iter()
-        .any(|e| e.name == b"org.open-zfs:large_blocks");
+    let mut head_zap_entries = dataset_feature_entries(cx, mos, head_obj, &head_dn, features)?;
+    let head_features = dataset_block_feature_owners(&head_zap_entries, features)?;
     let inherited_ivset_guid = zap_optional_u64(&head_zap_entries, DSL_DATASET_IVSET_GUID)?;
     let mut snap_zap_entries = Vec::new();
-    if head_has_large_blocks {
-        features.increment_read("org.open-zfs:large_blocks", new_txg)?;
+    for feature in head_features {
+        features.increment_read(feature, new_txg)?;
         snap_zap_entries.push(RawZapEntry {
-            name: b"org.open-zfs:large_blocks".to_vec(),
+            name: feature.as_bytes().to_vec(),
             integer_bytes: 8,
             values: vec![0],
             collision: 0,
@@ -2875,25 +3060,9 @@ fn stage_destroy_snapshot_by_id(
         )?;
     }
     if snap_dn.object_type() == DMU_OTN_ZAP_METADATA {
-        if let Ok(snap_entries) = mos.zap_values(cx, snap_ds_obj)
-            && snap_entries
-                .iter()
-                .any(|e| e.name == b"org.open-zfs:large_blocks")
-            && features
-                .read_features
-                .get("org.open-zfs:large_blocks")
-                .copied()
-                .unwrap_or(0)
-                > 0
-        {
-            features.decrement_read("org.open-zfs:large_blocks")?;
-        }
-        if features
-            .read_features
-            .contains_key("com.delphix:extensible_dataset")
-        {
-            features.decrement_read("com.delphix:extensible_dataset")?;
-        }
+        let snap_entries = dataset_feature_entries(cx, mos, snap_ds_obj, &snap_dn, features)?;
+        release_dataset_block_features(&snap_entries, features)?;
+        features.decrement_read(EXTENSIBLE_DATASET_FEATURE)?;
     }
     free_mos_object_completely(
         cx,
@@ -5161,15 +5330,12 @@ fn stage_create_clone(
     head_bonus[128..256].copy_from_slice(&o_snap_dn.bonus()[128..256]); // zero-copy ObjectSet BP!
 
     let origin_crypto = mos.dataset_crypto_info(cx, origin_dataset)?;
-    let o_snap_has_large_blocks = o_snap_dn.object_type() == DMU_OTN_ZAP_METADATA
-        && mos
-            .zap_values(cx, origin_snap_obj)
-            .is_ok_and(|rows| rows.iter().any(|e| e.name == b"org.open-zfs:large_blocks"));
+    let origin_features = dataset_feature_entries(cx, mos, origin_snap_obj, &o_snap_dn, features)?;
     let mut clone_head_zap = Vec::new();
-    if o_snap_has_large_blocks {
-        features.increment_read("org.open-zfs:large_blocks", new_txg)?;
+    for feature in dataset_block_feature_owners(&origin_features, features)? {
+        features.increment_read(feature, new_txg)?;
         clone_head_zap.push(RawZapEntry {
-            name: b"org.open-zfs:large_blocks".to_vec(),
+            name: feature.as_bytes().to_vec(),
             integer_bytes: 8,
             values: vec![0],
             collision: 0,
@@ -5884,9 +6050,8 @@ pub(super) fn stage_destroy_dataset_by_ids(
     )?;
 
     // 3. Free any extensible dataset ZAP objects (`com.delphix:bookmarks`) on `head_dn`.
-    let mut decremented_large_blocks = false;
     if head_dn.object_type() == DMU_OTN_ZAP_METADATA {
-        let head_entries = mos.zap_values(cx, head_obj)?;
+        let head_entries = dataset_feature_entries(cx, mos, head_obj, &head_dn, features)?;
         if let Some(bm_obj) =
             zap_optional_u64(&head_entries, b"com.delphix:bookmarks")?.filter(|&id| id != 0)
         {
@@ -5903,40 +6068,8 @@ pub(super) fn stage_destroy_dataset_by_ids(
                 new_txg,
             )?;
         }
-        if head_entries
-            .iter()
-            .any(|e| e.name == b"org.open-zfs:large_blocks")
-            && features
-                .read_features
-                .get("org.open-zfs:large_blocks")
-                .copied()
-                .unwrap_or(0)
-                > 0
-        {
-            features.decrement_read("org.open-zfs:large_blocks")?;
-            decremented_large_blocks = true;
-        }
-        if features
-            .read_features
-            .contains_key("com.delphix:extensible_dataset")
-        {
-            features.decrement_read("com.delphix:extensible_dataset")?;
-        }
-    }
-
-    // Decrement `org.open-zfs:large_blocks` if this dataset had `recordsize > 131_072`.
-    if !decremented_large_blocks
-        && props_zap != 0
-        && let Ok(rows) = mos.zap_values(cx, props_zap)
-        && effective_local_numeric_prop(&rows, "recordsize")?.unwrap_or(131_072) > 131_072
-        && features
-            .read_features
-            .get("org.open-zfs:large_blocks")
-            .copied()
-            .unwrap_or(0)
-            > 0
-    {
-        features.decrement_read("org.open-zfs:large_blocks")?;
+        release_dataset_block_features(&head_entries, features)?;
+        features.decrement_read(EXTENSIBLE_DATASET_FEATURE)?;
     }
 
     // 4. Unlink from `parent_dd.dd_child_dir_zapobj` and subtract space from `parent_dd` chain.
@@ -6534,7 +6667,6 @@ pub(super) fn apply_properties_batch_on_ids(
 
         let old_refquota = effective_local_numeric_prop(&rows, "refquota")?.unwrap_or(0);
         let old_refrsrv = effective_local_numeric_prop(&rows, "refreservation")?.unwrap_or(0);
-        let old_recordsize = effective_local_numeric_prop(&rows, "recordsize")?.unwrap_or(131_072);
 
         let is_user_prop = name.contains(':');
         if is_zvol
@@ -6709,18 +6841,8 @@ pub(super) fn apply_properties_batch_on_ids(
                                 "ZFS recordsize must be a power of two in 512..=1048576",
                             ));
                         }
-                        if num > 131_072 && old_recordsize <= 131_072 {
-                            features.increment_read("org.open-zfs:large_blocks", new_txg)?;
-                        } else if num <= 131_072
-                            && old_recordsize > 131_072
-                            && features
-                                .read_features
-                                .get("org.open-zfs:large_blocks")
-                                .copied()
-                                .unwrap_or(0)
-                                > 0
-                        {
-                            features.decrement_read("org.open-zfs:large_blocks")?;
+                        if num > 131_072 {
+                            require_dataset_block_feature(features, "org.open-zfs:large_blocks")?;
                         }
                     }
                     "checksum" => {
@@ -6728,6 +6850,9 @@ pub(super) fn apply_properties_batch_on_ids(
                             return Err(unsupported(format!(
                                 "unsupported ZFS checksum property index {num}"
                             )));
+                        }
+                        if num == 11 {
+                            require_dataset_block_feature(features, "org.illumos:sha512")?;
                         }
                     }
                     "compression" => {
@@ -6803,16 +6928,6 @@ pub(super) fn apply_properties_batch_on_ids(
                 let old_charge = old_refrsrv.saturating_sub(head_unique);
                 let new_charge = next_rr.saturating_sub(head_unique);
                 refrsrv_delta = i128::from(new_charge) - i128::from(old_charge);
-            } else if name == "recordsize"
-                && old_recordsize > 131_072
-                && features
-                    .read_features
-                    .get("org.open-zfs:large_blocks")
-                    .copied()
-                    .unwrap_or(0)
-                    > 0
-            {
-                features.decrement_read("org.open-zfs:large_blocks")?;
             }
 
             rows.retain(|r| {

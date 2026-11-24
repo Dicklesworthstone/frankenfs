@@ -625,10 +625,44 @@ pub(super) struct DnodeCowSpec<'a> {
     pub indirect_bucket: WriteBucket,
 }
 
+/// Native per-dataset feature ownership required by newly born blocks.
+/// Property changes alone do not acquire or release these references.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct DatasetFeatureUsage {
+    large_blocks: bool,
+    sha512: bool,
+}
+
+impl DatasetFeatureUsage {
+    pub fn observe(&mut self, bp: &BlockPointer) {
+        if !bp.hole() {
+            self.large_blocks |= bp.logical_bytes() > 131_072;
+            self.sha512 |= bp.checksum_type() == 11;
+        }
+    }
+
+    pub fn extend(&mut self, other: Self) {
+        self.large_blocks |= other.large_blocks;
+        self.sha512 |= other.sha512;
+    }
+
+    pub fn required_features(self) -> Vec<&'static str> {
+        let mut required = Vec::with_capacity(2);
+        if self.large_blocks {
+            required.push("org.open-zfs:large_blocks");
+        }
+        if self.sha512 {
+            required.push("org.illumos:sha512");
+        }
+        required
+    }
+}
+
 pub(super) struct DnodeCowOutput {
     pub dnode: Dnode,
     pub born: SpaceDelta,
     pub retired_bps: Vec<BlockPointer>,
+    pub feature_usage: DatasetFeatureUsage,
 }
 
 pub(super) fn max_nblkptr_for_dnode(
@@ -1341,6 +1375,7 @@ pub(super) fn cow_update_dnode_with_staged_leaves(
     let min_levels = raw_protected.map_or(1_u8, |(_, ml)| ml.clamp(1, 7));
     let mut retired_bps = Vec::new();
     let mut born = SpaceDelta::default();
+    let mut feature_usage = DatasetFeatureUsage::default();
     let effective_cksum = if matches!(spec.checksum_type, 6..=8 | 11) {
         spec.checksum_type
     } else {
@@ -1465,6 +1500,7 @@ pub(super) fn cow_update_dnode_with_staged_leaves(
                 alloc.hole_birth_active,
             )?,
         };
+        feature_usage.observe(&new_bp);
         current_updates.insert(block_id, new_bp);
     }
 
@@ -1650,6 +1686,7 @@ pub(super) fn cow_update_dnode_with_staged_leaves(
                 born.add_assign(SpaceDelta::from_bp(&bp)?)?;
                 bp
             };
+            feature_usage.observe(&new_ind_bp);
             next_updates.insert(parent_idx, new_ind_bp);
         }
         current_updates = next_updates;
@@ -1694,6 +1731,7 @@ pub(super) fn cow_update_dnode_with_staged_leaves(
             .is_some_and(|old_s| old_s == new_spill);
         if !was_same {
             born.add_assign(SpaceDelta::from_bp(new_spill)?)?;
+            feature_usage.observe(new_spill);
         }
     }
 
@@ -1740,6 +1778,7 @@ pub(super) fn cow_update_dnode_with_staged_leaves(
         dnode,
         born,
         retired_bps,
+        feature_usage,
     })
 }
 

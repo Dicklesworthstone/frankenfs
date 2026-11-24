@@ -6,21 +6,25 @@
 //! NEVER select host paths, devices, pools, key files, or import authority.
 
 use super::dmu_cow::{
-    DnodeCowSpec, PoolSpaceAllocator, SpaceDelta, StagedBlockWrite, StagedLeafUpdate, WriteBucket,
-    allocate_object_id, collect_non_hole_bps_from, cow_update_dnode_with_staged_leaves,
-    enqueue_into_dataset_deadlist, ensure_dnode_table_block_loaded, put_dnode_in_table,
-    read_staged_or_committed_dnode, remove_dnode_from_table, write_dataset_objset_block,
-    write_dataset_objset_block_raw_protected, zap_optional_u64,
+    DatasetFeatureUsage, DnodeCowSpec, PoolSpaceAllocator, SpaceDelta, StagedBlockWrite,
+    StagedLeafUpdate, WriteBucket, allocate_object_id, collect_non_hole_bps_from,
+    cow_update_dnode_with_staged_leaves, enqueue_into_dataset_deadlist,
+    ensure_dnode_table_block_loaded, put_dnode_in_table, read_staged_or_committed_dnode,
+    remove_dnode_from_table, write_dataset_objset_block, write_dataset_objset_block_raw_protected,
+    zap_optional_u64,
 };
 use super::dsl_ops::{
     DMU_OT_DSL_DATASET, DMU_OT_DSL_DIR_CHILD_MAP, DMU_OT_DSL_DS_SNAP_MAP, DMU_OT_DSL_PROPS,
-    DS_FLAG_UNIQUE_ACCURATE, ObjectSetWalkMode, adjust_dsl_crypto_key_refcount,
-    allocate_fresh_deadlist, bump_filesystem_limits_counter_if_present, derive_fsid_guid,
-    derive_unique_guid, enforce_dataset_quotas_for_growth, enforce_pool_reservations_for_growth,
+    DS_FLAG_UNIQUE_ACCURATE, ObjectSetWalkMode, activate_dataset_block_features,
+    adjust_dsl_crypto_key_refcount, allocate_fresh_deadlist,
+    bump_filesystem_limits_counter_if_present, dataset_block_feature_owners,
+    dataset_feature_entries, derive_fsid_guid, derive_unique_guid,
+    enforce_dataset_quotas_for_growth, enforce_pool_reservations_for_growth,
     free_deadlist_containers, free_mos_object_completely, link_dataset_to_origin_snapshot,
     lookup_pool_origin_snapshot, propagate_dsl_dir_space_delta, put_new_dsl_dir_in_mos,
-    reject_busy, reject_einval, resolve_dataset_ids, stage_destroy_dataset_by_ids,
-    validate_dsl_component, walk_objectset_above_txg, write_zap_dnode_in_mos,
+    reject_busy, reject_einval, release_dataset_block_features, resolve_dataset_ids,
+    stage_destroy_dataset_by_ids, validate_dsl_component, walk_objectset_above_txg,
+    write_zap_dnode_in_mos,
 };
 use super::{
     ZfsDurableToken, ZfsPropertySetValue, ZfsTransactionEngine, ZfsTxOutcome, checkpoint, corrupt,
@@ -336,6 +340,19 @@ fn is_resume_zap_key(name: &[u8]) -> bool {
             | DS_FIELD_RESUME_RAWOK
             | DS_FIELD_RESUME_IVSET_GUID
     )
+}
+
+// OpenZFS dmu_recv.c::recv_check_large_blocks refuses a downgrade of the
+// stream's block geometry when its incremental/resume base already owns it.
+fn require_receive_large_blocks(owners: &[&str], begin: &DrrBegin) -> Result<()> {
+    if owners.contains(&"org.open-zfs:large_blocks")
+        && !begin.features.contains(DMU_BACKUP_FEATURE_LARGE_BLOCKS)
+    {
+        return Err(unsupported(
+            "incremental or resumed receive of large blocks requires stream large-block support",
+        ));
+    }
+    Ok(())
 }
 
 fn build_resume_state_from_staging(staging: &RecvStagingDataset) -> Result<ZfsResumeState> {
@@ -1368,6 +1385,16 @@ impl ZfsTransactionEngine {
                 "resuming stream objset type disagrees with persisted staging dataset".into(),
             ));
         }
+        let (staging_head, _) = mos.object_with_ceiling(cx, staging.head_object)?;
+        let staging_entries = dataset_feature_entries(
+            cx,
+            &mut mos,
+            staging.head_object,
+            &staging_head,
+            &self.mos_features,
+        )?;
+        let owners = dataset_block_feature_owners(&staging_entries, &self.mos_features)?;
+        require_receive_large_blocks(&owners, begin)?;
         if let Some(kd) = keydata {
             if !state.rawok {
                 return Err(FfsError::Format(
@@ -1874,6 +1901,19 @@ impl ZfsTransactionEngine {
                             "target dataset has been modified since base snapshot (pass --force to roll back)",
                         ));
                     }
+                    dataset_feature_entries(cx, mos, target_head_obj, &target_head_dn, features)?;
+                    let previous_entries =
+                        dataset_feature_entries(cx, mos, prev_snap_obj, &prev_snap_dn, features)?;
+                    let inherited_owners = dataset_block_feature_owners(&previous_entries, features)?;
+                    require_receive_large_blocks(&inherited_owners, &begin_cloned)?;
+                    // Native receive creates a clone of the base snapshot. Its
+                    // shared blocks still require a distinct dataset owner.
+                    activate_dataset_block_features(
+                        &mut resume_zap,
+                        &inherited_owners,
+                        features,
+                        new_txg,
+                    )?;
                     let target_crypto = mos.dataset_crypto_info(cx, &target_dataset)?;
                     if let Some(ref kd) = kd_cloned {
                         let Some(ref tc) = target_crypto else {
@@ -2200,6 +2240,7 @@ impl ZfsTransactionEngine {
                 let mut drafts: BTreeMap<u64, ObjDraft> = BTreeMap::new();
                 let mut retired_bps: Vec<BlockPointer> = Vec::new();
                 let mut born_space = SpaceDelta::default();
+                let mut feature_usage = DatasetFeatureUsage::default();
                 let mut max_meta_block = old_meta.max_block();
 
                 let load_draft = |obj_id: u64,
@@ -2674,6 +2715,7 @@ impl ZfsTransactionEngine {
                         staged_writes,
                     )?;
                     born_space.add_assign(cow_out.born)?;
+                    feature_usage.extend(cow_out.feature_usage);
                     retired_bps.extend(cow_out.retired_bps);
 
                     // COW preserves an existing object's policy (or inheritance
@@ -2783,6 +2825,7 @@ impl ZfsTransactionEngine {
                         staged_writes,
                     )?;
                     born_space.add_assign(meta_out.born)?;
+                    feature_usage.extend(meta_out.feature_usage);
                     retired_bps.extend(meta_out.retired_bps);
                     os.meta = meta_out.dnode;
                 }
@@ -2804,6 +2847,7 @@ impl ZfsTransactionEngine {
                     write_dataset_objset_block(&mut os, alloc, 7, order, new_txg, None, staged_writes)?
                 };
                 born_space.add_assign(SpaceDelta::from_bp(&new_os_bp)?)?;
+                feature_usage.observe(&new_os_bp);
 
                 // Retire blocks (`birth > prev_snap_txg` freed now; `birth <= prev_snap_txg` to deadlist).
                 let mut dead_space = SpaceDelta::default();
@@ -2902,11 +2946,21 @@ impl ZfsTransactionEngine {
                 new_head_bonus[96..104].copy_from_slice(&order.encode(new_unique));
                 new_head_bonus[128..256].copy_from_slice(&new_os_bp.encode(order));
 
-                let mut head_entries = if head_dn.object_type() == DMU_OTN_ZAP_METADATA {
-                    mos.zap_values(cx, stage_cloned.stage_head_obj)?
-                } else {
-                    Vec::new()
-                };
+                let mut head_entries = dataset_feature_entries(
+                    cx,
+                    mos,
+                    stage_cloned.stage_head_obj,
+                    &head_dn,
+                    features,
+                )?;
+                // The checkpoint must own every emitted feature-bearing block
+                // even when the stream stops before final promotion.
+                activate_dataset_block_features(
+                    &mut head_entries,
+                    &feature_usage.required_features(),
+                    features,
+                    new_txg,
+                )?;
                 for (key, val) in [
                     (DS_FIELD_RESUME_OBJECT, prog_obj),
                     (DS_FIELD_RESUME_OFFSET, prog_off),
@@ -3010,6 +3064,26 @@ impl ZfsTransactionEngine {
                 let stage_deadlist = order
                     .u64(stage_head_dn.bonus(), 64)
                     .map_err(|e| parse_err(&e))?;
+                let stage_entries = dataset_feature_entries(
+                    cx,
+                    mos,
+                    stage_cloned.stage_head_obj,
+                    &stage_head_dn,
+                    features,
+                )?;
+                let stage_owners = dataset_block_feature_owners(&stage_entries, features)?;
+                let mut snapshot_entries = Vec::new();
+                if let Some(ivg) = stage_cloned.to_ivset_guid.filter(|&v| v != 0) {
+                    snapshot_entries.push(zap_u64_entry(DSL_DATASET_IVSET_GUID, ivg));
+                }
+                // Native snapshot creation acquires a separate feature reference
+                // even though its ObjectSet is physically shared with the head.
+                activate_dataset_block_features(
+                    &mut snapshot_entries,
+                    &stage_owners,
+                    features,
+                    new_txg,
+                )?;
 
                 if stage_cloned.is_pct_recv_child {
                     // Incremental receive promotion: atomic `dsl_dataset_clone_swap`!
@@ -3024,6 +3098,13 @@ impl ZfsTransactionEngine {
                         mos_dirty_dnodes,
                         target_head_obj,
                         order,
+                    )?;
+                    let mut target_head_entries = dataset_feature_entries(
+                        cx,
+                        mos,
+                        target_head_obj,
+                        &target_head_dn,
+                        features,
                     )?;
                     let target_snapmap_obj = order
                         .u64(target_head_dn.bonus(), 32)
@@ -3121,7 +3202,7 @@ impl ZfsTransactionEngine {
                     snap_bonus[120..128].copy_from_slice(&order.encode(clean_flags));
                     snap_bonus[128..256].copy_from_slice(&stage_head_dn.bonus()[128..256]);
 
-                    if let Some(ivg) = stage_cloned.to_ivset_guid.filter(|&v| v != 0) {
+                    if !snapshot_entries.is_empty() {
                         features.increment_read("com.delphix:extensible_dataset", new_txg)?;
                         write_zap_dnode_in_mos(
                             cx,
@@ -3135,7 +3216,7 @@ impl ZfsTransactionEngine {
                             DMU_OTN_ZAP_METADATA,
                             DMU_OT_DSL_DATASET,
                             snap_bonus,
-                            &[zap_u64_entry(DSL_DATASET_IVSET_GUID, ivg)],
+                            &snapshot_entries,
                             0,
                             false,
                             order,
@@ -3277,24 +3358,68 @@ impl ZfsTransactionEngine {
                     new_target_head_bonus[120..128].copy_from_slice(&order.encode(clean_flags));
                     new_target_head_bonus[128..256]
                         .copy_from_slice(&stage_head_dn.bonus()[128..256]);
-                    let target_spill = target_head_dn.spill().cloned();
-                    let mut updated_target_head = target_head_dn;
-                    updated_target_head
-                        .set_bonus_and_spill(
+                    // OpenZFS clone_swap swaps the feature-owner sets, then
+                    // destroys the temporary old head. In particular, --force
+                    // must release features used only by the discarded target.
+                    let old_target_owners =
+                        dataset_block_feature_owners(&target_head_entries, features)?;
+                    release_dataset_block_features(&target_head_entries, features)?;
+                    target_head_entries.retain(|entry| {
+                        !old_target_owners
+                            .iter()
+                            .any(|feature| entry.name == feature.as_bytes())
+                    });
+                    activate_dataset_block_features(
+                        &mut target_head_entries,
+                        &stage_owners,
+                        features,
+                        new_txg,
+                    )?;
+                    if target_head_dn.object_type() == DMU_OTN_ZAP_METADATA
+                        || !target_head_entries.is_empty()
+                    {
+                        if target_head_dn.object_type() != DMU_OTN_ZAP_METADATA {
+                            features.increment_read("com.delphix:extensible_dataset", new_txg)?;
+                        }
+                        write_zap_dnode_in_mos(
+                            cx,
+                            mos,
+                            &mos_meta,
+                            mos_ceiling,
+                            mos_dirty_dnodes,
+                            alloc,
+                            target_head_obj,
+                            Some((&target_head_dn, target_head_ceil)),
+                            DMU_OTN_ZAP_METADATA,
                             DMU_OT_DSL_DATASET,
                             new_target_head_bonus,
-                            target_spill,
-                        )
-                        .map_err(|e| parse_err(&e))?;
-                    put_dnode_in_table(
-                        cx,
-                        mos,
-                        &mos_meta,
-                        mos_ceiling,
-                        mos_dirty_dnodes,
-                        target_head_obj,
-                        &updated_target_head,
-                    )?;
+                            &target_head_entries,
+                            0,
+                            false,
+                            order,
+                            new_txg,
+                            staged_writes,
+                        )?;
+                    } else {
+                        let target_spill = target_head_dn.spill().cloned();
+                        let mut updated_target_head = target_head_dn;
+                        updated_target_head
+                            .set_bonus_and_spill(
+                                DMU_OT_DSL_DATASET,
+                                new_target_head_bonus,
+                                target_spill,
+                            )
+                            .map_err(|e| parse_err(&e))?;
+                        put_dnode_in_table(
+                            cx,
+                            mos,
+                            &mos_meta,
+                            mos_ceiling,
+                            mos_dirty_dnodes,
+                            target_head_obj,
+                            &updated_target_head,
+                        )?;
+                    }
 
                     // 5. Tear down temporary `%recv` MOS container objects (WITHOUT freeing the
                     //    ObjectSet blocks or deadlist that `snap_ds_obj`/`target_head` just adopted!).
@@ -3391,6 +3516,7 @@ impl ZfsTransactionEngine {
                     }
 
                     // Decrement `extensible_dataset` for `%recv` head (and `%recv` dd if zapified).
+                    release_dataset_block_features(&stage_entries, features)?;
                     if stage_head_dn.object_type() == DMU_OTN_ZAP_METADATA {
                         features.decrement_read("com.delphix:extensible_dataset")?;
                     }
@@ -3514,7 +3640,7 @@ impl ZfsTransactionEngine {
                     snap_bonus[120..128].copy_from_slice(&order.encode(clean_flags));
                     snap_bonus[128..256].copy_from_slice(&stage_head_dn.bonus()[128..256]);
 
-                    if let Some(ivg) = stage_cloned.to_ivset_guid.filter(|&v| v != 0) {
+                    if !snapshot_entries.is_empty() {
                         features.increment_read("com.delphix:extensible_dataset", new_txg)?;
                         write_zap_dnode_in_mos(
                             cx,
@@ -3528,7 +3654,7 @@ impl ZfsTransactionEngine {
                             DMU_OTN_ZAP_METADATA,
                             DMU_OT_DSL_DATASET,
                             snap_bonus,
-                            &[zap_u64_entry(DSL_DATASET_IVSET_GUID, ivg)],
+                            &snapshot_entries,
                             0,
                             false,
                             order,
@@ -3617,12 +3743,7 @@ impl ZfsTransactionEngine {
                     new_head_bonus[96..104].copy_from_slice(&order.encode(0));
                     new_head_bonus[120..128].copy_from_slice(&order.encode(clean_flags));
 
-                    let mut remaining_head_zap =
-                        if stage_head_dn.object_type() == DMU_OTN_ZAP_METADATA {
-                            mos.zap_values(cx, stage_cloned.stage_head_obj)?
-                        } else {
-                            Vec::new()
-                        };
+                    let mut remaining_head_zap = stage_entries;
                     remaining_head_zap.retain(|e| !is_resume_zap_key(&e.name));
                     if remaining_head_zap.is_empty() {
                         // Un-zapify `head_obj` cleanly and decrement `extensible_dataset`!
