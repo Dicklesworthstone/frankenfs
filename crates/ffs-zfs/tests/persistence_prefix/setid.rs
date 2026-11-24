@@ -181,6 +181,7 @@ fn mounted_setid_data_mutations_clear_privileges_and_survive_native_reopen() {
                 zpl_version,
                 mirror_width,
                 hello_mode: mode,
+                deadlist_mode: DeadlistMode::NativeDeadlist,
                 ..PoolFixtureSpec::default()
             });
             for operation in DATA_MUTATIONS {
@@ -274,6 +275,7 @@ fn mounted_setid_clearing_preserves_native_acl_bytes_and_default_permission_poli
                 zpl_version,
                 hello_mode: 0o6666,
                 auxiliary_ownership: Some((4, auxiliary)),
+                deadlist_mode: DeadlistMode::NativeDeadlist,
                 ..PoolFixtureSpec::default()
             },
         );
@@ -397,6 +399,7 @@ fn mounted_setid_data_mutations_still_refuse_native_capabilities_without_writes(
                 zpl_version,
                 hello_mode: 0o6755,
                 auxiliary_ownership: Some((4, AuxiliaryOwnership::CapabilityXattr)),
+                deadlist_mode: DeadlistMode::NativeDeadlist,
                 ..PoolFixtureSpec::default()
             },
         );
@@ -457,6 +460,7 @@ fn explicit_native_editors_preserve_setid_and_compound_truncate_honors_clear_req
             &PoolFixtureSpec {
                 zpl_version,
                 hello_mode: 0o6755,
+                deadlist_mode: DeadlistMode::NativeDeadlist,
                 ..PoolFixtureSpec::default()
             },
         );

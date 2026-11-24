@@ -20,6 +20,7 @@ env:
     crates/ffs-zfs/src/transaction/zpl_ops.rs
     crates/ffs-zfs/tests/persistence_prefix.rs
     crates/ffs-zfs/tests/persistence_prefix/writable_fs.rs
+    crates/ffs-zfs/tests/persistence_prefix/setid.rs
   FFS_VALIDATION_WORKFLOW: .github/workflows/ffs-mutation-validation.yml
 jobs:
   prepare:
