@@ -238,6 +238,9 @@ pub enum ProtectionScrubStep {
 /// coverage. An error after writing may leave changed source bytes; neither an
 /// error nor dropping this device implicitly rolls those bytes back or commits
 /// their protection. A pending archive requires explicit offline reconciliation.
+/// Nested native-commit scopes share one physical write epoch. After any source
+/// write in that epoch, aborting any scope poisons the device; completing an
+/// enclosing scope cannot recover publication authority or roll those writes back.
 ///
 /// Reads verify complete source blocks. When no writes are outstanding, detected
 /// corruption within the available redundancy is reconstructed and verified
@@ -444,7 +447,7 @@ impl SidecarImageDevice {
                 checkpoint(cx)?;
                 if matches!(state.phase, Phase::Poisoned) {
                     return Err(corrupt(
-                        "live repair device is poisoned after an I/O failure",
+                        "live repair device is poisoned after an I/O failure or aborted native commit",
                     ));
                 }
                 return Ok(state);
@@ -1401,12 +1404,14 @@ impl ByteDevice for SidecarImageDevice {
     fn abort_durability_commit(&self) {
         let mut state = self.state.lock();
         state.defer_seal_depth = state.defer_seal_depth.saturating_sub(1);
-        if state.defer_seal_depth == 0 && state.writes_during_defer {
-            // Physical source writes escaped before the native transaction
-            // committed; poison the live handle so uncommitted bytes can NEVER
-            // be sealed into a sidecar generation!
+        if state.writes_during_defer {
+            // Nested scopes share one physical write epoch, not rollback
+            // savepoints. An inner abort must poison it immediately: waiting
+            // for depth zero lets an outer completion seal the failed writes.
+            // The remaining guards may unwind, but cannot restore authority.
             state.writes_during_defer = false;
             state.native_durable = false;
+            state.native_durable_at_ns = None;
             state.phase = Phase::Poisoned;
         }
     }
@@ -4703,5 +4708,144 @@ mod tests {
 
         // Pending archive header (`FFSRQPD2`) guarantees reopen also refuses uncommitted state!
         assert!(SidecarImageDevice::open(&cx, &fixture.image, &fixture.sidecar).is_err());
+    }
+
+    #[test]
+    fn nested_aborted_durability_commit_cannot_be_sealed_by_outer_completion() {
+        let fixture = Fixture::new();
+        let device = fixture.open();
+        let cx = Cx::for_testing();
+        let mut outer = ffs_block::DurabilityCommitDeferral::enter(&cx, &device).unwrap();
+        let inner = ffs_block::DurabilityCommitDeferral::enter(&cx, &device).unwrap();
+        device
+            .write_all_at(&cx, ByteOffset(512), &[0xAB; 512])
+            .unwrap();
+        device.sync(&cx).unwrap();
+        let pending_archive = std::fs::read(&fixture.sidecar).unwrap();
+        assert_eq!(&pending_archive[..8], PENDING_MAGIC);
+
+        // A native sub-operation failed after its physical writes escaped.
+        // Even if its caller catches the error and completes its own scope,
+        // those bytes must never become an authoritative repair generation.
+        drop(inner);
+        outer.complete();
+        let error = device.sync(&cx).expect_err("nested abort must be sticky");
+        assert!(error.to_string().contains("poisoned"));
+        assert!(!device.ack_status().native_durable);
+        assert!(!device.ack_status().protected_durable);
+        assert!(device.protection(&cx).is_err());
+        assert_eq!(std::fs::read(&fixture.sidecar).unwrap(), pending_archive);
+        let mut expected = fixture.original.clone();
+        expected[512..1024].fill(0xAB);
+        assert_eq!(std::fs::read(&fixture.image).unwrap(), expected);
+        drop(outer);
+        drop(device);
+        assert!(SidecarImageDevice::open(&cx, &fixture.image, &fixture.sidecar).is_err());
+        assert!(SidecarImageDevice::open_read_only(&cx, &fixture.image, &fixture.sidecar).is_err());
+        assert_eq!(std::fs::read(&fixture.image).unwrap(), expected);
+    }
+
+    #[test]
+    fn nested_durability_abort_before_any_write_preserves_outer_commit() {
+        let fixture = Fixture::new();
+        let device = fixture.open();
+        let cx = Cx::for_testing();
+        let original_archive = std::fs::read(&fixture.sidecar).unwrap();
+        let mut outer = ffs_block::DurabilityCommitDeferral::enter(&cx, &device).unwrap();
+        let inner = ffs_block::DurabilityCommitDeferral::enter(&cx, &device).unwrap();
+        drop(inner);
+        assert_eq!(std::fs::read(&fixture.image).unwrap(), fixture.original);
+        assert_eq!(std::fs::read(&fixture.sidecar).unwrap(), original_archive);
+
+        device
+            .write_all_at(&cx, ByteOffset(512), &[0x6D; 512])
+            .unwrap();
+        device.sync(&cx).unwrap();
+        assert!(!device.ack_status().protected_durable);
+        outer.complete();
+        device.sync(&cx).unwrap();
+        let mut expected = fixture.original.clone();
+        expected[512..1024].fill(0x6D);
+        assert_eq!(std::fs::read(&fixture.image).unwrap(), expected);
+        drop(outer);
+        drop(device);
+        assert!(
+            verify(&cx, &fixture.image, &fixture.sidecar)
+                .unwrap()
+                .is_healthy()
+        );
+        drop(fixture.open());
+    }
+
+    #[test]
+    fn completed_inner_durability_commit_cannot_escape_outer_abort() {
+        let fixture = Fixture::new();
+        let device = fixture.open();
+        let cx = Cx::for_testing();
+        let outer = ffs_block::DurabilityCommitDeferral::enter(&cx, &device).unwrap();
+        let mut inner = ffs_block::DurabilityCommitDeferral::enter(&cx, &device).unwrap();
+        device
+            .write_all_at(&cx, ByteOffset(512), &[0x6D; 512])
+            .unwrap();
+        device.sync(&cx).unwrap();
+        inner.complete();
+        drop(inner);
+        device.sync(&cx).unwrap();
+        assert!(!device.ack_status().native_durable);
+        assert!(!device.ack_status().protected_durable);
+        let pending_archive = std::fs::read(&fixture.sidecar).unwrap();
+        drop(outer);
+        assert!(device.sync(&cx).is_err());
+        assert_eq!(std::fs::read(&fixture.sidecar).unwrap(), pending_archive);
+        drop(device);
+        assert!(SidecarImageDevice::open(&cx, &fixture.image, &fixture.sidecar).is_err());
+    }
+
+    #[test]
+    fn nested_successful_durability_commits_seal_only_after_outer_completion() {
+        let fixture = Fixture::new();
+        let device = fixture.open();
+        let cx = Cx::for_testing();
+        let mut outer = ffs_block::DurabilityCommitDeferral::enter(&cx, &device).unwrap();
+        let mut inner = ffs_block::DurabilityCommitDeferral::enter(&cx, &device).unwrap();
+        device
+            .write_all_at(&cx, ByteOffset(512), &[0x6D; 512])
+            .unwrap();
+        device.sync(&cx).unwrap();
+        inner.complete();
+        drop(inner);
+        device.sync(&cx).unwrap();
+        assert!(!device.ack_status().native_durable);
+        assert!(!device.ack_status().protected_durable);
+        assert_eq!(
+            &std::fs::read(&fixture.sidecar).unwrap()[..8],
+            PENDING_MAGIC
+        );
+
+        outer.complete();
+        assert!(device.ack_status().native_durable);
+        assert!(!device.ack_status().protected_durable);
+        device.sync(&cx).unwrap();
+        assert!(device.ack_status().protected_durable);
+        drop(outer);
+        drop(device);
+        assert!(
+            verify(&cx, &fixture.image, &fixture.sidecar)
+                .unwrap()
+                .is_healthy()
+        );
+
+        // The new sealed generation must restore the committed bytes, never
+        // the predecessor used when the nested transaction began.
+        let reopened = fixture.open();
+        fixture.damage(512, &[0xFF; 512]);
+        let mut readback = [0; 512];
+        reopened
+            .read_exact_at(&cx, ByteOffset(512), &mut readback)
+            .unwrap();
+        assert_eq!(readback, [0x6D; 512]);
+        let mut expected = fixture.original.clone();
+        expected[512..1024].fill(0x6D);
+        assert_eq!(std::fs::read(&fixture.image).unwrap(), expected);
     }
 }
