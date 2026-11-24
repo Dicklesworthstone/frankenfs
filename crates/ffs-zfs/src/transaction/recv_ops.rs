@@ -620,16 +620,68 @@ fn build_resume_state_from_staging(staging: &RecvStagingDataset) -> Result<ZfsRe
     })
 }
 
-fn extract_compound_props(pkg_nvl: &NvList) -> Vec<(String, ZfsPropertySetValue)> {
-    let mut out = Vec::new();
-    let Some(fss) = pkg_nvl.list("fss") else {
-        return out;
-    };
+struct CompoundMetadata {
+    properties: Vec<(String, ZfsPropertySetValue)>,
+    snapshots: BTreeMap<Vec<u8>, u64>,
+}
+
+fn stream_source_dataset(toname: &[u8]) -> Result<&[u8]> {
+    let snapshot = validate_toname_snapshot(toname).map_err(|e| parse_err(&e))?;
+    let dataset = &toname[..toname.len() - snapshot.len() - 1];
+    if dataset.split(|&b| b == b'/').any(|part| {
+        part.is_empty()
+            || matches!(part, b"." | b"..")
+            || part
+                .iter()
+                .any(|&b| matches!(b, 0..=31 | 127 | b'@' | b'#' | b'\\'))
+    }) {
+        return Err(corrupt("invalid compound stream source dataset name"));
+    }
+    Ok(dataset)
+}
+
+fn extract_compound_metadata(pkg_nvl: &NvList, source: &[u8]) -> Result<CompoundMetadata> {
+    // One receive request owns one destination. A recursive package must never
+    // flatten unrelated source datasets into that destination or borrow the
+    // properties of an arbitrary first nvlist entry.
+    if pkg_nvl.fields.get("not_recursive") != Some(&Value::Boolean(true)) {
+        return Err(unsupported(
+            "recursive compound receive requires dataset hierarchy support",
+        ));
+    }
+    let fss = pkg_nvl
+        .list("fss")
+        .ok_or_else(|| corrupt("compound metadata lacks fss nvlist"))?;
+    if fss.fields.len() != 1 {
+        return Err(unsupported(
+            "compound receive admits exactly one source dataset",
+        ));
+    }
     let Some(Value::List(ds_entry)) = fss.fields.values().next() else {
-        return out;
+        return Err(corrupt("compound source dataset metadata is not an nvlist"));
     };
+    if ds_entry.text("name").map(str::as_bytes) != Some(source) {
+        return Err(corrupt("compound source dataset disagrees with DRR_BEGIN"));
+    }
+    let snaps = ds_entry
+        .list("snaps")
+        .ok_or_else(|| corrupt("compound dataset lacks snapshot identities"))?;
+    let mut snapshots = BTreeMap::new();
+    for (name, value) in &snaps.fields {
+        let Value::Unsigned(guid) = value else {
+            return Err(corrupt("compound snapshot GUID is not a native uint64"));
+        };
+        if *guid == 0 {
+            return Err(corrupt("compound snapshot GUID must be nonzero"));
+        }
+        snapshots.insert(name.as_bytes().to_vec(), *guid);
+    }
+    let mut out = Vec::new();
     let Some(props) = ds_entry.list("props") else {
-        return out;
+        return Ok(CompoundMetadata {
+            properties: out,
+            snapshots,
+        });
     };
     for (k, v) in &props.fields {
         // Security boundary: never let untrusted received properties choose host mountpoints
@@ -675,7 +727,37 @@ fn extract_compound_props(pkg_nvl: &NvList) -> Vec<(String, ZfsPropertySetValue)
             _ => {}
         }
     }
-    out
+    Ok(CompoundMetadata {
+        properties: out,
+        snapshots,
+    })
+}
+
+fn validate_compound_substream(
+    source: &[u8],
+    metadata: Option<&CompoundMetadata>,
+    begin: &DrrBegin,
+    previous_guid: u64,
+) -> Result<()> {
+    if stream_source_dataset(&begin.toname)? != source {
+        return Err(corrupt(
+            "compound substream belongs to a different source dataset",
+        ));
+    }
+    let snapshot = validate_toname_snapshot(&begin.toname).map_err(|e| parse_err(&e))?;
+    if let Some(metadata) = metadata
+        && metadata.snapshots.get(&snapshot) != Some(&begin.toguid)
+    {
+        return Err(corrupt(
+            "compound substream snapshot name/GUID disagrees with metadata",
+        ));
+    }
+    if previous_guid != 0 && (begin.fromguid != previous_guid || begin.toguid == previous_guid) {
+        return Err(corrupt(
+            "compound substreams do not form an incremental snapshot chain",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_target_dataset(target: &[Vec<u8>]) -> Result<()> {
@@ -828,21 +910,81 @@ impl ZfsTransactionEngine {
 
         if first_begin.hdr_type == StreamHeaderType::CompoundStream {
             compound = true;
-            let payload_len = match DrrRecord::Begin(first_begin).expected_payload_len(false) {
-                Ok(n) => n,
-                Err(e) => return ZfsTxOutcome::NotCommitted(parse_err(&e)),
+            if first_begin.features.unsupported_bits() != 0 {
+                return ZfsTxOutcome::NotCommitted(unsupported(format!(
+                    "compound DMU stream requires unsupported feature bits 0x{:x}",
+                    first_begin.features.unsupported_bits()
+                )));
+            }
+            let source_dataset = match stream_source_dataset(&first_begin.toname) {
+                Ok(source) => source,
+                Err(e) => return ZfsTxOutcome::NotCommitted(e),
             };
+            let payload_len =
+                match DrrRecord::Begin(first_begin.clone()).expected_payload_len(false) {
+                    Ok(n) => n,
+                    Err(e) => return ZfsTxOutcome::NotCommitted(parse_err(&e)),
+                };
             let pkg_bytes = match reader.read_exact_bytes(cx, payload_len) {
                 Ok(b) => b,
                 Err(e) => return ZfsTxOutcome::NotCommitted(e),
             };
-            if !pkg_bytes.is_empty() {
-                match NvList::parse_exact(&pkg_bytes) {
-                    Ok(nvl) => compound_props = extract_compound_props(&nvl),
+            // Native compound packages have their own header END immediately
+            // after the nvlist, distinct from the final package terminator.
+            // Validate it before trusting properties or allocating staging state.
+            let mut header_checksum = Fletcher4Stream::new(stream_order);
+            if let Err(e) = header_checksum
+                .update(&first_hdr)
+                .and_then(|()| header_checksum.update(&pkg_bytes))
+            {
+                return ZfsTxOutcome::NotCommitted(parse_err(&e));
+            }
+            let header_end = match reader.read_header_or_eof(cx) {
+                Ok(Some(h)) => h,
+                Ok(None) => {
+                    return ZfsTxOutcome::NotCommitted(FfsError::Format(
+                        "truncated compound DMU stream before header DRR_END".into(),
+                    ));
+                }
+                Err(e) => return ZfsTxOutcome::NotCommitted(e),
+            };
+            let (header_end_record, trailer) =
+                match DrrRecord::parse_header(&header_end, stream_order) {
+                    Ok(r) => r,
                     Err(e) => return ZfsTxOutcome::NotCommitted(parse_err(&e)),
+                };
+            match header_end_record {
+                DrrRecord::End(end)
+                    if end.checksum == header_checksum.state()
+                        && end.toguid == 0
+                        && trailer == [0; 4] => {}
+                DrrRecord::End(_) => {
+                    return ZfsTxOutcome::NotCommitted(FfsError::Format(
+                        "compound DMU header DRR_END checksum or framing mismatch".into(),
+                    ));
+                }
+                _ => {
+                    return ZfsTxOutcome::NotCommitted(FfsError::Format(
+                        "compound DMU nvlist must be followed by its header DRR_END".into(),
+                    ));
                 }
             }
-            total_records += 1;
+            let compound_metadata = if pkg_bytes.is_empty() {
+                None
+            } else {
+                let nvl = match NvList::parse_exact(&pkg_bytes) {
+                    Ok(nvl) => nvl,
+                    Err(e) => return ZfsTxOutcome::NotCommitted(parse_err(&e)),
+                };
+                match extract_compound_metadata(&nvl, source_dataset) {
+                    Ok(metadata) => Some(metadata),
+                    Err(e) => return ZfsTxOutcome::NotCommitted(e),
+                }
+            };
+            if let Some(metadata) = &compound_metadata {
+                compound_props.clone_from(&metadata.properties);
+            }
+            total_records += 2;
 
             loop {
                 let next_hdr = match reader.read_header_or_eof(cx) {
@@ -854,12 +996,18 @@ impl ZfsTransactionEngine {
                     }
                     Err(e) => return ZfsTxOutcome::NotCommitted(e),
                 };
-                let (next_rec, _) = match DrrRecord::parse_header(&next_hdr, stream_order) {
+                let (next_rec, trailer) = match DrrRecord::parse_header(&next_hdr, stream_order) {
                     Ok(r) => r,
                     Err(e) => return ZfsTxOutcome::NotCommitted(parse_err(&e)),
                 };
                 match next_rec {
-                    DrrRecord::End(_) => {
+                    DrrRecord::End(end) => {
+                        if end.checksum != [0; 4] || end.toguid != 0 || trailer != [0; 4] {
+                            return ZfsTxOutcome::NotCommitted(FfsError::Format(
+                                "compound DMU final DRR_END must have zero checksum and GUID"
+                                    .into(),
+                            ));
+                        }
                         total_records += 1;
                         if let Err(e) = reader.assert_eof(cx) {
                             return ZfsTxOutcome::NotCommitted(e);
@@ -876,6 +1024,14 @@ impl ZfsTransactionEngine {
                             return ZfsTxOutcome::NotCommitted(unsupported(
                                 "compound stream exceeds 256 substream bound",
                             ));
+                        }
+                        if let Err(e) = validate_compound_substream(
+                            source_dataset,
+                            compound_metadata.as_ref(),
+                            &sub_begin,
+                            last_snap_guid,
+                        ) {
+                            return ZfsTxOutcome::NotCommitted(e);
                         }
                         let sub_props = if substreams_received == 0 {
                             &compound_props[..]

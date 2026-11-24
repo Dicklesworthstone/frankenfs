@@ -1290,7 +1290,7 @@ pub fn send_stream(
             full_ds_name.push_str(&String::from_utf8_lossy(comp));
         }
         ds_entry.insert("name".to_owned(), Value::String(full_ds_name));
-        ds_entry.insert("parentfromsnap".to_owned(), Value::String(String::new()));
+        ds_entry.insert("parentfromsnap".to_owned(), Value::Unsigned(0));
         ds_entry.insert("props".to_owned(), Value::List(props_nv));
         let mut snaps_nv = BTreeMap::new();
         let mut snapprops_nv = BTreeMap::new();
@@ -1317,6 +1317,13 @@ pub fn send_stream(
             Value::List(NvList { fields: ds_entry }),
         );
         pkg_fields.insert("fss".to_owned(), Value::List(NvList { fields: fss_map }));
+        // This sender packages snapshots from one explicitly selected dataset,
+        // not a recursive hierarchy. Native libzfs distinguishes those profiles
+        // by the presence of these boolean nvpair keys.
+        pkg_fields.insert("not_recursive".to_owned(), Value::Boolean(true));
+        if raw {
+            pkg_fields.insert("raw".to_owned(), Value::Boolean(true));
+        }
         pkg_fields.insert(
             "tosnap".to_owned(),
             Value::String(String::from_utf8_lossy(&to_snap.info.name).into_owned()),
@@ -1348,6 +1355,28 @@ pub fn send_stream(
         });
         let mut outer = StreamWriter::new(out, req.stream_order, false);
         outer.write_record(cx, &compound_begin, &pkg_bytes)?;
+        // OpenZFS send_prelim_records ends the package header before emitting
+        // any substreams. This END covers BEGIN + nvlist only and has no
+        // per-record checksum; the final zero END terminates the package later.
+        let mut header_checksum = Fletcher4Stream::new(req.stream_order);
+        header_checksum
+            .update(
+                &compound_begin
+                    .encode_header(req.stream_order)
+                    .map_err(|e| parse_err(&e))?,
+            )
+            .map_err(|e| parse_err(&e))?;
+        header_checksum
+            .update(&pkg_bytes)
+            .map_err(|e| parse_err(&e))?;
+        outer.write_record(
+            cx,
+            &DrrRecord::End(DrrEnd {
+                checksum: header_checksum.state(),
+                toguid: 0,
+            }),
+            &[],
+        )?;
         total_records += outer.records_written;
         total_bytes += outer.bytes_written;
     }

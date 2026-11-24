@@ -1,5 +1,22 @@
 # FEATURE_PARITY
 
+> **ZFS native compound replication framing (2026-11-24):**
+> Compound sends now emit the OpenZFS header END covering BEGIN plus its nvlist,
+> followed by ordinary substreams and the separate zero-checksum package END.
+> Metadata uses native uint64 `parentfromsnap` and presence-boolean
+> `not_recursive`/`raw` fields. Receive validates the header checksum before
+> staging writes, binds source dataset and snapshot identities, and refuses
+> recursive or multiple-dataset packages that the single-target API cannot
+> represent. Later substreams must continue the preceding snapshot GUID.
+> Zero-payload native intermediary packages remain admitted. An independently
+> constructed wire-format regression covers 17 malformed framing, checksum,
+> metadata and source-identity cases with unchanged-media/write-count assertions,
+> plus property/snapshot reopen and zero-payload positive controls. These tests
+> are authored, not executed. The three changed Rust files pass pinned rustfmt
+> and `git diff --check`; full checking failed during dependency compilation
+> with ENOSPC, followed by executor disconnection. Native OpenZFS interchange,
+> runtime/Clippy qualification and the full `bd-jbo9q` acceptance remain open.
+
 > **ZFS mixed-byte-order write admission (2026-11-23):**
 > Normal COW and final fixed-DVA replay refuse replacing an existing DNODE leaf
 > whose block-pointer payload order differs from commit order. This protects

@@ -113,6 +113,347 @@ fn assert_received_feature_owners(
     }
 }
 
+// Independent compound-header wire oracle derived from OpenZFS zfs-2.3.1,
+// lib/libzfs/libzfs_sendrecv.c: send_prelim_records/send_conclusion_record.
+// libzfs terminates BEGIN + nvlist with an END carrying that prefix's Fletcher4
+// and a zero trailer. It emits a second, all-zero-checksum END after substreams.
+fn native_compound_end(prefix: &[u8], order: Endian) -> [u8; DMU_REPLAY_RECORD_BYTES] {
+    assert!(prefix.len().is_multiple_of(4));
+    let mut checksum = [0_u64; 4];
+    for word in prefix.chunks_exact(4) {
+        let word: [u8; 4] = word.try_into().unwrap();
+        let word = match order {
+            Endian::Little => u32::from_le_bytes(word),
+            Endian::Big => u32::from_be_bytes(word),
+        };
+        checksum[0] = checksum[0].wrapping_add(u64::from(word));
+        checksum[1] = checksum[1].wrapping_add(checksum[0]);
+        checksum[2] = checksum[2].wrapping_add(checksum[1]);
+        checksum[3] = checksum[3].wrapping_add(checksum[2]);
+    }
+    let mut end = [0_u8; DMU_REPLAY_RECORD_BYTES];
+    end[..4].copy_from_slice(&match order {
+        Endian::Little => 5_u32.to_le_bytes(),
+        Endian::Big => 5_u32.to_be_bytes(),
+    });
+    for (index, word) in checksum.into_iter().enumerate() {
+        end[8 + index * 8..16 + index * 8].copy_from_slice(&order.encode(word));
+    }
+    end
+}
+
+fn assert_native_compound_header(stream: &[u8]) -> usize {
+    use ffs_ondisk::zfs::nvlist::{NvList, Value};
+    let payload_len = u32::from_le_bytes(stream[4..8].try_into().unwrap()) as usize;
+    let header_end = DMU_REPLAY_RECORD_BYTES + payload_len;
+    assert_eq!(
+        &stream[header_end..header_end + DMU_REPLAY_RECORD_BYTES],
+        native_compound_end(&stream[..header_end], Endian::Little),
+        "native compound header END must precede the first substream"
+    );
+    let nvl = NvList::parse_exact(&stream[DMU_REPLAY_RECORD_BYTES..header_end]).unwrap();
+    assert_eq!(nvl.fields["not_recursive"], Value::Boolean(true));
+    let fss = nvl.list("fss").unwrap();
+    assert_eq!(fss.fields.len(), 1);
+    let Value::List(dataset) = fss.fields.values().next().unwrap() else {
+        panic!("compound dataset must be an nvlist");
+    };
+    assert_eq!(dataset.unsigned("parentfromsnap"), Some(0));
+    assert_eq!(
+        &stream[stream.len() - DMU_REPLAY_RECORD_BYTES..],
+        native_compound_end(&[], Endian::Little),
+        "native final package END must retain a zero checksum and trailer"
+    );
+    header_end + DMU_REPLAY_RECORD_BYTES
+}
+
+fn native_compound_package(payload: &[u8], substreams: &[u8]) -> Vec<u8> {
+    let mut native = vec![0_u8; DMU_REPLAY_RECORD_BYTES];
+    native[4..8].copy_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
+    native[8..16].copy_from_slice(&0x0000_0002_f5ba_cbac_u64.to_le_bytes());
+    native[16..24].copy_from_slice(&2_u64.to_le_bytes());
+    let toname = b"ffstestpool/data@wire";
+    native[56..56 + toname.len()].copy_from_slice(toname);
+    native.extend_from_slice(payload);
+    native.extend_from_slice(&native_compound_end(&native, Endian::Little));
+    native.extend_from_slice(substreams);
+    native.extend_from_slice(&native_compound_end(&[], Endian::Little));
+    native
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn compound_native_header_checksum_is_validated_before_any_backing_write() {
+    use ffs_ondisk::zfs::nvlist::{NvList, Value};
+    let cx = Cx::for_testing();
+    let timestamp = Timestamp {
+        seconds: 1_730_000_499,
+        nanos: 0,
+    };
+    let source = vec![b"data".to_vec()];
+    let built = build_clean_zfs_pool(&send_recv_pool_spec(32 * 1024 * 1024));
+    let source_devices: Vec<_> = built
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut sender = open_engine_on_devices(
+        &cx,
+        &source_devices,
+        default_write_opts(built.pool_guid, built.initial_slot),
+    )
+    .unwrap();
+    sender
+        .create_snapshot(&cx, &source, b"wire", timestamp)
+        .into_result()
+        .unwrap();
+    let mut mos = sender.open_read_objects(&cx).unwrap();
+    let mut plain = Vec::new();
+    let mut request = ZfsSendRequest::full(source.clone(), b"wire".to_vec());
+    let report = send_stream(&cx, &mut mos, &request, &mut plain).unwrap();
+    request.properties = true;
+    let mut generated = Vec::new();
+    send_stream(&cx, &mut mos, &request, &mut generated).unwrap();
+    let substream_at = assert_native_compound_header(&generated);
+    assert_eq!(
+        &generated[substream_at..generated.len() - DMU_REPLAY_RECORD_BYTES],
+        plain
+    );
+
+    // Construct a libzfs-shaped package independently of the production sender.
+    // Only the already checksummed ordinary substream comes from send_stream.
+    let dataset = NvList {
+        fields: BTreeMap::from([
+            ("name".into(), Value::String("ffstestpool/data".into())),
+            ("parentfromsnap".into(), Value::Unsigned(0)),
+            (
+                "props".into(),
+                Value::List(NvList {
+                    fields: BTreeMap::from([(
+                        "app:received".into(),
+                        Value::String("native".into()),
+                    )]),
+                }),
+            ),
+            (
+                "snaps".into(),
+                Value::List(NvList {
+                    fields: BTreeMap::from([("wire".into(), Value::Unsigned(report.to_guid))]),
+                }),
+            ),
+        ]),
+    };
+    let payload = NvList {
+        fields: BTreeMap::from([
+            ("not_recursive".into(), Value::Boolean(true)),
+            ("tosnap".into(), Value::String("wire".into())),
+            (
+                "fss".into(),
+                Value::List(NvList {
+                    fields: BTreeMap::from([("dataset".into(), Value::List(dataset))]),
+                }),
+            ),
+        ]),
+    }
+    .encode_xdr()
+    .unwrap();
+    let native = native_compound_package(&payload, &plain);
+    let header_end = DMU_REPLAY_RECORD_BYTES + payload.len();
+
+    let target = build_clean_zfs_pool(&send_recv_pool_spec(32 * 1024 * 1024));
+    let devices: Vec<_> = target
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut receiver = open_engine_on_devices(
+        &cx,
+        &devices,
+        default_write_opts(target.pool_guid, target.initial_slot),
+    )
+    .unwrap();
+    let destination = vec![b"data".to_vec(), b"received".to_vec()];
+    let receive = ZfsRecvRequest::new(destination.clone());
+    let before = snapshot_media_bytes(&devices);
+    let writes: Vec<_> = devices
+        .iter()
+        .map(FaultableMemberDevice::write_calls)
+        .collect();
+    let initial_txg = receiver.committed_txg();
+    for case in 0..10 {
+        let mut bad = native.clone();
+        match case {
+            0 => bad.truncate(header_end),
+            1 => bad.truncate(header_end + DMU_REPLAY_RECORD_BYTES - 1),
+            2 => bad[header_end + 8] ^= 1,
+            3 => bad[56] ^= 1,
+            4 => bad[header_end..header_end + 4].copy_from_slice(&0_u32.to_le_bytes()),
+            5 => bad[header_end + 40] = 1,
+            6 => bad[header_end + 280] = 1,
+            7 => bad[23] |= 0x40,
+            8 => {
+                bad = [
+                    &native[..header_end],
+                    &native[header_end + DMU_REPLAY_RECORD_BYTES..],
+                ]
+                .concat();
+            }
+            9 => {
+                let value = payload
+                    .windows(6)
+                    .position(|bytes| bytes == b"native")
+                    .unwrap();
+                bad[DMU_REPLAY_RECORD_BYTES + value] ^= 1;
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            matches!(
+                receiver.receive_stream(&cx, &receive, &mut Cursor::new(bad)),
+                ZfsTxOutcome::NotCommitted(_)
+            ),
+            "malformed compound header case {case} was accepted"
+        );
+        assert_eq!(receiver.committed_txg(), initial_txg);
+        assert_eq!(
+            devices
+                .iter()
+                .map(FaultableMemberDevice::write_calls)
+                .collect::<Vec<_>>(),
+            writes,
+            "case {case} wrote before compound header validation"
+        );
+        assert_media_unchanged(&devices, &before);
+    }
+    for case in 0..6 {
+        let mut metadata = NvList::parse_exact(&payload).unwrap();
+        if case == 0 {
+            metadata.fields.remove("not_recursive");
+        } else if case == 1 {
+            metadata
+                .fields
+                .insert("not_recursive".into(), Value::Boolean(false));
+        } else {
+            let Value::List(fss) = metadata.fields.get_mut("fss").unwrap() else {
+                unreachable!();
+            };
+            if case == 2 {
+                let other = fss.fields["dataset"].clone();
+                fss.fields.insert("second-dataset".into(), other);
+            } else {
+                let Value::List(dataset) = fss.fields.get_mut("dataset").unwrap() else {
+                    unreachable!();
+                };
+                if case == 3 {
+                    dataset
+                        .fields
+                        .insert("name".into(), Value::String("ffstestpool/other".into()));
+                } else if case == 4 {
+                    let Value::List(snaps) = dataset.fields.get_mut("snaps").unwrap() else {
+                        unreachable!();
+                    };
+                    snaps
+                        .fields
+                        .insert("wire".into(), Value::Unsigned(report.to_guid ^ 1));
+                } else {
+                    dataset.fields.remove("snaps");
+                }
+            }
+        }
+        // Recompute the native header checksum: this must exercise dataset
+        // admission, not accidentally pass because of the checksum gate.
+        let bad = native_compound_package(&metadata.encode_xdr().unwrap(), &plain);
+        assert!(
+            matches!(
+                receiver.receive_stream(&cx, &receive, &mut Cursor::new(bad)),
+                ZfsTxOutcome::NotCommitted(_)
+            ),
+            "compound metadata case {case} was accepted"
+        );
+        assert_eq!(receiver.committed_txg(), initial_txg);
+        assert_eq!(
+            devices
+                .iter()
+                .map(FaultableMemberDevice::write_calls)
+                .collect::<Vec<_>>(),
+            writes
+        );
+        assert_media_unchanged(&devices, &before);
+    }
+    let unrelated = restamp_substream(&plain, false, |mut record, payload| {
+        if let DrrRecord::Begin(begin) = &mut record {
+            begin.toname = b"ffstestpool/other@wire".to_vec();
+        }
+        Some((record, payload))
+    });
+    let mixed_source = native_compound_package(&[], &unrelated);
+    assert!(matches!(
+        receiver.receive_stream(&cx, &receive, &mut Cursor::new(mixed_source)),
+        ZfsTxOutcome::NotCommitted(FfsError::Corruption { .. })
+    ));
+    assert_eq!(
+        devices
+            .iter()
+            .map(FaultableMemberDevice::write_calls)
+            .collect::<Vec<_>>(),
+        writes
+    );
+    assert_media_unchanged(&devices, &before);
+    let (received, token) = receiver
+        .receive_stream(&cx, &receive, &mut Cursor::new(&native))
+        .into_result()
+        .expect("native package framing must be accepted");
+    assert_eq!(received.records_applied, report.records_written + 3);
+    assert_eq!(received.stream_bytes_read, native.len() as u64);
+    let mut reopened = open_mos(&cx, &devices, target.pool_guid, token.published_slot());
+    let properties = reopened
+        .properties(&cx, &destination, None, &["app:received".into()])
+        .unwrap();
+    assert_eq!(
+        properties.values[0].value,
+        Some(PropertyValue::Text(b"native".to_vec()))
+    );
+    let expected = mos
+        .zpl_snapshot(&cx, &source, b"wire")
+        .unwrap()
+        .read(&cx, 4, 0, 8192)
+        .unwrap();
+    assert_eq!(
+        reopened
+            .zpl_snapshot(&cx, &destination, b"wire")
+            .unwrap()
+            .read(&cx, 4, 0, 8192)
+            .unwrap(),
+        expected
+    );
+    assert_pool_scrub_and_allocation_clean(
+        &cx,
+        &devices,
+        target.pool_guid,
+        Some(token.published_slot()),
+    );
+    // Native `-I` without property gathering can have a zero-length package
+    // nvlist. Keep that path, still bound to the outer source dataset.
+    let plain_destination = vec![b"data".to_vec(), b"without-properties".to_vec()];
+    receiver
+        .receive_stream(
+            &cx,
+            &ZfsRecvRequest::new(plain_destination.clone()),
+            &mut Cursor::new(native_compound_package(&[], &plain)),
+        )
+        .into_result()
+        .unwrap();
+    let mut reopened = receiver.open_read_objects(&cx).unwrap();
+    assert_eq!(
+        reopened
+            .zpl_snapshot(&cx, &plain_destination, b"wire")
+            .unwrap()
+            .read(&cx, 4, 0, 8192)
+            .unwrap(),
+        expected
+    );
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn compressed_zstd_receive_retains_native_blocks_and_owners_across_resume_and_abort() {
