@@ -697,6 +697,16 @@ impl ZfsZvolSession {
         offset: u64,
         len: u64,
     ) -> Result<(ZvolAckKind, Option<ZfsCommitReceipt>)> {
+        self.discard_with_fua(cx, offset, len, false)
+    }
+
+    fn discard_with_fua(
+        &mut self,
+        cx: &Cx,
+        offset: u64,
+        len: u64,
+        fua: bool,
+    ) -> Result<(ZvolAckKind, Option<ZfsCommitReceipt>)> {
         checkpoint(cx)?;
         if self.read_only {
             return Err(FfsError::ReadOnly);
@@ -714,7 +724,7 @@ impl ZfsZvolSession {
             .map_err(|_| FfsError::Io(std::io::Error::other("ZFS volume manager lock poisoned")))?;
         self.verify_epoch(&guard)?;
 
-        if self.sync_policy == ZvolSyncPolicy::Always && self.staged_dirty.is_empty() {
+        if (fua || self.sync_policy == ZvolSyncPolicy::Always) && self.staged_dirty.is_empty() {
             let (receipt, _) = guard
                 .engine
                 .zvol_discard(cx, &self.dataset, offset, len, self.checksum)
@@ -771,7 +781,7 @@ impl ZfsZvolSession {
             }
         }
 
-        if self.sync_policy == ZvolSyncPolicy::Always {
+        if fua || self.sync_policy == ZvolSyncPolicy::Always {
             let (receipt, _) = guard
                 .engine
                 .zvol_batch_apply(cx, &self.dataset, &self.staged_dirty, self.checksum)
@@ -915,9 +925,10 @@ impl NbdBackend {
         cx: &Cx,
         offset: u64,
         len: u64,
+        fua: bool,
     ) -> Result<(ZvolAckKind, Option<ZfsCommitReceipt>)> {
         match self {
-            Self::Session(s) => s.discard(cx, offset, len),
+            Self::Session(s) => s.discard_with_fua(cx, offset, len, fua),
             Self::ReadOnlyZvol(_) => Err(FfsError::ReadOnly),
         }
     }
@@ -1555,13 +1566,13 @@ impl ZfsZvolNbdServer {
                         }
                     }
                 }
-                NBD_CMD_TRIM => match self.backend.discard(cx, offset, u64::from(length)) {
+                NBD_CMD_TRIM => match self.backend.discard(cx, offset, u64::from(length), fua) {
                     Ok((ack_kind, receipt)) => {
                         self.record_audit(
                             "TRIM",
                             offset,
                             u64::from(length),
-                            false,
+                            fua,
                             NBD_OK,
                             ack_kind,
                             receipt.as_ref(),
@@ -1574,7 +1585,7 @@ impl ZfsZvolNbdServer {
                             "TRIM",
                             offset,
                             u64::from(length),
-                            false,
+                            fua,
                             code,
                             ZvolAckKind::Rejected,
                             None,
@@ -2001,6 +2012,11 @@ impl ZfsZvolNbdClient {
     }
 
     pub fn trim(&self, cx: &Cx, offset: u64, len: u64) -> Result<()> {
+        self.trim_with_fua(cx, offset, len, false)
+    }
+
+    /// Discard a range, optionally requiring native durability before acknowledgment.
+    pub fn trim_with_fua(&self, cx: &Cx, offset: u64, len: u64, fua: bool) -> Result<()> {
         checkpoint(cx)?;
         let len_u32 = u32::try_from(len)
             .map_err(|_| reject_errno(libc::EINVAL, "NBD TRIM length exceeds u32"))?;
@@ -2008,7 +2024,9 @@ impl ZfsZvolNbdClient {
             .inner
             .lock()
             .map_err(|_| FfsError::Io(std::io::Error::other("NBD client lock poisoned")))?;
-        let handle = Self::send_request(cx, &mut guard, NBD_CMD_TRIM, 0, offset, len_u32, None)?;
+        let flags = if fua { NBD_CMD_FLAG_FUA } else { 0 };
+        let handle =
+            Self::send_request(cx, &mut guard, NBD_CMD_TRIM, flags, offset, len_u32, None)?;
         Self::read_reply(cx, &mut guard, handle, "TRIM", None)
     }
 

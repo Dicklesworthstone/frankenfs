@@ -1190,6 +1190,11 @@ fn zvol_nbd_unix_tcp_always_readonly_flush_barrier_and_revocation() {
     c2.write_at(&cx, 16_384, &durable_pat, false).unwrap();
     c2.flush(&cx).unwrap();
 
+    // A FUA TRIM commits the preceding staged write and its discarded sector.
+    let trim_base = 32_768;
+    c2.write_at(&cx, trim_base, &[0x75; 4096], false).unwrap();
+    c2.trim_with_fua(&cx, trim_base + 512, 512, true).unwrap();
+
     // Live epoch revocation while client is connected -> next request fails closed (`NBD_EIO`)!
     mgr.revoke_handles(vol_info.dataset_guid).unwrap();
     assert!(c2.read_at(&cx, 16_384, &mut after_drop).is_err());
@@ -1202,6 +1207,9 @@ fn zvol_nbd_unix_tcp_always_readonly_flush_barrier_and_revocation() {
     }));
     assert!(fb_audit.iter().any(|e| {
         e.cmd == "FLUSH" && e.ack_kind == ZvolAckKind::DurableTxg && e.token.is_some()
+    }));
+    assert!(fb_audit.iter().any(|e| {
+        e.cmd == "TRIM" && e.fua && e.ack_kind == ZvolAckKind::DurableTxg && e.token.is_some()
     }));
 
     // Fresh reopen from durable snapshot proves flushed pattern survived and scrub/allocation are clean!
@@ -1218,6 +1226,13 @@ fn zvol_nbd_unix_tcp_always_readonly_flush_barrier_and_revocation() {
         .zvol_read_at(&cx, &vol_ds, None, 16_384, &mut persisted)
         .unwrap();
     assert_eq!(persisted, durable_pat);
+    let mut trimmed = [0_u8; 4096];
+    reopened
+        .zvol_read_at(&cx, &vol_ds, None, trim_base, &mut trimmed)
+        .unwrap();
+    let mut expected = [0x75; 4096];
+    expected[512..1024].fill(0);
+    assert_eq!(trimmed, expected);
     assert_zvol_and_pool_clean(
         &cx,
         std::slice::from_ref(&fresh),
