@@ -1022,6 +1022,17 @@ impl ZfsTransactionEngine {
                             FfsError::Format("DRR_OBJECT cannot target object 0".into()),
                         );
                     }
+                    // Native dnode overrides are limited to legacy checksums.
+                    // Newer algorithms remain valid on individual DRR_WRITE BPs.
+                    if o.checksumtype >= 9 {
+                        return cleanup_on_abort(
+                            self,
+                            FfsError::Format(
+                                "DRR_OBJECT checksum selector is outside the native legacy range"
+                                    .into(),
+                            ),
+                        );
+                    }
                     if o.object < last_obj || !seen_objects.insert(o.object) {
                         return cleanup_on_abort(
                             self,
@@ -2665,6 +2676,15 @@ impl ZfsTransactionEngine {
                     born_space.add_assign(cow_out.born)?;
                     retired_bps.extend(cow_out.retired_bps);
 
+                    // COW preserves an existing object's policy (or inheritance
+                    // for a new object). Receive must instead install the native
+                    // dn_checksum supplied by DRR_OBJECT, including changes in
+                    // an incremental stream, independently of the data BPs.
+                    let mut dnode_bytes = cow_out.dnode.encode().map_err(|e| parse_err(&e))?;
+                    dnode_bytes[5] = draft.checksum_type;
+                    let received_dnode =
+                        Dnode::parse(&dnode_bytes, order).map_err(|e| parse_err(&e))?;
+
                     let meta_bid = obj_id / 32;
                     max_meta_block = max_meta_block.max(meta_bid);
                     ensure_dnode_table_block_loaded(
@@ -2679,7 +2699,7 @@ impl ZfsTransactionEngine {
                         .get_mut(&meta_bid)
                         .ok_or_else(|| corrupt("missing loaded dnode table block"))?;
                     let slot = (obj_id % 32) as usize;
-                    write_dnode_at(blk, slot, &cow_out.dnode).map_err(|e| parse_err(&e))?;
+                    write_dnode_at(blk, slot, &received_dnode).map_err(|e| parse_err(&e))?;
                     if let Some(ref raw_b) = draft.raw_bonus {
                         write_raw_dnode_bonus(blk, slot, raw_b).map_err(|e| parse_err(&e))?;
                     }

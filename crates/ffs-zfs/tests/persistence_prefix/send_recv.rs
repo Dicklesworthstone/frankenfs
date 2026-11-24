@@ -6,8 +6,8 @@
 use super::*;
 use ffs_ondisk::zfs::crypto::{ZioEncrypt, verify_objset_macs};
 use ffs_ondisk::zfs::send_stream::{
-    DMU_BACKUP_FEATURE_COMPRESSED, DMU_REPLAY_RECORD_BYTES, DrrRecord, ReceiveResumeToken,
-    StreamHeaderType,
+    DMU_BACKUP_FEATURE_COMPRESSED, DMU_REPLAY_RECORD_BYTES, DrrRecord, Fletcher4Stream,
+    ReceiveResumeToken, StreamHeaderType,
 };
 use ffs_zfs::reader::dmu::properties::PropertyValue;
 use ffs_zfs::reader::dmu::zpl::PathPolicy;
@@ -78,6 +78,246 @@ fn pool_allocated_bytes(
     let mos = open_mos(cx, devs, pool_guid, slot);
     let alloc = mos.allocation(cx, AllocationLimits::default()).unwrap();
     alloc.allocated_bytes
+}
+
+fn stream_with_object_checksum(stream: &[u8], object: u64, checksum: u8) -> Vec<u8> {
+    let mut output = Vec::with_capacity(stream.len());
+    let mut rolling = Fletcher4Stream::new(Endian::Little);
+    let mut offset = 0;
+    let mut changed = 0;
+    while offset < stream.len() {
+        let header: &[u8; DMU_REPLAY_RECORD_BYTES] = stream
+            [offset..offset + DMU_REPLAY_RECORD_BYTES]
+            .try_into()
+            .unwrap();
+        let (mut record, _) = DrrRecord::parse_header(header, Endian::Little).unwrap();
+        offset += DMU_REPLAY_RECORD_BYTES;
+        let payload_len = record.expected_payload_len(false).unwrap();
+        let payload = &stream[offset..offset + payload_len];
+        offset += payload_len;
+        if let DrrRecord::Object(ref mut native) = record
+            && native.object == object
+        {
+            native.checksumtype = checksum;
+            changed += 1;
+        }
+        let mut encoded = record.encode_header(Endian::Little).unwrap();
+        rolling
+            .stamp_record(&mut encoded, payload, record.record_type())
+            .unwrap();
+        output.extend_from_slice(&encoded);
+        output.extend_from_slice(payload);
+    }
+    assert_eq!(
+        changed, 1,
+        "fixture must contain the selected native object"
+    );
+    output
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn receive_preserves_native_checksum_policy_across_incremental_updates_and_rewrites() {
+    let cx = Cx::for_testing();
+    let timestamp = Timestamp {
+        seconds: 1_730_000_400,
+        nanos: 0,
+    };
+    let source = vec![b"data".to_vec()];
+    let built = build_clean_zfs_pool(&send_recv_pool_spec(32 * 1024 * 1024));
+    let devices: Vec<_> = built
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut engine = open_engine_on_devices(
+        &cx,
+        &devices,
+        default_write_opts(built.pool_guid, built.initial_slot),
+    )
+    .unwrap();
+    let (object, _) = engine
+        .create_file(
+            &cx,
+            &source,
+            2,
+            b"checksummed",
+            0o640,
+            1000,
+            1000,
+            timestamp,
+            ZfsDataChecksum::Sha256,
+        )
+        .into_result()
+        .unwrap();
+    let initial = vec![0x6A; 8192];
+    engine
+        .write_file_data(
+            &cx,
+            &source,
+            object,
+            0,
+            &initial,
+            timestamp,
+            ZfsDataChecksum::Sha256,
+        )
+        .into_result()
+        .unwrap();
+    engine
+        .create_snapshot(&cx, &source, b"s1", timestamp)
+        .into_result()
+        .unwrap();
+    engine
+        .write_file_data(
+            &cx,
+            &source,
+            object,
+            64,
+            b"snapshot-two",
+            timestamp,
+            ZfsDataChecksum::Sha256,
+        )
+        .into_result()
+        .unwrap();
+    engine
+        .create_snapshot(&cx, &source, b"s2", timestamp)
+        .into_result()
+        .unwrap();
+    let mut mos = engine.open_read_objects(&cx).unwrap();
+    let mut full = Vec::new();
+    send_stream(
+        &cx,
+        &mut mos,
+        &ZfsSendRequest::full(source.clone(), b"s1".to_vec()),
+        &mut full,
+    )
+    .unwrap();
+    // Model a native per-object Fletcher4 policy upgraded to SHA256 between
+    // snapshots. Existing data BPs may retain their earlier checksum algorithm.
+    let full = stream_with_object_checksum(&full, object, 7);
+    let mut incremental = Vec::new();
+    let mut request = ZfsSendRequest::full(source, b"s2".to_vec());
+    request.from = Some(ZfsSendFrom::Snapshot(b"s1".to_vec()));
+    send_stream(&cx, &mut mos, &request, &mut incremental).unwrap();
+
+    let destination = vec![b"data".to_vec(), b"received".to_vec()];
+    let target = build_clean_zfs_pool(&send_recv_pool_spec(32 * 1024 * 1024));
+    let target_devices: Vec<_> = target
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut receiver = open_engine_on_devices(
+        &cx,
+        &target_devices,
+        default_write_opts(target.pool_guid, target.initial_slot),
+    )
+    .unwrap();
+    let receive = ZfsRecvRequest::new(destination.clone());
+    for invalid_checksum in [9, 11, 255] {
+        let invalid = stream_with_object_checksum(&full, object, invalid_checksum);
+        assert!(matches!(
+            receiver.receive_stream(&cx, &receive, &mut Cursor::new(&invalid)),
+            ZfsTxOutcome::NotCommitted(FfsError::Format(message))
+                if message.contains("outside the native legacy range")
+        ));
+        assert!(
+            receiver
+                .inspect_receive_resume_state(&cx, &destination)
+                .unwrap()
+                .is_none(),
+            "invalid native checksum {invalid_checksum} left receive staging behind"
+        );
+        let mut mos = receiver.open_read_objects(&cx).unwrap();
+        assert!(
+            !mos.datasets(&cx)
+                .unwrap()
+                .iter()
+                .any(|dataset| dataset.components == destination),
+            "invalid native checksum {invalid_checksum} published its destination"
+        );
+        assert!(mos.zpl(&cx, &destination).is_err());
+    }
+    receiver
+        .receive_stream(&cx, &receive, &mut Cursor::new(&full))
+        .into_result()
+        .unwrap();
+    let node = native_zpl_file_dnode(&cx, &receiver, &target_devices[0], &destination, object);
+    assert_eq!(node.checksum_type(), 7);
+    receiver
+        .receive_stream(&cx, &receive, &mut Cursor::new(&incremental))
+        .into_result()
+        .unwrap();
+    let check = |engine: &ZfsTransactionEngine| {
+        let node = native_zpl_file_dnode(&cx, engine, &target_devices[0], &destination, object);
+        assert_eq!(node.checksum_type(), 8);
+        assert!(!node.pointers()[0].hole());
+        assert_eq!(node.pointers()[0].checksum_type(), 8);
+    };
+    check(&receiver);
+    receiver
+        .write_file_data(
+            &cx,
+            &destination,
+            object,
+            11,
+            b"head",
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    check(&receiver);
+    receiver
+        .truncate_file(
+            &cx,
+            &destination,
+            object,
+            3333,
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    check(&receiver);
+    receiver
+        .edit_file_range(
+            &cx,
+            &destination,
+            object,
+            127,
+            49,
+            ffs_zfs::ZfsFileRangeOperation::ZeroRange { keep_size: true },
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    check(&receiver);
+    let slot = receiver.committed_slot();
+    drop(receiver);
+    let durable: Vec<_> = target_devices
+        .iter()
+        .map(FaultableMemberDevice::fresh_from_durable)
+        .collect();
+    let reopened =
+        open_engine_on_devices(&cx, &durable, default_write_opts(target.pool_guid, slot)).unwrap();
+    let mut mos = reopened.open_read_objects(&cx).unwrap();
+    let mut expected = initial.clone();
+    expected[64..76].copy_from_slice(b"snapshot-two");
+    for (snapshot, bytes) in [(b"s1", &initial), (b"s2", &expected)] {
+        let mut view = mos.zpl_snapshot(&cx, &destination, snapshot).unwrap();
+        assert_eq!(view.read(&cx, object, 0, 8192).unwrap(), *bytes);
+    }
+    expected.truncate(3333);
+    expected[11..15].copy_from_slice(b"head");
+    expected[127..176].fill(0);
+    let mut view = mos.zpl(&cx, &destination).unwrap();
+    assert_eq!(view.read(&cx, object, 0, 8192).unwrap(), expected);
+    let node = native_zpl_file_dnode(&cx, &reopened, &durable[0], &destination, object);
+    assert_eq!(node.checksum_type(), 8);
+    assert_eq!(node.pointers()[0].checksum_type(), 8);
+    assert_pool_scrub_and_allocation_clean(&cx, &durable, target.pool_guid, Some(slot));
 }
 
 #[test]
