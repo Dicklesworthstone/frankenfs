@@ -286,6 +286,90 @@ impl FatFs {
         Ok((full, name_str.to_owned()))
     }
 
+    fn check_create_mode(mode: u16, directory: bool) -> Result<bool> {
+        // FUSE includes the file type; direct FsOps callers may supply only
+        // permissions. Neither form permits silently creating another type.
+        let file_type = u32::from(mode) & libc::S_IFMT;
+        let expected = if directory {
+            libc::S_IFDIR
+        } else {
+            libc::S_IFREG
+        };
+        if file_type != 0 && file_type != expected {
+            return Err(FfsError::UnsupportedFeature(
+                "requested file type does not match FAT create operation".into(),
+            ));
+        }
+        let permissions = mode & 0o7777;
+        let read_only = permissions & 0o222 == 0;
+        let projected = match (directory, read_only) {
+            (true, false) => 0o755,
+            (true, true) => 0o555,
+            (false, false) => 0o644,
+            (false, true) => 0o444,
+        };
+        // FAT stores a read-only bit, not Unix permissions. Reject requests
+        // whose projection would expose access the caller did not grant.
+        if permissions & 0o7000 != 0 || projected & !permissions & 0o777 != 0 {
+            return Err(FfsError::UnsupportedFeature(
+                "requested mode cannot be represented by the FAT host projection".into(),
+            ));
+        }
+        Ok(read_only)
+    }
+
+    fn create_with_handle(
+        &self,
+        cx: &Cx,
+        parent: InodeNumber,
+        name: &OsStr,
+        mode: u16,
+        flags: Option<i32>,
+    ) -> Result<(InodeAttr, u64, u32)> {
+        let operation = self.operation(cx, true)?;
+        checkpoint(cx)?;
+        self.ensure_writable()?;
+        let read_only = Self::check_create_mode(mode, false)?;
+        if let Some(flags) = flags {
+            let access = flags & libc::O_ACCMODE;
+            if !matches!(access, libc::O_RDONLY | libc::O_WRONLY | libc::O_RDWR) {
+                return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                    libc::EINVAL,
+                )));
+            }
+            if read_only && (access != libc::O_RDONLY || flags & libc::O_TRUNC != 0) {
+                return Err(FfsError::PermissionDenied);
+            }
+        }
+        let next_ino = {
+            let state = self.state()?;
+            state.ensure_new_node(true)?;
+            InodeNumber(state.next_synthetic_ino)
+        };
+        let parent_dir = self.node(cx, parent)?.directory()?;
+        let (path, name_str) = self.child_path(parent, name)?;
+        // The exclusive operation gate keeps the next mount inode stable.
+        // Reserve its handle before native publication, so exhaustion cannot
+        // leave a newly created file behind an unsuccessful CREATE reply.
+        let handle = flags.map(|_| self.reserve_open(next_ino)).transpose()?;
+        create_in_volume(cx, &self.volume, &path, &[], now_unix_secs(), read_only)
+            .map_err(map_mutation_error)?;
+        operation.publish_committed(cx, || {
+            self.state()?.free_clusters = None;
+            let entry = self.volume.lookup(cx, parent_dir, &name_str)?;
+            let offset = entry.offset;
+            let ino = self.register(cx, parent, entry)?;
+            if ino != next_ino {
+                return Err(FfsError::Corruption {
+                    block: offset / 512,
+                    detail: "FAT create did not publish its reserved mount inode".into(),
+                });
+            }
+            let attr = self.attributes(cx, ino, &self.node(cx, ino)?)?;
+            Ok((attr, handle.map_or(0, lifetime::OpenReservation::accept), 0))
+        })
+    }
+
     /// Both rename entry points hold the same exclusive operation gate across
     /// destination lookup, native publication and mount-identity updates.
     /// NOREPLACE is a namespace exclusion rule, not crash-atomic FAT metadata.
@@ -801,6 +885,21 @@ fn fat_fiemap(
 }
 
 impl FsOps for FatFs {
+    fn requires_stateful_open(&self) -> bool {
+        // Both mount modes return registered handles; writable mounts also
+        // depend on their pins to preserve unlinked or overwritten files.
+        true
+    }
+
+    fn begin_request_scope(&self, cx: &Cx, op: ffs_core::vfs::RequestOp) -> Result<RequestScope> {
+        // RELEASE owns the last chance to drain a handle, even when the
+        // request context has already been cancelled.
+        if op != ffs_core::vfs::RequestOp::Release {
+            checkpoint(cx)?;
+        }
+        Ok(RequestScope::empty())
+    }
+
     fn directory_has_name_aliases(
         &self,
         cx: &Cx,
@@ -937,8 +1036,13 @@ impl FsOps for FatFs {
     ) -> Result<(u64, u32)> {
         let operation = self.operation(cx, flags & libc::O_TRUNC != 0)?;
         checkpoint(cx)?;
-        let wants_write = flags & libc::O_ACCMODE != libc::O_RDONLY
-            || flags & (libc::O_TRUNC | libc::O_CREAT) != 0;
+        let access = flags & libc::O_ACCMODE;
+        if !matches!(access, libc::O_RDONLY | libc::O_WRONLY | libc::O_RDWR) {
+            return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                libc::EINVAL,
+            )));
+        }
+        let wants_write = access != libc::O_RDONLY || flags & (libc::O_TRUNC | libc::O_CREAT) != 0;
         if wants_write && !self.writable {
             return Err(FfsError::ReadOnly);
         }
@@ -979,23 +1083,22 @@ impl FsOps for FatFs {
         _uid: u32,
         _gid: u32,
     ) -> Result<InodeAttr> {
-        let operation = self.operation(cx, true)?;
-        checkpoint(cx)?;
-        self.ensure_writable()?;
-        self.state()?.ensure_new_node(true)?;
-        let parent_node = self.node(cx, parent)?;
-        let parent_dir = parent_node.directory()?;
-        let (path, name_str) = self.child_path(parent, name)?;
-        let read_only = (mode & 0o222) == 0;
-        create_in_volume(cx, &self.volume, &path, &[], now_unix_secs(), read_only)
-            .map_err(map_mutation_error)?;
-        operation.publish_committed(cx, || {
-            self.state()?.free_clusters = None;
-            let entry = self.volume.lookup(cx, parent_dir, &name_str)?;
-            let ino = self.register(cx, parent, entry)?;
-            let node = self.node(cx, ino)?;
-            self.attributes(cx, ino, &node)
-        })
+        self.create_with_handle(cx, parent, name, mode, None)
+            .map(|(attr, _, _)| attr)
+    }
+
+    fn create_open(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        parent: InodeNumber,
+        name: &OsStr,
+        mode: u16,
+        _uid: u32,
+        _gid: u32,
+        flags: i32,
+    ) -> Result<(InodeAttr, u64, u32)> {
+        self.create_with_handle(cx, parent, name, mode, Some(flags))
     }
 
     fn mkdir(
@@ -1004,18 +1107,19 @@ impl FsOps for FatFs {
         _scope: &mut RequestScope,
         parent: InodeNumber,
         name: &OsStr,
-        _mode: u16,
+        mode: u16,
         _uid: u32,
         _gid: u32,
     ) -> Result<InodeAttr> {
         let operation = self.operation(cx, true)?;
         checkpoint(cx)?;
         self.ensure_writable()?;
+        let read_only = Self::check_create_mode(mode, true)?;
         self.state()?.ensure_new_node(true)?;
         let parent_node = self.node(cx, parent)?;
         let parent_dir = parent_node.directory()?;
         let (path, name_str) = self.child_path(parent, name)?;
-        mkdir_in_volume(cx, &self.volume, &path, now_unix_secs(), false)
+        mkdir_in_volume(cx, &self.volume, &path, now_unix_secs(), read_only)
             .map_err(map_mutation_error)?;
         operation.publish_committed(cx, || {
             self.state()?.free_clusters = None;
@@ -1396,10 +1500,12 @@ impl FsOps for FatFs {
         _scope: &mut RequestScope,
         request: ffs_core::vfs::ReleaseRequest,
     ) -> Result<()> {
-        let operation = self.operation(cx, true)?;
-        self.release_open(request.ino, request.fh)?;
-        self.reap_retained_locked(cx, request.ino, false)?;
-        operation.complete(())
+        cx.masked(|| {
+            let operation = self.operation(cx, true)?;
+            self.release_open(request.ino, request.fh)?;
+            self.reap_retained_locked(cx, request.ino, false)?;
+            operation.complete(())
+        })
     }
 
     fn finalize_unlinked_inode(

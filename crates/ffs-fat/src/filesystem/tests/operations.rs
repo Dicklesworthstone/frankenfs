@@ -53,19 +53,116 @@ fn raw_image(directory: &tempfile::TempDir) -> Vec<u8> {
 }
 
 #[test]
+fn creation_refuses_modes_that_would_broaden_access_without_native_changes() {
+    for kind in ["fat16", "fat32"] {
+        let (directory, fs) = writable_fat(kind);
+        let cx = Cx::for_testing();
+        let mut scope = RequestScope::empty();
+        let before = raw_image(&directory);
+        for mode in [0, 0o600, 0o640, 0o440, 0o1644, 0o4644, 0o040644] {
+            expect_errno(
+                fs.create(
+                    &cx,
+                    &mut scope,
+                    ROOT,
+                    OsStr::new("PRIVATE.BIN"),
+                    mode,
+                    1000,
+                    1000,
+                ),
+                libc::EOPNOTSUPP,
+            );
+        }
+        for mode in [0, 0o700, 0o750, 0o550, 0o1755, 0o2755, 0o100755] {
+            expect_errno(
+                fs.mkdir(
+                    &cx,
+                    &mut scope,
+                    ROOT,
+                    OsStr::new("PRIVATE"),
+                    mode,
+                    1000,
+                    1000,
+                ),
+                libc::EOPNOTSUPP,
+            );
+        }
+        assert_eq!(raw_image(&directory), before);
+        for name in ["PRIVATE.BIN", "PRIVATE"] {
+            expect_errno(
+                fs.lookup(&cx, &mut scope, ROOT, OsStr::new(name)),
+                libc::ENOENT,
+            );
+        }
+    }
+}
+
+#[test]
+fn creation_preserves_representable_modes_and_native_directory_read_only_bit() {
+    for kind in ["fat16", "fat32"] {
+        let (_directory, fs) = writable_fat(kind);
+        let cx = Cx::for_testing();
+        let mut scope = RequestScope::empty();
+        for (name, mode, expected) in [
+            ("NORMAL.BIN", 0o644, 0o644),
+            ("PUBLIC.BIN", 0o666, 0o644),
+            ("READONLY.BIN", 0o100444, 0o444),
+        ] {
+            let attr = fs
+                .create(&cx, &mut scope, ROOT, OsStr::new(name), mode, 1000, 1000)
+                .unwrap();
+            assert_eq!(attr.perm, expected);
+            assert_eq!(attr.kind, FileType::RegularFile);
+            let entry = fs.volume.lookup(&cx, Directory::Root, name).unwrap();
+            assert_eq!(entry.native.attributes & 0x01 != 0, expected == 0o444);
+        }
+        for (name, mode, expected) in [
+            ("NORMAL", 0o755, 0o755),
+            ("PUBLIC", 0o777, 0o755),
+            ("READONLY", 0o040555, 0o555),
+        ] {
+            let attr = fs
+                .mkdir(&cx, &mut scope, ROOT, OsStr::new(name), mode, 1000, 1000)
+                .unwrap();
+            assert_eq!(attr.perm, expected);
+            assert_eq!(attr.kind, FileType::Directory);
+            let entry = fs.volume.lookup(&cx, Directory::Root, name).unwrap();
+            assert_eq!(entry.native.attributes & 0x01 != 0, expected == 0o555);
+        }
+        let check = fs.volume.check(&cx).unwrap();
+        assert!(
+            check.clean && check.complete && check.namespace_complete,
+            "{check:?}"
+        );
+        assert_eq!(check.lost_clusters, Some(0));
+    }
+}
+
+#[test]
 fn create_and_mkdir_collisions_return_eexist_without_native_changes() {
     for kind in ["fat16", "fat32"] {
         let (directory, fs) = writable_fat(kind);
         let cx = Cx::for_testing();
         let mut scope = RequestScope::empty();
         let ino = create_file(&fs, "Native café and collision.txt");
-        fs.write(&cx, &mut scope, ino, 0, b"preserved source").unwrap();
-        let alias = fs.node(&cx, ino).unwrap().entry.unwrap().short_alias().unwrap();
+        fs.write(&cx, &mut scope, ino, 0, b"preserved source")
+            .unwrap();
+        let alias = fs
+            .node(&cx, ino)
+            .unwrap()
+            .entry
+            .unwrap()
+            .short_alias()
+            .unwrap();
         let before = raw_image(&directory);
         // The ASCII OEM lookup profile compares é/É exactly, but creation's
         // documented conservative Unicode collision policy still refuses both.
         // Transport must preserve that semantic EEXIST instead of EINVAL.
-        for name in ["Native café and collision.txt", "NATIVE CAFÉ AND COLLISION.TXT", &alias] {
+        for name in [
+            "Native café and collision.txt",
+            "NATIVE CAFÉ AND COLLISION.TXT",
+            &alias,
+        ] {
             expect_errno(
                 fs.create(&cx, &mut scope, ROOT, OsStr::new(name), 0o644, 1000, 1000),
                 libc::EEXIST,
@@ -79,11 +176,22 @@ fn create_and_mkdir_collisions_return_eexist_without_native_changes() {
         // An invalid name remains EINVAL; do not turn every refused creation
         // into a collision merely because it was rejected before publication.
         expect_errno(
-            fs.create(&cx, &mut scope, ROOT, OsStr::new("invalid?.txt"), 0o644, 1000, 1000),
+            fs.create(
+                &cx,
+                &mut scope,
+                ROOT,
+                OsStr::new("invalid?.txt"),
+                0o644,
+                1000,
+                1000,
+            ),
             libc::EINVAL,
         );
         assert_eq!(raw_image(&directory), before);
-        assert_eq!(fs.read(&cx, &mut scope, ino, 0, 128).unwrap(), b"preserved source");
+        assert_eq!(
+            fs.read(&cx, &mut scope, ino, 0, 128).unwrap(),
+            b"preserved source"
+        );
     }
 }
 
@@ -99,18 +207,28 @@ fn transport_flag_and_killpriv_probes_preserve_native_bytes_and_validate_inodes(
         let ops: &dyn FsOps = &fs;
         assert_eq!(ops.get_inode_flags(&cx, &mut scope, ino).unwrap(), 0);
         assert_eq!(ops.get_inode_flags(&cx, &mut scope, ROOT).unwrap(), 0);
-        for name in ["security.capability", "user.absent", "system.posix_acl_access"] {
+        for name in [
+            "security.capability",
+            "user.absent",
+            "system.posix_acl_access",
+        ] {
             assert!(ops.getxattr(&cx, ino, name).unwrap().is_none());
             assert!(!ops.removexattr(&cx, &mut scope, ino, name).unwrap());
         }
         assert_eq!(ops.listxattr(&cx, ino).unwrap(), [] as [String; 0]);
         let stale = InodeNumber(u64::MAX);
         expect_errno(ops.get_inode_flags(&cx, &mut scope, stale), libc::ENOENT);
-        expect_errno(ops.removexattr(&cx, &mut scope, stale, "security.capability"), libc::ENOENT);
+        expect_errno(
+            ops.removexattr(&cx, &mut scope, stale, "security.capability"),
+            libc::ENOENT,
+        );
         let cancelled = Cx::for_testing();
         cancelled.set_cancel_requested(true);
         assert!(ops.get_inode_flags(&cancelled, &mut scope, ino).is_err());
-        assert!(ops.removexattr(&cancelled, &mut scope, ino, "security.capability").is_err());
+        assert!(
+            ops.removexattr(&cancelled, &mut scope, ino, "security.capability")
+                .is_err()
+        );
         assert_eq!(raw_image(&directory), before);
 
         // End the exclusive writer before admitting a separate read-only view.
@@ -121,10 +239,15 @@ fn transport_flag_and_killpriv_probes_preserve_native_bytes_and_validate_inodes(
             length: None,
             oem_code_page: ffs_ondisk::fat::FatOemCodePage::Ascii,
             sidecar: None,
-        }.open(&cx).unwrap();
+        }
+        .open(&cx)
+        .unwrap();
         let readonly = FatFs::new(&cx, volume, 1000, 1000).unwrap();
         assert_eq!(readonly.get_inode_flags(&cx, &mut scope, ROOT).unwrap(), 0);
-        expect_errno(readonly.removexattr(&cx, &mut scope, ROOT, "security.capability"), libc::EROFS);
+        expect_errno(
+            readonly.removexattr(&cx, &mut scope, ROOT, "security.capability"),
+            libc::EROFS,
+        );
         assert_eq!(raw_image(&directory), before);
     }
 }
@@ -138,7 +261,8 @@ fn full_fixed_root_returns_enospc_without_changing_native_bytes() {
     drop(fs);
     let image = directory.path().join("volume.fat");
     let mut bytes = std::fs::read(&image).unwrap();
-    let (entries, remainder) = bytes[start as usize..(start + length) as usize].as_chunks_mut::<32>();
+    let (entries, remainder) =
+        bytes[start as usize..(start + length) as usize].as_chunks_mut::<32>();
     assert_eq!(remainder, [] as [u8; 0]);
     for (index, entry) in entries.iter_mut().enumerate() {
         if entry[0] == 0 || entry[0] == 0xE5 {
@@ -148,15 +272,22 @@ fn full_fixed_root_returns_enospc_without_changing_native_bytes() {
             entry[11] = 0x20;
         }
     }
-    let mut file = std::fs::OpenOptions::new().write(true).open(&image).unwrap();
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&image)
+        .unwrap();
     file.seek(std::io::SeekFrom::Start(start)).unwrap();
-    file.write_all(&bytes[start as usize..(start + length) as usize]).unwrap();
+    file.write_all(&bytes[start as usize..(start + length) as usize])
+        .unwrap();
     file.sync_all().unwrap();
     drop(file);
     let cx = Cx::for_testing();
     let args = crate::reader::ImageArgs {
-        image, offset: 0, length: None,
-        oem_code_page: ffs_ondisk::fat::FatOemCodePage::Ascii, sidecar: None,
+        image,
+        offset: 0,
+        length: None,
+        oem_code_page: ffs_ondisk::fat::FatOemCodePage::Ascii,
+        sidecar: None,
     };
     let volume = crate::reader::replacement::open_volume(&cx, &args, true).unwrap();
     assert!(volume.check(&cx).unwrap().clean);
@@ -164,8 +295,14 @@ fn full_fixed_root_returns_enospc_without_changing_native_bytes() {
     let mut scope = RequestScope::empty();
     assert!(fs.statfs(&cx, &mut scope, ROOT).unwrap().blocks_free > 0);
     for name in ["NEW.BIN", "Long native café name.bin"] {
-        expect_errno(fs.create(&cx, &mut scope, ROOT, OsStr::new(name), 0o644, 1000, 1000), libc::ENOSPC);
-        expect_errno(fs.mkdir(&cx, &mut scope, ROOT, OsStr::new(name), 0o755, 1000, 1000), libc::ENOSPC);
+        expect_errno(
+            fs.create(&cx, &mut scope, ROOT, OsStr::new(name), 0o644, 1000, 1000),
+            libc::ENOSPC,
+        );
+        expect_errno(
+            fs.mkdir(&cx, &mut scope, ROOT, OsStr::new(name), 0o755, 1000, 1000),
+            libc::ENOSPC,
+        );
         assert_eq!(raw_image(&directory), bytes);
     }
 }
