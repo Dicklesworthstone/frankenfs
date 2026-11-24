@@ -577,6 +577,117 @@ struct LostRetirement {
     dropped: Arc<std::sync::atomic::AtomicUsize>,
 }
 
+/// Persist a prefix of the first write that would install a different live
+/// short record, then fail. Earlier barriers and the untouched suffix survive.
+struct TornBinding {
+    device: Device,
+    slot: u64,
+    prefix: usize,
+}
+
+impl ByteDevice for TornBinding {
+    fn len_bytes(&self) -> u64 {
+        self.device.len_bytes()
+    }
+
+    fn read_exact_at(
+        &self,
+        cx: &Cx,
+        offset: ByteOffset,
+        bytes: &mut [u8],
+    ) -> ffs_error::Result<()> {
+        self.device.read_exact_at(cx, offset, bytes)
+    }
+
+    fn write_all_at(&self, cx: &Cx, offset: ByteOffset, bytes: &[u8]) -> ffs_error::Result<()> {
+        if let Some(relative) = self.slot.checked_sub(offset.0)
+            && relative + 32 <= bytes.len() as u64
+        {
+            let start = relative as usize;
+            let proposed = &bytes[start..start + 32];
+            let mut state = self.device.state.lock().unwrap();
+            let mut previous = [0; 32];
+            state.read(self.slot, &mut previous);
+            if !matches!(proposed[0], 0 | 0xE5) && proposed != previous {
+                state.put(offset.0, &bytes[..start + self.prefix]);
+                state.persist();
+                return Err(io::Error::other("torn live binding").into());
+            }
+        }
+        self.device.write_all_at(cx, offset, bytes)
+    }
+
+    fn sync(&self, cx: &Cx) -> ffs_error::Result<()> {
+        self.device.sync(cx)
+    }
+}
+
+#[test]
+fn torn_live_binding_cannot_publish_mixed_directory_or_file_metadata() {
+    let cx = Cx::for_testing();
+    for kind in [FatKind::Fat16, FatKind::Fat32] {
+        for overwrite in [false, true] {
+            let image = Image::new(kind, 512, false);
+            let slot = image.root + 32;
+            let (expected, prefix) = if overwrite {
+                assert_eq!(rename_target(&image, "TARGET.BIN").0, slot);
+                let mut state = image.device.state.lock().unwrap();
+                state.put(slot + 28, &1_u32.to_le_bytes());
+                state.persist();
+                let mut expected = [0; 32];
+                state.read(image.root, &mut expected);
+                expected[..11].copy_from_slice(b"TARGET  BIN");
+                // A one-step live overwrite would expose the source head
+                // with the old target's length.
+                (expected, 28)
+            } else {
+                let mut stale = short_entry(b"STALE   BIN", 5, 4);
+                stale[0] = 0;
+                {
+                    let mut state = image.device.state.lock().unwrap();
+                    state.put(slot, &stale);
+                    state.persist();
+                }
+                let control = Image::new(kind, 512, false);
+                mkdir::mkdir_in_volume(&cx, &control.volume(), "/NEW", NOW, false).unwrap();
+                // A one-step mkdir would make the old file record live.
+                (control.bytes(control.root + 32, 32).try_into().unwrap(), 1)
+            };
+            let volume = FatVolume::from_device(
+                &cx,
+                Box::new(TornBinding {
+                    device: image.device.clone(),
+                    slot,
+                    prefix,
+                }),
+                image.base,
+                image.geometry.volume_bytes(),
+            )
+            .unwrap();
+            let result = if overwrite {
+                mkdir::rename_in_volume(&cx, &volume, "/KEEP.BIN", "/TARGET.BIN", false)
+            } else {
+                mkdir::mkdir_in_volume(&cx, &volume, "/NEW", NOW, false)
+            };
+            assert!(format!("{:#}", result.unwrap_err()).contains("torn live binding"));
+            assert_eq!(image.bytes(slot, 32), expected);
+            assert_eq!(contents(&volume, "/KEEP.BIN"), b"SAFE");
+            if overwrite {
+                assert_eq!(contents(&volume, "/TARGET.BIN"), b"SAFE");
+            } else {
+                let directory = volume.resolve(&cx, "/NEW").unwrap().unwrap();
+                assert!(
+                    volume
+                        .list(&cx, directory.directory().unwrap())
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+            image.guards();
+        }
+    }
+}
+
 impl ByteDevice for LostRetirement {
     fn len_bytes(&self) -> u64 {
         self.device.len_bytes()

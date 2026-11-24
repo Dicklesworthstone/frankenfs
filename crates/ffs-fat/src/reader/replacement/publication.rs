@@ -203,6 +203,31 @@ impl EntryPublication {
         Ok(())
     }
 
+    /// A directory is traversable even at zero EOF. Hide a live binding
+    /// before changing its head, type or length. While the entry is hidden,
+    /// stage its complete new record and verify it before exposing the name
+    /// with a one-byte transition. The caller has already staged the next
+    /// end marker when consuming previously unused directory space.
+    pub(super) fn publish_binding(
+        &mut self,
+        cx: &Cx,
+        volume: &FatVolume,
+        original: &[u8; 32],
+        updated: &[u8; 32],
+    ) -> Result<()> {
+        let mut previous = *original;
+        if !matches!(previous[0], 0 | 0xE5) {
+            let mut retired = previous;
+            retired[0] = 0xE5;
+            self.publish(cx, volume, &previous, &retired)?;
+            previous = retired;
+        }
+        let mut hidden = *updated;
+        hidden[0] = 0xE5;
+        self.publish(cx, volume, &previous, &hidden)?;
+        self.publish(cx, volume, &hidden, updated)
+    }
+
     pub(super) fn publish_file(
         &mut self,
         cx: &Cx,
@@ -213,10 +238,7 @@ impl EntryPublication {
             // A reused deleted slot can still contain another object's old
             // cluster/length fields. Do not make its first name byte live
             // before the COMPLETE new record is durable and verified.
-            let mut hidden = plan.updated;
-            hidden[0] = 0xE5;
-            self.publish(cx, volume, &plan.original, &hidden)?;
-            return self.publish(cx, volume, &hidden, &plan.updated);
+            return self.publish_binding(cx, volume, &plan.original, &plan.updated);
         }
 
         // FAT32's high head word precedes its low word and logical EOF. A torn
