@@ -431,7 +431,7 @@ pub fn create_pool_on_leaves(
     // Assign supplied leaf indices and compute per-top-level vdev geometry + GUIDs.
     let mut dev_cursor = 0_usize;
     let mut top_trees: Vec<NvList> = Vec::with_capacity(spec.vdevs.len());
-    let mut top_member_ranges: Vec<(usize, usize, AllocatorWriteTopology, u64, u64)> =
+    let mut top_member_ranges: Vec<(usize, usize, AllocatorWriteTopology, u64, u64, u64)> =
         Vec::with_capacity(spec.vdevs.len());
     let mut guid_sum = spec.pool_guid;
     let mut uses_draid = false;
@@ -455,7 +455,12 @@ pub fn create_pool_on_leaves(
                 "backing leaf image too small for ZFS pool creation (minimum >= 6 MiB)".into(),
             ));
         }
-        let per_member_usable = ((aligned_end - DATA_OFFSET) >> SLAB_SHIFT) << SLAB_SHIFT;
+        let raw_usable = aligned_end - DATA_OFFSET;
+        let mut slab_shift = SLAB_SHIFT;
+        while (raw_usable >> slab_shift) > 256 {
+            slab_shift += 1;
+        }
+        let per_member_usable = (raw_usable >> slab_shift) << slab_shift;
         let top_guid = alloc_guid();
         guid_sum = guid_sum.wrapping_add(top_guid);
 
@@ -470,7 +475,7 @@ pub fn create_pool_on_leaves(
                         "metaslab_array",
                         Value::Unsigned(metaslab_array_obj_for(vdev_idx) as u64),
                     ),
-                    ("metaslab_shift", Value::Unsigned(SLAB_SHIFT)),
+                    ("metaslab_shift", Value::Unsigned(slab_shift)),
                     ("ashift", Value::Unsigned(u64::from(spec.ashift))),
                     ("asize", Value::Unsigned(per_member_usable)),
                     (
@@ -517,7 +522,7 @@ pub fn create_pool_on_leaves(
                         "metaslab_array",
                         Value::Unsigned(metaslab_array_obj_for(vdev_idx) as u64),
                     ),
-                    ("metaslab_shift", Value::Unsigned(SLAB_SHIFT)),
+                    ("metaslab_shift", Value::Unsigned(slab_shift)),
                     ("ashift", Value::Unsigned(u64::from(spec.ashift))),
                     ("asize", Value::Unsigned(per_member_usable)),
                     (
@@ -566,7 +571,7 @@ pub fn create_pool_on_leaves(
                         "metaslab_array",
                         Value::Unsigned(metaslab_array_obj_for(vdev_idx) as u64),
                     ),
-                    ("metaslab_shift", Value::Unsigned(SLAB_SHIFT)),
+                    ("metaslab_shift", Value::Unsigned(slab_shift)),
                     ("ashift", Value::Unsigned(u64::from(spec.ashift))),
                     ("asize", Value::Unsigned(total_asize)),
                     ("is_log", Value::Unsigned(0)),
@@ -619,7 +624,7 @@ pub fn create_pool_on_leaves(
                         "metaslab_array",
                         Value::Unsigned(metaslab_array_obj_for(vdev_idx) as u64),
                     ),
-                    ("metaslab_shift", Value::Unsigned(SLAB_SHIFT)),
+                    ("metaslab_shift", Value::Unsigned(slab_shift)),
                     ("ashift", Value::Unsigned(u64::from(spec.ashift))),
                     ("asize", Value::Unsigned(total_asize)),
                     ("is_log", Value::Unsigned(0)),
@@ -629,7 +634,7 @@ pub fn create_pool_on_leaves(
             }
         };
 
-        top_member_ranges.push((dev_cursor, count, topo, top_guid, asize));
+        top_member_ranges.push((dev_cursor, count, topo, top_guid, asize, slab_shift));
         top_trees.push(tree);
         dev_cursor += count;
     }
@@ -649,7 +654,7 @@ pub fn create_pool_on_leaves(
     }
 
     // Allocate initial MOS + root dataset + ZPL root on top-level vdev 0.
-    let (_, _, ref primary_topo, _, primary_asize) = top_member_ranges[0];
+    let (_, _, ref primary_topo, _, primary_asize, primary_slab_shift) = top_member_ranges[0];
     let mut arena = CreateArena::new(spec.ashift, primary_asize, primary_topo.clone())?;
 
     // Minimal ZPL root dataset (Objects 1=MASTER_NODE, 2=SA_MASTER, 3=SA_REG, 4=SA_LAYOUTS, 5=root_dir)
@@ -772,12 +777,21 @@ pub fn create_pool_on_leaves(
 
     // Build MOS dnode tables (metaslab space maps start strictly after all
     // secondary `metaslab_array` objects `31..=30+vdevs.len()`).
-    let num_slabs = usize::try_from(primary_asize >> SLAB_SHIFT)
+    // Only metaslab 0 (`sm_base_id`) is allocated at pool creation; sizing the
+    // initial MOS table to `sm_base_id + 1` keeps the root MOS dnode compact
+    // across pools of arbitrary size instead of overflowing the 3 direct root
+    // pointers on >= 32 MiB pools.
+    let num_slabs = usize::try_from(primary_asize >> primary_slab_shift)
         .map_err(|_| corrupt("metaslab count overflow"))?;
     let sm_base_id = (30 + spec.vdevs.len() + 2).max(40);
-    let total_mos_objs = sm_base_id + num_slabs + 4;
+    let total_mos_objs = sm_base_id + 1;
     let slots_per_blk = DNODE_BLOCK_BYTES / DNODE_BYTES;
     let mos_table_blocks = total_mos_objs.div_ceil(slots_per_blk);
+    if mos_table_blocks > 3 * 128 {
+        return Err(unsupported(
+            "pool creation exceeds 384 initial MOS dnode blocks",
+        ));
+    }
     let mut mos_tables = vec![vec![0_u8; DNODE_BLOCK_BYTES]; mos_table_blocks];
     let set_mos = |tables: &mut [Vec<u8>], id: usize, dn: &Dnode| -> Result<()> {
         write_dnode_at(&mut tables[id / slots_per_blk], id % slots_per_blk, dn)
@@ -1017,7 +1031,8 @@ pub fn create_pool_on_leaves(
     // Metaslab arrays for secondary vdevs (empty -> untouched `0` space maps).
     for (extra_idx, range_entry) in top_member_ranges.iter().enumerate().skip(1) {
         let extra_asize = range_entry.4;
-        let extra_slabs = usize::try_from(extra_asize >> SLAB_SHIFT)
+        let extra_slab_shift = range_entry.5;
+        let extra_slabs = usize::try_from(extra_asize >> extra_slab_shift)
             .unwrap_or(1)
             .max(1);
         let arr = vec![0_u8; (extra_slabs * 8).max(4096).next_multiple_of(512)];
@@ -1062,12 +1077,23 @@ pub fn create_pool_on_leaves(
         mos_table_dvas.push(arena.alloc_raw(&vec![0_u8; DNODE_BLOCK_BYTES])?);
         mos_table_slots.push(arena.blocks.len() - 1);
     }
+    let mos_indirect_blocks = if mos_table_blocks > 3 {
+        mos_table_blocks.div_ceil(128)
+    } else {
+        0
+    };
+    let mut mos_indirect_dvas = Vec::with_capacity(mos_indirect_blocks);
+    let mut mos_indirect_slots = Vec::with_capacity(mos_indirect_blocks);
+    for _ in 0..mos_indirect_blocks {
+        mos_indirect_dvas.push(arena.alloc_raw(&vec![0_u8; DNODE_BLOCK_BYTES])?);
+        mos_indirect_slots.push(arena.blocks.len() - 1);
+    }
     let mos_root_lsize = 1024_usize.max(sector as usize);
     let mos_root_dva = arena.alloc_raw(&vec![0_u8; mos_root_lsize])?;
     let mos_root_slot = arena.blocks.len() - 1;
 
     // Encode metaslab 0 space-map stream covering ALL allocated ranges in slab 0.
-    let slab_size = 1_u64 << SLAB_SHIFT;
+    let slab_size = 1_u64 << primary_slab_shift;
     let mut slab0_map =
         AllocationMap::new(0, slab_size, spec.ashift, 262_144).map_err(|e| parse_err(&e))?;
     let mut sm_stream = Vec::new();
@@ -1166,14 +1192,73 @@ pub fn create_pool_on_leaves(
         arena.blocks[slot_idx].2 = tbl;
         mos_table_bps.push(bp);
     }
-    let mos_meta = make_dnode(
-        DMU_OT_DNODE,
-        DNODE_BLOCK_BYTES,
-        mos_table_bps,
-        0,
-        Vec::new(),
-        order,
-    )?;
+    let mos_meta = if mos_table_bps.len() <= 3 {
+        make_dnode(
+            DMU_OT_DNODE,
+            DNODE_BLOCK_BYTES,
+            mos_table_bps,
+            0,
+            Vec::new(),
+            order,
+        )?
+    } else {
+        let mut indirect_bps = Vec::with_capacity(mos_indirect_blocks);
+        let mut total_used: u64 = mos_table_bps
+            .iter()
+            .filter_map(|bp| bp.data_dvas().ok())
+            .flatten()
+            .map(|d| d.allocated_bytes)
+            .sum();
+        for ((chunk, dva), slot_idx) in mos_table_bps
+            .chunks(128)
+            .zip(mos_indirect_dvas)
+            .zip(mos_indirect_slots)
+        {
+            let mut raw = vec![0_u8; DNODE_BLOCK_BYTES];
+            let mut fill = 0_u64;
+            for (idx, bp) in chunk.iter().enumerate() {
+                raw[idx * 128..(idx + 1) * 128].copy_from_slice(&bp.encode(order));
+                fill += bp.fill();
+            }
+            let ind_bp = BlockPointer::new_regular(&RegularBlockSpec {
+                dvas: &[dva],
+                physical: &raw,
+                logical_bytes: DNODE_BLOCK_BYTES,
+                compression: 2,
+                checksum_type: 7,
+                object_type: DMU_OT_DNODE,
+                level: 1,
+                payload_order: order,
+                birth: INITIAL_TXG,
+                fill,
+            })
+            .map_err(|e| parse_err(&e))?;
+            total_used += dva.allocated_bytes;
+            arena.blocks[slot_idx].2 = raw;
+            indirect_bps.push(ind_bp);
+        }
+        while indirect_bps.len() < 3 {
+            indirect_bps.push(BlockPointer::hole_pointer());
+        }
+        Dnode::from_spec(DnodeSpec {
+            object_type: DMU_OT_DNODE,
+            bonus_type: 0,
+            checksum_type: 0,
+            compress_type: 0,
+            flags: DNODE_FLAG_USED_BYTES,
+            order,
+            levels: 2,
+            indirect_shift: 14,
+            data_bytes: DNODE_BLOCK_BYTES,
+            max_block: (mos_table_bps.len() - 1) as u64,
+            used_bytes: total_used,
+            slots: 1,
+            pointers: indirect_bps,
+            bonus: Vec::new(),
+            spill: None,
+        })
+        .map_err(|e| parse_err(&e))?
+    };
     let mos_os = ObjectSet::new(1, 0, mos_meta, ZilHeader::empty(), mos_root_lsize)
         .map_err(|e| parse_err(&e))?;
     let mos_os_bytes = mos_os.encode(order).map_err(|e| parse_err(&e))?;
@@ -1193,7 +1278,7 @@ pub fn create_pool_on_leaves(
     .map_err(|e| parse_err(&e))?;
 
     // Write every allocated block onto top-level vdev 0's physical leaves!
-    let (base_idx, count, ref topo, _, _) = top_member_ranges[0];
+    let (base_idx, count, ref topo, _, _, _) = top_member_ranges[0];
     let primary_leaves = &leaves[base_idx..base_idx + count];
     for (dva_offset, _alloc_bytes, payload) in &arena.blocks {
         checkpoint(cx)?;
@@ -1218,7 +1303,7 @@ pub fn create_pool_on_leaves(
         raidz_reflow_info: 0,
     };
 
-    for (vdev_idx, &(start_i, cnt, _, top_guid, _)) in top_member_ranges.iter().enumerate() {
+    for (vdev_idx, &(start_i, cnt, _, top_guid, _, _)) in top_member_ranges.iter().enumerate() {
         let tree = &top_trees[vdev_idx];
         let child_guids: Vec<u64> = if let Some(Value::Lists(kids)) = tree.fields.get("children") {
             kids.iter().filter_map(|k| k.unsigned("guid")).collect()
