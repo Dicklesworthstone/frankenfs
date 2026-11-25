@@ -2772,6 +2772,9 @@ impl FsOps for OpenFs {
     ) -> ffs_error::Result<()> {
         let _mutation = self.mutation_gate_guard_with_pressure(cx);
         let _view = self.btrfs_semantic_view_guard()?;
+        if !self.is_writable() {
+            return Err(FfsError::ReadOnly);
+        }
         const EXT4_LABEL_MAX: usize = 16;
         const EXT4_VOLUME_NAME_OFFSET: usize = 0x78;
 
