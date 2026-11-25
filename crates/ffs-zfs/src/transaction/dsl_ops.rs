@@ -401,8 +401,8 @@ pub(super) fn enforce_pool_reservations_for_growth(
         let cur_u = order.u64(th_dn.bonus(), 96).map_err(|e| parse_err(&e))?;
         let p_zap = order.u64(tdd_dn.bonus(), 80).map_err(|e| parse_err(&e))?;
         if p_zap != 0
-            && let Ok(rows) = mos.zap_values(cx, p_zap)
-            && let Some(refrsrv) = effective_local_numeric_prop(&rows, "refreservation")?
+            && let Some(refrsrv) =
+                effective_local_numeric_prop(&mos.zap_values(cx, p_zap)?, "refreservation")?
             && refrsrv > cur_u
         {
             consumed_target_refrsrv = (refrsrv - cur_u).min(target_used_add);
@@ -456,9 +456,8 @@ pub(super) fn enforce_pool_reservations_for_growth(
         };
         let props_zap = order.u64(dd_dn.bonus(), 80).map_err(|e| parse_err(&e))?;
         let refrsrv_slack = if props_zap != 0
-            && let Ok(rows) = mos.zap_values(cx, props_zap)
-            && let Some(refrsrv) = effective_local_numeric_prop(&rows, "refreservation")?
-            && refrsrv > 0
+            && let Some(refrsrv) =
+                effective_local_numeric_prop(&mos.zap_values(cx, props_zap)?, "refreservation")?
         {
             refrsrv.saturating_sub(post_unique)
         } else {
@@ -2702,6 +2701,23 @@ pub(super) fn stage_create_snapshot(
         staged_writes,
     )?;
 
+    if refrsrv_add > 0 {
+        // The snapshot made all previously unique head blocks shared. Its
+        // newly unconsumed refreservation must fit alongside the commitments
+        // of other heads, including after this directory consumed any slack
+        // it had already reserved from its parent.
+        enforce_pool_reservations_for_growth(
+            cx,
+            mos,
+            mos_dirty_dnodes,
+            0,
+            0,
+            0,
+            0,
+            alloc.total_free_bytes(),
+            order,
+        )?;
+    }
     Ok(snap_ds_obj)
 }
 

@@ -581,6 +581,78 @@ fn received_space_fixture(
 }
 
 #[test]
+fn snapshot_preserves_other_heads_reserved_space_before_publication() {
+    use ffs_zfs::ZfsPropertySetValue::Number;
+
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    let (mut engine, devices) = file_range_fixture(
+        &cx,
+        &PoolFixtureSpec {
+            deadlist_mode: DeadlistMode::NativeDeadlist,
+            data_properties: vec![(b"compression", 2)],
+            ..PoolFixtureSpec::default()
+        },
+    );
+    let checksum = ZfsDataChecksum::Fletcher4;
+    let (file, _) = engine
+        .create_file(&cx, &dataset, 2, b"promised", 0o644, 0, 0, TIME, checksum)
+        .into_result()
+        .unwrap();
+    let payload = vec![0x37; 1024 * 1024];
+    engine
+        .write_file_data(&cx, &dataset, file, 0, &payload, TIME, checksum)
+        .into_result()
+        .unwrap();
+    let child = dataset_space(&cx, &engine, &dataset);
+    engine
+        .set_property(&cx, &dataset, "refreservation", Number(child.unique))
+        .into_result()
+        .unwrap();
+    assert!(child.unique > 512 * 1024);
+    let root = dataset_space(&cx, &engine, &[]);
+    let root_reserved = root.unique + engine.free_bytes() - 256 * 1024;
+    engine
+        .set_property(&cx, &[], "refreservation", Number(root_reserved))
+        .into_result()
+        .unwrap();
+    let before = dataset_space(&cx, &engine, &dataset);
+    assert!(
+        engine.free_bytes() > before.unique,
+        "raw free space alone would allow the snapshot"
+    );
+    assert_native_write_refused(&mut engine, &devices, libc::ENOSPC, |writer| {
+        writer.create_snapshot(&cx, &dataset, b"shared", TIME)
+    });
+    assert_eq!(dataset_space(&cx, &engine, &dataset), before);
+    engine
+        .inherit_property(&cx, &[], "refreservation")
+        .into_result()
+        .unwrap();
+    let (_, token) = engine
+        .create_snapshot(&cx, &dataset, b"shared", TIME)
+        .into_result()
+        .unwrap();
+    drop(engine);
+    let durable: Vec<_> = devices
+        .iter()
+        .map(FaultableMemberDevice::fresh_from_durable)
+        .collect();
+    let reopened = open_engine_on_devices(
+        &cx,
+        &durable,
+        default_write_opts(POOL_GUID, token.published_slot()),
+    )
+    .unwrap();
+    let after = dataset_space(&cx, &reopened, &dataset);
+    assert_eq!(after.unique, 0);
+    assert_eq!(after.used, before.used + before.unique);
+    let mut mos = reopened.open_read_objects(&cx).unwrap();
+    let mut snapshot = mos.zpl_snapshot(&cx, &dataset, b"shared").unwrap();
+    assert_eq!(snapshot.read(&cx, file, 0, 4096).unwrap(), payload[..4096]);
+}
+
+#[test]
 fn reserved_file_growth_and_truncation_preserve_saturated_ancestor_charges() {
     use ffs_core::{FsOps, RequestScope};
     use ffs_types::InodeNumber;
