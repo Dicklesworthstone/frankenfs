@@ -1377,6 +1377,329 @@ fn raw_dataset_objectset(
     (pointer, objectset)
 }
 
+struct RecvDnodeReadFaultDevice {
+    member: FaultableMemberDevice,
+    fault: Arc<Mutex<Option<(u64, FfsError)>>>,
+}
+
+impl ByteDevice for RecvDnodeReadFaultDevice {
+    fn len_bytes(&self) -> u64 {
+        self.member.len_bytes()
+    }
+
+    fn read_exact_at(&self, cx: &Cx, offset: ByteOffset, buf: &mut [u8]) -> Result<()> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        let mut fault = self.fault.lock().unwrap();
+        if fault.as_ref().is_some_and(|(at, _)| *at == offset.0) {
+            return Err(fault.take().unwrap().1);
+        }
+        drop(fault);
+        self.member.read_exact_at(cx, offset, buf)
+    }
+
+    fn write_all_at(&self, cx: &Cx, offset: ByteOffset, buf: &[u8]) -> Result<()> {
+        self.member.write_all_at(cx, offset, buf)
+    }
+
+    fn sync(&self, cx: &Cx) -> Result<()> {
+        self.member.sync(cx)
+    }
+
+    fn begin_durability_commit(&self, cx: &Cx) -> Result<()> {
+        self.member.begin_durability_commit(cx)
+    }
+
+    fn complete_durability_commit(&self) {
+        self.member.complete_durability_commit();
+    }
+
+    fn abort_durability_commit(&self) {
+        self.member.abort_durability_commit();
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn assert_receive_dnode_read_failure_preserves_checkpoint(corruption: bool) {
+    use ffs_ondisk::zfs::send_stream::DrrFreeObjects;
+
+    let cx = Cx::for_testing();
+    let timestamp = Timestamp {
+        seconds: 1_730_000_709,
+        nanos: 0,
+    };
+    let source = vec![b"data".to_vec()];
+    let destination = vec![b"data".to_vec(), b"read_fault".to_vec()];
+    let built = build_clean_zfs_pool(&send_recv_pool_spec(32 * 1024 * 1024));
+    let source_devices: Vec<_> = built
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut sender = open_engine_on_devices(
+        &cx,
+        &source_devices,
+        default_write_opts(built.pool_guid, built.initial_slot),
+    )
+    .unwrap();
+    let before = vec![0x51; 4096];
+    let after = vec![0xA7; 4096];
+    sender
+        .write_file_data(
+            &cx,
+            &source,
+            4,
+            0,
+            &before,
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    sender
+        .create_snapshot(&cx, &source, b"base", timestamp)
+        .into_result()
+        .unwrap();
+    sender
+        .write_file_data(
+            &cx,
+            &source,
+            4,
+            0,
+            &after,
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    sender
+        .create_snapshot(&cx, &source, b"next", timestamp)
+        .into_result()
+        .unwrap();
+    let mut source_mos = sender.open_read_objects(&cx).unwrap();
+    let mut full = Vec::new();
+    send_stream(
+        &cx,
+        &mut source_mos,
+        &ZfsSendRequest::full(source.clone(), b"base".to_vec()),
+        &mut full,
+    )
+    .unwrap();
+    let mut send = ZfsSendRequest::full(source, b"next".to_vec());
+    send.from = Some(ZfsSendFrom::Snapshot(b"base".to_vec()));
+    let mut incremental = Vec::new();
+    send_stream(&cx, &mut source_mos, &send, &mut incremental).unwrap();
+
+    let target = build_clean_zfs_pool(&send_recv_pool_spec(32 * 1024 * 1024));
+    let baseline_devices: Vec<_> = target
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    assert_eq!(baseline_devices.len(), 1);
+    let mut baseline = open_engine_on_devices(
+        &cx,
+        &baseline_devices,
+        default_write_opts(target.pool_guid, target.initial_slot),
+    )
+    .unwrap();
+    baseline
+        .receive_stream(
+            &cx,
+            &ZfsRecvRequest::new(destination.clone()),
+            &mut Cursor::new(&full),
+        )
+        .into_result()
+        .unwrap();
+    let baseline_slot = baseline.committed_slot();
+    let baseline_media = snapshot_media_bytes(&baseline_devices);
+    let mut mos = baseline.open_read_objects(&cx).unwrap();
+    let (_, objectset) =
+        raw_dataset_objectset(&cx, &mut mos, &baseline_devices[0], &destination, None);
+    assert_eq!(objectset.meta.levels(), 1);
+    let table = &objectset.meta.pointers()[0];
+    let table_dvas = table.data_dvas().unwrap();
+    assert_eq!(table_dvas.len(), 1, "fault must exhaust all block copies");
+    let table_offset = DATA_OFFSET + table_dvas[0].offset;
+    let table_start = usize::try_from(table_offset).unwrap();
+    let table_bytes = ffs_ondisk::zfs::decompress(
+        &baseline_media[0][table_start..table_start + table.physical_bytes()],
+        table.compression(),
+        table.logical_bytes(),
+    )
+    .unwrap();
+    assert!(
+        ffs_ondisk::zfs_dmu::dnode_at(&table_bytes, 31, table.payload_order())
+            .unwrap()
+            .is_none()
+    );
+
+    for case in ["object", "write", "freeobjects"] {
+        // Each correctly checksummed probe reaches one lookup before any other
+        // record can cache or stage its dnode table. FREEOBJECTS names an absent
+        // slot: an unreadable table must not masquerade as an absent object.
+        let mut selected = false;
+        let probe = restamp_substream(&incremental, false, |record, payload| match record {
+            DrrRecord::Begin(_) | DrrRecord::End(_) => Some((record, payload)),
+            DrrRecord::Object(object) if object.object == 4 && case == "object" => {
+                selected = true;
+                Some((DrrRecord::Object(object), payload))
+            }
+            DrrRecord::Write(write) if write.object == 4 && case == "write" && !selected => {
+                selected = true;
+                Some((DrrRecord::Write(write), payload))
+            }
+            DrrRecord::Object(object) if object.object == 4 && case == "freeobjects" => {
+                selected = true;
+                Some((
+                    DrrRecord::FreeObjects(DrrFreeObjects {
+                        firstobj: 31,
+                        numobjs: 1,
+                        toguid: object.toguid,
+                    }),
+                    Vec::new(),
+                ))
+            }
+            _ => None,
+        });
+        assert!(selected, "{case}: source record missing");
+        assert_eq!(checked_substream_records(&probe, false).len(), 3);
+
+        let devices: Vec<_> = baseline_media
+            .iter()
+            .cloned()
+            .map(FaultableMemberDevice::new)
+            .collect();
+        let fault = Arc::new(Mutex::new(None));
+        let device = RecvDnodeReadFaultDevice {
+            member: devices[0].clone(),
+            fault: Arc::clone(&fault),
+        };
+        let mut receiver = ZfsTransactionEngine::from_devices(
+            &cx,
+            vec![Box::new(device)],
+            default_write_opts(target.pool_guid, baseline_slot),
+        )
+        .unwrap();
+        let checkpoint = Arc::new(Mutex::new(None));
+        let checkpoint_for_hook = Arc::clone(&checkpoint);
+        let fault_for_hook = Arc::clone(&fault);
+        let member_for_hook = devices[0].clone();
+        let diagnostic = "injected receive dnode read failure";
+        let mut error = Some(if corruption {
+            FfsError::Corruption {
+                block: table_offset,
+                detail: diagnostic.into(),
+            }
+        } else {
+            FfsError::Io(std::io::Error::other(diagnostic))
+        });
+        receiver.with_fault_hook(move |event| {
+            if event.operation == "recv_begin" && event.stage == ZfsPersistenceStage::AckPublished {
+                *checkpoint_for_hook.lock().unwrap() = Some((
+                    event.txg,
+                    member_for_hook.write_calls(),
+                    member_for_hook.durable_snapshot(),
+                ));
+                *fault_for_hook.lock().unwrap() = Some((table_offset, error.take().unwrap()));
+            }
+            Ok(())
+        });
+        let mut receive = ZfsRecvRequest::new(destination.clone());
+        receive.resumable = true;
+        match receiver.receive_stream(&cx, &receive, &mut Cursor::new(&probe)) {
+            ZfsTxOutcome::NotCommitted(error) => assert!(
+                error.to_string().contains(diagnostic),
+                "{case}: original metadata read error was replaced: {error}"
+            ),
+            outcome => panic!("{case}: unreadable dnode was accepted: {outcome:?}"),
+        }
+        assert!(fault.lock().unwrap().is_none(), "{case}: fault not reached");
+        let (checkpoint_txg, checkpoint_writes, checkpoint_media) =
+            checkpoint.lock().unwrap().take().unwrap();
+        assert_eq!(receiver.committed_txg(), checkpoint_txg, "{case}");
+        assert_eq!(devices[0].write_calls(), checkpoint_writes, "{case}");
+        assert_eq!(devices[0].durable_snapshot(), checkpoint_media, "{case}");
+
+        // Reopen only durable bytes: failed preparation must leave the original
+        // head and the zero-progress receive checkpoint usable and abortable.
+        let fresh_devices: Vec<_> = devices
+            .iter()
+            .map(FaultableMemberDevice::fresh_from_durable)
+            .collect();
+        let mut fresh = open_engine_on_devices(
+            &cx,
+            &fresh_devices,
+            default_write_opts(target.pool_guid, receiver.committed_slot()),
+        )
+        .unwrap();
+        let state = fresh
+            .inspect_receive_resume_state(&cx, &destination)
+            .unwrap()
+            .unwrap();
+        assert_eq!((state.object, state.offset, state.bytes), (0, 0, 0));
+        assert!(state.is_pct_recv_child);
+        let mut fresh_mos = fresh.open_read_objects(&cx).unwrap();
+        assert_eq!(
+            fresh_mos
+                .zpl(&cx, &destination)
+                .unwrap()
+                .read(&cx, 4, 0, before.len())
+                .unwrap(),
+            before
+        );
+        assert_eq!(fresh_mos.snapshots(&cx, &destination).unwrap().len(), 1);
+        fresh
+            .abort_receive(&cx, &destination)
+            .into_result()
+            .unwrap();
+        // Without a read error the absent FREEOBJECTS slot remains a legal
+        // no-op; the other cases retry the complete original incremental.
+        let recovery = if case == "freeobjects" {
+            &probe
+        } else {
+            &incremental
+        };
+        fresh
+            .receive_stream(&cx, &receive, &mut Cursor::new(recovery))
+            .into_result()
+            .unwrap();
+        let expected = if case == "freeobjects" { &before } else { &after };
+        let mut fresh_mos = fresh.open_read_objects(&cx).unwrap();
+        assert_eq!(
+            fresh_mos
+                .zpl(&cx, &destination)
+                .unwrap()
+                .read(&cx, 4, 0, expected.len())
+                .unwrap(),
+            *expected
+        );
+        assert!(
+            fresh_mos
+                .zpl(&cx, &destination)
+                .unwrap()
+                .scrub(&cx, ScrubLimits::default())
+                .unwrap()
+                .is_clean()
+        );
+        assert!(
+            fresh
+                .inspect_receive_resume_state(&cx, &destination)
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn incremental_receive_dnode_io_failure_preserves_checkpoint() {
+    assert_receive_dnode_read_failure_preserves_checkpoint(false);
+}
+
+#[test]
+fn incremental_receive_dnode_corruption_preserves_checkpoint() {
+    assert_receive_dnode_read_failure_preserves_checkpoint(true);
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn malformed_plain_compressed_records_preserve_the_last_durable_checkpoint() {

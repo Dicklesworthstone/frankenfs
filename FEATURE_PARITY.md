@@ -3985,3 +3985,25 @@ execution environment became unavailable. The direct GitHub commit records the
 emergency gate bypass. These authored storage-model tests are not mounted FUSE,
 native OpenZFS interchange or device power-loss qualification, and the broad
 ZFS delivery beads remain open.
+
+## ZFS receive dnode lookup error propagation
+
+Receive chunk preparation now distinguishes a genuinely absent dnode from a
+failed read in three paths: OBJECT replacement, lazy draft loading for WRITE
+and related records, and FREEOBJECTS. Only `NotFound` retains the previous
+missing-object behavior; I/O, corruption and cancellation errors propagate
+instead of being converted into an absent object or skipped free.
+
+Two authored integration tests cover I/O and corruption across all three
+lookups. Each arms a one-shot dnode-table fault only after the durable
+`recv_begin` acknowledgment, checks the original diagnostic and unchanged
+checkpoint/TXG/write count/media, then reopens durable bytes, checks the original
+head and zero-progress resume state, aborts and retries. The FREEOBJECTS control
+also requires a truly absent slot to remain a legal no-op.
+
+Qualification is **source review only**: formatting, compiler, strict Clippy and
+runtime validation remain unverified because the execution environment is
+unavailable. The direct GitHub commit records the emergency gate bypass. This
+bounded correction does not address sparse-range traversal, finite FREE edge
+zeroing, receive-begin target lookup error handling, or native interchange
+qualification, and does not close the broad receive/ZFS feature beads.

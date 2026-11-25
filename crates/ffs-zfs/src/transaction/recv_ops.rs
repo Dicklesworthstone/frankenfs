@@ -2831,7 +2831,7 @@ impl ZfsTransactionEngine {
                     if drafts.contains_key(&obj_id) {
                         return Ok(());
                     }
-                    let existing = read_staged_or_committed_dnode(
+                    let dn = match read_staged_or_committed_dnode(
                         cx,
                         os_view,
                         &old_meta,
@@ -2839,13 +2839,14 @@ impl ZfsTransactionEngine {
                         meta_dirty,
                         obj_id,
                         order,
-                    )
-                    .ok()
-                    .map(|(dn, _)| dn);
-                    let Some(dn) = existing else {
-                        return Err(corrupt(format!(
-                            "receive stream referenced unknown object {obj_id}"
-                        )));
+                    ) {
+                        Ok((dn, _)) => dn,
+                        Err(FfsError::NotFound(_)) => {
+                            return Err(corrupt(format!(
+                                "receive stream referenced unknown object {obj_id}"
+                            )));
+                        }
+                        Err(error) => return Err(error),
                     };
                     let preserved_raw_bonus = if stage_cloned.is_raw_encrypted {
                         let meta_bid = obj_id / 32;
@@ -2908,7 +2909,7 @@ impl ZfsTransactionEngine {
                             }
                         }
                         RecvOp::Object { rec, bonus } => {
-                            let existing = read_staged_or_committed_dnode(
+                            let existing = match read_staged_or_committed_dnode(
                                 cx,
                                 &mut os_view,
                                 &old_meta,
@@ -2916,9 +2917,11 @@ impl ZfsTransactionEngine {
                                 &meta_dirty_blocks,
                                 rec.object,
                                 order,
-                            )
-                            .ok()
-                            .map(|(dn, _)| dn);
+                            ) {
+                                Ok((dn, _)) => Some(dn),
+                                Err(FfsError::NotFound(_)) => None,
+                                Err(error) => return Err(error),
+                            };
                             let slots = usize::from(rec.dn_slots.max(1));
                             let ind_shift = if (10..=17).contains(&rec.indblkshift) {
                                 rec.indblkshift
@@ -2982,7 +2985,7 @@ impl ZfsTransactionEngine {
                                 .ok_or_else(|| corrupt("DRR_FREEOBJECTS overflow"))?;
                             for obj_id in f.firstobj..end {
                                 drafts.remove(&obj_id);
-                                if let Ok((dn, dn_ceil)) = read_staged_or_committed_dnode(
+                                let (dn, dn_ceil) = match read_staged_or_committed_dnode(
                                     cx,
                                     &mut os_view,
                                     &old_meta,
@@ -2991,28 +2994,31 @@ impl ZfsTransactionEngine {
                                     obj_id,
                                     order,
                                 ) {
-                                    collect_non_hole_bps_from(
-                                        cx,
-                                        &mut os_view,
-                                        &dn,
-                                        dn_ceil,
-                                        0,
-                                        true,
-                                        &mut retired_bps,
-                                    )?;
-                                    if let Some(sbp) = dn.spill() {
-                                        retired_bps.push(sbp.clone());
-                                    }
-                                    remove_dnode_from_table(
-                                        cx,
-                                        &mut os_view,
-                                        &old_meta,
-                                        old_meta_ceil,
-                                        &mut meta_dirty_blocks,
-                                        obj_id,
-                                        order,
-                                    )?;
+                                    Ok(existing) => existing,
+                                    Err(FfsError::NotFound(_)) => continue,
+                                    Err(error) => return Err(error),
+                                };
+                                collect_non_hole_bps_from(
+                                    cx,
+                                    &mut os_view,
+                                    &dn,
+                                    dn_ceil,
+                                    0,
+                                    true,
+                                    &mut retired_bps,
+                                )?;
+                                if let Some(sbp) = dn.spill() {
+                                    retired_bps.push(sbp.clone());
                                 }
+                                remove_dnode_from_table(
+                                    cx,
+                                    &mut os_view,
+                                    &old_meta,
+                                    old_meta_ceil,
+                                    &mut meta_dirty_blocks,
+                                    obj_id,
+                                    order,
+                                )?;
                             }
                         }
                         RecvOp::Write { rec, payload } => {
