@@ -59,7 +59,7 @@ fn creation_refuses_modes_that_would_broaden_access_without_native_changes() {
         let cx = Cx::for_testing();
         let mut scope = RequestScope::empty();
         let before = raw_image(&directory);
-        for mode in [0, 0o600, 0o640, 0o440, 0o1644, 0o4644, 0o040644] {
+        for mode in [0, 0o600, 0o640, 0o440, 0o1644, 0o4644, 0o040_644] {
             expect_errno(
                 fs.create(
                     &cx,
@@ -73,7 +73,7 @@ fn creation_refuses_modes_that_would_broaden_access_without_native_changes() {
                 libc::EOPNOTSUPP,
             );
         }
-        for mode in [0, 0o700, 0o750, 0o550, 0o1755, 0o2755, 0o100755] {
+        for mode in [0, 0o700, 0o750, 0o550, 0o1755, 0o2755, 0o100_755] {
             expect_errno(
                 fs.mkdir(
                     &cx,
@@ -106,7 +106,7 @@ fn creation_preserves_representable_modes_and_native_directory_read_only_bit() {
         for (name, mode, expected) in [
             ("NORMAL.BIN", 0o644, 0o644),
             ("PUBLIC.BIN", 0o666, 0o644),
-            ("READONLY.BIN", 0o100444, 0o444),
+            ("READONLY.BIN", 0o100_444, 0o444),
         ] {
             let attr = fs
                 .create(&cx, &mut scope, ROOT, OsStr::new(name), mode, 1000, 1000)
@@ -119,7 +119,7 @@ fn creation_preserves_representable_modes_and_native_directory_read_only_bit() {
         for (name, mode, expected) in [
             ("NORMAL", 0o755, 0o755),
             ("PUBLIC", 0o777, 0o755),
-            ("READONLY", 0o040555, 0o555),
+            ("READONLY", 0o040_555, 0o555),
         ] {
             let attr = fs
                 .mkdir(&cx, &mut scope, ROOT, OsStr::new(name), mode, 1000, 1000)

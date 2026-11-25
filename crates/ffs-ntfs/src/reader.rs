@@ -2,6 +2,7 @@
 
 pub mod allocation;
 mod attributes;
+pub use attributes::AttributeSet;
 pub mod check;
 mod compression;
 pub mod ea;

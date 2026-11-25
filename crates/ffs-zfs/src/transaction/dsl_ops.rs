@@ -6482,7 +6482,7 @@ fn stage_change_key(
     pbkdf2_iters: Option<u64>,
     extra_entropy: &[u8],
     mos_dirty_dnodes: &mut BTreeMap<u64, Vec<u8>>,
-    features: &mut MosFeatureState,
+    features: &MosFeatureState,
     alloc: &mut PoolSpaceAllocator,
     order: Endian,
     new_txg: u64,

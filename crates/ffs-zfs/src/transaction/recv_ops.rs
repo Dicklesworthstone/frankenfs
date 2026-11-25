@@ -1468,14 +1468,8 @@ impl ZfsTransactionEngine {
                             FfsError::Format("DRR_OBJECT cannot target object 0".into()),
                         );
                     }
-                    let bonus_type = match u8::try_from(o.bonus_type) {
-                        Ok(kind) => kind,
-                        Err(_) => {
-                            return cleanup_on_abort(
-                                self,
-                                corrupt("DRR_OBJECT bonus type overflow"),
-                            );
-                        }
+                    let Ok(bonus_type) = u8::try_from(o.bonus_type) else {
+                        return cleanup_on_abort(self, corrupt("DRR_OBJECT bonus type overflow"));
                     };
                     if u8::try_from(o.object_type).is_err() || o.object_type == 0 {
                         return cleanup_on_abort(self, corrupt("invalid DRR_OBJECT type"));
@@ -1491,12 +1485,12 @@ impl ZfsTransactionEngine {
                     {
                         return cleanup_on_abort(self, error);
                     }
-                    if !is_raw && o.bonuslen != 0 {
-                        if let Err(error) =
+                    if !is_raw
+                        && o.bonuslen != 0
+                        && let Err(error) =
                             validate_received_plain_order(bonus_type, stream_order, self.order)
-                        {
-                            return cleanup_on_abort(self, error);
-                        }
+                    {
+                        return cleanup_on_abort(self, error);
                     }
                     // Native dnode overrides are limited to legacy checksums.
                     // Newer algorithms remain valid on individual DRR_WRITE BPs.
@@ -3457,8 +3451,10 @@ impl ZfsTransactionEngine {
                             existing: Some((&old_meta, old_meta_ceil)),
                             object_type: DMU_OT_DNODE,
                             bonus_type: 0,
-                            checksum_type: raw_meta.map_or(old_meta.checksum_type(), |meta| meta.checksum),
-                            compress_type: raw_meta.map_or(old_meta.compress_type(), |meta| meta.compression),
+                            checksum_type: raw_meta
+                                .map_or_else(|| old_meta.checksum_type(), |meta| meta.checksum),
+                            compress_type: raw_meta
+                                .map_or_else(|| old_meta.compress_type(), |meta| meta.compression),
                             user_flags: 0,
                             indirect_shift: old_meta.indirect_shift(),
                             data_bytes: DNODE_BLOCK_BYTES,
@@ -3476,7 +3472,12 @@ impl ZfsTransactionEngine {
                         0,
                         stage_cloned.compression,
                         None,
-                        raw_enc_ver.map(|v| (v, raw_meta.map_or(old_meta.levels(), |meta| meta.levels))),
+                        raw_enc_ver.map(|v| {
+                            (
+                                v,
+                                raw_meta.map_or_else(|| old_meta.levels(), |meta| meta.levels),
+                            )
+                        }),
                         staged_writes,
                     )?;
                     born_space.add_assign(meta_out.born)?;

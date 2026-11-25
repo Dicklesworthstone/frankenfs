@@ -123,7 +123,7 @@ fn create_open_pins_survive_unlink_until_cancelled_last_release() {
                 &mut scope,
                 ROOT,
                 OsStr::new("CREATED.BIN"),
-                0o100644,
+                0o100_644,
                 1000,
                 1000,
                 libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,

@@ -33,7 +33,7 @@ impl AttributeSet<'_> {
         self.extensions.keys().copied()
     }
 
-    pub(crate) fn all(&self) -> Result<Vec<NtfsAttribute<'_>>> {
+    pub fn all(&self) -> Result<Vec<NtfsAttribute<'_>>> {
         let mut result = Vec::new();
         for record in std::iter::once(self.base).chain(self.extensions.values()) {
             result.extend(
@@ -138,11 +138,7 @@ impl NtfsVolume {
         Ok(result)
     }
 
-    pub(crate) fn attributes<'a>(
-        &self,
-        cx: &Cx,
-        base: &'a NtfsFileRecord,
-    ) -> Result<AttributeSet<'a>> {
+    pub fn attributes<'a>(&self, cx: &Cx, base: &'a NtfsFileRecord) -> Result<AttributeSet<'a>> {
         let list = read_list(&self.source, &self.geometry, cx, base)?;
         resolve_catalog(cx, &self.geometry, base, list.as_deref(), |reference| {
             self.record(cx, reference.record, Some(reference.sequence))

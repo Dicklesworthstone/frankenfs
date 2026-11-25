@@ -540,8 +540,8 @@ struct StagedEdit<'a> {
     undo_bytes: usize,
 }
 
-fn staged_block_bytes(block: &Option<Vec<u8>>) -> usize {
-    STAGED_BLOCK_METADATA_BYTES.saturating_add(block.as_ref().map_or(0, Vec::capacity))
+fn staged_block_bytes(block: Option<&Vec<u8>>) -> usize {
+    STAGED_BLOCK_METADATA_BYTES.saturating_add(block.map_or(0, Vec::capacity))
 }
 
 fn writeback_budget_exhausted() -> FfsError {
@@ -564,7 +564,7 @@ impl<'a> StagedEdit<'a> {
 
     fn replace(&mut self, id: u64, block: Option<Vec<u8>>) -> Result<()> {
         let previous = self.blocks.get(&id);
-        let old_bytes = previous.map_or(0, staged_block_bytes);
+        let old_bytes = previous.map_or(0, |b| staged_block_bytes(b.as_ref()));
         let retained = previous.and_then(Option::as_ref).map_or(0, Vec::capacity);
         let undo_bytes = self
             .undo_bytes
@@ -573,7 +573,7 @@ impl<'a> StagedEdit<'a> {
         let staged_bytes = self
             .bytes
             .checked_sub(old_bytes)
-            .and_then(|bytes| bytes.checked_add(staged_block_bytes(&block)))
+            .and_then(|bytes| bytes.checked_add(staged_block_bytes(block.as_ref())))
             .ok_or_else(writeback_budget_exhausted)?;
         if self.undo.len() >= MAX_STAGED_REQUEST_BLOCKS
             || undo_bytes > MAX_STAGED_UNDO_BYTES
@@ -2265,7 +2265,10 @@ mod tests {
     fn writeback_holes_trigger_pressure_and_rollback_keeps_the_prior_cache() {
         let count = MAX_STAGED_VOLATILE_BYTES / STAGED_BLOCK_METADATA_BYTES - 2;
         let mut blocks: BTreeMap<_, _> = (0..count as u64).map(|id| (id, None)).collect();
-        let mut bytes = blocks.values().map(staged_block_bytes).sum();
+        let mut bytes = blocks
+            .values()
+            .map(|b| staged_block_bytes(b.as_ref()))
+            .sum();
         let original_bytes = bytes;
         {
             let mut edit = StagedEdit::new(&mut blocks, &mut bytes);
@@ -2287,7 +2290,10 @@ mod tests {
         original.resize(512, 0x73);
         let capacity = original.capacity();
         let mut blocks = BTreeMap::from([(7, Some(original)), (8, None)]);
-        let mut bytes = blocks.values().map(staged_block_bytes).sum();
+        let mut bytes = blocks
+            .values()
+            .map(|b| staged_block_bytes(b.as_ref()))
+            .sum();
         let original_bytes = bytes;
         let mut rejected = false;
         {
@@ -2322,7 +2328,10 @@ mod tests {
     #[test]
     fn writeback_command_entry_limit_rejects_without_leaking_partial_tombstones() {
         let mut blocks = BTreeMap::from([(u64::MAX, Some(vec![0x19; 512]))]);
-        let mut bytes = blocks.values().map(staged_block_bytes).sum();
+        let mut bytes = blocks
+            .values()
+            .map(|b| staged_block_bytes(b.as_ref()))
+            .sum();
         let original_bytes = bytes;
         {
             let mut edit = StagedEdit::new(&mut blocks, &mut bytes);
