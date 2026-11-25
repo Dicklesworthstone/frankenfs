@@ -230,6 +230,7 @@ fn workflows_have_tracked_nonempty_baselines_and_zero_vacuous_patterns() {
         "--example native_reader",
         "test_ffs_inspect_sandbox.py",
         "ffs_inspect_sandbox_native_e2e.sh",
+        "verify_fat_read.py",
         "verify_ntfs_read.py",
         "verify_ntfs_mount.py",
         "verify_zfs_root.py",
