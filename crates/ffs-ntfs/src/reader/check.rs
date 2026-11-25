@@ -408,42 +408,14 @@ pub fn check_volume_device(
         scope_note: "Native non-mutating NTFS 3.0/3.1 structural checker (not Windows chkdsk; zero writes/syncs issued)",
     };
 
-    // Check trailing backup boot sector (NTFS places it at sector `total_sectors`,
-    // i.e. byte `volume_bytes`, or the final sector `length - sector_bytes`).
-    let sec_u64 = u64::from(geometry.sector_bytes());
-    if length >= geometry.volume_bytes().saturating_add(sec_u64) {
-        let backup_rel = length - sec_u64;
-        report.backup_boot_present = true;
-        report.backup_boot_offset = Some(backup_rel);
-        let mut backup_sector = vec![0_u8; sector_len];
-        guarded.read_exact_at(cx, ByteOffset(base + backup_rel), &mut backup_sector)?;
-        let matches = backup_sector == vbr_sector;
-        report.backup_boot_matches = Some(matches);
-        if !matches {
-            report.push_issue(
-                NtfsCheckCategory::Boot,
-                "backup_boot_mismatch",
-                None,
-                None,
-                format!(
-                    "trailing backup boot sector at relative offset {backup_rel} disagrees with primary VBR"
-                ),
-            );
-        }
-    } else {
-        report.backup_boot_present = false;
-        report.backup_boot_matches = None;
-        report.push_issue(
-            NtfsCheckCategory::Boot,
-            "backup_boot_missing",
-            None,
-            None,
-            format!(
-                "backing length ({length}) equals volume_bytes ({}) without room for trailing backup boot sector",
-                geometry.volume_bytes()
-            ),
-        );
-    }
+    check_backup_boot(
+        cx,
+        guarded.as_ref(),
+        base,
+        &vbr_sector,
+        &geometry,
+        &mut report,
+    )?;
 
     // Open NtfsVolume in read-only check mode (permits reading dirty flags without overlay).
     let boxed_guard: Box<dyn ByteDevice> = Box::new(ReadOnlyAssertDevice {
@@ -488,6 +460,72 @@ pub fn check_volume_device(
     report.sync_calls = syncs.load(Ordering::Relaxed);
     report.finalize_status();
     Ok(report)
+}
+
+fn check_backup_boot(
+    cx: &Cx,
+    device: &dyn ByteDevice,
+    base: u64,
+    primary: &[u8],
+    geometry: &NtfsGeometry,
+    report: &mut NtfsCheckReport,
+) -> Result<()> {
+    let sector = u64::from(geometry.sector_bytes());
+    let cluster = u64::from(geometry.cluster_bytes());
+    let first = geometry.volume_bytes();
+    let available = (report.backing_bytes - first) / sector;
+    if available == 0 {
+        report.push_issue(
+            NtfsCheckCategory::Boot,
+            "backup_boot_missing",
+            None,
+            None,
+            format!("no complete backup boot sector after volume_bytes ({first})"),
+        );
+        return Ok(());
+    }
+
+    // mkntfs places the copy immediately after the declared sectors. ntfsresize
+    // can round the declared size down to a cluster while writing the copy to
+    // the actual partition end. Never treat an arbitrary container end as NTFS.
+    let candidates = if first.is_multiple_of(cluster) {
+        available.min(cluster / sector)
+    } else {
+        1
+    };
+    let mut backup = vec![0_u8; primary.len()];
+    for i in 0..candidates {
+        let offset = first + i * sector;
+        device.read_exact_at(cx, ByteOffset(base + offset), &mut backup)?;
+        if backup == primary {
+            report.backup_boot_present = true;
+            report.backup_boot_matches = Some(true);
+            report.backup_boot_offset = Some(offset);
+            return Ok(());
+        }
+    }
+    report.backup_boot_matches = Some(false);
+    if candidates == 1 {
+        report.backup_boot_present = true;
+        report.backup_boot_offset = Some(first);
+        report.push_issue(
+            NtfsCheckCategory::Boot,
+            "backup_boot_mismatch",
+            None,
+            None,
+            format!("backup boot sector at relative offset {first} disagrees with primary VBR"),
+        );
+    } else {
+        report.push_issue(
+            NtfsCheckCategory::Boot,
+            "backup_boot_location_ambiguous",
+            None,
+            None,
+            "no matching backup in the final partial cluster; cannot identify a repair target"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 fn empty_report(length: u64, writes: &AtomicU64, syncs: &AtomicU64) -> NtfsCheckReport {

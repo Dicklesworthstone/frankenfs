@@ -25,7 +25,6 @@ use std::sync::Arc;
 use asupersync::Cx;
 use ffs_block::ByteDevice;
 use ffs_error::{FfsError, Result};
-use ffs_ondisk::ntfs::{NtfsBootSectorSpec, encode_ntfs_boot_sector};
 use ffs_types::ByteOffset;
 use serde::Serialize;
 
@@ -429,33 +428,9 @@ pub fn run_resize(
     relocator::rewrite_metadata(cx, &out_dev, &plan)?;
     invoke_hook(hook, NtfsResizeStage::MetadataRewritten)?;
 
-    // Encode new primary/backup VBR sector (updating total_sectors, mft_cluster, mirror_cluster).
-    let hidden_sectors = if plan.source_vbr.len() >= 32 {
-        u32::from_le_bytes([
-            plan.source_vbr[28],
-            plan.source_vbr[29],
-            plan.source_vbr[30],
-            plan.source_vbr[31],
-        ])
-    } else {
-        0
-    };
-    let new_vbr = encode_ntfs_boot_sector(&NtfsBootSectorSpec {
-        sector_bytes: plan.public.sector_bytes,
-        sectors_per_cluster: plan.sectors_per_cluster,
-        total_sectors: plan.new_total_sectors,
-        mft_cluster: plan.public.new_mft_cluster,
-        mirror_cluster: plan.public.new_mirror_cluster,
-        record_bytes: plan.record_bytes,
-        index_bytes: plan.index_bytes,
-        serial: plan.serial,
-        hidden_sectors,
-    })
-    .map_err(|e| FfsError::Format(e.to_string()))?;
-
     // Write trailing backup boot sector and sync before pre-publication verification.
     let backup_off = plan.public.new_backing_bytes - u64::from(plan.public.sector_bytes);
-    out_dev.write_all_at(cx, ByteOffset(backup_off), &new_vbr)?;
+    out_dev.write_all_at(cx, ByteOffset(backup_off), &plan.new_vbr)?;
     out_dev.sync(cx)?;
     invoke_hook(hook, NtfsResizeStage::BackupBootWritten)?;
 
@@ -472,7 +447,7 @@ pub fn run_resize(
     // Pre-publication verification over candidate VBR overlay + full output readback BLAKE3.
     let overlay: Arc<dyn ByteDevice> = Arc::new(CandidateBootOverlayDevice::new(
         Arc::clone(&out_dev),
-        new_vbr.clone(),
+        plan.new_vbr.clone(),
     ));
     let check = check_volume_device(
         cx,
@@ -504,7 +479,7 @@ pub fn run_resize(
     )?;
 
     // Publish primary VBR at offset 0 and sync durably!
-    out_dev.write_all_at(cx, ByteOffset(0), &new_vbr)?;
+    out_dev.write_all_at(cx, ByteOffset(0), &plan.new_vbr)?;
     invoke_hook(hook, NtfsResizeStage::PrimaryBootPublished)?;
     out_dev.sync(cx)?;
     sync_parent_dir(&opts.output);
