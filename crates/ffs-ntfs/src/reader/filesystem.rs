@@ -1437,7 +1437,8 @@ impl FsOps for NtfsFs {
             self.record(cx, ino)?;
         }
         self.sync_device_locked(cx)?;
-        checkpoint(cx)?;
+        // A completed barrier must not become a retryable cancellation.
+        // The request's pending cancellation remains visible to its caller.
         op.complete(())
     }
 
@@ -1448,7 +1449,8 @@ impl FsOps for NtfsFs {
         }
         let op = self.operation(cx, true)?;
         self.sync_device_locked(cx)?;
-        checkpoint(cx)?;
+        // A completed barrier must not become a retryable cancellation.
+        // The request's pending cancellation remains visible to its caller.
         op.complete(())
     }
 
@@ -1472,7 +1474,8 @@ impl FsOps for NtfsFs {
             return Err(FfsError::NotDirectory);
         }
         self.sync_device_locked(cx)?;
-        checkpoint(cx)?;
+        // A completed barrier must not become a retryable cancellation.
+        // The request's pending cancellation remains visible to its caller.
         op.complete(())
     }
 
@@ -1498,7 +1501,8 @@ impl FsOps for NtfsFs {
         let op = self.operation(cx, true)?;
         self.reap_all_retained_locked(cx)?;
         self.sync_device_locked(cx)?;
-        checkpoint(cx)?;
+        // A completed barrier must not become a retryable cancellation.
+        // The request's pending cancellation remains visible to its caller.
         op.complete(())
     }
 

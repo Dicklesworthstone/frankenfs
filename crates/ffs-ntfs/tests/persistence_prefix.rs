@@ -1098,6 +1098,90 @@ fn writable_fsops_preserve_success_when_cancelled_after_native_commit() {
 }
 
 #[test]
+fn writable_sync_boundaries_preserve_completed_barriers_and_real_failures() {
+    use ffs_core::{FsOps, RequestScope};
+    use ffs_types::InodeNumber;
+    use std::ffi::OsStr;
+
+    for boundary in ["fsync", "fsyncdir", "sync_fs", "periodic_commit", "destroy"] {
+        for fail_sync in [false, true] {
+            let cx = Cx::for_testing();
+            let image = build_clean_ntfs_image(256, 50, 0xF12A_6E17_0000_0052);
+            let length = image.len() as u64 - SECTOR_BYTES as u64;
+            let device = FaultInjectingNtfsDevice::new(image);
+            let mut engine = NtfsTransactionEngine::from_device(
+                &cx,
+                Arc::clone(&device) as Arc<dyn ByteDevice>,
+                0,
+                length,
+                write_options_clean(),
+            )
+            .unwrap();
+            engine
+                .create_file(&cx, "/", "saved", b"durable payload")
+                .into_result()
+                .unwrap();
+            let fs = ffs_ntfs::NtfsFs::from_engine(&cx, engine, 1000, 1000).unwrap();
+            let mut scope = RequestScope::empty();
+            let root = InodeNumber(1);
+            let file = fs
+                .lookup(&cx, &mut scope, root, OsStr::new("saved"))
+                .unwrap();
+            let before = device.snapshot_durable_only();
+            device.set_fail_sync_call(fail_sync.then_some(1));
+            device.state.lock().unwrap().cancel_after_sync = true;
+
+            let sync = |request: &Cx| {
+                let mut scope = RequestScope::empty();
+                match boundary {
+                    "fsync" => fs.fsync(request, &mut scope, file.ino, 0, false),
+                    "fsyncdir" => fs.fsyncdir(request, &mut scope, root, 0, false),
+                    "sync_fs" => fs.sync_fs(request, &mut scope),
+                    "periodic_commit" => fs.periodic_commit(request).map(|_| ()),
+                    "destroy" => fs.flush_on_destroy(request),
+                    _ => unreachable!(),
+                }
+            };
+
+            // Cancellation before admission must not enter the device or poison
+            // the mount. The same mounted filesystem then exercises its barrier.
+            let cancelled = Cx::for_testing();
+            cancelled.set_cancel_requested(true);
+            assert!(matches!(sync(&cancelled), Err(FfsError::Cancelled)));
+            assert_eq!(device.state.lock().unwrap().sync_calls, 0, "{boundary}");
+            let result = sync(&cx);
+            assert_eq!(device.state.lock().unwrap().sync_calls, 1, "{boundary}");
+            assert!(cx.checkpoint().is_err(), "cancellation remains pending");
+            assert_eq!(device.snapshot_durable_only(), before, "{boundary}");
+
+            let next = Cx::for_testing();
+            if fail_sync {
+                assert_eq!(result.unwrap_err().to_errno(), libc::EIO, "{boundary}");
+                assert!(
+                    fs.getattr(&next, &mut scope, file.ino).is_err(),
+                    "{boundary}"
+                );
+                assert!(fs.sync_fs(&next, &mut scope).is_err(), "{boundary}");
+            } else {
+                result.unwrap_or_else(|error| panic!("completed {boundary}: {error}"));
+                assert_eq!(
+                    fs.read(&next, &mut scope, file.ino, 0, 64).unwrap(),
+                    b"durable payload",
+                    "{boundary}"
+                );
+                device.state.lock().unwrap().cancel_after_sync = false;
+                fs.sync_fs(&next, &mut scope).unwrap();
+                assert_eq!(
+                    read_all_files_from_clean_volume(&device.snapshot_durable_only())["/saved"],
+                    b"durable payload",
+                    "{boundary}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn direct_native_transactions_defer_protection_through_journal_initialization_and_commit() {
     let cx = Cx::for_testing();
     let image = build_clean_ntfs_image(256, 50, 0xF12A_6E17_0000_0051);
@@ -2071,6 +2155,7 @@ struct FaultState {
     pending: Vec<(u64, Vec<u8>)>,
     sync_calls: usize,
     fail_sync_call: Option<usize>,
+    cancel_after_sync: bool,
     write_bytes_total: u64,
     protection_depth: usize,
     protection_completed: usize,
@@ -2089,6 +2174,7 @@ impl FaultInjectingNtfsDevice {
                 pending: Vec::new(),
                 sync_calls: 0,
                 fail_sync_call: None,
+                cancel_after_sync: false,
                 write_bytes_total: 0,
                 protection_depth: 0,
                 protection_completed: 0,
@@ -2156,13 +2242,16 @@ impl ByteDevice for FaultInjectingNtfsDevice {
         Ok(())
     }
 
-    fn sync(&self, _cx: &Cx) -> Result<()> {
+    fn sync(&self, cx: &Cx) -> Result<()> {
         let mut st = self.state.lock().unwrap();
         if st.protection_depth == 0 {
             st.unprotected_syncs += 1;
         }
         st.sync_calls += 1;
         if st.fail_sync_call == Some(st.sync_calls) {
+            if st.cancel_after_sync {
+                cx.set_cancel_requested(true);
+            }
             return Err(FfsError::Io(std::io::Error::other(
                 "injected ByteDevice::sync barrier failure",
             )));
@@ -2171,6 +2260,9 @@ impl ByteDevice for FaultInjectingNtfsDevice {
         for (off, bytes) in pending {
             let at = usize::try_from(off).unwrap();
             st.durable[at..at + bytes.len()].copy_from_slice(&bytes);
+        }
+        if st.cancel_after_sync {
+            cx.set_cancel_requested(true);
         }
         Ok(())
     }

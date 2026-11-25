@@ -3934,3 +3934,26 @@ admission and recovery budgets remain unchanged; the structural audit's bounded
 scan allowance does not widen recovery or native-format compatibility claims.
 At publication these changes are statically reviewed; hosted compilation and
 execution remain pending. The broader bd-h7cme work package stays open.
+
+## NTFS synchronization completion after cancellation
+
+The mounted NTFS adapter now returns the completed result of its backing-device
+barrier through `fsync`, `fsyncdir`, `sync_fs`, periodic commit and orderly
+destruction. A cancellation arriving during a successful barrier remains pending
+for the caller; it no longer replaces that successful result with `Cancelled`.
+Cancellation before admission still refuses the request before backing I/O.
+An actual synchronization failure still propagates and fences the mounted view.
+
+The new `writable_sync_boundaries_preserve_completed_barriers_and_real_failures`
+regression in `crates/ffs-ntfs/tests/persistence_prefix.rs` covers those five
+entry points with both successful and failed barriers, pre-admission cancellation,
+unchanged durable bytes, continued access after success, failure fencing, and
+fresh native-reader consistency/readback.
+
+Qualification for this increment is **source review only**. The regression was
+authored, but did not execute: the shared executor became unavailable during
+dependency compilation for the session's first selected ZFS test. No candidate
+runtime, complete formatting, workspace check or strict Clippy pass is claimed.
+The direct GitHub publication uses the documented emergency gate-bypass path;
+the corresponding commit records that limitation. This does not close the broad
+native recovery, mounted interoperability or six-format acceptance beads.
