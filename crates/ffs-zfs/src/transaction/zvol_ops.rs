@@ -41,12 +41,11 @@ use super::dsl_ops::{
     activate_initial_compression_feature, adjust_dsl_crypto_key_refcount, allocate_fresh_deadlist,
     apply_properties_batch_on_ids, bump_filesystem_limits_counter_if_present,
     dataset_feature_entries, derive_fsid_guid, derive_unique_guid,
-    effective_compression_for_new_dataset, effective_local_numeric_prop,
-    enforce_dataset_quotas_for_growth, enforce_pool_reservations_for_growth,
-    link_dataset_to_origin_snapshot, lookup_pool_origin_snapshot, propagate_dsl_dir_space_delta,
-    put_new_dsl_dir_in_mos, reject_einval, require_filesystem_parent, resolve_dataset_ids,
-    stage_activate_dataset_features, stage_create_snapshot, stage_destroy_dataset,
-    validate_dsl_component, write_zap_dnode_in_mos,
+    effective_compression_for_new_dataset, enforce_dataset_quotas_for_growth,
+    enforce_pool_reservations_for_growth, link_dataset_to_origin_snapshot,
+    lookup_pool_origin_snapshot, propagate_dsl_dir_space_delta, put_new_dsl_dir_in_mos,
+    reject_einval, require_filesystem_parent, resolve_dataset_ids, stage_activate_dataset_features,
+    stage_create_snapshot, stage_destroy_dataset, validate_dsl_component, write_zap_dnode_in_mos,
 };
 use super::zpl_ops::ZfsDataChecksum;
 use super::{
@@ -452,36 +451,6 @@ fn finalize_zvol_to_mos(
         }
     }
 
-    let ref_add = born
-        .dsize
-        .saturating_sub(killed_free.dsize + killed_snap.dsize);
-    let used_add = born.dsize.saturating_sub(killed_free.dsize);
-    if ref_add > 0 || used_add > 0 {
-        enforce_dataset_quotas_for_growth(
-            cx,
-            mos,
-            mos_dirty_dnodes,
-            ctx.head_object,
-            ctx.directory_object,
-            ref_add,
-            used_add,
-            order,
-        )?;
-        if used_add > 0 {
-            enforce_pool_reservations_for_growth(
-                cx,
-                mos,
-                mos_dirty_dnodes,
-                ctx.head_object,
-                ctx.directory_object,
-                used_add,
-                0,
-                alloc.total_free_bytes(),
-                order,
-            )?;
-        }
-    }
-
     if !snap_bps.is_empty() {
         enqueue_into_dataset_deadlist(
             cx,
@@ -499,73 +468,18 @@ fn finalize_zvol_to_mos(
         )?;
     }
 
-    // 3. Update MOS `dsl_dataset` (`head_object`) and `dsl_dir` ancestor accounting.
-    let mos_meta = mos.meta_dnode().clone();
-    let mos_ceiling = mos.root_birth_txg();
-    let (head_dn, _) = read_staged_or_committed_dnode(
+    super::dsl_ops::stage_head_space(
         cx,
         mos,
-        &mos_meta,
-        mos_ceiling,
         mos_dirty_dnodes,
         ctx.head_object,
+        ctx.directory_object,
+        &new_os_bp,
+        born,
+        killed_free,
+        killed_snap,
+        alloc.total_free_bytes(),
         order,
-    )?;
-    let mut head_bonus = head_dn.bonus().to_vec();
-    let old_unique = order.u64(&head_bonus, 96).map_err(|e| parse_err(&e))?;
-    let apply_u64_delta =
-        |buf: &mut [u8], at: usize, add: u64, sub: u64, label: &'static str| -> Result<u64> {
-            let cur = order.u64(buf, at).map_err(|e| parse_err(&e))?;
-            let next = cur
-                .checked_add(add)
-                .and_then(|v| v.checked_sub(sub))
-                .ok_or_else(|| corrupt(format!("{label} accounting underflow/overflow")))?;
-            buf[at..at + 8].copy_from_slice(&order.encode(next));
-            Ok(next)
-        };
-
-    apply_u64_delta(
-        &mut head_bonus,
-        72,
-        born.dsize,
-        killed_free.dsize + killed_snap.dsize,
-        "ds_referenced_bytes",
-    )?;
-    apply_u64_delta(
-        &mut head_bonus,
-        80,
-        born.comp,
-        killed_free.comp + killed_snap.comp,
-        "ds_compressed_bytes",
-    )?;
-    apply_u64_delta(
-        &mut head_bonus,
-        88,
-        born.uncomp,
-        killed_free.uncomp + killed_snap.uncomp,
-        "ds_uncompressed_bytes",
-    )?;
-    let new_unique = apply_u64_delta(
-        &mut head_bonus,
-        96,
-        born.dsize,
-        killed_free.dsize,
-        "ds_unique_bytes",
-    )?;
-    head_bonus[128..256].copy_from_slice(&new_os_bp.encode(order));
-    let mut updated_head = head_dn;
-    let head_btype = updated_head.bonus_type();
-    updated_head
-        .set_bonus_and_spill(head_btype, head_bonus, None)
-        .map_err(|e| parse_err(&e))?;
-    put_dnode_in_table(
-        cx,
-        mos,
-        &mos_meta,
-        mos_ceiling,
-        mos_dirty_dnodes,
-        ctx.head_object,
-        &updated_head,
     )?;
     stage_activate_dataset_features(
         cx,
@@ -578,60 +492,6 @@ fn finalize_zvol_to_mos(
         order,
         new_txg,
         staged_writes,
-    )?;
-
-    // Exact signed delta propagation (supporting both growth and shrink/discard with
-    // thick `refreservation` consumption AND restoration!).
-    let (own_dd_dn, _) = read_staged_or_committed_dnode(
-        cx,
-        mos,
-        &mos_meta,
-        mos_ceiling,
-        mos_dirty_dnodes,
-        ctx.directory_object,
-        order,
-    )?;
-    let own_dd_flags = order
-        .u64(own_dd_dn.bonus(), 96)
-        .map_err(|e| parse_err(&e))?;
-    let own_props_zap = order
-        .u64(own_dd_dn.bonus(), 80)
-        .map_err(|e| parse_err(&e))?;
-    let refreservation = if own_dd_flags & DD_FLAG_USED_BREAKDOWN != 0 && own_props_zap != 0 {
-        let rows = mos.zap_values(cx, own_props_zap)?;
-        effective_local_numeric_prop(&rows, "refreservation")?.unwrap_or(0)
-    } else {
-        0
-    };
-    let refrsrv_delta = if own_dd_flags & DD_FLAG_USED_BREAKDOWN != 0 && refreservation > 0 {
-        let old_rr = refreservation.saturating_sub(old_unique);
-        let new_rr = refreservation.saturating_sub(new_unique);
-        i128::from(new_rr) - i128::from(old_rr)
-    } else {
-        0
-    };
-
-    let head_dsize_delta =
-        i128::from(born.dsize) - i128::from(killed_free.dsize) - i128::from(killed_snap.dsize);
-    let snap_dsize_delta = i128::from(killed_snap.dsize);
-    let comp_delta = i128::from(born.comp) - i128::from(killed_free.comp);
-    let uncomp_delta = i128::from(born.uncomp) - i128::from(killed_free.uncomp);
-
-    propagate_dsl_dir_space_delta(
-        cx,
-        mos,
-        &mos_meta,
-        mos_ceiling,
-        mos_dirty_dnodes,
-        ctx.directory_object,
-        head_dsize_delta,
-        snap_dsize_delta,
-        0,
-        0,
-        refrsrv_delta,
-        comp_delta,
-        uncomp_delta,
-        order,
     )?;
 
     Ok(result_val)

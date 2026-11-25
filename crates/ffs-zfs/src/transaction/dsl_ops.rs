@@ -320,10 +320,9 @@ pub(super) fn enforce_dataset_quotas_for_growth(
         .map_err(|e| parse_err(&e))?;
     if ref_add > 0
         && props_zap != 0
-        && let Ok(rows) = mos.zap_values(cx, props_zap)
-        && let Some(rq) = effective_local_numeric_prop(&rows, "refquota")?
+        && let Some(rq) = effective_local_numeric_prop(&mos.zap_values(cx, props_zap)?, "refquota")?
         && rq > 0
-        && cur_ref.saturating_add(ref_add) > rq
+        && ref_add > rq.saturating_sub(cur_ref)
     {
         return Err(reject_edquot("ZFS dataset refquota exceeded"));
     }
@@ -331,7 +330,8 @@ pub(super) fn enforce_dataset_quotas_for_growth(
     if used_add > 0 {
         let mut cur_dir = directory_object;
         let mut seen = BTreeSet::new();
-        while cur_dir != 0 {
+        let mut growth = used_add;
+        while cur_dir != 0 && growth > 0 {
             checkpoint(cx)?;
             if !seen.insert(cur_dir) {
                 return Err(corrupt("cycle in DSL directory ancestry"));
@@ -348,9 +348,13 @@ pub(super) fn enforce_dataset_quotas_for_growth(
             let parent = order.u64(dd_dn.bonus(), 16).map_err(|e| parse_err(&e))?;
             let dd_used = order.u64(dd_dn.bonus(), 40).map_err(|e| parse_err(&e))?;
             let dd_quota = order.u64(dd_dn.bonus(), 64).map_err(|e| parse_err(&e))?;
-            if dd_quota > 0 && dd_used.saturating_add(used_add) > dd_quota {
+            if dd_quota > 0 && growth > dd_quota.saturating_sub(dd_used) {
                 return Err(reject_edquot("ZFS dataset or ancestor quota exceeded"));
             }
+            // The parent already carries max(dd_used, dd_reserved) for this
+            // child. Only growth beyond that commitment reaches the next quota.
+            let dd_reserved = order.u64(dd_dn.bonus(), 72).map_err(|e| parse_err(&e))?;
+            growth = growth.saturating_sub(dd_reserved.saturating_sub(dd_used));
             cur_dir = parent;
         }
     }
@@ -1697,6 +1701,126 @@ fn walk_meta_bp_above_txg(
         if mode == ObjectSetWalkMode::FreeToAllocator {
             alloc.free_block_dvas(bp, new_txg)?;
         }
+    }
+    Ok(())
+}
+
+/// Publish the same space charges for filesystem and volume COW. A snapshot
+/// retains its retired blocks. A refreservation charges only the portion not
+/// already occupied by unique data, both when the head grows and when it shrinks.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn stage_head_space(
+    cx: &Cx,
+    mos: &mut Objects,
+    mos_dirty_dnodes: &mut BTreeMap<u64, Vec<u8>>,
+    head_object: u64,
+    directory_object: u64,
+    new_root: &BlockPointer,
+    born: SpaceDelta,
+    freed: SpaceDelta,
+    retained: SpaceDelta,
+    pool_free_bytes: u64,
+    order: Endian,
+) -> Result<()> {
+    let meta = mos.meta_dnode().clone();
+    let ceiling = mos.root_birth_txg();
+    let (mut head, _) = read_staged_or_committed_dnode(
+        cx,
+        mos,
+        &meta,
+        ceiling,
+        mos_dirty_dnodes,
+        head_object,
+        order,
+    )?;
+    let (dir, _) = read_staged_or_committed_dnode(
+        cx,
+        mos,
+        &meta,
+        ceiling,
+        mos_dirty_dnodes,
+        directory_object,
+        order,
+    )?;
+    let props = order.u64(dir.bonus(), 80).map_err(|e| parse_err(&e))?;
+    let refreservation = if props == 0 {
+        0
+    } else {
+        effective_local_numeric_prop(&mos.zap_values(cx, props)?, "refreservation")?.unwrap_or(0)
+    };
+    let mut bonus = head.bonus().to_vec();
+    let old_unique = order.u64(&bonus, 96).map_err(|e| parse_err(&e))?;
+    let unique_delta = i128::from(born.dsize) - i128::from(freed.dsize);
+    let ref_delta = unique_delta - i128::from(retained.dsize);
+    let comp_delta = i128::from(born.comp) - i128::from(freed.comp);
+    let uncomp_delta = i128::from(born.uncomp) - i128::from(freed.uncomp);
+    for (offset, delta) in [
+        (72, ref_delta),
+        (80, comp_delta - i128::from(retained.comp)),
+        (88, uncomp_delta - i128::from(retained.uncomp)),
+        (96, unique_delta),
+    ] {
+        let old = order.u64(&bonus, offset).map_err(|e| parse_err(&e))?;
+        let new = u64::try_from(i128::from(old) + delta)
+            .map_err(|_| corrupt("DSL dataset space counter underflow/overflow"))?;
+        bonus[offset..offset + 8].copy_from_slice(&order.encode(new));
+    }
+    let new_unique = order.u64(&bonus, 96).map_err(|e| parse_err(&e))?;
+    let reservation_delta = i128::from(refreservation.saturating_sub(new_unique))
+        - i128::from(refreservation.saturating_sub(old_unique));
+    let dir_delta = unique_delta + reservation_delta;
+    enforce_dataset_quotas_for_growth(
+        cx,
+        mos,
+        mos_dirty_dnodes,
+        head_object,
+        directory_object,
+        u64::try_from(ref_delta.max(0)).map_err(|_| corrupt("DSL referenced growth overflow"))?,
+        u64::try_from(dir_delta.max(0)).map_err(|_| corrupt("DSL directory growth overflow"))?,
+        order,
+    )?;
+    bonus[128..256].copy_from_slice(&new_root.encode(order));
+    head.set_bonus_and_spill(head.bonus_type(), bonus, None)
+        .map_err(|e| parse_err(&e))?;
+    put_dnode_in_table(
+        cx,
+        mos,
+        &meta,
+        ceiling,
+        mos_dirty_dnodes,
+        head_object,
+        &head,
+    )?;
+    propagate_dsl_dir_space_delta(
+        cx,
+        mos,
+        &meta,
+        ceiling,
+        mos_dirty_dnodes,
+        directory_object,
+        ref_delta,
+        i128::from(retained.dsize),
+        0,
+        0,
+        reservation_delta,
+        comp_delta,
+        uncomp_delta,
+        order,
+    )?;
+    if unique_delta > 0 {
+        // Use the staged counters. The same physical bytes can satisfy a head
+        // refreservation and several nested directory reservations.
+        enforce_pool_reservations_for_growth(
+            cx,
+            mos,
+            mos_dirty_dnodes,
+            0,
+            0,
+            0,
+            0,
+            pool_free_bytes,
+            order,
+        )?;
     }
     Ok(())
 }
@@ -7129,9 +7253,11 @@ pub fn dataset_statfs_quota_space(
     let (head_dn, _) = mos.object_with_ceiling(cx, head_obj)?;
     let order = head_dn.order();
     let referenced = order.u64(head_dn.bonus(), 72).map_err(|e| parse_err(&e))?;
+    let unique = order.u64(head_dn.bonus(), 96).map_err(|e| parse_err(&e))?;
 
     let mut has_quota = false;
     let mut avail = pool_free_bytes;
+    let mut reserved_headroom = 0_u64;
 
     let mut cur_dir = dir_obj;
     let mut is_self = true;
@@ -7142,31 +7268,37 @@ pub fn dataset_statfs_quota_space(
             return Err(corrupt("cycle in DSL directory parent chain"));
         }
         let (dd_dn, _) = mos.object_with_ceiling(cx, cur_dir)?;
+        let order = dd_dn.order();
         let parent_dd = order.u64(dd_dn.bonus(), 16).map_err(|e| parse_err(&e))?;
         let dd_used = order.u64(dd_dn.bonus(), 40).map_err(|e| parse_err(&e))?;
         let dd_quota = order.u64(dd_dn.bonus(), 64).map_err(|e| parse_err(&e))?;
-        let props_obj = order.u64(dd_dn.bonus(), 80).map_err(|e| parse_err(&e))?;
+        let dd_reserved = order.u64(dd_dn.bonus(), 72).map_err(|e| parse_err(&e))?;
+        if is_self {
+            let props_obj = order.u64(dd_dn.bonus(), 80).map_err(|e| parse_err(&e))?;
+            if props_obj != 0 {
+                let entries = mos.zap_values(cx, props_obj)?;
+                if let Some(rq) = effective_local_numeric_prop(&entries, "refquota")?
+                    && rq > 0
+                {
+                    has_quota = true;
+                    avail = avail.min(rq.saturating_sub(referenced));
+                }
+                reserved_headroom = effective_local_numeric_prop(&entries, "refreservation")?
+                    .unwrap_or(0)
+                    .saturating_sub(unique);
+            }
+        }
         if dd_quota > 0 {
             has_quota = true;
-            avail = avail.min(dd_quota.saturating_sub(dd_used));
+            avail = avail.min(
+                dd_quota
+                    .saturating_sub(dd_used)
+                    .saturating_add(reserved_headroom),
+            );
         }
-        if props_obj != 0
-            && let Ok(entries) = mos.zap_values(cx, props_obj)
-        {
-            if let Ok(Some(q)) = zap_optional_u64(&entries, b"quota")
-                && q > 0
-            {
-                has_quota = true;
-                avail = avail.min(q.saturating_sub(dd_used));
-            }
-            if is_self
-                && let Ok(Some(rq)) = zap_optional_u64(&entries, b"refquota")
-                && rq > 0
-            {
-                has_quota = true;
-                avail = avail.min(rq.saturating_sub(referenced));
-            }
-        }
+        // This directory's reservation is charged to its parent, so it can
+        // offset a parent quota but cannot enlarge the directory's own quota.
+        reserved_headroom = reserved_headroom.saturating_add(dd_reserved.saturating_sub(dd_used));
         is_self = false;
         cur_dir = parent_dd;
     }

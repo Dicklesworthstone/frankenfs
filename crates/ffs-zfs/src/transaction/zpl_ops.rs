@@ -4773,36 +4773,6 @@ fn finalize_dataset_to_mos(
         }
     }
 
-    let ref_add = zpl_born
-        .dsize
-        .saturating_sub(killed_free.dsize + killed_snap.dsize);
-    let used_add = zpl_born.dsize.saturating_sub(killed_free.dsize);
-    if ref_add > 0 || used_add > 0 {
-        super::dsl_ops::enforce_dataset_quotas_for_growth(
-            cx,
-            mos,
-            mos_dirty_dnodes,
-            ds_ctx.head_object,
-            ds_ctx.directory_object,
-            ref_add,
-            used_add,
-            order,
-        )?;
-        if used_add > 0 {
-            super::dsl_ops::enforce_pool_reservations_for_growth(
-                cx,
-                mos,
-                mos_dirty_dnodes,
-                ds_ctx.head_object,
-                ds_ctx.directory_object,
-                used_add,
-                0,
-                alloc.total_free_bytes(),
-                order,
-            )?;
-        }
-    }
-
     if !snap_bps.is_empty() {
         enqueue_into_dataset_deadlist(
             cx,
@@ -4820,72 +4790,18 @@ fn finalize_dataset_to_mos(
         )?;
     }
 
-    // 4. Update `dsl_dataset_phys_t` (`head_object`) and `dsl_dir_phys_t` ancestor chain!
-    let mos_meta = mos.meta_dnode().clone();
-    let mos_ceiling = mos.root_birth_txg();
-    let (head_dn, _) = read_staged_or_committed_dnode(
+    super::dsl_ops::stage_head_space(
         cx,
         mos,
-        &mos_meta,
-        mos_ceiling,
         mos_dirty_dnodes,
         ds_ctx.head_object,
+        ds_ctx.directory_object,
+        &new_os_bp,
+        zpl_born,
+        killed_free,
+        killed_snap,
+        alloc.total_free_bytes(),
         order,
-    )?;
-    let mut head_bonus = head_dn.bonus().to_vec();
-    let apply_u64_delta =
-        |buf: &mut [u8], at: usize, add: u64, sub: u64, label: &'static str| -> Result<()> {
-            let cur = order.u64(buf, at).map_err(|e| parse_err(&e))?;
-            let next = cur
-                .checked_add(add)
-                .and_then(|v| v.checked_sub(sub))
-                .ok_or_else(|| corrupt(format!("{label} accounting underflow/overflow")))?;
-            buf[at..at + 8].copy_from_slice(&order.encode(next));
-            Ok(())
-        };
-
-    apply_u64_delta(
-        &mut head_bonus,
-        72,
-        zpl_born.dsize,
-        killed_free.dsize + killed_snap.dsize,
-        "ds_referenced_bytes",
-    )?;
-    apply_u64_delta(
-        &mut head_bonus,
-        80,
-        zpl_born.comp,
-        killed_free.comp + killed_snap.comp,
-        "ds_compressed_bytes",
-    )?;
-    apply_u64_delta(
-        &mut head_bonus,
-        88,
-        zpl_born.uncomp,
-        killed_free.uncomp + killed_snap.uncomp,
-        "ds_uncompressed_bytes",
-    )?;
-    apply_u64_delta(
-        &mut head_bonus,
-        96,
-        zpl_born.dsize,
-        killed_free.dsize,
-        "ds_unique_bytes",
-    )?;
-    head_bonus[128..256].copy_from_slice(&new_os_bp.encode(order));
-    let mut updated_head = head_dn;
-    let head_btype = updated_head.bonus_type();
-    updated_head
-        .set_bonus_and_spill(head_btype, head_bonus, None)
-        .map_err(|e| parse_err(&e))?;
-    put_dnode_in_table(
-        cx,
-        mos,
-        &mos_meta,
-        mos_ceiling,
-        mos_dirty_dnodes,
-        ds_ctx.head_object,
-        &updated_head,
     )?;
 
     // Publish feature ownership with the first blocks that require it. The
@@ -4903,113 +4819,5 @@ fn finalize_dataset_to_mos(
         staged_writes,
     )?;
 
-    // Walk `dsl_dir` chain from `directory_object` up to root (`dd_parent_obj == 0`).
-    let mut cur_dir = ds_ctx.directory_object;
-    let mut is_owning_dir = true;
-    let mut consumed_refrsrv = 0_u64;
-    let mut visited_dirs = BTreeSet::new();
-    while cur_dir != 0 {
-        checkpoint(cx)?;
-        if !visited_dirs.insert(cur_dir) {
-            return Err(corrupt("cycle in DSL directory parent chain"));
-        }
-        let (dir_dn, _) = read_staged_or_committed_dnode(
-            cx,
-            mos,
-            &mos_meta,
-            mos_ceiling,
-            mos_dirty_dnodes,
-            cur_dir,
-            order,
-        )?;
-        let mut dir_bonus = dir_dn.bonus().to_vec();
-        let parent_dir = order.u64(&dir_bonus, 16).map_err(|e| parse_err(&e))?;
-        let dd_flags = order.u64(&dir_bonus, 96).map_err(|e| parse_err(&e))?;
-
-        if is_owning_dir && dd_flags & 1 != 0 && zpl_born.dsize > killed_free.dsize {
-            let cur_refrsrv = order.u64(&dir_bonus, 136).map_err(|e| parse_err(&e))?;
-            consumed_refrsrv = cur_refrsrv.min(zpl_born.dsize - killed_free.dsize);
-        }
-
-        apply_u64_delta(
-            &mut dir_bonus,
-            40,
-            zpl_born.dsize,
-            killed_free.dsize + consumed_refrsrv,
-            "dd_used_bytes",
-        )?;
-        apply_u64_delta(
-            &mut dir_bonus,
-            48,
-            zpl_born.comp,
-            killed_free.comp,
-            "dd_compressed_bytes",
-        )?;
-        apply_u64_delta(
-            &mut dir_bonus,
-            56,
-            zpl_born.uncomp,
-            killed_free.uncomp,
-            "dd_uncompressed_bytes",
-        )?;
-        if dd_flags & 1 != 0 {
-            if is_owning_dir {
-                // DD_USED_HEAD (`104..112`) loses both `killed_free` and `killed_snap`;
-                // DD_USED_SNAP (`112..120`) gains `killed_snap`!
-                apply_u64_delta(
-                    &mut dir_bonus,
-                    104,
-                    zpl_born.dsize,
-                    killed_free.dsize + killed_snap.dsize,
-                    "dd_used_breakdown[HEAD]",
-                )?;
-                if killed_snap.dsize != 0 {
-                    apply_u64_delta(
-                        &mut dir_bonus,
-                        112,
-                        killed_snap.dsize,
-                        0,
-                        "dd_used_breakdown[SNAP]",
-                    )?;
-                }
-                if consumed_refrsrv != 0 {
-                    apply_u64_delta(
-                        &mut dir_bonus,
-                        136,
-                        0,
-                        consumed_refrsrv,
-                        "dd_used_breakdown[REFRSRV]",
-                    )?;
-                }
-            } else {
-                // Ancestor DSL dirs count all descendant space in DD_USED_CHILD (`120..128`).
-                apply_u64_delta(
-                    &mut dir_bonus,
-                    120,
-                    zpl_born.dsize,
-                    killed_free.dsize + consumed_refrsrv,
-                    "dd_used_breakdown[CHILD]",
-                )?;
-            }
-        }
-        let mut updated_dir = dir_dn;
-        let dir_btype = updated_dir.bonus_type();
-        updated_dir
-            .set_bonus_and_spill(dir_btype, dir_bonus, None)
-            .map_err(|e| parse_err(&e))?;
-        put_dnode_in_table(
-            cx,
-            mos,
-            &mos_meta,
-            mos_ceiling,
-            mos_dirty_dnodes,
-            cur_dir,
-            &updated_dir,
-        )?;
-        is_owning_dir = false;
-        cur_dir = parent_dir;
-    }
-
-    let _ = DNODE_BYTES;
     Ok(result_u64)
 }
