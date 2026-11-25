@@ -6796,7 +6796,25 @@ pub(super) fn apply_properties_batch_on_ids(
         let recvd_key = format!("{name}$recvd").into_bytes();
         let has_recvd = rows.iter().any(|r| r.name == recvd_key);
 
-        if let Some(val) = value {
+        // OpenZFS zfs-2.3.0 dsl_prop_predict treats clearing these
+        // non-inheritable properties as restoring their received value (or
+        // zero). A restored limit can tighten quotas or consume reserved
+        // space, so it needs the same preflight and accounting as a local set.
+        // Retain the original request separately so restoration does not
+        // accidentally publish a new local override of the received value.
+        let is_space_property = matches!(
+            name,
+            "quota" | "refquota" | "reservation" | "refreservation"
+        );
+        let restored_space_value = if value.is_none() && is_space_property {
+            Some(ZfsPropertySetValue::Number(
+                zap_optional_u64(&rows, &recvd_key)?.unwrap_or(0),
+            ))
+        } else {
+            None
+        };
+
+        if let Some(val) = value.or(restored_space_value.as_ref()) {
             if is_user_prop || name == "keylocation" {
                 if name == "keylocation" && !is_encryption_root {
                     return Err(reject_einval(
@@ -6964,12 +6982,8 @@ pub(super) fn apply_properties_batch_on_ids(
                 rows.retain(|r| {
                     r.name != name.as_bytes() && r.name != iuv_key && r.name != inherit_key
                 });
-                let clear_zero = matches!(
-                    name,
-                    "quota" | "refquota" | "reservation" | "refreservation"
-                ) && num == 0
-                    && !has_recvd;
-                if !clear_zero {
+                let clear_zero = is_space_property && num == 0 && !has_recvd;
+                if value.is_some() && !clear_zero {
                     rows.push(RawZapEntry {
                         name: name.as_bytes().to_vec(),
                         integer_bytes: 8,
@@ -6979,39 +6993,12 @@ pub(super) fn apply_properties_batch_on_ids(
                 }
             }
         } else {
-            // Inherit / clear local property!
-            if name == "quota" {
-                next_dd_quota = if has_recvd {
-                    zap_optional_u64(&rows, &recvd_key)?.unwrap_or(0)
-                } else {
-                    0
-                };
-            } else if name == "reservation" {
-                next_dd_reserved = if has_recvd {
-                    zap_optional_u64(&rows, &recvd_key)?.unwrap_or(0)
-                } else {
-                    0
-                };
-            } else if name == "refreservation" {
-                let next_rr = if has_recvd {
-                    zap_optional_u64(&rows, &recvd_key)?.unwrap_or(0)
-                } else {
-                    0
-                };
-                let old_charge = old_refrsrv.saturating_sub(head_unique);
-                let new_charge = next_rr.saturating_sub(head_unique);
-                refrsrv_delta = i128::from(new_charge) - i128::from(old_charge);
-            }
-
+            // Ordinary inheritable properties suppress received values and
+            // resolve their parent/default after the local override is removed.
             rows.retain(|r| {
                 r.name != name.as_bytes() && r.name != iuv_key && r.name != inherit_key
             });
-            if has_recvd
-                && !matches!(
-                    name,
-                    "quota" | "refquota" | "reservation" | "refreservation"
-                )
-            {
+            if has_recvd && !is_space_property {
                 rows.push(RawZapEntry {
                     name: inherit_key,
                     integer_bytes: 8,

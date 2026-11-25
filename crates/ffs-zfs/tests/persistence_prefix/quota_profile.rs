@@ -527,3 +527,222 @@ fn absent_or_zero_owner_quota_references_admit_accounted_project_creation() {
         assert_pool_scrub_and_allocation_clean(&cx, &fresh, POOL_GUID, None);
     }
 }
+
+#[derive(Debug, PartialEq, Eq)]
+struct DatasetSpace {
+    used: u64,
+    referenced: u64,
+    unique: u64,
+    quota: u64,
+    reservation: u64,
+}
+
+fn dataset_space(
+    cx: &Cx,
+    engine: &ZfsTransactionEngine,
+    dataset: &[Vec<u8>],
+) -> DatasetSpace {
+    let mut mos = engine.open_read_objects(cx).unwrap();
+    let row = mos
+        .datasets(cx)
+        .unwrap()
+        .into_iter()
+        .find(|row| row.components == dataset)
+        .unwrap();
+    let head = mos.object(cx, row.head_object).unwrap();
+    let directory = mos.object(cx, row.directory_object).unwrap();
+    DatasetSpace {
+        used: directory.order().u64(directory.bonus(), 40).unwrap(),
+        referenced: head.order().u64(head.bonus(), 72).unwrap(),
+        unique: head.order().u64(head.bonus(), 96).unwrap(),
+        quota: directory.order().u64(directory.bonus(), 64).unwrap(),
+        reservation: directory.order().u64(directory.bonus(), 72).unwrap(),
+    }
+}
+
+fn received_space_fixture(
+    cx: &Cx,
+    property: &'static str,
+    received: u64,
+) -> (ZfsTransactionEngine, Vec<FaultableMemberDevice>) {
+    let key = match property {
+        "quota" => b"quota$recvd".as_slice(),
+        "refquota" => b"refquota$recvd".as_slice(),
+        "reservation" => b"reservation$recvd".as_slice(),
+        "refreservation" => b"refreservation$recvd".as_slice(),
+        _ => panic!("unexpected space property"),
+    };
+    file_range_fixture(
+        cx,
+        &PoolFixtureSpec {
+            // A local unlimited/zero value masks the received value until the
+            // administrative operation clears that override.
+            data_properties: vec![(property.as_bytes(), 0), (key, received)],
+            deadlist_mode: DeadlistMode::NativeDeadlist,
+            ..PoolFixtureSpec::default()
+        },
+    )
+}
+
+#[test]
+fn received_space_properties_reject_invalid_effective_limits_without_writes() {
+    use ffs_zfs::ZfsPropertySetValue::Number;
+
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    let mib = 1024 * 1024;
+    // The effective value, including a received fallback, must satisfy the
+    // same native constraints as an explicit property update.
+    for (property, received, setup, errno) in [
+        ("quota", 1, None, libc::EDQUOT),
+        ("refquota", 1, None, libc::EDQUOT),
+        ("quota", mib, Some(("reservation", 2 * mib)), libc::EDQUOT),
+        (
+            "refquota",
+            mib,
+            Some(("refreservation", 2 * mib)),
+            libc::EDQUOT,
+        ),
+        ("reservation", 2 * mib, Some(("quota", mib)), libc::EDQUOT),
+        (
+            "refreservation",
+            2 * mib,
+            Some(("refquota", mib)),
+            libc::EDQUOT,
+        ),
+        ("reservation", 64 * mib, None, libc::ENOSPC),
+        ("refreservation", 64 * mib, None, libc::ENOSPC),
+    ] {
+        let (mut engine, devices) = received_space_fixture(&cx, property, received);
+        if let Some((name, value)) = setup {
+            engine
+                .set_property(&cx, &dataset, name, Number(value))
+                .into_result()
+                .unwrap();
+        }
+        let before = dataset_space(&cx, &engine, &dataset);
+        let parent_before = dataset_space(&cx, &engine, &[]);
+        let free_before = engine.free_bytes();
+        assert_native_write_refused(&mut engine, &devices, errno, |writer| {
+            writer.inherit_property(&cx, &dataset, property)
+        });
+        assert_eq!(dataset_space(&cx, &engine, &dataset), before, "{property}");
+        assert_eq!(dataset_space(&cx, &engine, &[]), parent_before, "{property}");
+        assert_eq!(engine.free_bytes(), free_before, "{property}");
+        assert!(!engine.requires_recovery());
+        let props = engine
+            .open_read_objects(&cx)
+            .unwrap()
+            .properties(&cx, &dataset, None, &[property.to_owned()])
+            .unwrap();
+        assert_eq!(
+            props.values[0].value,
+            Some(ffs_zfs::reader::dmu::properties::PropertyValue::Number(0))
+        );
+        assert_eq!(
+            props.values[0].source,
+            ffs_zfs::reader::dmu::properties::PropertySource::Local
+        );
+    }
+}
+
+#[test]
+fn received_space_reservations_respect_ancestor_quotas_before_publication() {
+    use ffs_zfs::ZfsPropertySetValue::Number;
+
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    for property in ["reservation", "refreservation"] {
+        let (mut engine, devices) = received_space_fixture(&cx, property, 2 * 1024 * 1024);
+        let parent = dataset_space(&cx, &engine, &[]);
+        engine
+            .set_property(&cx, &[], "quota", Number(parent.used + 128 * 1024))
+            .into_result()
+            .unwrap();
+        let child_before = dataset_space(&cx, &engine, &dataset);
+        let parent_before = dataset_space(&cx, &engine, &[]);
+        assert_native_write_refused(&mut engine, &devices, libc::EDQUOT, |writer| {
+            writer.inherit_property(&cx, &dataset, property)
+        });
+        assert_eq!(dataset_space(&cx, &engine, &dataset), child_before);
+        assert_eq!(dataset_space(&cx, &engine, &[]), parent_before);
+    }
+}
+
+#[test]
+fn received_space_properties_restore_valid_limits_and_accounting_after_restart() {
+    use ffs_zfs::ZfsPropertySetValue::Number;
+    use ffs_zfs::reader::dmu::properties::{PropertySource, PropertyValue};
+
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    for property in ["quota", "refquota", "reservation", "refreservation"] {
+        for received in [0, 1024 * 1024] {
+            let (mut engine, devices) = received_space_fixture(&cx, property, received);
+            if received == 0 {
+                engine
+                    .set_property(&cx, &dataset, property, Number(1024 * 1024))
+                    .into_result()
+                    .unwrap();
+            }
+            let before = dataset_space(&cx, &engine, &dataset);
+            let parent_before = dataset_space(&cx, &engine, &[]);
+            let (_, token) = engine
+                .inherit_property(&cx, &dataset, property)
+                .into_result()
+                .unwrap();
+            drop(engine);
+            let durable: Vec<_> = devices
+                .iter()
+                .map(FaultableMemberDevice::fresh_from_durable)
+                .collect();
+            let reopened = open_engine_on_devices(
+                &cx,
+                &durable,
+                default_write_opts(POOL_GUID, token.published_slot()),
+            )
+            .unwrap();
+            let mut mos = reopened.open_read_objects(&cx).unwrap();
+            let properties = mos
+                .properties(&cx, &dataset, None, &[property.to_owned()])
+                .unwrap();
+            assert_eq!(properties.values[0].source, PropertySource::Received);
+            assert_eq!(properties.values[0].value, Some(PropertyValue::Number(received)));
+            let after = dataset_space(&cx, &reopened, &dataset);
+            let parent_after = dataset_space(&cx, &reopened, &[]);
+            match property {
+                "quota" => {
+                    assert_eq!(after.quota, received);
+                    assert_eq!(after.used, before.used);
+                    assert_eq!(parent_after, parent_before);
+                }
+                "refquota" => {
+                    assert_eq!(after, before);
+                    assert_eq!(parent_after, parent_before);
+                }
+                "reservation" => {
+                    assert_eq!(after.reservation, received);
+                    assert_eq!(after.used, before.used);
+                    assert_eq!(
+                        parent_after.used + before.reservation.saturating_sub(before.used),
+                        parent_before.used + received.saturating_sub(before.used)
+                    );
+                }
+                "refreservation" => {
+                    let old: u64 = if received == 0 { 1024 * 1024 } else { 0 };
+                    let previous_charge = old.saturating_sub(before.unique);
+                    let restored_charge = received.saturating_sub(before.unique);
+                    assert_eq!(after.used + previous_charge, before.used + restored_charge);
+                    assert_eq!(
+                        parent_after.used + previous_charge,
+                        parent_before.used + restored_charge
+                    );
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(after.referenced, before.referenced);
+            assert_eq!(after.unique, before.unique);
+            assert_pool_scrub_and_allocation_clean(&cx, &durable, POOL_GUID, None);
+        }
+    }
+}
