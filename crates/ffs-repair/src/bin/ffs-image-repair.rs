@@ -67,6 +67,9 @@ enum Command {
         special_members: Vec<PathBuf>,
         #[arg(long, default_value = "raw")]
         filesystem: String,
+        /// Bind the mount view to this ZFS dataset path relative to the pool root.
+        #[arg(long)]
+        zfs_dataset: Option<String>,
         #[arg(long)]
         trust_key_file: Option<PathBuf>,
         /// Confirm that every member image is unmounted and has no external writers.
@@ -237,6 +240,7 @@ fn run(cli: Cli) -> Result<u8> {
             log_members,
             special_members,
             filesystem,
+            zfs_dataset,
             trust_key_file,
             offline: _,
             block_size,
@@ -245,6 +249,20 @@ fn run(cli: Cli) -> Result<u8> {
         } => {
             let signing_key = trust_key_file.as_deref().map(load_por_key).transpose()?;
             let specs = collect_specs(&members, &log_members, &special_members);
+            let filesystem = match (zfs_dataset.is_some(), filesystem.as_str()) {
+                (true, "raw") => "zfs".to_owned(),
+                (true, other) if other != "zfs" => {
+                    return Err(FfsError::Format(
+                        "--zfs-dataset requires a ZFS storage set".into(),
+                    ));
+                }
+                _ => filesystem,
+            };
+            let view = zfs_dataset
+                .as_deref()
+                .map(ProtectedViewIdentity::from_zfs_dataset)
+                .transpose()?
+                .unwrap_or_default();
             let topology = if specs.len() == 1 {
                 StorageSetTopology::SingleData
             } else if filesystem == "zfs" {
@@ -264,7 +282,7 @@ fn run(cli: Cli) -> Result<u8> {
                 manifest_path: manifest,
                 filesystem,
                 topology,
-                view: ProtectedViewIdentity::default(),
+                view,
                 native_binding: NativeCommitBinding::UninterpretedRaw,
                 members: specs,
                 options: SidecarOptions {
@@ -325,6 +343,39 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protect_set_binds_the_selected_dataset_before_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("member");
+        let sidecar = dir.path().join("sidecar");
+        let manifest = dir.path().join("manifest");
+        std::fs::write(&image, [0x31; 8192]).unwrap();
+        let run_for = |dataset: &str| {
+            run(Cli::try_parse_from([
+                "ffs-image-repair",
+                "protect-set",
+                manifest.to_str().unwrap(),
+                "--member",
+                image.to_str().unwrap(),
+                sidecar.to_str().unwrap(),
+                "--offline",
+                "--zfs-dataset",
+                dataset,
+            ])
+            .unwrap())
+        };
+        assert!(run_for("home/../users").is_err());
+        assert!(!manifest.exists() && !sidecar.exists());
+        assert_eq!(run_for("/home/users/").unwrap(), 0);
+        let saved = ffs_repair::sidecar::StorageSetManifest::decode(
+            &std::fs::read(&manifest).unwrap(),
+            TrustPolicy::AllowUnauthenticated,
+        )
+        .unwrap();
+        assert_eq!(saved.filesystem, "zfs");
+        assert_eq!(saved.view.zfs_dataset, ["home", "users"]);
+    }
 
     #[test]
     fn mutating_commands_require_an_explicit_offline_acknowledgement() {

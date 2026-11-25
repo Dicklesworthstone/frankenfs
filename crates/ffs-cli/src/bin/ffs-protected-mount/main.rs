@@ -31,7 +31,7 @@ use ffs_repair::sidecar::live::{
     ProtectedStorageSet, SharedEvidenceLedger, SidecarImageDevice, StorageSetOpenOptions,
     blake3_digest, open_shared_evidence_ledger,
 };
-use ffs_repair::sidecar::{MemberRole, NativeCommitBinding, TrustPolicy};
+use ffs_repair::sidecar::{MemberRole, NativeCommitBinding, ProtectedViewIdentity, TrustPolicy};
 use ffs_types::{ByteOffset, InodeNumber};
 use serde::Serialize;
 use std::io::Write;
@@ -101,7 +101,7 @@ struct SetOptions {
     /// Partition/slice byte length inside a standalone single-member image.
     #[arg(long)]
     length: Option<u64>,
-    /// Slash-separated ZPL dataset path relative to the pool root (default: root dataset).
+    /// ZPL dataset path relative to the pool root. Defaults to the manifest view, or root without a manifest.
     #[arg(long)]
     zfs_dataset: Option<String>,
     /// Expected ZFS pool GUID (optional; verified against on-disk labels).
@@ -421,22 +421,30 @@ fn checked_paths(args: &Args) -> Result<CheckedInputs> {
     })
 }
 
-fn parse_zfs_dataset_components(raw: Option<&str>) -> Result<Vec<Vec<u8>>> {
-    let Some(raw) = raw else {
-        return Ok(Vec::new());
-    };
-    let trimmed = raw.trim_matches('/');
-    if trimmed.is_empty() {
-        return Ok(Vec::new());
+fn protected_dataset_components(
+    filesystem: &str,
+    requested: Option<&str>,
+    bound: Option<&ProtectedViewIdentity>,
+) -> Result<Vec<Vec<u8>>> {
+    if filesystem != "zfs"
+        && (requested.is_some() || bound.is_some_and(|view| !view.zfs_dataset.is_empty()))
+    {
+        bail!("a ZFS dataset view requires a ZFS pool");
     }
-    let mut out = Vec::new();
-    for part in trimmed.split('/') {
-        if part.is_empty() || part == "." || part == ".." {
-            bail!("invalid ZFS dataset path component '{part}'");
-        }
-        out.push(part.as_bytes().to_vec());
+    let requested = requested
+        .map(ProtectedViewIdentity::from_zfs_dataset)
+        .transpose()?;
+    if let (Some(view), Some(requested)) = (bound, &requested)
+        && requested.zfs_dataset != view.zfs_dataset
+    {
+        bail!("requested ZFS dataset differs from the view bound in the storage-set manifest");
     }
-    Ok(out)
+    Ok(bound
+        .or(requested.as_ref())
+        .into_iter()
+        .flat_map(|view| &view.zfs_dataset)
+        .map(|part| part.as_bytes().to_vec())
+        .collect())
 }
 
 fn clean_single_slice(
@@ -832,10 +840,16 @@ fn prepare(cx: &Cx, args: &Args) -> Result<Prepared> {
     let filesystem = clean_single_slice(cx, probe_slice.as_ref(), storage_set.members().len())?;
     drop(probe_slice);
 
+    let manifest = storage_set.manifest();
+    let dataset_components = protected_dataset_components(
+        filesystem,
+        args.set.zfs_dataset.as_deref(),
+        manifest.as_ref().map(|m| &m.view),
+    )?;
     let live_binding =
         compute_live_native_binding(cx, &storage_set, filesystem, args.set.pool_guid)
             .context("verify native filesystem commit identity across storage set")?;
-    if let Some(manifest) = storage_set.manifest() {
+    if let Some(manifest) = manifest {
         verify_manifest_native_binding(
             &manifest.filesystem,
             &manifest.native_binding,
@@ -952,7 +966,6 @@ fn prepare(cx: &Cx, args: &Args) -> Result<Prepared> {
             ProtectedFs::Ntfs(Box::new(ntfs_fs))
         }
         "zfs" => {
-            let dataset_components = parse_zfs_dataset_components(args.set.zfs_dataset.as_deref())?;
             let zfs_fs = if args.rw {
                 let mut probe_leaves = Vec::with_capacity(storage_set.members().len());
                 let mut member_devices = Vec::with_capacity(storage_set.members().len());

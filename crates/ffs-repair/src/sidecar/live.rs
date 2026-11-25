@@ -1524,6 +1524,7 @@ pub fn protect_storage_set(
     request: &StorageSetProtectRequest,
 ) -> Result<StorageSetManifest> {
     checkpoint(cx)?;
+    request.view.validate_zfs_dataset(&request.filesystem)?;
     if request.members.is_empty() {
         return Err(corrupt("storage set requires at least one member"));
     }
