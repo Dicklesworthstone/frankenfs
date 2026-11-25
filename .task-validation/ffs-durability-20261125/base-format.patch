@@ -1,0 +1,61 @@
+diff --git a/crates/ffs-zfs/tests/persistence_prefix/send_recv.rs b/crates/ffs-zfs/tests/persistence_prefix/send_recv.rs
+index 71ce1d9..302ff06 100644
+--- a/crates/ffs-zfs/tests/persistence_prefix/send_recv.rs
++++ b/crates/ffs-zfs/tests/persistence_prefix/send_recv.rs
+@@ -1663,7 +1663,11 @@ fn assert_receive_dnode_read_failure_preserves_checkpoint(corruption: bool) {
+             .receive_stream(&cx, &receive, &mut Cursor::new(recovery))
+             .into_result()
+             .unwrap();
+-        let expected = if case == "freeobjects" { &before } else { &after };
++        let expected = if case == "freeobjects" {
++            &before
++        } else {
++            &after
++        };
+         let mut fresh_mos = fresh.open_read_objects(&cx).unwrap();
+         assert_eq!(
+             fresh_mos
+diff --git a/crates/ffs-zfs/tests/persistence_prefix/writable_fs.rs b/crates/ffs-zfs/tests/persistence_prefix/writable_fs.rs
+index c859f23..5b0aa31 100644
+--- a/crates/ffs-zfs/tests/persistence_prefix/writable_fs.rs
++++ b/crates/ffs-zfs/tests/persistence_prefix/writable_fs.rs
+@@ -3232,7 +3232,9 @@ fn sync_cancellation_fixture(
+ #[test]
+ #[allow(clippy::too_many_lines)]
+ fn mounted_sync_preserves_success_after_final_member_cancellation() {
+-    for operation in ["fsync", "fsyncdir", "sync_fs", "periodic", "destroy", "release"] {
++    for operation in [
++        "fsync", "fsyncdir", "sync_fs", "periodic", "destroy", "release",
++    ] {
+         let cx = Cx::for_testing();
+         let request = Cx::for_testing();
+         let (engine, devices, controls) = sync_cancellation_fixture(&cx);
+@@ -3562,12 +3564,8 @@ fn cancellation_after_staged_root_sync_does_not_begin_uberblock_publication() {
+         .iter()
+         .map(FaultableMemberDevice::fresh_from_durable)
+         .collect();
+-    let reopened = open_engine_on_devices(
+-        &cx,
+-        &fresh,
+-        default_write_opts(POOL_GUID, original_slot),
+-    )
+-    .unwrap();
++    let reopened =
++        open_engine_on_devices(&cx, &fresh, default_write_opts(POOL_GUID, original_slot)).unwrap();
+     let mut objects = reopened.open_read_objects(&cx).unwrap();
+     let mut view = objects.zpl(&cx, &[b"data".to_vec()]).unwrap();
+     assert!(matches!(
+diff --git a/crates/ffs-ondisk/src/zfs/crypto.rs b/crates/ffs-ondisk/src/zfs/crypto.rs
+--- a/crates/ffs-ondisk/src/zfs/crypto.rs
++++ b/crates/ffs-ondisk/src/zfs/crypto.rs
+@@ -2216,7 +2216,9 @@
+         );
+         assert_eq!(compress_lzjb_payload(&[b'x'; 67]), [2, b'x', 252, 1]);
+         for period in [1, 2, 3, 7, 65, 66, 67, 255, 1023, 1024, 1025] {
+-            let block: Vec<u8> = (0..8192).map(|i| (i % period % 251) as u8).collect();
++            let block: Vec<u8> = (0..8192)
++                .map(|i| u8::try_from(i % period % 251).expect("remainder fits a byte"))
++                .collect();
+             let encoded = compress_lzjb_payload(&block);
+             assert_eq!(decompress(&encoded, 3, block.len()).unwrap(), block);
+         }

@@ -1,0 +1,200 @@
+diff --git a/crates/ffs-block/src/cache.rs b/crates/ffs-block/src/cache.rs
+--- a/crates/ffs-block/src/cache.rs
++++ b/crates/ffs-block/src/cache.rs
+@@ -3526,39 +3526,47 @@
+         }
+     }
+ 
+-    fn flush_blocks(&self, cx: &Cx, flushes: &[FlushCandidate]) -> Result<()> {
+-        let lifecycle = Arc::clone(&self.mvcc_flush_lifecycle);
+-        for candidate in flushes {
+-            cx_checkpoint(cx)?;
+-            let pin = match lifecycle.pin_for_flush(candidate.block, candidate.commit_seq) {
+-                Ok(pin) => pin,
+-                Err(err) => {
+-                    error!(
+-                        event = "mvcc_flush_pin_conflict",
+-                        block = candidate.block.0,
+-                        commit_seq = candidate.commit_seq.0,
+-                        error = %err
+-                    );
+-                    return Err(err);
+-                }
+-            };
+-            self.inner
+-                .write_block(cx, candidate.block, candidate.data.as_slice())?;
+-            if let Err(err) = lifecycle.mark_persisted(candidate.block, candidate.commit_seq) {
+-                error!(
+-                    event = "mvcc_flush_commit_state_update_failed",
+-                    txn_id = candidate.txn_id.0,
+-                    block = candidate.block.0,
+-                    commit_seq = candidate.commit_seq.0,
+-                    error = %err
+-                );
+-                return Err(err);
+-            }
+-            drop(pin);
+-        }
+-        Ok(())
+-    }
+-
++    fn flush_blocks(&self, cx: &Cx, flushes: &[FlushCandidate]) -> Result<()> {
++        let lifecycle = Arc::clone(&self.mvcc_flush_lifecycle);
++        // A completed write can still live only in a volatile device cache.
++        // Keep every version pinned until the entire batch passes its barrier,
++        // then publish persistence before allowing downstream repair refresh.
++        let mut pins = Vec::with_capacity(flushes.len());
++        for candidate in flushes {
++            cx_checkpoint(cx)?;
++            let pin = match lifecycle.pin_for_flush(candidate.block, candidate.commit_seq) {
++                Ok(pin) => pin,
++                Err(err) => {
++                    error!(
++                        event = "mvcc_flush_pin_conflict",
++                        block = candidate.block.0,
++                        commit_seq = candidate.commit_seq.0,
++                        error = %err
++                    );
++                    return Err(err);
++                }
++            };
++            pins.push(pin);
++            self.inner
++                .write_block(cx, candidate.block, candidate.data.as_slice())?;
++        }
++        self.inner.sync(cx)?;
++        for candidate in flushes {
++            if let Err(err) = lifecycle.mark_persisted(candidate.block, candidate.commit_seq) {
++                error!(
++                    event = "mvcc_flush_commit_state_update_failed",
++                    txn_id = candidate.txn_id.0,
++                    block = candidate.block.0,
++                    commit_seq = candidate.commit_seq.0,
++                    error = %err
++                );
++                return Err(err);
++            }
++        }
++        drop(pins);
++        Ok(())
++    }
++
+     fn notify_repair_flush(&self, cx: &Cx, flushes: &[FlushCandidate]) -> Result<()> {
+         if flushes.is_empty() {
+             return Ok(());
+@@ -3855,11 +3863,14 @@
+         self.inner.block_count()
+     }
+ 
+-    fn sync(&self, cx: &Cx) -> Result<()> {
+-        // Flush any deferred dirty blocks before syncing the underlying device.
+-        self.flush_dirty(cx)?;
+-        self.inner.sync(cx)
+-    }
++    fn sync(&self, cx: &Cx) -> Result<()> {
++        // A nonempty flush already performs the durability barrier before
++        // publishing persistence. Clean/write-through caches still need sync.
++        if !self.flush_dirty_inner(cx)? {
++            self.inner.sync(cx)?;
++        }
++        Ok(())
++    }
+ }
+ 
+ impl<D: BlockDevice> BlockDevice for ShardedArcCache<D> {
+@@ -3879,12 +3890,16 @@
+         self.inner.block_count()
+     }
+ 
+-    fn sync(&self, cx: &Cx) -> Result<()> {
+-        for shard in &self.shards {
+-            shard.flush_dirty(cx)?;
+-        }
+-        self.inner.sync(cx)
+-    }
++    fn sync(&self, cx: &Cx) -> Result<()> {
++        let mut flushed = false;
++        for shard in &self.shards {
++            flushed |= shard.flush_dirty_inner(cx)?;
++        }
++        if !flushed {
++            self.inner.sync(cx)?;
++        }
++        Ok(())
++    }
+ }
+ 
+ impl<D: BlockDevice> BlockCache for ShardedArcCache<D> {
+@@ -4097,18 +4112,23 @@
+     /// flushes them durably.
+     ///
+     /// Returns Ok(()) if all dirty blocks were successfully flushed.
+-    pub fn flush_dirty(&self, cx: &Cx) -> Result<()> {
+-        cx_checkpoint(cx)?;
+-
+-        // Collect all dirty payloads (resident + evicted pending) under lock.
+-        let flushes = {
+-            let mut guard = self.state.lock();
+-            guard.take_dirty_and_pending_flushes()
+-        };
+-
+-        if flushes.is_empty() {
+-            return Ok(());
+-        }
++    pub fn flush_dirty(&self, cx: &Cx) -> Result<()> {
++        self.flush_dirty_inner(cx).map(|_| ())
++    }
++
++    /// Return whether a batch completed its own backing-device barrier.
++    fn flush_dirty_inner(&self, cx: &Cx) -> Result<bool> {
++        cx_checkpoint(cx)?;
++
++        // Collect all dirty payloads (resident + evicted pending) under lock.
++        let flushes = {
++            let mut guard = self.state.lock();
++            guard.take_dirty_and_pending_flushes()
++        };
++
++        if flushes.is_empty() {
++            return Ok(false);
++        }
+ 
+         let flush_bytes: usize = flushes.iter().map(|candidate| candidate.data.len()).sum();
+         let min_commit_seq = flushes.iter().map(|candidate| candidate.commit_seq.0).min();
+@@ -4164,15 +4184,15 @@
+             remaining_dirty_bytes = metrics.dirty_bytes,
+             remaining_dirty_ratio = metrics.dirty_ratio()
+         );
+-        info!(
+-            event = "flush_batch",
+-            blocks_flushed = flushes.len(),
+-            bytes_written = flush_bytes,
+-            flush_duration_us = started.elapsed().as_micros()
+-        );
+-
+-        Ok(())
+-    }
++        info!(
++            event = "flush_batch",
++            blocks_flushed = flushes.len(),
++            bytes_written = flush_bytes,
++            flush_duration_us = started.elapsed().as_micros()
++        );
++
++        Ok(true)
++    }
+ 
+     /// Return the number of currently dirty blocks.
+     #[must_use]
+diff --git a/crates/ffs-block/src/lib.rs b/crates/ffs-block/src/lib.rs
+--- a/crates/ffs-block/src/lib.rs
++++ b/crates/ffs-block/src/lib.rs
+@@ -3343,5 +3343,6 @@
+ /// MVCC coordination hook for write-back flush lifecycle.
+ ///
+-/// Implementations can pin version chains before disk write and mark versions
+-/// persisted after successful write completion.
++/// Implementations pin version chains through the backing-device durability
++/// barrier and mark versions persisted only after that barrier succeeds.
++/// A failed write or sync must leave the batch retryable without notification.
+ pub trait MvccFlushLifecycle: Send + Sync + std::fmt::Debug {
