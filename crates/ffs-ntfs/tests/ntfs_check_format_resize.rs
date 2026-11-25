@@ -629,6 +629,59 @@ fn resize_preserves_native_boot_code_and_optional_checksum() {
 }
 
 #[test]
+fn format_and_resize_reserve_only_out_of_volume_bitmap_bits() {
+    let cx = Cx::for_testing();
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("legacy-bitmap.img");
+    let mut opts = NtfsFormatOptions::new_image(source.clone(), 16);
+    opts.size_mib = None;
+    opts.size_bytes = Some(4105 * 4096 + 512);
+    opts.cluster_bytes = Some(4096);
+    let layout = ffs_ntfs::formatter::plan_format(&opts).unwrap();
+    format_image_file(&cx, &opts, None).unwrap();
+
+    let check_tail = |path: &std::path::Path, clusters: u64| {
+        let volume = NtfsVolume::open(&cx, path, 0, None).unwrap();
+        assert_eq!(volume.geometry.cluster_count(), clusters);
+        let record = volume.record(&cx, 6, None).unwrap();
+        let stream = volume.data_stream(&cx, &record, &[]).unwrap();
+        assert_eq!(stream.size, clusters.div_ceil(64) * 8);
+        let bytes = volume.read(&cx, &stream, 0, stream.size as usize).unwrap();
+        assert_ne!(bytes[0] & 1, 0);
+        for lcn in 4090..stream.size * 8 {
+            let allocated = bytes[(lcn / 8) as usize] & (1 << (lcn % 8)) != 0;
+            assert_eq!(allocated, lcn >= clusters, "LCN {lcn} of {clusters}");
+        }
+    };
+    check_tail(&source, 4105);
+
+    // Older FrankenFS images leave this padding clear. They remain valid resize
+    // inputs, and growing across the previous boundary frees the new clusters.
+    let file = OpenOptions::new().write(true).open(&source).unwrap();
+    let last_word = layout.bitmap_cluster * 4096 + layout.bitmap_bytes - 8;
+    file.write_all_at(&[0; 8], last_word).unwrap();
+    drop(file);
+    let mut input = source;
+    for clusters in [4151, 4096, 4097] {
+        let output = dir.path().join(format!("resized-{clusters}.img"));
+        let resize = NtfsResizeOptions {
+            source_image: input,
+            source_offset: 0,
+            source_length: None,
+            output: output.clone(),
+            size_mib: None,
+            size_bytes: Some(clusters * 4096 + 512),
+            relocate: false,
+            offline_image: true,
+            dry_run: false,
+        };
+        run_resize(&cx, &resize, None).unwrap();
+        check_tail(&output, clusters);
+        input = output;
+    }
+}
+
+#[test]
 fn resize_grow_free_tail_shrink_relocate_shrink_and_slice_sentinel_preservation() {
     let cx = Cx::for_testing();
     let dir = tempdir().expect("tempdir");

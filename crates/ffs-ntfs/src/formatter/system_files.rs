@@ -22,6 +22,8 @@ use ffs_ondisk::ntfs_security::{
 use super::NtfsFormatLayout;
 use super::upcase::{canonical_ntfs_upcase_bytes, canonical_ntfs_upcase_u16, compare_utf16_upcase};
 
+use crate::reader::allocation::empty_volume_bitmap;
+
 const SECTOR_BYTES: usize = 512;
 const ATTR_STANDARD_INFORMATION: u32 = 0x10;
 const ATTR_FILE_NAME: u32 = 0x30;
@@ -546,11 +548,7 @@ pub fn build_bootstrap_volume(
     let logfile_bytes = build_clean_logfile(cx, layout.logfile_bytes)?;
 
     // 3. $Bitmap covering exact allocated bootstrap runs.
-    let mut bitmap_bytes = vec![
-        0_u8;
-        usize::try_from(layout.bitmap_bytes)
-            .map_err(|_| format_err("bitmap overflow"))?
-    ];
+    let mut bitmap_bytes = empty_volume_bitmap(layout.cluster_count)?;
     mark_bitmap_span(&mut bitmap_bytes, 0, layout.boot_clusters);
     mark_bitmap_span(&mut bitmap_bytes, layout.mft_cluster, layout.mft_clusters);
     mark_bitmap_span(

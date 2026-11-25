@@ -166,6 +166,21 @@ pub(crate) fn bit(bytes: &[u8], index: u64) -> bool {
     bytes[index as usize / 8] & (1 << (index % 8)) != 0
 }
 
+/// Build a fresh native volume $Bitmap. The logical stream is word-aligned,
+/// and all bits past the last addressable cluster must be set.
+pub(crate) fn empty_volume_bitmap(clusters: u64) -> Result<Vec<u8>> {
+    let bytes = usize::try_from(clusters.div_ceil(64) * 8)
+        .map_err(|_| FfsError::Format("volume bitmap length overflows usize".into()))?;
+    let mut bitmap = buffer(bytes)?;
+    let valid = clusters % 64;
+    if valid != 0
+        && let Some(word) = bitmap.last_chunk_mut::<8>()
+    {
+        *word = (u64::MAX << valid).to_le_bytes();
+    }
+    Ok(bitmap)
+}
+
 pub(crate) fn read_bitmap(
     cx: &Cx,
     volume: &NtfsVolume,

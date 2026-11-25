@@ -12,7 +12,7 @@ use ffs_ondisk::ntfs::{
 use ffs_types::ByteOffset;
 
 use super::{NtfsClusterRelocation, NtfsResizeDirection, NtfsResizeOptions, NtfsResizePlan};
-use crate::reader::allocation::{bit, read_bitmap};
+use crate::reader::allocation::{bit, empty_volume_bitmap, read_bitmap};
 use crate::reader::check::{NtfsCheckLimits, NtfsCheckStatus, check_volume_device};
 use crate::reader::{NtfsVolume, checkpoint};
 
@@ -243,11 +243,7 @@ pub(super) fn build_resize_plan(
     let new_bitmap_clusters_needed = new_bitmap_bytes.div_ceil(cb);
 
     // Prepare new_bitmap_bytes initialized with retained allocated bits (< new_clusters).
-    let mut new_bitmap = vec![
-        0_u8;
-        usize::try_from(new_bitmap_bytes)
-            .map_err(|_| fmt_err("new_bitmap_bytes overflow"))?
-    ];
+    let mut new_bitmap = empty_volume_bitmap(new_clusters)?;
     let common_clusters = old_clusters.min(new_clusters);
     for lcn in 0..common_clusters {
         if bit(&old_bitmap, lcn) {

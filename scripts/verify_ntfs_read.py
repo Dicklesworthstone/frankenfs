@@ -932,6 +932,17 @@ def main() -> None:
         (root / "result.json").write_text(json.dumps(report, indent=2) + "\n")
 
 
+def verify_volume_bitmap_tail(command: Callable[..., bytes], image: Path) -> None:
+    """Compare the declared cluster range with the native reader's $Bitmap data."""
+    with image.open("rb") as source:
+        boot = source.read(512)
+    clusters = int.from_bytes(boot[40:48], "little") // boot[13]
+    bitmap = command("ntfscat", "-i", "6", image)
+    require(len(bitmap) == ((clusters + 63) // 64) * 8, "unexpected $Bitmap stream length")
+    for bit in range(clusters, len(bitmap) * 8):
+        require(bitmap[bit // 8] & (1 << (bit % 8)) != 0, f"$Bitmap marks padding cluster {bit} free")
+
+
 def native_format_and_resize_cases(
     command: Callable[..., bytes],
     binary: Path,
@@ -974,6 +985,7 @@ def native_format_and_resize_cases(
         )
         require(fmt_json["boot_published"] is True and fmt_json["check_clean"] is True,
                 f"ffs-ntfs format {tag} did not report clean published volume")
+        verify_volume_bitmap_tail(command, img)
         before_chk = digest(img)
         chk_json = json.loads(command(binary, "check", img, "--offline-image"))
         require(chk_json["clean"] is True and chk_json["write_calls"] == 0 and chk_json["sync_calls"] == 0,
@@ -1054,6 +1066,8 @@ def native_format_and_resize_cases(
     require(grow_res["plan"]["direction"] == "grow" and grow_res["check_clean"] is True,
             "grow resize report invalid")
 
+    verify_volume_bitmap_tail(command, grown)
+
     # Embed grown 40 MiB image inside a container with sentinels and shrink to 12 MiB with --relocate!
     prefix = b"\x5A" * 65536
     suffix = b"\xA5" * 65536
@@ -1085,6 +1099,7 @@ def native_format_and_resize_cases(
     require(digest(part_container) == container_sha,
             "offline resize modified source partition container or sentinels")
 
+    verify_volume_bitmap_tail(command, reloc_out)
     # Independent ntfs-3g verification of relocated shrunk image!
     require(command("ntfscat", reloc_out, "/big.bin") == big_data,
             "ntfscat /big.bin mismatch after relocating shrink")
