@@ -876,7 +876,7 @@ impl FsOps for ZfsFs {
                 timestamp,
             )
         })?;
-        state.publish_committed(|state| {
+        state.publish_committed(cx, |state| {
             state.refresh_head(cx)?;
             let ino = state.head.remember_object(cx, object)?;
             self.attributes(cx, state, ino)
@@ -911,7 +911,7 @@ impl FsOps for ZfsFs {
                 crate::ZfsDataChecksum::Inherit,
             )
         })?;
-        state.publish_committed(|state| {
+        state.publish_committed(cx, |state| {
             state.refresh_head(cx)?;
             let ino = state.head.remember_object(cx, object)?;
             self.attributes(cx, state, ino)
@@ -1126,7 +1126,7 @@ impl FsOps for ZfsFs {
                     crate::ZfsDataChecksum::Inherit,
                 )
             })?;
-            return state.publish_committed(|state| {
+            return state.publish_committed(cx, |state| {
                 state.refresh_head(cx)?;
                 self.attributes(cx, state, ino)
             });
@@ -1150,7 +1150,7 @@ impl FsOps for ZfsFs {
         state.mutate(cx, |engine, dataset| {
             engine.link_entry(cx, dataset, object, parent, new_name.as_bytes(), timestamp)
         })?;
-        state.publish_committed(|state| {
+        state.publish_committed(cx, |state| {
             state.refresh_head(cx)?;
             self.attributes(cx, state, ino)
         })
@@ -1355,7 +1355,7 @@ impl FsOps for ZfsFs {
         state.mutate(cx, |engine, dataset| {
             engine.set_xattr(cx, dataset, object, name, value, native_mode, timestamp)
         })?;
-        state.publish_committed(|state| state.refresh_head(cx))
+        state.publish_committed(cx, |state| state.refresh_head(cx))
     }
 
     fn removexattr(
@@ -1397,7 +1397,7 @@ impl FsOps for ZfsFs {
                     crate::ZfsDataChecksum::Inherit,
                 )
             })?;
-            state.publish_committed(|state| state.refresh_head(cx))?;
+            state.publish_committed(cx, |state| state.refresh_head(cx))?;
             return Ok(true);
         }
         if !name.starts_with("user.") {
@@ -1408,7 +1408,7 @@ impl FsOps for ZfsFs {
             engine.remove_xattr(cx, dataset, object, name, timestamp)
         }) {
             Ok(_) => {
-                state.publish_committed(|state| state.refresh_head(cx))?;
+                state.publish_committed(cx, |state| state.refresh_head(cx))?;
                 Ok(true)
             }
             Err(FfsError::RequestRejected { errno, .. }) if errno == libc::ENODATA => Ok(false),

@@ -3957,3 +3957,31 @@ runtime, complete formatting, workspace check or strict Clippy pass is claimed.
 The direct GitHub publication uses the documented emergency gate-bypass path;
 the corresponding commit records that limitation. This does not close the broad
 native recovery, mounted interoperability or six-format acceptance beads.
+
+## ZFS post-commit reply and cache publication
+
+The writable ZFS filesystem adapter now defers cancellation while completing
+cache refresh, returned attributes and open-handle publication after a confirmed
+native TXG commit. The shared `publish_committed` helper covers eleven callers:
+create/open, mkdir, symlink, hard link, setattr, xattr updates/removals, and
+snapshot creation, rename and destruction. Native transaction admission and
+pre-commit cancellation remain unchanged. Pending cancellation is still visible
+after reply publication; a real publication/read failure fences the mounted
+view instead of allowing stale state to continue.
+
+Three new regressions exercise seven metadata operations on ZPL versions 4 and
+5 with durable-byte cold reopen, cancellation before native persistence, and
+actual post-commit read failures on both members of a mirror. Three existing
+cancellation regressions now require successful committed replies while retaining
+their snapshot pin, stale inode, native data, TXG and allocation assertions.
+The create-open regression additionally requires a returned handle and verifies
+open-unlink retention through final release.
+
+Qualification remains **source review only**. The original new-test insertion
+was formatted with the pinned toolchain before executor loss; the final candidate
+has not completed formatting, workspace checking, strict Clippy or runtime tests.
+The baseline selected test never reached a returned runtime result before the
+execution environment became unavailable. The direct GitHub commit records the
+emergency gate bypass. These authored storage-model tests are not mounted FUSE,
+native OpenZFS interchange or device power-loss qualification, and the broad
+ZFS delivery beads remain open.
