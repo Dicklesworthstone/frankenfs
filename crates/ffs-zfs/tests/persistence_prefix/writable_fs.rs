@@ -3232,7 +3232,9 @@ fn sync_cancellation_fixture(
 #[test]
 #[allow(clippy::too_many_lines)]
 fn mounted_sync_preserves_success_after_final_member_cancellation() {
-    for operation in ["fsync", "fsyncdir", "sync_fs", "periodic", "destroy", "release"] {
+    for operation in [
+        "fsync", "fsyncdir", "sync_fs", "periodic", "destroy", "release",
+    ] {
         let cx = Cx::for_testing();
         let request = Cx::for_testing();
         let (engine, devices, controls) = sync_cancellation_fixture(&cx);
@@ -3562,12 +3564,8 @@ fn cancellation_after_staged_root_sync_does_not_begin_uberblock_publication() {
         .iter()
         .map(FaultableMemberDevice::fresh_from_durable)
         .collect();
-    let reopened = open_engine_on_devices(
-        &cx,
-        &fresh,
-        default_write_opts(POOL_GUID, original_slot),
-    )
-    .unwrap();
+    let reopened =
+        open_engine_on_devices(&cx, &fresh, default_write_opts(POOL_GUID, original_slot)).unwrap();
     let mut objects = reopened.open_read_objects(&cx).unwrap();
     let mut view = objects.zpl(&cx, &[b"data".to_vec()]).unwrap();
     assert!(matches!(

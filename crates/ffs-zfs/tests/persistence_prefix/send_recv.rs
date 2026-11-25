@@ -1663,7 +1663,11 @@ fn assert_receive_dnode_read_failure_preserves_checkpoint(corruption: bool) {
             .receive_stream(&cx, &receive, &mut Cursor::new(recovery))
             .into_result()
             .unwrap();
-        let expected = if case == "freeobjects" { &before } else { &after };
+        let expected = if case == "freeobjects" {
+            &before
+        } else {
+            &after
+        };
         let mut fresh_mos = fresh.open_read_objects(&cx).unwrap();
         assert_eq!(
             fresh_mos
