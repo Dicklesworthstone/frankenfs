@@ -399,12 +399,12 @@ fn compound_native_header_checksum_is_validated_before_any_backing_write() {
         writes
     );
     assert_media_unchanged(&devices, &before);
-    let (received, token) = receiver
+    let (recv_report, token) = receiver
         .receive_stream(&cx, &receive, &mut Cursor::new(&native))
         .into_result()
         .expect("native package framing must be accepted");
-    assert_eq!(received.records_applied, report.records_written + 3);
-    assert_eq!(received.stream_bytes_read, native.len() as u64);
+    assert_eq!(recv_report.records_applied, report.records_written + 3);
+    assert_eq!(recv_report.stream_bytes_read, native.len() as u64);
     let mut reopened = open_mos(&cx, &devices, target.pool_guid, token.published_slot());
     let properties = reopened
         .properties(&cx, &destination, None, &["app:received".into()])
@@ -3574,10 +3574,10 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
     ));
     assert_eq!(&dsl_block_feature_counts(&cx, &dst_engine)[..2], &[1, 1]);
     let mut checkpoint_mos = dst_engine.open_read_objects(&cx).unwrap();
-    let (_, checkpoint_os) =
+    let (_, checkpoint_objset) =
         raw_dataset_objectset(&cx, &mut checkpoint_mos, &dst_devs[0], &vault_dst, None);
     assert_eq!(
-        StreamMetaDnode::from_dnode(&checkpoint_os.meta).unwrap(),
+        StreamMetaDnode::from_dnode(&checkpoint_objset.meta).unwrap(),
         keydata_e1.meta_dnode
     );
     let state = dst_engine
@@ -3637,9 +3637,10 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
     assert!(r_e1.raw && r_e1.final_snapshot == "e1");
     assert_eq!(&dsl_block_feature_counts(&cx, &dst_engine)[..2], &[2, 2]);
     let mut full_mos = dst_engine.open_read_objects(&cx).unwrap();
-    let (_, full_os) = raw_dataset_objectset(&cx, &mut full_mos, &dst_devs[0], &vault_dst, None);
+    let (_, full_objset) =
+        raw_dataset_objectset(&cx, &mut full_mos, &dst_devs[0], &vault_dst, None);
     assert_eq!(
-        StreamMetaDnode::from_dnode(&full_os.meta).unwrap(),
+        StreamMetaDnode::from_dnode(&full_objset.meta).unwrap(),
         keydata_e1.meta_dnode
     );
 
@@ -3730,10 +3731,10 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
     assert_eq!(&dsl_block_feature_counts(&cx, &dst_engine)[..2], &[3, 3]);
     let mut before_empty_mos =
         open_mos(&cx, &dst_devs, dst_built.pool_guid, tok_e2.published_slot());
-    let (before_empty_root, before_empty_os) =
+    let (before_empty_root, before_empty_objset) =
         raw_dataset_objectset(&cx, &mut before_empty_mos, &dst_devs[0], &vault_dst, None);
     assert_eq!(
-        StreamMetaDnode::from_dnode(&before_empty_os.meta).unwrap(),
+        StreamMetaDnode::from_dnode(&before_empty_objset.meta).unwrap(),
         keydata_e2.meta_dnode
     );
     let (empty_report, tok_e3) = dst_engine
@@ -3746,19 +3747,22 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
         .unwrap();
     assert_eq!(empty_report.final_snapshot, "e3-empty");
     let mut after_empty_mos = dst_engine.open_read_objects(&cx).unwrap();
-    let (after_empty_root, after_empty_os) =
+    let (after_empty_root, after_empty_objset) =
         raw_dataset_objectset(&cx, &mut after_empty_mos, &dst_devs[0], &vault_dst, None);
     assert!(
         after_empty_root.birth() > before_empty_root.birth(),
         "even an empty raw stream must publish its ObjectSet authentication metadata"
     );
     assert_eq!(
-        StreamMetaDnode::from_dnode(&after_empty_os.meta).unwrap(),
+        StreamMetaDnode::from_dnode(&after_empty_objset.meta).unwrap(),
         keydata_e3.meta_dnode
     );
-    assert_eq!(after_empty_os.portable_mac(), Some(keydata_e3.portable_mac));
-    assert_eq!(after_empty_os.local_mac(), Some([0; 32]));
-    assert_eq!(after_empty_os.flags & 1, 0);
+    assert_eq!(
+        after_empty_objset.portable_mac(),
+        Some(keydata_e3.portable_mac)
+    );
+    assert_eq!(after_empty_objset.local_mac(), Some([0; 32]));
+    assert_eq!(after_empty_objset.flags & 1, 0);
     assert_eq!(&dsl_block_feature_counts(&cx, &dst_engine)[..2], &[4, 4]);
 
     // 4. Verify locked behavior, keyless scrub, and exact keyed decryption + MAC verification!

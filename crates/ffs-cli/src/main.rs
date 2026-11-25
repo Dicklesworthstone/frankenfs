@@ -11926,14 +11926,14 @@ fn build_live_tui_snapshot(
                     image_path.display()
                 )
             })?;
-        let mut scope = RequestScope::empty();
+        let mut scope = ffs_core::RequestScope::empty();
         let _ = ro.filesystem.getattr(&cx, &mut scope, InodeNumber(1));
         if let Ok(entries) = ro.filesystem.readdir(&cx, &mut scope, InodeNumber(1), 0) {
             for entry in entries.iter().take(16) {
                 let _ = ro.filesystem.getattr(&cx, &mut scope, entry.ino);
             }
         }
-        let _ = ro.filesystem.statfs(&cx, &mut scope);
+        let _ = ro.filesystem.statfs(&cx, &mut scope, InodeNumber(1));
 
         let (scrub_blocks_scanned, scrub_blocks_corrupt, scrub_findings_count) = if run_scrub {
             match detected.kind() {
@@ -11949,7 +11949,7 @@ fn build_live_tui_snapshot(
                         .context("FAT TUI scrub check failed")?;
                     let findings = usize::from(!chk.clean);
                     (
-                        u64::from(chk.geometry.cluster_count),
+                        chk.scanned_clusters.max(u64::from(chk.data_clusters)),
                         u64::try_from(findings).unwrap_or(0),
                         findings,
                     )
@@ -11965,7 +11965,7 @@ fn build_live_tui_snapshot(
                     .context("NTFS TUI scrub check failed")?;
                     let findings = chk.issues.len();
                     (
-                        chk.volume.total_clusters,
+                        chk.cluster_count,
                         u64::try_from(findings).unwrap_or(0),
                         findings,
                     )
@@ -11975,18 +11975,24 @@ fn build_live_tui_snapshot(
                         .context("open ZFS leaf for TUI scrub")?;
                     let pool = ffs_zfs::reader::Pool::from_leaves(vec![leaf])
                         .context("import ZFS pool for TUI scrub")?;
-                    let report = pool
-                        .scrub_mos(
+                    let mut objects = pool
+                        .import_objects(&cx, None)
+                        .context("open ZFS MOS for TUI scrub")?;
+                    let zpl = objects
+                        .zpl(&cx, &[])
+                        .context("open ZFS root ZPL for TUI scrub")?;
+                    let report = zpl
+                        .scrub(
                             &cx,
                             ffs_zfs::reader::dmu::scrub::ScrubLimits {
-                                max_blocks: 16_384,
-                                max_bytes: 256 * 1024 * 1024,
-                                max_depth: 16,
+                                pointers: 16_777_216,
+                                decoded_bytes: 1_099_511_627_776,
+                                objects: 1_048_576,
+                                copy_bytes: None,
                             },
                         )
-                        .context("ZFS TUI MOS scrub failed")?;
-                    let corrupt = u64::try_from(report.issues.len()).unwrap_or(0);
-                    (report.blocks_verified, corrupt, report.issues.len())
+                        .context("ZFS TUI scrub failed")?;
+                    (report.verified_blocks, report.errors, report.issues.len())
                 }
                 ffs_core::FsFormatKind::Ext4 | ffs_core::FsFormatKind::Btrfs => (0, 0, 0),
             }

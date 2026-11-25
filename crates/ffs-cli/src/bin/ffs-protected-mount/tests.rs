@@ -2822,6 +2822,7 @@ mod bd_tqrnc {
             birth,
             order,
         );
+        let sa_master_bytes = bp_allocated_bytes(&sa_master_bp);
         write_dnode_at(
             &mut table,
             8,
@@ -2878,6 +2879,7 @@ mod bd_tqrnc {
             birth,
             order,
         );
+        let master_bytes = bp_allocated_bytes(&master_bp);
         write_dnode_at(
             &mut table,
             1,
@@ -2892,6 +2894,7 @@ mod bd_tqrnc {
         )
         .unwrap();
         let delq_bp = arena.alloc_block(&mzap(&[], 0x66, order), 22, 0, birth, order);
+        let delq_bytes = bp_allocated_bytes(&delq_bp);
         write_dnode_at(
             &mut table,
             3,
@@ -2928,6 +2931,7 @@ mod bd_tqrnc {
         tmpl[4..6].copy_from_slice(&((1_u16 << 10) | 2_u16).to_le_bytes());
         let root_bonus = sa_reg.encode_new_from_template(&tmpl, &root_meta).unwrap();
         let root_bp = arena.alloc_block(&mzap(&[], 0x88, order), 20, 0, birth, order);
+        let root_bytes = bp_allocated_bytes(&root_bp);
         write_dnode_at(
             &mut table,
             2,
@@ -2943,6 +2947,7 @@ mod bd_tqrnc {
         .unwrap();
 
         let table_bp = arena.alloc_block(&table, DMU_OT_DNODE, 0, birth, order);
+        let table_bytes = bp_allocated_bytes(&table_bp);
         let meta_dn = make_dnode(
             DMU_OT_DNODE,
             DNODE_BLOCK_BYTES,
@@ -2954,13 +2959,13 @@ mod bd_tqrnc {
         let os_obj = ObjectSet::new(2, 0, meta_dn, ZilHeader::empty(), 1024).unwrap();
         let encoded_os = os_obj.encode(order).unwrap();
         let os_bp = arena.alloc_block(&encoded_os, DMU_OT_OBJSET, 0, birth, order);
-        let referenced = bp_allocated_bytes(&sa_master_bp)
+        let referenced = sa_master_bytes
             + reg_bytes
             + lay_bytes
-            + bp_allocated_bytes(&master_bp)
-            + bp_allocated_bytes(&delq_bp)
-            + bp_allocated_bytes(&root_bp)
-            + bp_allocated_bytes(&table_bp)
+            + master_bytes
+            + delq_bytes
+            + root_bytes
+            + table_bytes
             + bp_allocated_bytes(&os_bp);
         (os_bp, referenced)
     }

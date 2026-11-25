@@ -994,7 +994,17 @@ fn build_zpl_objectset(
     if head_object == 18
         && let Some((objectset_order, contents_order)) = spec.zvol_orders
     {
-        return mixed_order::build_zvol_objectset(arena, birth, objectset_order, contents_order);
+        let (bp, bytes, raw) =
+            mixed_order::build_zvol_objectset(arena, birth, objectset_order, contents_order);
+        return (
+            bp,
+            DatasetSpaceTotals {
+                dsize: bytes,
+                comp: bytes,
+                uncomp: bytes,
+            },
+            raw,
+        );
     }
     let objectset_order = spec.zpl_order.unwrap_or(order);
     let order = spec.zpl_contents_order.unwrap_or(objectset_order);
