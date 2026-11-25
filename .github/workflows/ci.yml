@@ -487,13 +487,14 @@ jobs:
           export FFS_ZFS_LIVE_DATASET="data"
           ./scripts/e2e/ffs_inspect_sandbox_native_e2e.sh
 
-      - name: Native NTFS and ZFS differential and TXG write verification
+      - name: Native FAT, NTFS, and ZFS differential and TXG write verification
         if: ${{ !cancelled() && steps.native_build.conclusion == 'success' }}
         timeout-minutes: 25
         run: |
           set -euo pipefail
           sudo modprobe zfs
           test -e /dev/zfs
+          python3 scripts/verify_fat_read.py --binary "$FFS_FAT_BIN" --facade-binary "$FFS_NATIVE_READER_BIN" --mounted
           python3 scripts/verify_zfs_root.py --self-test --binary "$FFS_ZFS_BIN"
           python3 scripts/verify_zfs_files.py --self-test --binary "$FFS_ZFS_BIN"
           python3 scripts/verify_zfs_snapshots.py --self-test --binary "$FFS_ZFS_BIN"

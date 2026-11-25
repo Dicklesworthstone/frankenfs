@@ -1981,12 +1981,226 @@ pub fn format_cmd(
             );
             Ok(())
         }
-        "zfs" => bail!(
-            "ffs format --filesystem {fs_norm} is refused: FrankenFS does not create new standalone ZFS pools from scratch"
-        ),
+        "zfs" => {
+            if size_mib < 64 {
+                bail!(
+                    "native ZFS single-leaf pool formatting requires --size-mib >= 64 (got {size_mib})"
+                );
+            }
+            let ashift = match block_size {
+                None | Some(4096) => 12_u8,
+                Some(512) => 9_u8,
+                Some(8192) => 13_u8,
+                Some(other) => {
+                    bail!(
+                        "native ZFS pool formatting supports --block-size 512, 4096, or 8192 (got {other})"
+                    );
+                }
+            };
+            let size_bytes = size_mib
+                .checked_mul(1024 * 1024)
+                .context("size_mib overflow")?;
+            let pool_name = label.unwrap_or("frankenpool").to_owned();
+            // Deterministic non-zero pool GUID derived from the pool name.
+            let mut hasher = Sha256::new();
+            hasher.update(b"frankenfs-zfs-pool-guid-v1:");
+            hasher.update(pool_name.as_bytes());
+            let digest = hasher.finalize();
+            let raw_guid = u64::from_le_bytes(digest[..8].try_into().unwrap());
+            let pool_guid = raw_guid | 1;
+
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(output)
+                .with_context(|| format!("create new ZFS pool image {}", output.display()))?;
+            file.set_len(size_bytes)
+                .with_context(|| format!("size new ZFS pool image {}", output.display()))?;
+            drop(file);
+
+            let spec = ffs_zfs::ZfsPoolCreateSpec {
+                pool_name: pool_name.clone(),
+                pool_guid,
+                ashift,
+                hostid: 0x0046_4653,
+                hostname: "frankenfs".to_owned(),
+                vdevs: vec![ffs_zfs::ZfsCreateVdevSpec {
+                    kind: ffs_zfs::ZfsCreateVdevKind::Leaf,
+                    alloc_class: ffs_zfs::AllocClass::Normal,
+                }],
+                spare_count: 0,
+                exported: true,
+            };
+            let report = ffs_zfs::create_pool_files(&cx, &[output], &spec)
+                .with_context(|| format!("failed to format native zfs at {}", output.display()))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "Formatted native ZFS v5000 pool '{pool_name}' at {} ({size_mib} MiB, ashift={ashift}, guid=0x{pool_guid:016x})",
+                    output.display()
+                );
+            }
+            info!(
+                target: "ffs::cli::router",
+                command = "format",
+                format = "zfs",
+                partition_id = "whole_image",
+                capability_admitted = true,
+                native_rust_formatter = true,
+                "six_format_router_complete"
+            );
+            Ok(())
+        }
         other => bail!(
-            "unsupported --filesystem {other:?}; expected one of: fat16, fat32, ext4, btrfs, ntfs, zfs"
+            "unsupported --filesystem {other:?}; expected one of: fat16, fat32, ext4, btrfs, ntfs, ntfs31, ntfs30, zfs"
         ),
+    }
+}
+
+/// Non-destructively resize an offline FAT16, FAT32, or NTFS image into a
+/// brand-new standalone output image without modifying the source.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "CLI resize subcommand forwards explicit operator resize flags directly"
+)]
+pub fn resize_cmd(
+    source_image: &Path,
+    output: &Path,
+    size_mib: u64,
+    relocate: bool,
+    root_entries: Option<u16>,
+    dry_run: bool,
+    json: bool,
+    six: &SixFormatCliArgs,
+) -> Result<()> {
+    if !six.offline_image {
+        bail!("--offline-image is required for offline resize");
+    }
+    let cx = cli_cx();
+    let (offset, length, partition_id) = if let Some(selector) = six.partition_selector()? {
+        let (_table, part_dev) =
+            open_partition_read_only(&cx, source_image, &selector, &six.partition_parse_options())?;
+        let entry = part_dev.entry();
+        (
+            entry.start_byte,
+            Some(entry.byte_len),
+            format!("partition:{}", entry.index),
+        )
+    } else {
+        (0_u64, None, "whole_image".to_owned())
+    };
+
+    let dev = ffs_block::FileByteDevice::open_read_only(source_image)
+        .with_context(|| format!("open resize source {}", source_image.display()))?;
+    let detected = if let Some(len) = length {
+        let slice = ffs_block::io_engine::VolumeDevice::new(
+            Arc::new(dev),
+            ffs_types::ByteOffset(offset),
+            len,
+            VolumeAccess::ReadOnly,
+        )?;
+        detect_all_filesystems_on_device(&cx, &slice)?
+    } else {
+        detect_all_filesystems_on_device(&cx, &dev)?
+    };
+    let kind = detected.kind();
+
+    match kind {
+        FsFormatKind::Fat16 | FsFormatKind::Fat32 => {
+            let args = ffs_fat::resize::ResizeArgs {
+                image: ffs_fat::ImageArgs {
+                    image: source_image.to_path_buf(),
+                    offset,
+                    length,
+                    oem_code_page: FatOemCodePage::Ascii,
+                    sidecar: None,
+                },
+                output: output.to_path_buf(),
+                size_mib,
+                relocate,
+                root_entries,
+                offline_image: true,
+                dry_run,
+            };
+            let report = ffs_fat::resize::run(&cx, &args).with_context(|| {
+                format!(
+                    "failed to resize {} image {} -> {}",
+                    kind.as_str(),
+                    source_image.display(),
+                    output.display()
+                )
+            })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "Resized native {} image {} -> {} ({size_mib} MiB, dry_run={dry_run})",
+                    kind.as_str(),
+                    source_image.display(),
+                    output.display()
+                );
+            }
+            info!(
+                target: "ffs::cli::router",
+                command = "resize",
+                format = %kind.as_str(),
+                partition_id = %partition_id,
+                capability_admitted = true,
+                dry_run,
+                "six_format_router_complete"
+            );
+            Ok(())
+        }
+        FsFormatKind::Ntfs => {
+            if root_entries.is_some() {
+                bail!("--root-entries is valid only for FAT16 resize, not NTFS");
+            }
+            let opts = ffs_ntfs::resize::NtfsResizeOptions {
+                source_image: source_image.to_path_buf(),
+                source_offset: offset,
+                source_length: length,
+                output: output.to_path_buf(),
+                size_bytes: None,
+                size_mib: Some(size_mib),
+                relocate,
+                offline_image: true,
+                dry_run,
+            };
+            let report = ffs_ntfs::resize::run_resize(&cx, &opts, None).with_context(|| {
+                format!(
+                    "failed to resize NTFS image {} -> {}",
+                    source_image.display(),
+                    output.display()
+                )
+            })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "Resized native NTFS image {} -> {} ({size_mib} MiB, dry_run={dry_run})",
+                    source_image.display(),
+                    output.display()
+                );
+            }
+            info!(
+                target: "ffs::cli::router",
+                command = "resize",
+                format = "ntfs",
+                partition_id = %partition_id,
+                capability_admitted = true,
+                dry_run,
+                "six_format_router_complete"
+            );
+            Ok(())
+        }
+        FsFormatKind::Ext4 | FsFormatKind::Btrfs | FsFormatKind::Zfs => {
+            bail!(
+                "unified `ffs resize` currently supports offline FAT16, FAT32, and NTFS images (detected `{}`; for ZFS zvols use `ffs-zfs tx-zvol-resize`)",
+                kind.as_str()
+            )
+        }
     }
 }
 
@@ -3336,5 +3550,203 @@ mod tests {
         .expect_err("ext4 format without --delegate-host-mkfs must fail closed");
         assert!(err.to_string().contains("--delegate-host-mkfs"));
         assert!(!ext4.exists());
+    }
+
+    #[test]
+    fn format_zfs_resize_fat_ntfs_and_six_format_tui_snapshots() {
+        let cx = cli_cx();
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // 1. Native Rust ZFS pool creation via unified `ffs format -t zfs` + negative size guard.
+        let tiny_zfs = dir.path().join("too_small.zfs");
+        let tiny_err = format_cmd(
+            &tiny_zfs,
+            "zfs",
+            16,
+            Some("tiny"),
+            Some(4096),
+            None,
+            false,
+            true,
+        )
+        .expect_err("ZFS format < 64 MiB must fail closed");
+        assert!(tiny_err.to_string().contains(">= 64"));
+        assert!(!tiny_zfs.exists());
+
+        let zfs_img = dir.path().join("native_pool.zfs");
+        format_cmd(
+            &zfs_img,
+            "zfs",
+            64,
+            Some("unifiedpool"),
+            Some(4096),
+            None,
+            false,
+            true,
+        )
+        .expect("native zfs format");
+        let zfs_detected = detect_all_filesystems_at_path(&cx, &zfs_img).expect("detect zfs");
+        assert_eq!(zfs_detected.kind(), FsFormatKind::Zfs);
+
+        // 2. Unified `ffs resize` on FAT16 + NTFS (dry-run + real grow + negative controls).
+        let fat16_src = dir.path().join("resize_src.fat16");
+        format_cmd(
+            &fat16_src,
+            "fat16",
+            8,
+            Some("RESZ16"),
+            None,
+            None,
+            false,
+            true,
+        )
+        .expect("format fat16 source");
+        let fat16_sha = sha256_regular_file(&fat16_src).expect("fat16 sha");
+        let offline = SixFormatCliArgs {
+            offline_image: true,
+            ..SixFormatCliArgs::default()
+        };
+        let online = SixFormatCliArgs::default();
+
+        let fat16_dry = dir.path().join("resize_dry.fat16");
+        resize_cmd(
+            &fat16_src, &fat16_dry, 16, false, None, true, true, &offline,
+        )
+        .expect("fat16 dry-run resize");
+        assert!(!fat16_dry.exists(), "dry-run resize must not create output");
+
+        let fat16_grown = dir.path().join("resize_grown.fat16");
+        let online_err = resize_cmd(
+            &fat16_src,
+            &fat16_grown,
+            16,
+            false,
+            None,
+            false,
+            true,
+            &online,
+        )
+        .expect_err("resize without --offline-image must fail closed");
+        assert!(online_err.to_string().contains("--offline-image"));
+
+        resize_cmd(
+            &fat16_src,
+            &fat16_grown,
+            16,
+            false,
+            None,
+            false,
+            true,
+            &offline,
+        )
+        .expect("fat16 grow resize");
+        assert_eq!(sha256_regular_file(&fat16_src), Some(fat16_sha));
+        let fat_chk = ffs_fat::reader::recovery::check(
+            &cx,
+            &ffs_fat::ImageArgs {
+                image: fat16_grown.clone(),
+                offset: 0,
+                length: None,
+                oem_code_page: FatOemCodePage::Ascii,
+                sidecar: None,
+            },
+        )
+        .expect("check grown fat16");
+        assert!(fat_chk.clean, "grown fat16 must pass check");
+
+        let ntfs_src = dir.path().join("resize_src.ntfs");
+        format_cmd(
+            &ntfs_src,
+            "ntfs",
+            8,
+            Some("RESZNT"),
+            None,
+            None,
+            false,
+            true,
+        )
+        .expect("format ntfs source");
+        let ntfs_sha = sha256_regular_file(&ntfs_src).expect("ntfs sha");
+
+        let ntfs_bad_root = dir.path().join("resize_bad.ntfs");
+        let root_err = resize_cmd(
+            &ntfs_src,
+            &ntfs_bad_root,
+            16,
+            false,
+            Some(512),
+            false,
+            true,
+            &offline,
+        )
+        .expect_err("--root-entries must be refused on NTFS resize");
+        assert!(root_err.to_string().contains("--root-entries"));
+
+        let ntfs_grown = dir.path().join("resize_grown.ntfs");
+        resize_cmd(
+            &ntfs_src,
+            &ntfs_grown,
+            16,
+            false,
+            None,
+            false,
+            true,
+            &offline,
+        )
+        .expect("ntfs grow resize");
+        assert_eq!(sha256_regular_file(&ntfs_src), Some(ntfs_sha));
+        let ntfs_chk = ffs_ntfs::check_image_file(
+            &cx,
+            &ntfs_grown,
+            0,
+            None,
+            ffs_ntfs::NtfsCheckLimits::default(),
+        )
+        .expect("check grown ntfs");
+        assert!(
+            ntfs_chk.clean,
+            "grown ntfs must pass check: {:?}",
+            ntfs_chk.issues
+        );
+
+        let zfs_resize_out = dir.path().join("resize_refused.zfs");
+        let zfs_resize_err = resize_cmd(
+            &zfs_img,
+            &zfs_resize_out,
+            128,
+            false,
+            None,
+            false,
+            true,
+            &offline,
+        )
+        .expect_err("ZFS whole-pool resize must fail closed cleanly");
+        assert!(zfs_resize_err.to_string().contains("tx-zvol-resize"));
+
+        // 3. Unified six-format `ffs tui --snapshot-json` across FAT16, NTFS, and ZFS.
+        for (path, expected_fs_type) in [
+            (&fat16_src, "fat16"),
+            (&ntfs_src, "ntfs"),
+            (&zfs_img, "zfs"),
+        ] {
+            let before = sha256_regular_file(path).expect("pre-tui sha");
+            let snap = crate::build_live_tui_snapshot(path, true)
+                .unwrap_or_else(|e| panic!("TUI snapshot for {expected_fs_type}: {e:#}"));
+            assert_eq!(snap.fs_type, expected_fs_type);
+            assert!(
+                snap.bytes_read_total > 0,
+                "{expected_fs_type} TUI snapshot must record observed physical I/O bytes"
+            );
+            assert!(
+                snap.scrub_blocks_scanned > 0,
+                "{expected_fs_type} TUI scrub snapshot must scan blocks/clusters"
+            );
+            assert_eq!(snap.scrub_blocks_corrupt, 0);
+            assert_eq!(
+                sha256_regular_file(path),
+                Some(before),
+                "{expected_fs_type} TUI snapshot must not mutate image"
+            );
+        }
     }
 }

@@ -1702,7 +1702,7 @@ enum Command {
     },
     /// Launch the FrankenFS telemetry dashboard (TUI, ASCII console, or JSON snapshot).
     Tui {
-        /// Path to the filesystem image (ext4 or btrfs).
+        /// Path to the filesystem image (ext4, btrfs, fat16, fat32, ntfs, or zfs).
         image: PathBuf,
         /// Mount the image read-only here while displaying live telemetry.
         #[arg(
@@ -1741,17 +1741,17 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Format a new filesystem image (pure-Rust for `fat16`/`fat32`; `--delegate-host-mkfs` required for `ext4`/`btrfs`).
+    /// Format a new filesystem image (pure-Rust for `fat16`/`fat32`/`ntfs`/`ntfs31`/`ntfs30`/`zfs`; `--delegate-host-mkfs` required for `ext4`/`btrfs`).
     Format {
         /// Output path for the new image file (never overwrites an existing file).
         output: PathBuf,
-        /// Target filesystem (`fat16`, `fat32`, `ext4`, `btrfs`).
+        /// Target filesystem (`fat16`, `fat32`, `ntfs`, `ntfs31`, `ntfs30`, `zfs`, `ext4`, `btrfs`).
         #[arg(long, short = 't')]
         filesystem: String,
         /// Image size in MiB.
         #[arg(long = "size-mib", visible_alias = "size-mb", default_value_t = 64)]
         size_mib: u64,
-        /// Optional volume label.
+        /// Optional volume label (or ZFS pool name).
         #[arg(long)]
         label: Option<String>,
         /// Optional logical block size in bytes.
@@ -1763,6 +1763,29 @@ enum Command {
         /// Explicitly authorize delegation to host `mkfs.ext4` or `mkfs.btrfs`.
         #[arg(long)]
         delegate_host_mkfs: bool,
+        /// Output in JSON format.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Non-destructively resize an offline FAT16, FAT32, or NTFS image into a new standalone image.
+    Resize {
+        /// Offline read-only source filesystem image.
+        source_image: PathBuf,
+        /// Brand-new standalone output image path (existing files/symlinks refused).
+        #[arg(long)]
+        output: PathBuf,
+        /// Target output volume size in MiB.
+        #[arg(long = "size-mib", visible_alias = "size-mb")]
+        size_mib: u64,
+        /// Authorize moving live tail clusters into free retained slots when shrinking.
+        #[arg(long)]
+        relocate: bool,
+        /// Optional FAT16 fixed-root directory slot expansion.
+        #[arg(long = "root-entries")]
+        root_entries: Option<u16>,
+        /// Validate source and print the relocation plan without creating `--output`.
+        #[arg(long)]
+        dry_run: bool,
         /// Output in JSON format.
         #[arg(long)]
         json: bool,
@@ -1905,6 +1928,7 @@ impl Command {
             Self::Partitions { .. } => "partitions",
             Self::Ls { .. } => "ls",
             Self::Format { .. } => "format",
+            Self::Resize { .. } => "resize",
             Self::Streams { .. } => "streams",
             Self::Pool(_) => "pool",
             Self::Dataset(_) => "dataset",
@@ -3265,6 +3289,24 @@ fn execute_command(
             sectors_per_cluster,
             delegate_host_mkfs,
             json,
+        ),
+        Command::Resize {
+            source_image,
+            output,
+            size_mib,
+            relocate,
+            root_entries,
+            dry_run,
+            json,
+        } => cmd_six_format::resize_cmd(
+            &source_image,
+            &output,
+            size_mib,
+            relocate,
+            root_entries,
+            dry_run,
+            json,
+            &six_format,
         ),
         Command::Streams {
             image,
@@ -11867,6 +11909,103 @@ fn build_live_tui_snapshot(
     run_scrub: bool,
 ) -> Result<ffs_tui::DashboardSnapshot> {
     let cx = cli_cx();
+    if let Ok(detected) = ffs_core::detect_all_filesystems_at_path(&cx, image_path)
+        && matches!(
+            detected.kind(),
+            ffs_core::FsFormatKind::Fat16
+                | ffs_core::FsFormatKind::Fat32
+                | ffs_core::FsFormatKind::Ntfs
+                | ffs_core::FsFormatKind::Zfs
+        )
+    {
+        let ro = ffs::open_read_only(&cx, image_path, &ffs::ReadOnlyOpenOptions::default())
+            .with_context(|| {
+                format!(
+                    "failed to open native {} image for TUI snapshot: {}",
+                    detected.kind().as_str(),
+                    image_path.display()
+                )
+            })?;
+        let mut scope = RequestScope::empty();
+        let _ = ro.filesystem.getattr(&cx, &mut scope, InodeNumber(1));
+        if let Ok(entries) = ro.filesystem.readdir(&cx, &mut scope, InodeNumber(1), 0) {
+            for entry in entries.iter().take(16) {
+                let _ = ro.filesystem.getattr(&cx, &mut scope, entry.ino);
+            }
+        }
+        let _ = ro.filesystem.statfs(&cx, &mut scope);
+
+        let (scrub_blocks_scanned, scrub_blocks_corrupt, scrub_findings_count) = if run_scrub {
+            match detected.kind() {
+                ffs_core::FsFormatKind::Fat16 | ffs_core::FsFormatKind::Fat32 => {
+                    let img = ffs_fat::ImageArgs {
+                        image: image_path.to_path_buf(),
+                        offset: 0,
+                        length: None,
+                        oem_code_page: ffs_ondisk::fat::FatOemCodePage::Ascii,
+                        sidecar: None,
+                    };
+                    let chk = ffs_fat::reader::recovery::check(&cx, &img)
+                        .context("FAT TUI scrub check failed")?;
+                    let findings = usize::from(!chk.clean);
+                    (
+                        u64::from(chk.geometry.cluster_count),
+                        u64::try_from(findings).unwrap_or(0),
+                        findings,
+                    )
+                }
+                ffs_core::FsFormatKind::Ntfs => {
+                    let chk = ffs_ntfs::check_image_file(
+                        &cx,
+                        image_path,
+                        0,
+                        None,
+                        ffs_ntfs::NtfsCheckLimits::default(),
+                    )
+                    .context("NTFS TUI scrub check failed")?;
+                    let findings = chk.issues.len();
+                    (
+                        chk.volume.total_clusters,
+                        u64::try_from(findings).unwrap_or(0),
+                        findings,
+                    )
+                }
+                ffs_core::FsFormatKind::Zfs => {
+                    let leaf = ffs_zfs::reader::Leaf::open(&cx, image_path, 0, None)
+                        .context("open ZFS leaf for TUI scrub")?;
+                    let pool = ffs_zfs::reader::Pool::from_leaves(vec![leaf])
+                        .context("import ZFS pool for TUI scrub")?;
+                    let report = pool
+                        .scrub_mos(
+                            &cx,
+                            ffs_zfs::reader::dmu::scrub::ScrubLimits {
+                                max_blocks: 16_384,
+                                max_bytes: 256 * 1024 * 1024,
+                                max_depth: 16,
+                            },
+                        )
+                        .context("ZFS TUI MOS scrub failed")?;
+                    let corrupt = u64::try_from(report.issues.len()).unwrap_or(0);
+                    (report.blocks_verified, corrupt, report.issues.len())
+                }
+                ffs_core::FsFormatKind::Ext4 | ffs_core::FsFormatKind::Btrfs => (0, 0, 0),
+            }
+        } else {
+            (0, 0, 0)
+        };
+
+        let mut collector = ffs_tui::LiveTelemetryCollector::new();
+        let image_label = image_path.display().to_string();
+        return Ok(collector.sample_read_only_fs(
+            &ro,
+            &image_label,
+            std::time::Duration::ZERO,
+            scrub_blocks_scanned,
+            scrub_blocks_corrupt,
+            scrub_findings_count,
+        ));
+    }
+
     let open_fs = OpenFs::open(&cx, image_path)
         .with_context(|| format!("failed to open filesystem image: {}", image_path.display()))?;
 

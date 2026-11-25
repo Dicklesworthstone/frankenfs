@@ -99302,6 +99302,52 @@ mod tests {
     }
 
     #[test]
+    fn btrfs_fslabel_re_reads_live_superblock_and_btrfs_send_validates_flags_and_version() {
+        let (rw_btrfs, cx) = open_writable_btrfs();
+        let mut s = RequestScope::empty();
+
+        // Update label through btrfs_set_fslabel (NUL-padded 256B UAPI buffer)
+        // and confirm both get_fs_label and btrfs_get_fslabel observe the new on-disk label.
+        let mut raw_label = [0_u8; 256];
+        raw_label[..11].copy_from_slice(b"franken_new");
+        <OpenFs as FsOps>::btrfs_set_fslabel(&rw_btrfs, &cx, &mut s, &raw_label)
+            .expect("btrfs_set_fslabel must succeed on RW mount");
+        assert_eq!(
+            <OpenFs as FsOps>::btrfs_get_fslabel(&rw_btrfs, &cx, &mut s).unwrap(),
+            b"franken_new"
+        );
+        assert_eq!(
+            <OpenFs as FsOps>::get_fs_label(&rw_btrfs, &cx, &mut s).unwrap(),
+            b"franken_new\0"
+        );
+
+        // Read-only btrfs must still reject btrfs_set_fslabel with EROFS.
+        let ro_dev = TestDevice::from_vec(build_btrfs_csum_image());
+        let ro_btrfs = OpenFs::from_device(&cx, Box::new(ro_dev), &OpenOptions::default())
+            .expect("open ro btrfs");
+        let ro_err = <OpenFs as FsOps>::btrfs_set_fslabel(&ro_btrfs, &cx, &mut s, &raw_label)
+            .expect_err("RO btrfs must refuse btrfs_set_fslabel");
+        assert_eq!(ro_err.to_errno(), libc::EROFS);
+
+        // btrfs_send must reject unsupported non-zero flags and stream versions > 1 fail-closed.
+        let mut flag_args = [0_u8; 72];
+        flag_args[0..8].copy_from_slice(&(-1_i64).to_le_bytes());
+        flag_args[32..40].copy_from_slice(&1_u64.to_le_bytes()); // BTRFS_SEND_FLAG_NO_FILE_DATA
+        let flag_err =
+            <OpenFs as FsOps>::btrfs_send(&rw_btrfs, &cx, &mut s, &flag_args, std::process::id())
+                .expect_err("unsupported btrfs_send flags must be rejected");
+        assert_eq!(flag_err.to_errno(), libc::EOPNOTSUPP);
+
+        let mut ver_args = [0_u8; 72];
+        ver_args[0..8].copy_from_slice(&(-1_i64).to_le_bytes());
+        ver_args[40..44].copy_from_slice(&2_u32.to_le_bytes()); // unsupported v2
+        let ver_err =
+            <OpenFs as FsOps>::btrfs_send(&rw_btrfs, &cx, &mut s, &ver_args, std::process::id())
+                .expect_err("unsupported btrfs_send version > 1 must be rejected");
+        assert_eq!(ver_err.to_errno(), libc::EOPNOTSUPP);
+    }
+
+    #[test]
     fn btrfs_space_info_works_on_readonly_and_rw_mounts() {
         let cx = Cx::for_testing();
         let image = build_btrfs_csum_image();

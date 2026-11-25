@@ -2611,7 +2611,10 @@ impl FsOps for OpenFs {
                 label.push(0);
                 Ok(label)
             }
-            FsFlavor::Btrfs(sb) => {
+            FsFlavor::Btrfs(_) => {
+                let sb_region = read_btrfs_superblock_region(cx, self.dev.as_ref())?;
+                let sb = ffs_ondisk::BtrfsSuperblock::parse_superblock_region(&sb_region)
+                    .map_err(|e| parse_to_ffs_error(&e))?;
                 let mut label = sb.label.as_bytes().to_vec();
                 label.push(0);
                 Ok(label)
@@ -3774,9 +3777,12 @@ impl FsOps for OpenFs {
                 let send_fd = i64::from_le_bytes(args[0..8].try_into().unwrap());
                 let clone_sources_count = u64::from_le_bytes(args[8..16].try_into().unwrap());
                 let parent_root = u64::from_le_bytes(args[24..32].try_into().unwrap());
-                let _flags = u64::from_le_bytes(args[32..40].try_into().unwrap());
+                let flags = u64::from_le_bytes(args[32..40].try_into().unwrap());
+                let version = u32::from_le_bytes(args[40..44].try_into().unwrap());
 
-                // Incremental sends (with parent or clone sources) are not supported
+                // Incremental sends (with parent or clone sources), non-zero
+                // send flags (e.g. NO_FILE_DATA, OMIT_STREAM_HEADER, COMPRESSED),
+                // and stream versions > 1 are not supported by v1 stream output.
                 if parent_root != 0 {
                     return Err(FfsError::UnsupportedFeature(
                         "BTRFS_IOC_SEND: incremental sends (parent_root != 0) not supported"
@@ -3787,6 +3793,16 @@ impl FsOps for OpenFs {
                     return Err(FfsError::UnsupportedFeature(
                         "BTRFS_IOC_SEND: clone sources not supported".to_owned(),
                     ));
+                }
+                if flags != 0 {
+                    return Err(FfsError::UnsupportedFeature(format!(
+                        "BTRFS_IOC_SEND: unsupported flags 0x{flags:x}"
+                    )));
+                }
+                if version > 1 {
+                    return Err(FfsError::UnsupportedFeature(format!(
+                        "BTRFS_IOC_SEND: unsupported send stream version {version}"
+                    )));
                 }
 
                 // Validate send_fd
@@ -3808,14 +3824,38 @@ impl FsOps for OpenFs {
                         }
                     })?;
 
-                // Get the mounted subvolume info from BtrfsContext
+                // Get the mounted subvolume info from BtrfsContext and prefer the
+                // actual ROOT_ITEM UUID and generation over open-time superblock fallbacks.
                 let ctx = self
                     .btrfs_context()
                     .ok_or_else(|| FfsError::Format("btrfs context not available".to_owned()))?;
                 let subvol_objectid = ctx.subvol_objectid;
                 let subvol_name = format!("subvol_{subvol_objectid}");
-                let subvol_uuid = sb.fsid;
-                let ctransid = sb.generation;
+                let root_item = if let Some(alloc_mutex) = &self.btrfs_alloc_state {
+                    let alloc = alloc_mutex.read();
+                    Self::btrfs_find_root_item(&alloc.root_tree, subvol_objectid)?
+                        .and_then(|(_k, data)| parse_root_item(&data).ok())
+                } else {
+                    self.walk_btrfs_root_tree(cx)
+                        .ok()
+                        .and_then(|items| {
+                            items.into_iter().find(|item| {
+                                item.key.objectid == subvol_objectid
+                                    && item.key.item_type == BTRFS_ITEM_ROOT_ITEM
+                            })
+                        })
+                        .and_then(|item| parse_root_item(&item.data).ok())
+                };
+                let subvol_uuid = root_item
+                    .as_ref()
+                    .map(|ri| ri.uuid)
+                    .filter(|uuid| *uuid != [0_u8; 16])
+                    .unwrap_or(sb.fsid);
+                let ctransid = root_item
+                    .as_ref()
+                    .map(|ri| ri.generation)
+                    .filter(|&gen_id| gen_id != 0)
+                    .unwrap_or(sb.generation);
 
                 // Walk the FS tree to collect all items
                 let fs_tree_items = self.walk_btrfs_fs_tree(cx)?;
@@ -3889,15 +3929,18 @@ impl FsOps for OpenFs {
 
     fn btrfs_set_fslabel(
         &self,
-        _cx: &Cx,
-        _scope: &mut RequestScope,
-        _args: &[u8],
+        cx: &Cx,
+        scope: &mut RequestScope,
+        args: &[u8],
     ) -> ffs_error::Result<()> {
         match &self.flavor {
             FsFlavor::Ext4(_) => Err(FfsError::UnsupportedFeature(
                 "BTRFS_IOC_SET_FSLABEL is not supported on ext4 filesystems".to_owned(),
             )),
-            FsFlavor::Btrfs(_) => Err(FfsError::ReadOnly),
+            FsFlavor::Btrfs(_) => {
+                let nul_pos = args.iter().position(|&b| b == 0).unwrap_or(args.len());
+                self.set_fs_label(cx, scope, &args[..nul_pos])
+            }
         }
     }
 
@@ -4091,14 +4134,17 @@ impl FsOps for OpenFs {
         }
     }
 
-    fn btrfs_get_fslabel(&self, _cx: &Cx, _scope: &mut RequestScope) -> ffs_error::Result<Vec<u8>> {
+    fn btrfs_get_fslabel(&self, cx: &Cx, _scope: &mut RequestScope) -> ffs_error::Result<Vec<u8>> {
         let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => Err(FfsError::UnsupportedFeature(
                 "BTRFS_IOC_GET_FSLABEL is not supported on ext4 filesystems".to_owned(),
             )),
-            FsFlavor::Btrfs(state) => {
-                let label = state.label.as_bytes();
+            FsFlavor::Btrfs(_) => {
+                let sb_region = read_btrfs_superblock_region(cx, self.dev.as_ref())?;
+                let sb = ffs_ondisk::BtrfsSuperblock::parse_superblock_region(&sb_region)
+                    .map_err(|e| parse_to_ffs_error(&e))?;
+                let label = sb.label.as_bytes();
                 let nul_pos = label.iter().position(|&b| b == 0).unwrap_or(label.len());
                 Ok(label[..nul_pos].to_vec())
             }

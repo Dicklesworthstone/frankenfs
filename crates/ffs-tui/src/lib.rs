@@ -221,6 +221,49 @@ impl DashboardSnapshot {
         }
     }
 
+    /// Sample a truthful [`DashboardSnapshot`] from a unified six-format
+    /// [`ffs::ReadOnlyFs`] handle (covering FAT16, FAT32, NTFS, ZFS, ext4, and btrfs).
+    ///
+    /// Native read-only backends bypass `OpenFs`'s ARC/MVCC caches, so ARC and
+    /// MVCC counters remain zero while `fs_type` and `bytes_read_total` report
+    /// observed format identity and physical I/O bytes from [`ffs::ReadOnlyFs::resource_usage`].
+    #[must_use]
+    pub fn from_read_only_fs(fs: &ffs::ReadOnlyFs, mount_point: &str, uptime_seconds: u64) -> Self {
+        let usage = fs.resource_usage();
+        Self {
+            fs_type: fs.format.as_str().to_owned(),
+            mount_point: mount_point.to_owned(),
+            uptime_seconds,
+            bytes_read_total: usage.physical_io_bytes,
+            bytes_written_total: 0,
+            cache_hits: 0,
+            cache_misses: 0,
+            cache_evictions: 0,
+            cache_resident: 0,
+            cache_capacity: 0,
+            cache_t1_len: 0,
+            cache_t2_len: 0,
+            mvcc_snapshot_seq: 0,
+            mvcc_active_snapshots: 0,
+            mvcc_watermark: None,
+            mvcc_version_count: 0,
+            mvcc_versioned_blocks: 0,
+            degradation_level: DegradationLevel::Normal,
+            cpu_pressure: None,
+            memory_pressure: 0.0,
+            io_queue_depth: None,
+            degradation_events: Vec::new(),
+            scrub_blocks_scanned: 0,
+            scrub_blocks_corrupt: 0,
+            scrub_blocks_io_error: 0,
+            scrub_findings_count: 0,
+            repair_symbol_freshness_secs: None,
+            hit_rate_history: SparklineHistory::new(),
+            commit_rate_history: SparklineHistory::new(),
+            io_throughput_history: SparklineHistory::new(),
+        }
+    }
+
     /// Overlay [`ffs_block::CacheMetrics`] from a [`ffs_block::ByteBlockCache`] or [`ffs_block::ArcCache`].
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
@@ -416,6 +459,24 @@ impl LiveTelemetryCollector {
 
         let mvcc = fs.mvcc_telemetry();
         self.record_sample(snap, mvcc.commits_total, uptime)
+    }
+
+    /// Sample telemetry from a unified six-format [`ffs::ReadOnlyFs`] handle.
+    #[must_use]
+    pub fn sample_read_only_fs(
+        &mut self,
+        fs: &ffs::ReadOnlyFs,
+        mount_point: &str,
+        uptime: std::time::Duration,
+        scrub_blocks_scanned: u64,
+        scrub_blocks_corrupt: u64,
+        scrub_findings_count: usize,
+    ) -> DashboardSnapshot {
+        let mut snap = DashboardSnapshot::from_read_only_fs(fs, mount_point, uptime.as_secs());
+        snap.scrub_blocks_scanned = scrub_blocks_scanned;
+        snap.scrub_blocks_corrupt = scrub_blocks_corrupt;
+        snap.scrub_findings_count = scrub_findings_count;
+        self.record_sample(snap, 0, uptime)
     }
 
     #[allow(clippy::cast_precision_loss)]
@@ -1734,5 +1795,35 @@ mod tests {
         assert_eq!(roundtrip.cache_hits, 80);
         assert_eq!(roundtrip.mvcc_snapshot_seq, 1);
         assert_eq!(roundtrip.scrub_blocks_scanned, 512);
+    }
+
+    #[test]
+    fn from_read_only_fs_samples_native_format_truthfully() {
+        let img = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/images/ext4_small.img");
+        let cx = asupersync::Cx::for_testing();
+        let ro = ffs::open_read_only(&cx, &img, &ffs::ReadOnlyOpenOptions::default())
+            .expect("open fixture image via unified read-only facade");
+        let mut scope = ffs::RequestScope::empty();
+        let _ = ro.filesystem.getattr(&cx, &mut scope, ffs::InodeNumber(1));
+
+        let mut collector = LiveTelemetryCollector::new();
+        let snap = collector.sample_read_only_fs(
+            &ro,
+            "/mnt/ext4",
+            std::time::Duration::from_secs(5),
+            42,
+            0,
+            0,
+        );
+        assert_eq!(snap.fs_type, "ext4");
+        assert_eq!(snap.mount_point, "/mnt/ext4");
+        assert_eq!(snap.uptime_seconds, 5);
+        assert!(snap.bytes_read_total > 0);
+        assert_eq!(snap.bytes_written_total, 0);
+        assert_eq!(snap.scrub_blocks_scanned, 42);
+        assert_eq!(snap.scrub_blocks_corrupt, 0);
+        let ascii = snap.render_ascii();
+        assert!(ascii.contains("Type:       ext4"));
     }
 }

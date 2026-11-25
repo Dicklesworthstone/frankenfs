@@ -8265,10 +8265,7 @@ mod tests {
             .unwrap();
         let early = done_rx.recv_timeout(Duration::from_millis(100));
         request_cx.set_cancel_requested(true);
-        let result = match early {
-            Ok(result) => Ok(result),
-            Err(_) => done_rx.recv_timeout(Duration::from_secs(2)),
-        };
+        let result = early.or_else(|_| done_rx.recv_timeout(Duration::from_secs(2)));
         let pending_before_release = cache.state.lock().pending_flush.len();
         release_tx.send(()).expect("release first retry");
         first.join().expect("first worker").expect("first retry");
@@ -8339,15 +8336,14 @@ mod tests {
         let worker = std::thread::spawn(move || {
             done_tx.send(worker_cache.flush_dirty(&worker_cx)).unwrap();
         });
-        let outcome = match done_rx.recv_timeout(Duration::from_millis(500)) {
-            Ok(result) => Ok(result),
-            Err(_) => {
+        let outcome = done_rx
+            .recv_timeout(Duration::from_millis(500))
+            .or_else(|_| {
                 // Bound a broken self-deadlock without leaving a live test
                 // worker or depending on the whole test process timing out.
                 cx.set_cancel_requested(true);
                 done_rx.recv_timeout(Duration::from_secs(2))
-            }
-        };
+            });
         worker.join().expect("flush worker");
         let result = outcome.expect("reentrant notification must terminate");
         result.unwrap();
