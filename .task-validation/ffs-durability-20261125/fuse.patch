@@ -1,0 +1,223 @@
+diff --git a/crates/ffs-fuse/src/lib.rs b/crates/ffs-fuse/src/lib.rs
+index 91849e6..4c8c7c8 100644
+--- a/crates/ffs-fuse/src/lib.rs
++++ b/crates/ffs-fuse/src/lib.rs
+@@ -215,6 +215,8 @@ struct QuarantinedMountLease {
+ 
+ static NEXT_QUARANTINED_LEASE_ID: AtomicU64 = AtomicU64::new(1);
+ static QUARANTINED_MOUNT_LEASES: Mutex<Vec<QuarantinedMountLease>> = Mutex::new(Vec::new());
++#[cfg(test)]
++static QUARANTINED_MOUNT_LEASE_TEST_LOCK: Mutex<()> = Mutex::new(());
+ 
+ fn register_quarantined_mount_lease(ops: Arc<dyn FsOps>) -> u64 {
+     let id = NEXT_QUARANTINED_LEASE_ID.fetch_add(1, Ordering::Relaxed);
+@@ -226,10 +228,59 @@ fn register_quarantined_mount_lease(ops: Arc<dyn FsOps>) -> u64 {
+ }
+ 
+ fn release_quarantined_mount_lease(id: u64) {
+-    QUARANTINED_MOUNT_LEASES
+-        .lock()
+-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+-        .retain(|lease| lease.id != id);
++    let lease = {
++        let mut leases = QUARANTINED_MOUNT_LEASES
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        leases
++            .iter()
++            .position(|lease| lease.id == id)
++            .map(|position| leases.swap_remove(position))
++    };
++    // FsOps destruction can join other workers. Never hold the registry lock
++    // while releasing the last owner of a mount or its device authority.
++    drop(lease);
++}
++
++#[derive(Default)]
++enum MountJoinRetirementState {
++    #[default]
++    Joining,
++    Quarantined(u64),
++    Retired,
++}
++
++/// Serializes timeout-side lease publication with actual dispatch retirement.
++/// A completion receipt may still be in flight after the worker retires: a
++/// timeout in that window must not register a lease nobody can release.
++#[derive(Default)]
++struct MountJoinRetirement {
++    state: Mutex<MountJoinRetirementState>,
++}
++
++impl MountJoinRetirement {
++    fn quarantine(&self, ops: Arc<dyn FsOps>) {
++        let mut state = self
++            .state
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        if matches!(*state, MountJoinRetirementState::Joining) {
++            *state = MountJoinRetirementState::Quarantined(register_quarantined_mount_lease(ops));
++        }
++    }
++
++    fn retire(&self) {
++        let previous = {
++            let mut state = self
++                .state
++                .lock()
++                .unwrap_or_else(std::sync::PoisonError::into_inner);
++            std::mem::replace(&mut *state, MountJoinRetirementState::Retired)
++        };
++        if let MountJoinRetirementState::Quarantined(id) = previous {
++            release_quarantined_mount_lease(id);
++        }
++    }
+ }
+ 
+ #[cfg(test)]
+@@ -9780,8 +9831,8 @@ impl MountHandle {
+             let (tx, mut rx) = asupersync::channel::oneshot::channel();
+             if let Ok(region) = ffs_block::OwnedChildRegion::open_sync(&cleanup_cx) {
+                 let ops_for_quarantine = Arc::clone(&self.diagnostics.inner.ops);
+-                let quarantine_lease_id = Arc::new(AtomicU64::new(0));
+-                let worker_quarantine_id = Arc::clone(&quarantine_lease_id);
++                let retirement = Arc::new(MountJoinRetirement::default());
++                let worker_retirement = Arc::clone(&retirement);
+                 let _ = region.cx().spawn_blocking(move |worker_cx| {
+                     // Dropping the session only requests unmount and detaches
+                     // its dispatch thread. The receipt must follow the actual
+@@ -9790,10 +9841,7 @@ impl MountHandle {
+                         session.join_dispatch()
+                     }));
+                     drop(ops_for_quarantine);
+-                    let lease_id = worker_quarantine_id.load(Ordering::Acquire);
+-                    if lease_id != 0 {
+-                        release_quarantined_mount_lease(lease_id);
+-                    }
++                    worker_retirement.retire();
+                     if let Ok(permit) = worker_cx.masked(|| tx.reserve(&worker_cx)) {
+                         let _ = permit.send(joined);
+                     }
+@@ -9841,12 +9889,8 @@ impl MountHandle {
+                         ));
+                     }
+                     Err(_) => {
+-                        let lease_id = register_quarantined_mount_lease(Arc::clone(
+-                            &self.diagnostics.inner.ops,
+-                        ));
+-                        quarantine_lease_id.store(lease_id, Ordering::Release);
++                        retirement.quarantine(Arc::clone(&self.diagnostics.inner.ops));
+                         if let Ok(joined) = rx.try_recv() {
+-                            release_quarantined_mount_lease(lease_id);
+                             region.close_sync();
+                             let (dispatch, finish_unmount) = joined.map_err(|_| {
+                                 std::io::Error::other("FUSE background session cleanup panicked")
+@@ -31470,6 +31514,98 @@ AllowOther"#;
+         );
+     }
+ 
++    #[test]
++    fn quarantine_after_dispatch_retirement_does_not_leak_before_receipt_bd_in31y() {
++        let _leases = QUARANTINED_MOUNT_LEASE_TEST_LOCK
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        let retirement = Arc::new(MountJoinRetirement::default());
++        let ops: Arc<dyn FsOps> = Arc::new(MinimalTestFs);
++        let weak = Arc::downgrade(&ops);
++        let retired = Arc::new(std::sync::Barrier::new(2));
++        let send_receipt = Arc::new(std::sync::Barrier::new(2));
++        let (receipt_tx, receipt_rx) = std::sync::mpsc::channel();
++
++        std::thread::scope(|scope| {
++            let worker_retirement = Arc::clone(&retirement);
++            let worker_retired = Arc::clone(&retired);
++            let worker_send_receipt = Arc::clone(&send_receipt);
++            scope.spawn(move || {
++                // The dispatch has joined, but its completion receipt has not
++                // reached the timeout owner yet. The old AtomicU64 handshake
++                // observed lease_id == 0 here and never looked again.
++                worker_retirement.retire();
++                worker_retired.wait();
++                worker_send_receipt.wait();
++                receipt_tx.send(()).expect("send completion receipt");
++            });
++
++            retired.wait();
++            retirement.quarantine(ops);
++            let no_receipt = matches!(
++                receipt_rx.try_recv(),
++                Err(std::sync::mpsc::TryRecvError::Empty)
++            );
++            let authority_released = weak.upgrade().is_none();
++            // Always release the worker before assertions so a regression
++            // fails promptly instead of wedging the scoped thread's join.
++            send_receipt.wait();
++            assert!(no_receipt, "the regression must hit the pre-receipt window");
++            assert!(
++                authority_released,
++                "a late timeout must not retain an already-retired mount indefinitely"
++            );
++        });
++        receipt_rx.recv().expect("completion receipt");
++    }
++
++    #[test]
++    fn quarantine_holds_authority_until_dispatch_retires_bd_in31y() {
++        let _leases = QUARANTINED_MOUNT_LEASE_TEST_LOCK
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        let retirement = MountJoinRetirement::default();
++        let ops: Arc<dyn FsOps> = Arc::new(MinimalTestFs);
++        let weak = Arc::downgrade(&ops);
++        retirement.quarantine(ops);
++        let held_until_retirement = weak.strong_count();
++        retirement.retire();
++        assert_eq!(
++            held_until_retirement, 1,
++            "a timed-out worker must retain exactly one lease until actual retirement"
++        );
++        assert!(weak.upgrade().is_none());
++    }
++
++    #[test]
++    fn quarantine_repeated_timeouts_and_retirement_do_not_leak_bd_in31y() {
++        let _leases = QUARANTINED_MOUNT_LEASE_TEST_LOCK
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        let retirement = MountJoinRetirement::default();
++        let ops: Arc<dyn FsOps> = Arc::new(MinimalTestFs);
++        let weak = Arc::downgrade(&ops);
++        retirement.quarantine(Arc::clone(&ops));
++        retirement.quarantine(Arc::clone(&ops));
++        drop(ops);
++        let lease_count = weak.strong_count();
++        retirement.retire();
++        retirement.retire();
++        assert_eq!(
++            lease_count, 1,
++            "repeated timeouts must share the same lease"
++        );
++        assert!(weak.upgrade().is_none());
++
++        let after_retirement: Arc<dyn FsOps> = Arc::new(MinimalTestFs);
++        let after_retirement_weak = Arc::downgrade(&after_retirement);
++        retirement.quarantine(after_retirement);
++        assert!(
++            after_retirement_weak.upgrade().is_none(),
++            "a duplicate timeout cannot reactivate a retired mount"
++        );
++    }
++
+     #[test]
+     fn nonresponsive_device_unmount_timeout_bounds_wait_and_quarantines_lease_bd_in31y() {
+         struct DropTrackedFs {
+@@ -31527,6 +31663,9 @@ AllowOther"#;
+             }
+         }
+ 
++        let _leases = QUARANTINED_MOUNT_LEASE_TEST_LOCK
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
+         // 1. Deterministic component proof of quarantine lease retention & release.
+         let baseline_leases = quarantined_mount_lease_count();
+         let retired = Arc::new(AtomicBool::new(false));

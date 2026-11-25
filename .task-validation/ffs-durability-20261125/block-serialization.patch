@@ -1,0 +1,348 @@
+diff --git a/crates/ffs-block/src/cache.rs b/crates/ffs-block/src/cache.rs
+--- a/crates/ffs-block/src/cache.rs
++++ b/crates/ffs-block/src/cache.rs
+@@ -2303,8 +2303,13 @@
+ ///    `write_block` writes through to the device first, then acquires the lock
+ ///    only to update metadata.
+ /// 2. `parking_lot::Mutex` is non-poisoning and uses adaptive spinning, so
+ ///    contention under typical FUSE workloads (many concurrent reads, few
+ ///    writes) remains low.
+ ///
++/// A separate flush mutex orders candidate selection, device writes and dirty
++/// retirement. It is acquired before the metadata mutex, never while holding
++/// it. Read hits and cached write-back publication do not take the flush mutex.
++/// Repair notifications run after both locks are released.
++///
+ /// **High-core sharding:** [`ShardedArcCache`] shards resident metadata by
+ /// `BlockNumber` into N independent `Mutex<ArcState>` segments for workloads
+@@ -2316,8 +2321,9 @@
+ #[derive(Debug)]
+ pub struct ArcCache<D: BlockDevice> {
+     inner: D,
+     state: Mutex<ArcState>,
++    flush_lock: Mutex<()>,
+     page_locks: PageLockTable,
+     write_policy: ArcWritePolicy,
+     mvcc_flush_lifecycle: Arc<dyn MvccFlushLifecycle>,
+     repair_flush_lifecycle: Arc<dyn RepairFlushLifecycle>,
+@@ -2746,8 +2752,9 @@
+         let s3_fast_hits_enabled = ArcState::s3_capacity_split(capacity_blocks).0 > 32;
+         let cache = Self {
+             inner,
+             state: Mutex::new(ArcState::new(capacity_blocks)),
++            flush_lock: Mutex::new(()),
+             page_locks: PageLockTable::for_host_parallelism(),
+             write_policy,
+             mvcc_flush_lifecycle,
+             repair_flush_lifecycle,
+@@ -3177,10 +3184,10 @@
+             }
+         }
+ 
+-        let pending_flush = guard.take_pending_flush();
++        let pending_flush = !guard.pending_flush.is_empty();
+         #[cfg(feature = "s3fifo")]
+         {
+             // Publish while the same state lock still pins these identities.
+             // Fast readers are excluded by mutation_guard until all are ready.
+             let invalidations = guard.take_fast_invalidations();
+             self.apply_s3_fast_resident_updates(invalidations, None);
+@@ -3190,11 +3197,13 @@
+         }
+         drop(guard);
+         #[cfg(feature = "s3fifo")]
+         drop(mutation_guard);
+-        self.flush_pending_evictions(cx, pending_flush)?;
++        if pending_flush {
++            self.flush_pending_evictions(cx)?;
++        }
+ 
+         if enforce_backpressure {
+             loop {
+                 let dirty_ratio = self.committed_dirty_ratio();
+                 if dirty_ratio <= DIRTY_HIGH_WATERMARK {
+                     break;
+@@ -3631,45 +3640,57 @@
+         }
+     }
+ 
+-    fn flush_pending_evictions(&self, cx: &Cx, pending_flush: Vec<FlushCandidate>) -> Result<()> {
+-        if pending_flush.is_empty() {
+-            return Ok(());
+-        }
+-
+-        debug!(
+-            event = "pending_flush_batch_start",
+-            blocks = pending_flush.len(),
+-            "flushing pending dirty evictions"
+-        );
+-
+-        if let Err(err) = self.flush_blocks(cx, &pending_flush) {
+-            // Restore the pending queue on failure so callers can retry.
+-            self.restore_pending_flush_candidates(pending_flush);
+-            error!(event = "pending_flush_batch_failed", error = %err);
+-            return Err(err);
+-        }
+-
+-        if let Err(err) = self.notify_repair_flush(cx, &pending_flush) {
+-            // Blocks were already written to device by flush_blocks above.
+-            // Do NOT restore them as dirty — just log the repair notification
+-            // failure and continue. The blocks are persisted; only the repair
+-            // system missed the notification.
+-            error!(event = "pending_flush_batch_repair_notify_failed", error = %err);
+-        }
+-
+-        let mut guard = self.state.lock();
+-        for candidate in &pending_flush {
+-            guard.clear_dirty(candidate.block, candidate.seq);
+-        }
+-        ArcState::add_usize_to_counter(&mut guard.dirty_flushes, pending_flush.len());
+-        info!(
+-            event = "pending_flush_batch_complete",
+-            blocks = pending_flush.len(),
+-            dirty_flushes = guard.dirty_flushes
+-        );
+-        drop(guard);
++    fn lock_flush(&self, cx: &Cx) -> Result<parking_lot::MutexGuard<'_, ()>> {
++        loop {
++            cx_checkpoint(cx)?;
++            if let Some(guard) = self.flush_lock.try_lock_for(Duration::from_millis(10)) {
++                cx_checkpoint(cx)?;
++                return Ok(guard);
++            }
++        }
++    }
++
++    fn flush_pending_evictions(&self, cx: &Cx) -> Result<()> {
++        let flush_guard = self.lock_flush(cx)?;
++        // Keep pending payloads visible to every flusher until this owner can
++        // select them. Cancellation while waiting must not remove retry data.
++        let pending_flush = self.state.lock().take_pending_flush();
++        if pending_flush.is_empty() {
++            return Ok(());
++        }
++
++        debug!(
++            event = "pending_flush_batch_start",
++            blocks = pending_flush.len(),
++            "flushing pending dirty evictions"
++        );
++
++        if let Err(err) = self.flush_blocks(cx, &pending_flush) {
++            // Restore the pending queue on failure so callers can retry.
++            self.restore_pending_flush_candidates(pending_flush);
++            error!(event = "pending_flush_batch_failed", error = %err);
++            return Err(err);
++        }
++
++        let mut guard = self.state.lock();
++        for candidate in &pending_flush {
++            guard.clear_dirty(candidate.block, candidate.seq);
++        }
++        ArcState::add_usize_to_counter(&mut guard.dirty_flushes, pending_flush.len());
++        info!(
++            event = "pending_flush_batch_complete",
++            blocks = pending_flush.len(),
++            dirty_flushes = guard.dirty_flushes
++        );
++        drop(guard);
++        drop(flush_guard);
++        if let Err(err) = self.notify_repair_flush(cx, &pending_flush) {
++            // Native durability succeeded; repair refresh is a separate
++            // notification and must be allowed to reenter the cache.
++            error!(event = "pending_flush_batch_repair_notify_failed", error = %err);
++        }
+         Ok(())
+     }
+ }
+ 
+ impl<D: BlockDevice> BlockDevice for ArcCache<D> {
+@@ -3738,26 +3759,31 @@
+             }
+             buf
+         };
+-        let pending_flush = guard.take_pending_flush();
+-        #[cfg(feature = "s3fifo")]
+-        let fast_invalidations = guard.take_fast_invalidations();
+-        drop(guard);
+-        #[cfg(feature = "s3fifo")]
+-        self.apply_s3_fast_resident_updates(fast_invalidations, fast_insert);
+-        #[cfg(feature = "s3fifo")]
+-        drop(mutation_guard);
+-        self.flush_pending_evictions(cx, pending_flush)?;
+-        Ok(final_buf)
+-    }
+-
+-    fn write_block(&self, cx: &Cx, block: BlockNumber, data: &[u8]) -> Result<()> {
+-        if matches!(self.write_policy, ArcWritePolicy::WriteThrough) {
+-            self.inner.write_block(cx, block, data)?;
+-        } else {
+-            cx_checkpoint(cx)?;
+-        }
++        let pending_flush = !guard.pending_flush.is_empty();
++        #[cfg(feature = "s3fifo")]
++        let fast_invalidations = guard.take_fast_invalidations();
++        drop(guard);
++        #[cfg(feature = "s3fifo")]
++        self.apply_s3_fast_resident_updates(fast_invalidations, fast_insert);
++        #[cfg(feature = "s3fifo")]
++        drop(mutation_guard);
++        if pending_flush {
++            self.flush_pending_evictions(cx)?;
++        }
++        Ok(final_buf)
++    }
++
++    fn write_block(&self, cx: &Cx, block: BlockNumber, data: &[u8]) -> Result<()> {
++        let write_through_guard = if matches!(self.write_policy, ArcWritePolicy::WriteThrough) {
++            let guard = self.lock_flush(cx)?;
++            self.inner.write_block(cx, block, data)?;
++            Some(guard)
++        } else {
++            cx_checkpoint(cx)?;
++            None
++        };
+ 
+         let mut enforce_backpressure = false;
+         #[cfg(feature = "s3fifo")]
+         let mutation_guard = self.begin_s3_fast_mutation();
+         let mut guard = self.state.lock();
+@@ -3831,18 +3857,21 @@
+             }
+         }
+ 
+-        let pending_flush = guard.take_pending_flush();
+-        #[cfg(feature = "s3fifo")]
+-        let fast_invalidations = guard.take_fast_invalidations();
+-        drop(guard);
+-        #[cfg(feature = "s3fifo")]
+-        self.apply_s3_fast_resident_updates(fast_invalidations, fast_insert);
+-        #[cfg(feature = "s3fifo")]
+-        drop(mutation_guard);
+-        self.flush_pending_evictions(cx, pending_flush)?;
++        let pending_flush = !guard.pending_flush.is_empty();
++        #[cfg(feature = "s3fifo")]
++        let fast_invalidations = guard.take_fast_invalidations();
++        drop(guard);
++        #[cfg(feature = "s3fifo")]
++        self.apply_s3_fast_resident_updates(fast_invalidations, fast_insert);
++        #[cfg(feature = "s3fifo")]
++        drop(mutation_guard);
++        drop(write_through_guard);
++        if pending_flush {
++            self.flush_pending_evictions(cx)?;
++        }
+ 
+         if enforce_backpressure {
+             // Block writers by synchronously draining until we're back under high watermark.
+             loop {
+                 let dirty_ratio = self.committed_dirty_ratio();
+                 if dirty_ratio <= DIRTY_HIGH_WATERMARK {
+@@ -4018,11 +4047,12 @@
+     /// Returns the number of blocks flushed in this batch.
+     pub fn flush_dirty_batch(&self, cx: &Cx, max_blocks: usize) -> Result<usize> {
+         cx_checkpoint(cx)?;
+         if max_blocks == 0 {
+             return Ok(0);
+         }
++        let flush_guard = self.lock_flush(cx)?;
+ 
+         let (flushes, pre_metrics) = {
+             let mut guard = self.state.lock();
+             let metrics = guard.snapshot_metrics();
+             let flushes = guard.take_dirty_and_pending_flushes_limited(max_blocks);
+@@ -4060,28 +4090,25 @@
+             return Err(err);
+         }
+ 
+-        if let Err(err) = self.notify_repair_flush(cx, &flushes) {
+-            // Blocks were already written to device by flush_blocks above.
+-            // Do NOT restore them as dirty — the write is durable. Only
+-            // the repair notification was lost; log and continue.
+-            error!(
+-                event = "flush_batch_repair_notify_failed",
+-                error = %err,
+-                attempted_blocks = flushes.len(),
+-                duration_ms = started.elapsed().as_millis(),
+-                attempted_bytes = flush_bytes
+-            );
+-        }
+-
+-        let mut guard = self.state.lock();
+-        for candidate in &flushes {
+-            guard.clear_dirty(candidate.block, candidate.seq);
+-        }
+-        ArcState::add_usize_to_counter(&mut guard.dirty_flushes, flushes.len());
+-        let metrics = guard.snapshot_metrics();
+-        drop(guard);
++        let mut guard = self.state.lock();
++        for candidate in &flushes {
++            guard.clear_dirty(candidate.block, candidate.seq);
++        }
++        ArcState::add_usize_to_counter(&mut guard.dirty_flushes, flushes.len());
++        let metrics = guard.snapshot_metrics();
++        drop(guard);
++        drop(flush_guard);
++        if let Err(err) = self.notify_repair_flush(cx, &flushes) {
++            error!(
++                event = "flush_batch_repair_notify_failed",
++                error = %err,
++                attempted_blocks = flushes.len(),
++                duration_ms = started.elapsed().as_millis(),
++                attempted_bytes = flush_bytes
++            );
++        }
+         info!(
+             event = "mvcc_flush_commit_batch",
+             flushed_blocks = flushes.len(),
+             min_commit_seq = min_commit_seq.unwrap_or(0),
+             max_commit_seq = max_commit_seq.unwrap_or(0),
+@@ -4117,10 +4144,11 @@
+     }
+ 
+     /// Return whether a batch completed its own backing-device barrier.
+     fn flush_dirty_inner(&self, cx: &Cx) -> Result<bool> {
+         cx_checkpoint(cx)?;
++        let flush_guard = self.lock_flush(cx)?;
+ 
+         // Collect all dirty payloads (resident + evicted pending) under lock.
+         let flushes = {
+             let mut guard = self.state.lock();
+             guard.take_dirty_and_pending_flushes()
+@@ -4151,16 +4179,6 @@
+             return Err(err);
+         }
+ 
+-        if let Err(err) = self.notify_repair_flush(cx, &flushes) {
+-            // Blocks already persisted by flush_blocks. Only repair
+-            // notification was lost — log and continue.
+-            error!(
+-                event = "flush_dirty_repair_notify_failed",
+-                error = %err,
+-                duration_ms = started.elapsed().as_millis()
+-            );
+-        }
+-
+         let mut guard = self.state.lock();
+         for candidate in &flushes {
+             guard.clear_dirty(candidate.block, candidate.seq);
+@@ -4191,10 +4209,19 @@
+             flush_duration_us = started.elapsed().as_micros()
+         );
+ 
++        drop(guard);
++        drop(flush_guard);
++        if let Err(err) = self.notify_repair_flush(cx, &flushes) {
++            error!(
++                event = "flush_dirty_repair_notify_failed",
++                error = %err,
++                duration_ms = started.elapsed().as_millis()
++            );
++        }
+         Ok(true)
+     }
+ 
+     /// Return the number of currently dirty blocks.
+     #[must_use]
+     pub fn dirty_count(&self) -> usize {
+         self.state.lock().dirty.dirty_count()
