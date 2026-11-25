@@ -1,0 +1,112 @@
+name: Durable flush, mount retirement, and received-limit validation
+
+on:
+  push:
+    branches: [validation/ffs-durability-20261125]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ffs-durability-20261125
+  cancel-in-progress: false
+
+env:
+  FFS_EXPECTED_MAIN: edf52ac83ba731441938f3cf074cacbd7e60d6b2
+  FFS_TREE_1: 25eaaba8b62a5c8927a34f4dd7c79a69c029e0bf
+  FFS_TREE_2: a0ed8e0306cfaa4e25a99b6f201718a4ba13dd32
+  FFS_TREE_3: 4f6faacdbbd5a18eb9aaf92ae9573aa86bd4ff1d
+  CARGO_TERM_COLOR: never
+  CARGO_BUILD_JOBS: "2"
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  RUSTFLAGS: "-Z threads=1"
+  CARGO_HTTP_USER_AGENT: "frankenfs-agent (+https://github.com/Dicklesworthstone/frankenfs)"
+
+jobs:
+  required-gates:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    outputs:
+      tree_1: ${{ steps.validate.outputs.tree_1 }}
+      tree_2: ${{ steps.validate.outputs.tree_2 }}
+      tree_3: ${{ steps.validate.outputs.tree_3 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch pinned UBS source and scanner modules
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/ultimate_bug_scanner
+          ref: d82d76da9a91a69030ab76e939f91fc4874de4d1
+          path: .validation-ubs
+          persist-credentials: false
+      - name: Verify pinned UBS revision
+        run: test "$(git -C .validation-ubs rev-parse HEAD)" = d82d76da9a91a69030ab76e939f91fc4874de4d1
+      - name: Install pinned tools and reserve swap
+        run: |
+          rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends e2fsprogs btrfs-progs ntfs-3g dosfstools mtools fuse3 pkg-config ripgrep jq
+          validation_swap=$(sudo mktemp /mnt/ffs-durability-XXXXXX)
+          sudo fallocate -l 12G "$validation_swap"
+          sudo chmod 0600 "$validation_swap"
+          sudo mkswap "$validation_swap"
+          sudo swapon "$validation_swap"
+          candidate_build=$(mktemp -d "$RUNNER_TEMP/ffs-build-XXXXXX")
+          echo "CARGO_TARGET_DIR=$candidate_build/target" >> "$GITHUB_ENV"
+          echo "CARGO_BUILD_BUILD_DIR=$candidate_build/build" >> "$GITHUB_ENV"
+          free -h
+          df -h .
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ffs-registry-only-v1
+          shared-key: ffs-durability-20261125
+          cache-targets: "false"
+          cache-workspace-crates: "false"
+          cache-on-failure: "true"
+      - name: Gate every cumulative commit tree
+        id: validate
+        run: bash .task-validation/ffs-durability-20261125/run.sh gates
+  owning-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    outputs:
+      tree_1: ${{ steps.validate.outputs.tree_1 }}
+      tree_2: ${{ steps.validate.outputs.tree_2 }}
+      tree_3: ${{ steps.validate.outputs.tree_3 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install pinned tools and reserve swap
+        run: |
+          rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends e2fsprogs btrfs-progs ntfs-3g dosfstools mtools fuse3 pkg-config
+          validation_swap=$(sudo mktemp /mnt/ffs-durability-XXXXXX)
+          sudo fallocate -l 12G "$validation_swap"
+          sudo chmod 0600 "$validation_swap"
+          sudo mkswap "$validation_swap"
+          sudo swapon "$validation_swap"
+          candidate_build=$(mktemp -d "$RUNNER_TEMP/ffs-build-XXXXXX")
+          echo "CARGO_TARGET_DIR=$candidate_build/target" >> "$GITHUB_ENV"
+          echo "CARGO_BUILD_BUILD_DIR=$candidate_build/build" >> "$GITHUB_ENV"
+          free -h
+          df -h .
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ffs-registry-only-v1
+          shared-key: ffs-durability-20261125
+          cache-targets: "false"
+          cache-workspace-crates: "false"
+          cache-on-failure: "true"
+      - name: Prove regressions and run the owning test suites
+        id: validate
+        run: bash .task-validation/ffs-durability-20261125/run.sh tests

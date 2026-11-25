@@ -1,0 +1,57 @@
+diff --git a/FEATURE_PARITY.md b/FEATURE_PARITY.md
+--- a/FEATURE_PARITY.md
++++ b/FEATURE_PARITY.md
+@@ -4031,4 +4031,53 @@
+ unavailable and the commit records the gate bypass. Faultable-device tests
+ provide deterministic cancellation placement but do not establish an executed
+ race inside `std::fs::File::sync_all`, mounted FUSE behavior or native OpenZFS
+ interchange qualification.
++
++## Cache durability, mount retirement, and received ZFS limits (2026-11-25)
++
++The write-back ARC cache now synchronizes each nonempty flush batch before
++marking any version persisted, clearing its dirty state, or notifying repair
++refresh. Version pins span the backing-device barrier. A failed write or sync
++keeps the batch available for retry, including when a newer cached version
++replaces a failed payload. Explicit cache synchronization uses the batch's
++completed barrier, while a clean/write-through cache still synchronizes its
++backing device. These are block-cache durability guarantees; they do not replace
++a filesystem's native journal or TXG publication protocol.
++
++Full, bounded, and pending-eviction flushes serialize candidate selection through
++dirty retirement. Write-through updates share this ordering, so an older flush
++cannot overwrite an acknowledged newer version. Cancellation while waiting keeps
++pending payloads visible for retry. Repair callbacks run after the flush and
++metadata locks are released, allowing them to reenter cache synchronization.
++
++Managed FUSE shutdown now serializes dispatch retirement and timeout quarantine
++registration. A timeout arriving after dispatch retirement cannot strand an
++image/device lease while the completion receipt is still in flight. A genuinely
++unfinished dispatch retains its lease until retirement. Lease destruction occurs
++outside the global registry lock because filesystem destruction can join workers.
++
++ZFS inheritance of received `quota`, `refquota`, `reservation`, and
++`refreservation` values now uses the existing direct-update preflight. Restored
++values must satisfy current usage, paired quota/reservation constraints, ancestor
++headroom, and pool capacity before native publication. Clearing a local override
++preserves received-property provenance and updates native accounting without
++creating a replacement local property.
++
++Focused regression entry points:
++
++- `cargo test -p ffs-block --lib arc_cache_flush_barrier`
++- `cargo test -p ffs-block --lib arc_cache_failed_sync`
++- `cargo test -p ffs-block --lib arc_cache_overlapping_flushes`
++- `cargo test -p ffs-fuse --lib quarantine_`
++- `cargo test -p ffs-zfs --test persistence_prefix received_space_`
++
++The regression scope is deterministic lifecycle interleaving and faultable-device
++durability/restart behavior. It does not establish new mounted FUSE,
++hardware-power-loss, performance, or native OpenZFS interchange qualification,
++and does not close the broader writeback, caller-runtime, or ZFS lifecycle beads.
++
++At publication, the local executor was unavailable after repeated failures and
++hosted runners were backlogged. These changes have source review and new
++regressions, but no completed compiler, strict-Clippy, UBS, or runtime result is
++claimed. The FUSE change and existing formatting corrections passed local
++formatting before the outage; subsequent changes await hosted formatting checks.
