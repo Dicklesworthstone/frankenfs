@@ -4515,7 +4515,17 @@ mod bd_tqrnc {
             };
 
             // Phase 1: Writable FsOps (mkdir, create, write, chmod setattr, setxattr, rename, fsync)
-            let rw_args = make_args(true, false);
+            // A valid pool root is still the wrong view for this signed child manifest.
+            for (rw, check) in [(false, true), (true, false)] {
+                let mut wrong = make_args(rw, check);
+                wrong.set.zfs_dataset = Some("/".to_owned());
+                let err = prepare(&cx, &wrong)
+                    .err()
+                    .expect("root conflicts with signed child view");
+                assert!(err.to_string().contains("differs from the view"), "{err:#}");
+            }
+            let mut rw_args = make_args(true, false);
+            rw_args.set.zfs_dataset = None;
             let prepared = prepare(&cx, &rw_args).expect("admit writable protected ZFS");
             assert_eq!(prepared.filesystem, "zfs");
             assert!(prepared.fs.is_writable());

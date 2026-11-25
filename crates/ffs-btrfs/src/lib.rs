@@ -6991,6 +6991,16 @@ pub enum ChunkKind {
     System,
 }
 
+impl ChunkKind {
+    const fn flag(self) -> u64 {
+        match self {
+            Self::Metadata => BTRFS_BLOCK_GROUP_METADATA,
+            Self::Data => BTRFS_BLOCK_GROUP_DATA,
+            Self::System => BTRFS_BLOCK_GROUP_SYSTEM,
+        }
+    }
+}
+
 /// Sizing inputs and limits for one chunk allocation.
 ///
 /// Separated from the decision so the policy numbers are visible and testable
@@ -7124,9 +7134,9 @@ impl ChunkSizePolicy {
 pub struct ChunkAllocationPlan {
     /// The CHUNK_ITEM, keyed `(FIRST_CHUNK_TREE_OBJECTID, CHUNK_ITEM, logical)`.
     pub chunk: BtrfsChunkEntry,
-    /// Key of the DEV_EXTENT: `(devid, DEV_EXTENT, physical offset)`.
+    /// Key of the first stripe's DEV_EXTENT: `(devid, DEV_EXTENT, physical offset)`.
     pub dev_extent_key: BtrfsKey,
-    /// The DEV_EXTENT itself, pointing back at the chunk.
+    /// The DEV_EXTENT payload, shared by each stripe of this chunk.
     pub dev_extent: BtrfsDevExtent,
     /// Key of the BLOCK_GROUP_ITEM: `(logical, BLOCK_GROUP_ITEM, length)`.
     pub block_group_key: BtrfsKey,
@@ -7186,6 +7196,14 @@ pub struct ChunkAllocationRequest {
 pub fn plan_chunk_allocation(
     request: &ChunkAllocationRequest,
 ) -> Result<ChunkAllocationPlan, BtrfsMutationError> {
+    plan_single_device_chunk(request, request.kind.flag(), None)
+}
+
+fn plan_single_device_chunk(
+    request: &ChunkAllocationRequest,
+    flags: u64,
+    duplicate_offset: Option<u64>,
+) -> Result<ChunkAllocationPlan, BtrfsMutationError> {
     if request.length == 0 {
         return Err(BtrfsMutationError::InvalidConfig("chunk length is zero"));
     }
@@ -7213,21 +7231,39 @@ pub fn plan_chunk_allocation(
     // The device's own accounting must stay inside the device. This is a
     // separate check from the one above: a chunk can fit at its offset while the
     // running total is already wrong, and `parse_dev_item` refuses the result.
+    let mut stripes = vec![BtrfsStripe {
+        devid: request.devid,
+        offset: request.physical,
+        dev_uuid: request.dev_uuid,
+    }];
+    if let Some(offset) = duplicate_offset {
+        let end = offset
+            .checked_add(request.length)
+            .ok_or(BtrfsMutationError::AddressOverflow)?;
+        if end > request.dev_total_bytes || (offset < physical_end && request.physical < end) {
+            return Err(BtrfsMutationError::InvalidConfig(
+                "invalid DUP stripe placement",
+            ));
+        }
+        stripes.push(BtrfsStripe {
+            offset,
+            ..stripes[0].clone()
+        });
+    }
+    let num_stripes: u16 = if duplicate_offset.is_some() { 2 } else { 1 };
+    let physical_bytes = request
+        .length
+        .checked_mul(u64::from(num_stripes))
+        .ok_or(BtrfsMutationError::AddressOverflow)?;
     let dev_bytes_used_after = request
         .dev_bytes_used_before
-        .checked_add(request.length)
+        .checked_add(physical_bytes)
         .ok_or(BtrfsMutationError::AddressOverflow)?;
     if dev_bytes_used_after > request.dev_total_bytes {
         return Err(BtrfsMutationError::InvalidConfig(
             "device bytes_used would exceed the device size",
         ));
     }
-
-    let flags = match request.kind {
-        ChunkKind::Metadata => BTRFS_BLOCK_GROUP_METADATA,
-        ChunkKind::Data => BTRFS_BLOCK_GROUP_DATA,
-        ChunkKind::System => BTRFS_BLOCK_GROUP_SYSTEM,
-    };
 
     let chunk = BtrfsChunkEntry {
         key: BtrfsKey {
@@ -7245,13 +7281,9 @@ pub fn plan_chunk_allocation(
         io_align: request.sector_size,
         io_width: request.sector_size,
         sector_size: request.sector_size,
-        num_stripes: 1,
+        num_stripes,
         sub_stripes: 0,
-        stripes: vec![BtrfsStripe {
-            devid: request.devid,
-            offset: request.physical,
-            dev_uuid: request.dev_uuid,
-        }],
+        stripes,
     };
 
     Ok(ChunkAllocationPlan {
@@ -7332,8 +7364,8 @@ impl GrowthDevice {
     /// Refuses a filesystem with no DEV_ITEM, one whose DEV_ITEM does not parse,
     /// and — deliberately — one with MORE THAN ONE DEVICE. Everything in this
     /// bead models a single device: `DeviceOccupancy` maps one devid, the sizing
-    /// policy reasons about one device's size, and `plan_chunk_allocation` emits
-    /// exactly one stripe. On a two-device filesystem those assumptions do not
+    /// policy reasons about one device's size, and every new stripe is placed
+    /// on that same device. On a two-device filesystem those assumptions do not
     /// merely under-perform, they place a chunk using one device's free space
     /// and record it against whichever devid happened to be found first. Refusing
     /// costs a multi-device filesystem the ability to grow; guessing costs it its
@@ -7533,6 +7565,100 @@ pub fn plan_growth_for_commit(
     plan_growth_for_shortfall(chunks, ChunkKind::Metadata, shortfall, device, policy)
 }
 
+// A filesystem can contain both SINGLE and DUP after a profile conversion.
+// Keep the more redundant profile for new space. Mixed DATA|METADATA groups
+// must also remain mixed when either kind asks for more space.
+fn growth_flags(chunks: &[BtrfsChunkEntry], kind: ChunkKind) -> Result<u64, BtrfsMutationError> {
+    let mut flags = kind.flag();
+    for chunk in chunks
+        .iter()
+        .filter(|entry| entry.chunk_type & kind.flag() != 0)
+    {
+        let profile = chunk.chunk_type & chunk_type_flags::RAID_MASK;
+        if profile != 0 && profile != chunk_type_flags::BTRFS_BLOCK_GROUP_DUP {
+            return Err(BtrfsMutationError::InvalidConfig(
+                "unsupported chunk growth profile",
+            ));
+        }
+        flags |= chunk.chunk_type & (BTRFS_BLOCK_GROUP_DATA | BTRFS_BLOCK_GROUP_METADATA | profile);
+    }
+    Ok(flags)
+}
+
+// Yield each free run once, including the tail after the last occupied range.
+// Clamp to the device boundary before subtraction.
+fn free_device_runs<'a>(
+    occupancy: &'a DeviceOccupancy,
+    device: &GrowthDevice,
+) -> impl Iterator<Item = (u64, u64)> + 'a {
+    let end = device.total_bytes;
+    let mut cursor = device.min_offset;
+    occupancy
+        .ranges()
+        .iter()
+        .copied()
+        .chain(std::iter::once((end, 0)))
+        .filter_map(move |(start, len)| {
+            let gap_start = cursor;
+            cursor = cursor.max(start.saturating_add(len));
+            let available = start.min(end).saturating_sub(gap_start);
+            (available != 0).then_some((gap_start, available))
+        })
+}
+
+struct ChunkPlacement {
+    length: u64,
+    first: u64,
+    duplicate: Option<u64>,
+}
+
+fn place_chunk(
+    occupancy: &DeviceOccupancy,
+    device: &GrowthDevice,
+    policy: &ChunkSizePolicy,
+    kind: ChunkKind,
+    flags: u64,
+) -> Option<ChunkPlacement> {
+    let dup = flags & chunk_type_flags::BTRFS_BLOCK_GROUP_DUP != 0;
+    let alignment = u64::from(device.sector_size);
+    let runs = || {
+        free_device_runs(occupancy, device).filter_map(|(start, len)| {
+            let aligned = start.checked_next_multiple_of(alignment)?;
+            Some((aligned, len.checked_sub(aligned - start)?))
+        })
+    };
+    let (mut largest, mut second) = (0, 0);
+    for (_, len) in runs() {
+        if len >= largest {
+            second = largest;
+            largest = len;
+        } else {
+            second = second.max(len);
+        }
+    }
+    // Two equal stripes fit either in the largest hole together, or in two holes.
+    let max_length = if dup {
+        (largest / 2).max(second)
+    } else {
+        largest
+    };
+    let length = policy.decide(kind, device.total_bytes, max_length)?;
+    let mut placements = runs().filter(|&(_, len)| len >= length);
+    let (first, room) = placements.next()?;
+    let duplicate = if !dup {
+        None
+    } else if room / 2 >= length {
+        Some(first + length)
+    } else {
+        Some(placements.next()?.0)
+    };
+    Some(ChunkPlacement {
+        length,
+        first,
+        duplicate,
+    })
+}
+
 /// Bytes of new `kind` chunks the growth planner could still place on
 /// `device`: [`plan_growth_for_shortfall`]'s own model — the chunk map's
 /// occupancy, the superblock mirrors, the reserved head below `min_offset`
@@ -7553,20 +7679,16 @@ pub fn growable_chunk_bytes(
         return 0;
     };
     occupancy.reserve_superblock_mirrors(device.total_bytes);
+    let Ok(flags) = growth_flags(chunks, kind) else {
+        return 0;
+    };
     let mut total = 0_u64;
-    // Each pass places one chunk; a device holds at most total/min_chunk.
-    let max_chunks = device.total_bytes / policy.min_chunk.max(1) + 1;
-    for _ in 0..max_chunks {
-        let free_run = occupancy.largest_free_run(device.min_offset, device.total_bytes);
-        let Some(length) = policy.decide(kind, device.total_bytes, free_run) else {
-            break;
-        };
-        let Some(physical) = occupancy.find_free(length, device.min_offset, device.total_bytes)
-        else {
-            break;
-        };
-        occupancy.reserve(physical, length);
-        total = total.saturating_add(length);
+    while let Some(placement) = place_chunk(&occupancy, device, policy, kind, flags) {
+        occupancy.reserve(placement.first, placement.length);
+        if let Some(offset) = placement.duplicate {
+            occupancy.reserve(offset, placement.length);
+        }
+        total += placement.length;
     }
     total
 }
@@ -7585,19 +7707,7 @@ pub fn unallocated_device_runs(
     let mut occupancy = DeviceOccupancy::from_chunks(device.devid, chunks)
         .map_err(|_| BtrfsMutationError::InvalidConfig("chunk layout is not modelled"))?;
     occupancy.reserve_superblock_mirrors(device.total_bytes);
-    let mut runs = Vec::new();
-    let mut cursor = device.min_offset;
-    for &(start, len) in occupancy.ranges() {
-        let start = start.min(device.total_bytes);
-        if start > cursor {
-            runs.push((cursor, start - cursor));
-        }
-        cursor = cursor.max(start.saturating_add(len));
-    }
-    if device.total_bytes > cursor {
-        runs.push((cursor, device.total_bytes - cursor));
-    }
-    Ok(runs)
+    Ok(free_device_runs(&occupancy, device).collect())
 }
 
 /// [`plan_growth_for_commit`] for an arbitrary chunk kind and an already-computed
@@ -7634,45 +7744,39 @@ pub fn plan_growth_for_shortfall(
     // over a mirror is an unmountable filesystem, and it fails late — the image
     // works until the kernel next writes that mirror.
     occupancy.reserve_superblock_mirrors(device.total_bytes);
-    let free_run = occupancy.largest_free_run(device.min_offset, device.total_bytes);
-
-    let Some(length) = policy.decide(kind, device.total_bytes, free_run) else {
-        // The device genuinely has nowhere to put a useful chunk. This is the
-        // ENOSPC that is honest: not "we cannot reach the space", but "there is
-        // none". `shortfall` is carried into the log by the caller, not swallowed.
+    let flags = growth_flags(chunks, kind)?;
+    let Some(ChunkPlacement {
+        length,
+        first: physical,
+        duplicate,
+    }) = place_chunk(&occupancy, device, policy, kind, flags)
+    else {
         debug!(
             target: "ffs::btrfs::alloc",
-            shortfall,
-            free_run,
+            shortfall, flags,
             device_total = device.total_bytes,
             "growth_refused_device_full"
         );
         return Err(BtrfsMutationError::NoSpace);
     };
 
-    let Some(physical) = occupancy.find_free(length, device.min_offset, device.total_bytes) else {
-        // `largest_free_run` said a run of at least this size exists and
-        // `find_free` cannot place it. The two walk the same ranges, so this is
-        // not a space problem, it is a disagreement between two functions that
-        // must agree — refuse rather than place a chunk on a guess.
-        return Err(BtrfsMutationError::BrokenInvariant(
-            "largest_free_run and find_free disagree about the device",
-        ));
-    };
-
     let logical = next_logical_chunk_start(chunks)?;
-    let plan = plan_chunk_allocation(&ChunkAllocationRequest {
-        kind,
-        logical,
-        length,
-        devid: device.devid,
-        physical,
-        dev_total_bytes: device.total_bytes,
-        dev_bytes_used_before: device.bytes_used,
-        sector_size: device.sector_size,
-        chunk_tree_uuid: device.chunk_tree_uuid,
-        dev_uuid: device.dev_uuid,
-    })?;
+    let plan = plan_single_device_chunk(
+        &ChunkAllocationRequest {
+            kind,
+            logical,
+            length,
+            devid: device.devid,
+            physical,
+            dev_total_bytes: device.total_bytes,
+            dev_bytes_used_before: device.bytes_used,
+            sector_size: device.sector_size,
+            chunk_tree_uuid: device.chunk_tree_uuid,
+            dev_uuid: device.dev_uuid,
+        },
+        flags,
+        duplicate,
+    )?;
 
     debug!(
         target: "ffs::btrfs::alloc",
@@ -7754,11 +7858,15 @@ pub fn apply_chunk_allocation(
     // The caller is expected to have picked this offset with
     // `DeviceOccupancy::find_free`, but "the caller should have" is not a
     // property, and the cost of being wrong is silently overwritten data.
-    let physical = plan.dev_extent_key.offset;
-    let physical_end = physical
-        .checked_add(plan.dev_extent.length)
-        .ok_or(BtrfsMutationError::AddressOverflow)?;
     let devid = plan.dev_extent_key.objectid;
+    let mut physical_ranges = Vec::with_capacity(plan.chunk.stripes.len());
+    for stripe in &plan.chunk.stripes {
+        let end = stripe
+            .offset
+            .checked_add(plan.dev_extent.length)
+            .ok_or(BtrfsMutationError::AddressOverflow)?;
+        physical_ranges.push(stripe.offset..end);
+    }
     let mut conflict = None;
     dev_tree.range_with(
         &BtrfsKey {
@@ -7787,7 +7895,10 @@ pub fn apply_chunk_allocation(
                 conflict = Some("device tree holds a dev extent that overflows");
                 return;
             };
-            if key.offset < physical_end && existing_end > physical {
+            if physical_ranges
+                .iter()
+                .any(|range| key.offset < range.end && existing_end > range.start)
+            {
                 conflict = Some("the physical range overlaps a live device extent");
             }
         },
@@ -7837,12 +7948,16 @@ pub fn apply_chunk_allocation(
     // extents, the exact complaint updating the item was supposed to prevent.
     // Recompute what the planner must have seen and refuse if it is not what is
     // there. Found by a unit test asserting the arithmetic rather than the field.
-    let expected_before = plan
-        .dev_bytes_used_after
-        .checked_sub(plan.chunk.length)
-        .ok_or(BtrfsMutationError::BrokenInvariant(
+    let footprint = plan
+        .chunk
+        .length
+        .checked_mul(u64::from(plan.chunk.num_stripes))
+        .ok_or(BtrfsMutationError::AddressOverflow)?;
+    let expected_before = plan.dev_bytes_used_after.checked_sub(footprint).ok_or(
+        BtrfsMutationError::BrokenInvariant(
             "the plan's dev_bytes_used_after is smaller than the chunk it adds",
-        ))?;
+        ),
+    )?;
     if dev_item.bytes_used != expected_before {
         return Err(BtrfsMutationError::BrokenInvariant(
             "the DEV_ITEM moved since the plan was made; the plan is stale",
@@ -7868,7 +7983,15 @@ pub fn apply_chunk_allocation(
 
     // ── Writes. Nothing below here may fail for a reason checked above ─────
     chunk_tree.insert(plan.chunk.key, &chunk_value)?;
-    dev_tree.insert(plan.dev_extent_key, &dev_extent_value)?;
+    for range in &physical_ranges {
+        dev_tree.insert(
+            BtrfsKey {
+                offset: range.start,
+                ..plan.dev_extent_key
+            },
+            &dev_extent_value,
+        )?;
+    }
     alloc
         .extent_tree_mut()
         .insert(plan.block_group_key, &plan.block_group.to_bytes())?;
@@ -21931,6 +22054,147 @@ mod tests {
             chunk_tree_uuid: [0x11; 16],
             dev_uuid: [0x22; 16],
         }
+    }
+
+    #[test]
+    fn growth_preserves_dup_stripes_and_logical_capacity() {
+        const MB: u64 = 1024 * 1024;
+        let policy = ChunkSizePolicy::default();
+        let device = growth_device(33 * MB, 16 * MB);
+        let mixed = BTRFS_BLOCK_GROUP_DATA | BTRFS_BLOCK_GROUP_METADATA;
+        for (kind, class) in [
+            (ChunkKind::System, BTRFS_BLOCK_GROUP_SYSTEM),
+            (ChunkKind::Metadata, BTRFS_BLOCK_GROUP_METADATA),
+            (ChunkKind::Data, BTRFS_BLOCK_GROUP_DATA),
+            (ChunkKind::Metadata, mixed),
+            (ChunkKind::Data, mixed),
+        ] {
+            let flags = class | chunk_type_flags::BTRFS_BLOCK_GROUP_DUP;
+            let existing = logical_chunk(0, 8 * MB, flags, &[(1, MB), (1, 17 * MB)]);
+            // The only remaining holes are [9,17) and [25,33) MiB.
+            let chunks = [existing];
+            assert_eq!(
+                growable_chunk_bytes(&chunks, kind, &device, &policy),
+                8 * MB
+            );
+            let plan = plan_growth_for_shortfall(&chunks, kind, 4096, &device, &policy)
+                .expect("two stripe-sized holes")
+                .expect("shortfall");
+            let mut chunk_tree = InMemoryCowBtrfsTree::new(8).expect("chunk tree");
+            seed_dev_item(&mut chunk_tree, 1, device.total_bytes, device.bytes_used);
+            let mut dev_tree = InMemoryCowBtrfsTree::new(8).expect("dev tree");
+            let mut alloc = BtrfsExtentAllocator::new(7).expect("allocator");
+            let mut sb = test_superblock();
+            apply_chunk_allocation(
+                &plan,
+                &mut chunk_tree,
+                &mut dev_tree,
+                &mut alloc,
+                Some(&mut sb),
+            )
+            .expect("apply two device extents");
+            let stored = chunk_entries_from_chunk_tree(&chunk_tree).expect("parse chunk tree");
+            assert_eq!(stored.len(), 1);
+            assert_eq!(stored[0].chunk_type, flags);
+            assert_eq!(stored[0].length, 8 * MB);
+            assert_eq!(
+                alloc
+                    .block_group(plan.chunk.key.offset)
+                    .expect("block group")
+                    .flags,
+                flags
+            );
+            let mapping = map_logical_to_stripes(&stored, plan.chunk.key.offset + 4096)
+                .expect("valid layout")
+                .expect("mapped");
+            assert_eq!(mapping.profile, BtrfsRaidProfile::Dup);
+            let mapped: Vec<_> = mapping
+                .stripes
+                .iter()
+                .map(|stripe| stripe.physical)
+                .collect();
+            assert_eq!(mapped, [9 * MB + 4096, 25 * MB + 4096]);
+            for offset in [9 * MB, 25 * MB] {
+                let item = dev_tree
+                    .get(&BtrfsKey {
+                        offset,
+                        ..plan.dev_extent_key
+                    })
+                    .expect("one DEV_EXTENT per physical copy");
+                assert_eq!(
+                    parse_dev_extent(&item).expect("parse DEV_EXTENT"),
+                    plan.dev_extent
+                );
+            }
+            assert_eq!(
+                GrowthDevice::from_chunk_tree(&chunk_tree, device.chunk_tree_uuid)
+                    .expect("read updated DEV_ITEM")
+                    .bytes_used,
+                32 * MB
+            );
+            if kind == ChunkKind::System {
+                assert_eq!(
+                    parse_sys_chunk_array(&sb.sys_chunk_array).expect("bootstrap"),
+                    stored
+                );
+            } else {
+                assert!(sb.sys_chunk_array.is_empty());
+            }
+            // One fitting hole cannot justify a SINGLE fallback on a DUP filesystem.
+            let smaller = growth_device(32 * MB, 16 * MB);
+            assert_eq!(growable_chunk_bytes(&chunks, kind, &smaller, &policy), 0);
+            assert!(matches!(
+                plan_growth_for_shortfall(&chunks, kind, 4096, &smaller, &policy),
+                Err(BtrfsMutationError::NoSpace)
+            ));
+        }
+    }
+
+    #[test]
+    fn growth_checks_second_dup_extent_before_publication() {
+        const MB: u64 = 1024 * 1024;
+        let flags = BTRFS_BLOCK_GROUP_METADATA | chunk_type_flags::BTRFS_BLOCK_GROUP_DUP;
+        let chunks = [logical_chunk(0, 8 * MB, flags, &[(1, MB), (1, 9 * MB)])];
+        let device = growth_device(33 * MB, 16 * MB);
+        let policy = ChunkSizePolicy::default();
+        // Only the metadata class has requested DUP. Data growth stays SINGLE.
+        assert_eq!(
+            growable_chunk_bytes(&chunks, ChunkKind::Data, &device, &policy),
+            16 * MB
+        );
+        let plan = plan_growth_for_shortfall(&chunks, ChunkKind::Metadata, 4096, &device, &policy)
+            .expect("16 MiB contiguous free")
+            .expect("growth");
+        assert_eq!(plan.chunk.stripes[0].offset, 17 * MB);
+        assert_eq!(plan.chunk.stripes[1].offset, 25 * MB);
+        let mut chunk_tree = InMemoryCowBtrfsTree::new(8).expect("chunk tree");
+        seed_dev_item(&mut chunk_tree, 1, device.total_bytes, device.bytes_used);
+        let mut dev_tree = InMemoryCowBtrfsTree::new(8).expect("dev tree");
+        let key = BtrfsKey {
+            offset: 26 * MB,
+            ..plan.dev_extent_key
+        };
+        let conflict = BtrfsDevExtent {
+            length: MB,
+            ..plan.dev_extent
+        };
+        dev_tree
+            .insert(key, &conflict.to_bytes().expect("encode"))
+            .expect("seed conflicting extent");
+        let mut alloc = BtrfsExtentAllocator::new(7).expect("allocator");
+        assert!(
+            apply_chunk_allocation(&plan, &mut chunk_tree, &mut dev_tree, &mut alloc, None)
+                .is_err()
+        );
+        assert!(chunk_tree.get(&plan.chunk.key).is_none());
+        assert!(dev_tree.get(&plan.dev_extent_key).is_none());
+        assert!(alloc.block_group(plan.chunk.key.offset).is_none());
+        assert_eq!(
+            GrowthDevice::from_chunk_tree(&chunk_tree, device.chunk_tree_uuid)
+                .expect("device")
+                .bytes_used,
+            device.bytes_used
+        );
     }
 
     /// bd-3fmbr: FITRIM's device space is everything above the reserved head

@@ -121256,6 +121256,82 @@ pub(crate) mod scrub;\n";
     }
 
     #[test]
+    fn btrfs_growth_fsync_preserves_dup_data_on_native_image() {
+        let Some((fs, device, _tmp, image)) =
+            open_writable_btrfs_mkfs_args(256, &["-m", "single", "-d", "dup"])
+        else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        fs.set_btrfs_grow_chunks(false);
+        fs.set_btrfs_dirty_bytes_threshold(0);
+        let name = OsStr::new("dup-growth");
+        let file = fs.create(&cx, InodeNumber(1), name, 0o600, 0, 0).unwrap();
+        // Pin the original free DATA ranges to force on-demand growth on the
+        // next write. The committed image will only contain the real allocation.
+        {
+            let mut alloc = fs.require_btrfs_alloc_state().unwrap().write();
+            for group in alloc.extent_alloc.free_space_extents().unwrap() {
+                if group.flags & BTRFS_BLOCK_GROUP_DATA != 0 {
+                    for (start, length) in group.free_ranges {
+                        alloc.extent_alloc.pin_freed_extent(start, length);
+                    }
+                }
+            }
+            assert_eq!(
+                alloc.extent_alloc.allocatable_bytes(BTRFS_BLOCK_GROUP_DATA),
+                0
+            );
+        }
+        fs.set_btrfs_grow_chunks(true);
+        let sector = fs.btrfs_superblock().unwrap().sectorsize;
+        let payload = vec![0xBC; sector as usize];
+        fs.write(&cx, file.ino, 0, &payload).unwrap();
+        let ops: &dyn FsOps = &fs;
+        ops.fsync(&cx, &mut RequestScope::empty(), file.ino, 0, false)
+            .unwrap();
+        let bytes = device.snapshot_bytes();
+        std::fs::write(&image, &bytes).unwrap();
+        let Some((clean, output)) = run_btrfs_check(&image) else {
+            return;
+        };
+        assert!(clean, "btrfs check after DUP growth: {output}");
+        let cold = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(bytes)),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        let grown = cold.lookup(&cx, InodeNumber(1), name).unwrap();
+        assert_eq!(cold.read(&cx, grown.ino, 0, sector).unwrap(), payload);
+        let extent = cold
+            .btrfs_fiemap(&cx, grown.ino, 0, u64::from(sector))
+            .unwrap();
+        assert_eq!(extent.len(), 1);
+        let logical = extent[0].physical;
+        assert!(
+            ffs_ondisk::map_logical_to_stripes(&fs.btrfs_context().unwrap().chunks, logical)
+                .unwrap()
+                .is_none(),
+            "the data must reside in a grown group"
+        );
+        let chunks = &cold.btrfs_context().unwrap().chunks;
+        let mapping = ffs_ondisk::map_logical_to_stripes(chunks, logical)
+            .unwrap()
+            .unwrap();
+        assert_eq!(mapping.profile, ffs_ondisk::BtrfsRaidProfile::Dup);
+        assert_eq!(mapping.stripes.len(), 2);
+        assert_ne!(mapping.stripes[0].physical, mapping.stripes[1].physical);
+        let mut stored = vec![0; payload.len()];
+        for stripe in &mapping.stripes {
+            device
+                .read_exact_at(&cx, ByteOffset(stripe.physical), &mut stored)
+                .unwrap();
+            assert_eq!(stored, payload);
+        }
+    }
+
+    #[test]
     fn btrfs_tree_log_maps_committed_grown_data_and_metadata_chunks_after_mount() {
         for kind in [ffs_btrfs::ChunkKind::Data, ffs_btrfs::ChunkKind::Metadata] {
             let Some((fs, device, _tmp, image)) =

@@ -6,11 +6,13 @@ use std::sync::Arc;
 use asupersync::Cx;
 use ffs_block::ByteDevice;
 use ffs_error::{FfsError, Result};
-use ffs_ondisk::ntfs::{DATA, NtfsRun, NtfsValue, decode_mapping_pairs};
+use ffs_ondisk::ntfs::{
+    DATA, NtfsGeometry, NtfsRun, NtfsValue, decode_mapping_pairs, ntfs_boot_sector_checksum,
+};
 use ffs_types::ByteOffset;
 
 use super::{NtfsClusterRelocation, NtfsResizeDirection, NtfsResizeOptions, NtfsResizePlan};
-use crate::reader::allocation::{bit, read_bitmap};
+use crate::reader::allocation::{bit, empty_volume_bitmap, read_bitmap};
 use crate::reader::check::{NtfsCheckLimits, NtfsCheckStatus, check_volume_device};
 use crate::reader::{NtfsVolume, checkpoint};
 
@@ -32,12 +34,8 @@ pub(super) struct AttrRemapPlan {
 #[derive(Debug)]
 pub(super) struct InternalResizePlan {
     pub(super) public: NtfsResizePlan,
-    pub(super) source_vbr: Vec<u8>,
-    pub(super) serial: u64,
+    pub(super) new_vbr: Vec<u8>,
     pub(super) record_bytes: u32,
-    pub(super) index_bytes: u32,
-    pub(super) sectors_per_cluster: u32,
-    pub(super) new_total_sectors: u64,
     /// Every live physical cluster span `< new_clusters` that stays at its same LCN.
     pub(super) retained_spans: Vec<(u64, u64)>,
     /// Every physical cluster span moved from `old_lcn` -> `new_lcn`.
@@ -245,11 +243,7 @@ pub(super) fn build_resize_plan(
     let new_bitmap_clusters_needed = new_bitmap_bytes.div_ceil(cb);
 
     // Prepare new_bitmap_bytes initialized with retained allocated bits (< new_clusters).
-    let mut new_bitmap = vec![
-        0_u8;
-        usize::try_from(new_bitmap_bytes)
-            .map_err(|_| fmt_err("new_bitmap_bytes overflow"))?
-    ];
+    let mut new_bitmap = empty_volume_bitmap(new_clusters)?;
     let common_clusters = old_clusters.min(new_clusters);
     for lcn in 0..common_clusters {
         if bit(&old_bitmap, lcn) {
@@ -649,14 +643,22 @@ pub(super) fn build_resize_plan(
         new_bitmap_bytes,
     };
 
+    // Keep the source bootstrap, BPB encodings and all producer-specific bytes.
+    // An all-zero checksum field is unused on many native NTFS volumes.
+    let mut new_vbr = source_vbr;
+    new_vbr[40..48].copy_from_slice(&new_total_sectors.to_le_bytes());
+    new_vbr[48..56].copy_from_slice(&new_mft_cluster.to_le_bytes());
+    new_vbr[56..64].copy_from_slice(&new_mirror_cluster.to_le_bytes());
+    if new_vbr[80..84] != [0; 4] {
+        let checksum = ntfs_boot_sector_checksum(&new_vbr).map_err(|e| fmt_err(e.to_string()))?;
+        new_vbr[80..84].copy_from_slice(&checksum.to_le_bytes());
+    }
+    NtfsGeometry::parse(&new_vbr, new_backing_bytes).map_err(|e| fmt_err(e.to_string()))?;
+
     Ok(InternalResizePlan {
         public,
-        source_vbr,
-        serial: geom.serial(),
+        new_vbr,
         record_bytes,
-        index_bytes: geom.index_bytes(),
-        sectors_per_cluster,
-        new_total_sectors,
         retained_spans: merged_retained,
         relocations,
         record_remaps,

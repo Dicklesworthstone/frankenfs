@@ -26,7 +26,7 @@ use ffs_ntfs::resize::{
     run_resize,
 };
 use ffs_ntfs::{NtfsTransactionEngine, NtfsVolume, NtfsWriteOptions};
-use ffs_ondisk::ntfs::NtfsGeometry;
+use ffs_ondisk::ntfs::{NtfsGeometry, ntfs_boot_sector_checksum};
 use ffs_types::ByteOffset;
 use tempfile::tempdir;
 
@@ -467,6 +467,218 @@ fn checker_detects_planted_corruptions_without_mutating_image_and_bounded_repair
     assert!(!hib_chk.clean);
     assert!(hib_chk.hibernated);
     assert!(!plan_bounded_repair(&hib_chk).eligible);
+}
+
+#[test]
+fn bounded_boot_repair_uses_the_volume_end_within_a_larger_container() {
+    let cx = Cx::for_testing();
+    let dir = tempdir().unwrap();
+    let image = dir.path().join("volume.img");
+    format_image_file(&cx, &NtfsFormatOptions::new_image(image.clone(), 8), None).unwrap();
+    let volume = fs::read(image).unwrap();
+    let prefix = [0xB5; 1024];
+    let suffix = [0xDA; 1536];
+    let base = prefix.len() as u64;
+    let backup = volume.len() - 512;
+    let container = dir.path().join("disk.img");
+    let intact = [&prefix[..], &volume, &suffix[..]].concat();
+    fs::write(&container, &intact).unwrap();
+
+    let check = check_image_file(&cx, &container, base, None, NtfsCheckLimits::default()).unwrap();
+    assert!(check.clean, "{:?}", check.issues);
+    assert_eq!(check.backup_boot_offset, Some(backup as u64));
+
+    let file = OpenOptions::new().write(true).open(&container).unwrap();
+    file.write_all_at(&[0; 512], base + backup as u64).unwrap();
+    drop(file);
+    let (plan, after) = apply_bounded_repair(
+        &cx,
+        &container,
+        base,
+        None,
+        true,
+        true,
+        NtfsCheckLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        plan.actions,
+        vec![NtfsRepairAction::SyncBackupBootSector {
+            backup_offset: backup as u64,
+            sector_bytes: 512,
+        }]
+    );
+    assert!(after.clean);
+    assert_eq!(fs::read(container).unwrap(), intact);
+}
+
+#[test]
+fn check_recognizes_cluster_rounded_boot_geometry_and_refuses_ambiguous_repair() {
+    let cx = Cx::for_testing();
+    let dir = tempdir().unwrap();
+    let image = dir.path().join("rounded.img");
+    format_image_file(&cx, &NtfsFormatOptions::new_image(image.clone(), 8), None).unwrap();
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&image)
+        .unwrap();
+    let mut boot = [0; 512];
+    file.read_exact_at(&mut boot, 0).unwrap();
+    let backup = file.metadata().unwrap().len() - 512;
+    let sectors_per_cluster = u64::from(boot[13]);
+    let rounded_sectors = (backup / 512 / sectors_per_cluster) * sectors_per_cluster;
+    assert!(rounded_sectors * 512 < backup);
+    boot[40..48].copy_from_slice(&rounded_sectors.to_le_bytes());
+    boot[80..84].fill(0);
+    file.write_all_at(&boot, 0).unwrap();
+    file.write_all_at(&boot, backup).unwrap();
+    file.write_all_at(&[0xDB; 8192], backup + 512).unwrap();
+
+    let check = check_image_file(&cx, &image, 0, None, NtfsCheckLimits::default()).unwrap();
+    assert!(check.clean, "{:?}", check.issues);
+    assert_eq!(check.backup_boot_offset, Some(backup));
+
+    file.write_all_at(&[0; 512], backup).unwrap();
+    drop(file);
+    let before = file_blake3(&image);
+    let check = check_image_file(&cx, &image, 0, None, NtfsCheckLimits::default()).unwrap();
+    assert_eq!(check.backup_boot_offset, None);
+    assert!(
+        check
+            .issues
+            .iter()
+            .any(|issue| issue.code == "backup_boot_location_ambiguous")
+    );
+    assert!(!plan_bounded_repair(&check).eligible);
+    assert!(
+        apply_bounded_repair(&cx, &image, 0, None, true, true, NtfsCheckLimits::default()).is_err()
+    );
+    assert_eq!(file_blake3(&image), before);
+}
+
+#[test]
+fn resize_preserves_native_boot_code_and_optional_checksum() {
+    let cx = Cx::for_testing();
+    let dir = tempdir().unwrap();
+    for (sector_bytes, checksummed) in [(512, true), (4096, false)] {
+        let source = dir.path().join(format!("source-{sector_bytes}.img"));
+        let mut format = NtfsFormatOptions::new_image(source.clone(), 16);
+        format.sector_bytes = sector_bytes;
+        format.cluster_bytes = Some(4096);
+        format_image_file(&cx, &format, None).unwrap();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&source)
+            .unwrap();
+        let mut boot = vec![0; sector_bytes as usize];
+        file.read_exact_at(&mut boot, 0).unwrap();
+        boot[24..26].copy_from_slice(&17_u16.to_le_bytes()); // producer's BIOS geometry
+        boot[68] = 0xF4; // alternate native encoding of a 4096-byte index block
+        boot[84..510].fill(0xAB); // bootstrap code
+        boot[512..].fill(0xCD);
+        let checksum = if checksummed {
+            ntfs_boot_sector_checksum(&boot).unwrap()
+        } else {
+            0
+        };
+        boot[80..84].copy_from_slice(&checksum.to_le_bytes());
+        let source_end = file.metadata().unwrap().len();
+        file.write_all_at(&boot, 0).unwrap();
+        file.write_all_at(&boot, source_end - u64::from(sector_bytes))
+            .unwrap();
+        drop(file);
+
+        let output = dir.path().join(format!("resized-{sector_bytes}.img"));
+        let report = run_resize(
+            &cx,
+            &NtfsResizeOptions {
+                source_image: source,
+                source_offset: 0,
+                source_length: None,
+                output: output.clone(),
+                size_bytes: None,
+                size_mib: Some(6),
+                relocate: true,
+                offline_image: true,
+                dry_run: false,
+            },
+            None,
+        )
+        .unwrap();
+        assert_ne!(
+            report.plan.new_mirror_cluster,
+            report.plan.old_mirror_cluster
+        );
+        let file = fs::File::open(output).unwrap();
+        let mut actual = vec![0; sector_bytes as usize];
+        let expected_sectors = (6 * 1024 * 1024 / u64::from(sector_bytes)) - 1;
+        boot[40..48].copy_from_slice(&expected_sectors.to_le_bytes());
+        boot[48..56].copy_from_slice(&report.plan.new_mft_cluster.to_le_bytes());
+        boot[56..64].copy_from_slice(&report.plan.new_mirror_cluster.to_le_bytes());
+        if checksummed {
+            let checksum = ntfs_boot_sector_checksum(&boot).unwrap();
+            boot[80..84].copy_from_slice(&checksum.to_le_bytes());
+        }
+        for offset in [0, expected_sectors * u64::from(sector_bytes)] {
+            file.read_exact_at(&mut actual, offset).unwrap();
+            assert_eq!(actual, boot);
+        }
+    }
+}
+
+#[test]
+fn format_and_resize_reserve_only_out_of_volume_bitmap_bits() {
+    let cx = Cx::for_testing();
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("legacy-bitmap.img");
+    let mut opts = NtfsFormatOptions::new_image(source.clone(), 16);
+    opts.size_mib = None;
+    opts.size_bytes = Some(4105 * 4096 + 512);
+    opts.cluster_bytes = Some(4096);
+    let layout = ffs_ntfs::formatter::plan_format(&opts).unwrap();
+    format_image_file(&cx, &opts, None).unwrap();
+
+    let check_tail = |path: &std::path::Path, clusters: u64| {
+        let volume = NtfsVolume::open(&cx, path, 0, None).unwrap();
+        assert_eq!(volume.geometry.cluster_count(), clusters);
+        let record = volume.record(&cx, 6, None).unwrap();
+        let stream = volume.data_stream(&cx, &record, &[]).unwrap();
+        assert_eq!(stream.size, clusters.div_ceil(64) * 8);
+        let bytes = volume.read(&cx, &stream, 0, stream.size as usize).unwrap();
+        assert_ne!(bytes[0] & 1, 0);
+        for lcn in 4090..stream.size * 8 {
+            let allocated = bytes[(lcn / 8) as usize] & (1 << (lcn % 8)) != 0;
+            assert_eq!(allocated, lcn >= clusters, "LCN {lcn} of {clusters}");
+        }
+    };
+    check_tail(&source, 4105);
+
+    // Older FrankenFS images leave this padding clear. They remain valid resize
+    // inputs, and growing across the previous boundary frees the new clusters.
+    let file = OpenOptions::new().write(true).open(&source).unwrap();
+    let last_word = layout.bitmap_cluster * 4096 + layout.bitmap_bytes - 8;
+    file.write_all_at(&[0; 8], last_word).unwrap();
+    drop(file);
+    let mut input = source;
+    for clusters in [4151, 4096, 4097] {
+        let output = dir.path().join(format!("resized-{clusters}.img"));
+        let resize = NtfsResizeOptions {
+            source_image: input,
+            source_offset: 0,
+            source_length: None,
+            output: output.clone(),
+            size_mib: None,
+            size_bytes: Some(clusters * 4096 + 512),
+            relocate: false,
+            offline_image: true,
+            dry_run: false,
+        };
+        run_resize(&cx, &resize, None).unwrap();
+        check_tail(&output, clusters);
+        input = output;
+    }
 }
 
 #[test]

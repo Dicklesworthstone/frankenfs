@@ -301,11 +301,25 @@ fn sync_backup_boot_sector(
     let mut primary = vec![0_u8; sec_len];
     file.read_exact_at(&mut primary, base)?;
     // Verify primary VBR parses cleanly before copying it.
-    let _ = NtfsGeometry::parse(&primary, backup_rel_offset)
+    let geometry = NtfsGeometry::parse(&primary, backup_rel_offset)
         .map_err(|e| FfsError::Format(e.to_string()))?;
+    if geometry.volume_bytes() != backup_rel_offset || geometry.sector_bytes() != sector_bytes {
+        return Err(FfsError::InvalidGeometry(
+            "NTFS backup boot location changed after repair planning".into(),
+        ));
+    }
     let dst = base
         .checked_add(backup_rel_offset)
         .ok_or_else(|| FfsError::Format("backup boot offset overflow".into()))?;
+    let file_len = file.metadata()?.len();
+    if dst
+        .checked_add(u64::from(sector_bytes))
+        .is_none_or(|end| end > file_len)
+    {
+        return Err(FfsError::InvalidGeometry(
+            "NTFS backup boot sector no longer fits the image".into(),
+        ));
+    }
     file.write_all_at(&primary, dst)?;
     file.sync_all()?;
     checkpoint(cx)

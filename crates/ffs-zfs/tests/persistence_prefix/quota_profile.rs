@@ -581,6 +581,184 @@ fn received_space_fixture(
 }
 
 #[test]
+fn snapshot_preserves_other_heads_reserved_space_before_publication() {
+    use ffs_zfs::ZfsPropertySetValue::Number;
+
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    let (mut engine, devices) = file_range_fixture(
+        &cx,
+        &PoolFixtureSpec {
+            deadlist_mode: DeadlistMode::NativeDeadlist,
+            data_properties: vec![(b"compression", 2)],
+            ..PoolFixtureSpec::default()
+        },
+    );
+    let checksum = ZfsDataChecksum::Fletcher4;
+    let (file, _) = engine
+        .create_file(&cx, &dataset, 2, b"promised", 0o644, 0, 0, TIME, checksum)
+        .into_result()
+        .unwrap();
+    let payload = vec![0x37; 1024 * 1024];
+    engine
+        .write_file_data(&cx, &dataset, file, 0, &payload, TIME, checksum)
+        .into_result()
+        .unwrap();
+    let child = dataset_space(&cx, &engine, &dataset);
+    engine
+        .set_property(&cx, &dataset, "refreservation", Number(child.unique))
+        .into_result()
+        .unwrap();
+    assert!(child.unique > 512 * 1024);
+    let root = dataset_space(&cx, &engine, &[]);
+    let root_reserved = root.unique + engine.free_bytes() - 256 * 1024;
+    engine
+        .set_property(&cx, &[], "refreservation", Number(root_reserved))
+        .into_result()
+        .unwrap();
+    let before = dataset_space(&cx, &engine, &dataset);
+    assert!(
+        engine.free_bytes() > before.unique,
+        "raw free space alone would allow the snapshot"
+    );
+    assert_native_write_refused(&mut engine, &devices, libc::ENOSPC, |writer| {
+        writer.create_snapshot(&cx, &dataset, b"shared", TIME)
+    });
+    assert_eq!(dataset_space(&cx, &engine, &dataset), before);
+    engine
+        .inherit_property(&cx, &[], "refreservation")
+        .into_result()
+        .unwrap();
+    let (_, token) = engine
+        .create_snapshot(&cx, &dataset, b"shared", TIME)
+        .into_result()
+        .unwrap();
+    drop(engine);
+    let durable: Vec<_> = devices
+        .iter()
+        .map(FaultableMemberDevice::fresh_from_durable)
+        .collect();
+    let reopened = open_engine_on_devices(
+        &cx,
+        &durable,
+        default_write_opts(POOL_GUID, token.published_slot()),
+    )
+    .unwrap();
+    let after = dataset_space(&cx, &reopened, &dataset);
+    assert_eq!(after.unique, 0);
+    assert_eq!(after.used, before.used + before.unique);
+    let mut mos = reopened.open_read_objects(&cx).unwrap();
+    let mut snapshot = mos.zpl_snapshot(&cx, &dataset, b"shared").unwrap();
+    assert_eq!(snapshot.read(&cx, file, 0, 4096).unwrap(), payload[..4096]);
+}
+
+#[test]
+fn reserved_file_growth_and_truncation_preserve_saturated_ancestor_charges() {
+    use ffs_core::{FsOps, RequestScope};
+    use ffs_types::InodeNumber;
+    use ffs_zfs::{ZfsFs, ZfsPropertySetValue::Number};
+
+    let cx = Cx::for_testing();
+    let parent = [b"data".to_vec()];
+    let dataset = [b"data".to_vec(), b"child".to_vec()];
+    for property in ["reservation", "refreservation"] {
+        let (mut engine, devices) = file_range_fixture(
+            &cx,
+            &PoolFixtureSpec {
+                deadlist_mode: DeadlistMode::NativeDeadlist,
+                ..PoolFixtureSpec::default()
+            },
+        );
+        engine
+            .create_dataset(
+                &cx,
+                &parent,
+                b"child",
+                &[("compression".into(), Number(2))],
+                TIME,
+            )
+            .into_result()
+            .unwrap();
+        let checksum = ZfsDataChecksum::Fletcher4;
+        let (file, _) = engine
+            .create_file(&cx, &dataset, 3, b"bytes", 0o644, 0, 0, TIME, checksum)
+            .into_result()
+            .unwrap();
+        let target = dataset_space(&cx, &engine, &dataset);
+        let reserve = target.used.max(target.unique) + 256 * 1024;
+        engine
+            .set_property(&cx, &dataset, property, Number(reserve))
+            .into_result()
+            .unwrap();
+        // All remaining space allowed by the parent quota belongs to this child.
+        let parent_used = dataset_space(&cx, &engine, &parent).used;
+        engine
+            .set_property(&cx, &parent, "quota", Number(parent_used))
+            .into_result()
+            .unwrap();
+        let before = dataset_space(&cx, &engine, &dataset);
+        let payload = vec![0x35; 64 * 1024];
+        engine
+            .write_file_data(&cx, &dataset, file, 0, &payload, TIME, checksum)
+            .into_result()
+            .unwrap();
+        let after = dataset_space(&cx, &engine, &dataset);
+        assert!(after.unique > before.unique);
+        assert_eq!(dataset_space(&cx, &engine, &parent).used, parent_used);
+        if property == "reservation" {
+            assert_eq!(after.used - before.used, after.unique - before.unique);
+        } else {
+            assert_eq!(after.used, before.used);
+        }
+        assert_native_write_refused(&mut engine, &devices, libc::EDQUOT, |writer| {
+            writer.write_file_data(
+                &cx,
+                &dataset,
+                file,
+                0,
+                &vec![0x97; 512 * 1024],
+                TIME,
+                checksum,
+            )
+        });
+        let (_, token) = engine
+            .truncate_file(&cx, &dataset, file, 0, TIME, checksum)
+            .into_result()
+            .unwrap();
+        drop(engine);
+        let durable: Vec<_> = devices
+            .iter()
+            .map(FaultableMemberDevice::fresh_from_durable)
+            .collect();
+        let reopened = open_engine_on_devices(
+            &cx,
+            &durable,
+            default_write_opts(POOL_GUID, token.published_slot()),
+        )
+        .unwrap();
+        let shrunk = dataset_space(&cx, &reopened, &dataset);
+        assert!(shrunk.unique < after.unique);
+        assert_eq!(dataset_space(&cx, &reopened, &parent).used, parent_used);
+        let available = if property == "reservation" {
+            assert_eq!(after.used - shrunk.used, after.unique - shrunk.unique);
+            reserve - shrunk.used
+        } else {
+            assert_eq!(shrunk.used, before.used);
+            reserve - shrunk.unique
+        };
+        let fs = ZfsFs::with_writer(&cx, reopened, dataset.to_vec()).unwrap();
+        let stat = fs
+            .statfs(&cx, &mut RequestScope::empty(), InodeNumber(1))
+            .unwrap();
+        assert_eq!(
+            stat.blocks_available,
+            available / u64::from(stat.fragment_size)
+        );
+        assert_pool_scrub_and_allocation_clean(&cx, &durable, POOL_GUID, None);
+    }
+}
+
+#[test]
 fn received_space_properties_reject_invalid_effective_limits_without_writes() {
     use ffs_zfs::ZfsPropertySetValue::Number;
 

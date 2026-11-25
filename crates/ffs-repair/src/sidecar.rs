@@ -718,6 +718,33 @@ pub struct ProtectedViewIdentity {
     pub btrfs_subvolume_id: Option<u64>,
 }
 
+impl ProtectedViewIdentity {
+    /// Parse a ZPL dataset path relative to the pool root. An empty path selects the root.
+    pub fn from_zfs_dataset(path: &str) -> Result<Self> {
+        let path = path.trim_matches('/');
+        let mut view = Self::default();
+        if !path.is_empty() {
+            view.zfs_dataset = path.split('/').map(str::to_owned).collect();
+            view.validate_zfs_dataset("zfs")?;
+        }
+        Ok(view)
+    }
+
+    fn validate_zfs_dataset(&self, filesystem: &str) -> Result<()> {
+        if !self.zfs_dataset.is_empty() && filesystem != "zfs" && filesystem != "raw" {
+            return Err(corrupt("ZFS dataset view requires a ZFS storage set"));
+        }
+        if self
+            .zfs_dataset
+            .iter()
+            .any(|part| matches!(part.as_str(), "" | "." | "..") || part.contains(['/', '\0']))
+        {
+            return Err(corrupt("invalid ZFS dataset path component"));
+        }
+        Ok(())
+    }
+}
+
 /// Format-native durable commit/generation identity bound to a sealed protection point.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "format")]
@@ -909,6 +936,7 @@ impl StorageSetManifest {
     /// Encode this manifest into its canonical binary envelope (`FFSRQSM3`), signing
     /// with `signing_key` when provided.
     pub fn encode(&self, signing_key: Option<&PorKey>) -> Result<Vec<u8>> {
+        self.view.validate_zfs_dataset(&self.filesystem)?;
         if self.generation == 0 {
             return Err(corrupt("storage-set manifest generation must be non-zero"));
         }
@@ -1025,6 +1053,7 @@ impl StorageSetManifest {
 
         let mut decoded: Self = serde_json::from_slice(body_bytes)
             .map_err(|err| corrupt(&format!("decode storage-set manifest JSON: {err}")))?;
+        decoded.view.validate_zfs_dataset(&decoded.filesystem)?;
         if decoded.generation != generation || decoded.set_id != set_id || generation == 0 {
             return Err(corrupt(
                 "storage-set manifest envelope disagrees with body identity",
