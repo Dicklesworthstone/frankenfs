@@ -3644,7 +3644,7 @@ mod tests {
         let fat_chk = ffs_fat::reader::recovery::check(
             &cx,
             &ffs_fat::ImageArgs {
-                image: fat16_grown.clone(),
+                image: fat16_grown,
                 offset: 0,
                 length: None,
                 oem_code_page: FatOemCodePage::Ascii,

@@ -3306,7 +3306,7 @@ fn execute_command(
             root_entries,
             dry_run,
             json,
-            &six_format,
+            six_format,
         ),
         Command::Streams {
             image,
