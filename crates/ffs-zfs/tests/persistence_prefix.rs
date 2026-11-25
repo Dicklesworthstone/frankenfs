@@ -4928,7 +4928,7 @@ fn native_plain_leaf_pointers(device: &FaultableMemberDevice, node: &Dnode) -> V
             pointer.logical_bytes(),
         )
         .unwrap();
-        pending.extend(raw.chunks_exact(128).rev().map(|bytes| {
+        pending.extend(raw.as_chunks::<128>().0.iter().rev().map(|bytes| {
             let child = BlockPointer::parse(bytes, pointer.payload_order()).unwrap();
             assert!(child.hole() || child.level() + 1 == pointer.level());
             child
@@ -5677,12 +5677,12 @@ fn inherited_zstd_first_data_crash_cuts_publish_compression_and_owner_together()
                 .unwrap(),
             if published { payload.as_slice() } else { &[] }
         );
-        assert!(
+        assert_eq!(
             mos.zpl_snapshot(&cx, &dataset, b"empty")
                 .unwrap()
                 .read(&cx, file, 0, payload.len())
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            [] as [u8; 0]
         );
         assert_pool_scrub_and_allocation_clean(&cx, &durable, built.pool_guid, Some(slot));
         recovered

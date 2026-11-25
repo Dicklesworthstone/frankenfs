@@ -3478,7 +3478,7 @@ fn native_final_barrier_cancellation_preserves_only_fully_committed_outcomes() {
                 let mut view = objects.zpl(&cx, &[b"data".to_vec()]).unwrap();
                 let object = view.resolve(&cx, b"/committed-at-barrier").unwrap();
                 assert_eq!(object, value);
-                assert!(view.read(&cx, object, 0, 1).unwrap().is_empty());
+                assert_eq!(view.read(&cx, object, 0, 1).unwrap(), [] as [u8; 0]);
                 assert_pool_scrub_and_allocation_clean(
                     &cx,
                     &fresh,

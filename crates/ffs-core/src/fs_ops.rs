@@ -1789,13 +1789,19 @@ impl FsOps for OpenFs {
             });
         }
         if flags & RENAME_WHITEOUT != 0 {
-            if !self.is_ext4() {
-                return Err(FfsError::RequestRejected {
-                    errno: libc::EINVAL,
-                    detail: "RENAME_WHITEOUT is not supported".into(),
-                });
-            }
             let no_replace = flags & RENAME_NOREPLACE != 0;
+            if !self.is_ext4() {
+                clear_readdir_snapshot(&self.readdir_snapshot);
+                self.check_btrfs_mutation_allowed("rename")?;
+                return self.btrfs_rename2_whiteout(
+                    parent,
+                    name.as_encoded_bytes(),
+                    new_parent,
+                    new_name.as_encoded_bytes(),
+                    no_replace,
+                    owner,
+                );
+            }
             let _namespace = self.begin_namespace_mutation();
             clear_readdir_snapshot(&self.readdir_snapshot);
             let canon_parent = Self::ext4_canonical_inode(parent);

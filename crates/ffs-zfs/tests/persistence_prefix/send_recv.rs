@@ -120,11 +120,10 @@ fn assert_received_feature_owners(
 fn native_compound_end(prefix: &[u8], order: Endian) -> [u8; DMU_REPLAY_RECORD_BYTES] {
     assert!(prefix.len().is_multiple_of(4));
     let mut checksum = [0_u64; 4];
-    for word in prefix.chunks_exact(4) {
-        let word: [u8; 4] = word.try_into().unwrap();
+    for word in prefix.as_chunks::<4>().0 {
         let word = match order {
-            Endian::Little => u32::from_le_bytes(word),
-            Endian::Big => u32::from_be_bytes(word),
+            Endian::Little => u32::from_le_bytes(*word),
+            Endian::Big => u32::from_be_bytes(*word),
         };
         checksum[0] = checksum[0].wrapping_add(u64::from(word));
         checksum[1] = checksum[1].wrapping_add(checksum[0]);
@@ -3316,7 +3315,9 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
         )
         .unwrap();
         meta_payload
-            .chunks_exact(128)
+            .as_chunks::<128>()
+            .0
+            .iter()
             .enumerate()
             .filter_map(|(block, bytes)| {
                 let pointer = BlockPointer::parse(bytes, meta_indirect.payload_order()).unwrap();

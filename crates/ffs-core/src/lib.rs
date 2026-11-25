@@ -49054,6 +49054,156 @@ impl OpenFs {
         Ok(())
     }
 
+    /// Atomic rename + caller-owned whiteout (`0:0` char device) for
+    /// `renameat2(RENAME_WHITEOUT [| RENAME_NOREPLACE])` on btrfs.
+    ///
+    /// Runs every validation and preflight under one exclusive `alloc_mutex`
+    /// critical section before mutating `fs_tree`, then publishes the move and
+    /// the caller-owned whiteout inode together in the same in-memory tree
+    /// state so concurrent readers and transaction commits never observe the
+    /// source moved without its whiteout.
+    #[allow(clippy::too_many_arguments)]
+    fn btrfs_rename2_whiteout(
+        &self,
+        parent: InodeNumber,
+        name: &[u8],
+        new_parent: InodeNumber,
+        new_name: &[u8],
+        no_replace: bool,
+        owner: (u32, u32),
+    ) -> ffs_error::Result<()> {
+        self.require_btrfs_rw_allowed("rename")?;
+        let alloc_mutex = self.require_btrfs_alloc_state()?;
+        let parent_oid = self.btrfs_canonical_inode(parent)?;
+        let new_parent_oid = self.btrfs_canonical_inode(new_parent)?;
+        let (secs, nanos) = Self::btrfs_now_timestamp();
+
+        Self::validate_single_path_component(name)?;
+        Self::validate_single_path_component(new_name)?;
+
+        let mut alloc = alloc_mutex.write();
+        let parent_inode = self.btrfs_require_directory_inode(&alloc, parent_oid)?;
+        let new_parent_inode = self.btrfs_require_directory_inode(&alloc, new_parent_oid)?;
+
+        let child = Self::btrfs_lookup_dir_entry(&alloc, parent_oid, name)?;
+        Self::btrfs_refuse_subvol_link(&child)?;
+        let child_is_dir = child.file_type == BTRFS_FT_DIR;
+        let child_dir_index =
+            Self::btrfs_require_inode_ref_index(&alloc, child.child_objectid, parent_oid, name)?;
+
+        let existing_target = match Self::btrfs_lookup_dir_entry(&alloc, new_parent_oid, new_name) {
+            Ok(entry) => Some(entry),
+            Err(FfsError::NotFound(_)) => None,
+            Err(err) => return Err(err),
+        };
+        if no_replace && existing_target.is_some() {
+            return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                libc::EEXIST,
+            )));
+        }
+        if parent_oid == new_parent_oid && name == new_name {
+            return Ok(());
+        }
+        if let Some(ref target) = existing_target
+            && target.child_objectid == child.child_objectid
+        {
+            return Ok(());
+        }
+        if child_is_dir
+            && parent_oid != new_parent_oid
+            && Self::btrfs_directory_is_descendant_of(&alloc, new_parent_oid, child.child_objectid)?
+        {
+            return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                libc::EINVAL,
+            )));
+        }
+
+        let protected_mask = BTRFS_INODE_IMMUTABLE | BTRFS_INODE_APPEND;
+        let src_inode = self.btrfs_read_inode_from_tree(&alloc, child.child_objectid)?;
+        if (parent_inode.flags | new_parent_inode.flags | src_inode.flags) & protected_mask != 0 {
+            return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EPERM)));
+        }
+        if let Some(ref victim) = existing_target {
+            let victim_inode = self.btrfs_read_inode_from_tree(&alloc, victim.child_objectid)?;
+            if victim_inode.flags & protected_mask != 0 {
+                return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EPERM)));
+            }
+        }
+
+        Self::btrfs_preflight_dir_entry_insert(
+            &alloc,
+            new_parent_oid,
+            new_name,
+            child.child_objectid,
+        )?;
+        Self::btrfs_preflight_inode_ref_insert(&alloc, child.child_objectid, new_parent_oid)?;
+        let target_will_be_purged =
+            self.btrfs_preflight_rename_target(&alloc, new_parent_oid, new_name, child_is_dir)?;
+
+        let ctx = BtrfsRenameCtx {
+            parent_oid,
+            new_parent_oid,
+            child: &child,
+            child_dir_index,
+            name,
+            new_name,
+            secs,
+            nanos,
+        };
+        self.btrfs_apply_rename_per_op(&mut alloc, &ctx, target_will_be_purged)?;
+        self.btrfs_touch_inode_ctime(&mut alloc, child.child_objectid, secs, nanos)?;
+
+        let whiteout_oid = self.btrfs_take_next_objectid(&mut alloc);
+        let whiteout_inode = BtrfsInodeItem {
+            generation: alloc.generation,
+            size: 0,
+            nbytes: 0,
+            nlink: 1,
+            uid: owner.0,
+            gid: owner.1,
+            mode: u32::from(ffs_types::S_IFCHR),
+            rdev: 0,
+            flags: 0,
+            atime_sec: secs,
+            atime_nsec: nanos,
+            ctime_sec: secs,
+            ctime_nsec: nanos,
+            mtime_sec: secs,
+            mtime_nsec: nanos,
+            otime_sec: secs,
+            otime_nsec: nanos,
+        };
+        let whiteout_key = BtrfsKey {
+            objectid: whiteout_oid,
+            item_type: BTRFS_ITEM_INODE_ITEM,
+            offset: 0,
+        };
+        alloc
+            .fs_tree
+            .insert(whiteout_key, &whiteout_inode.to_bytes())
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+        let whiteout_dir_item = BtrfsDirItem {
+            child_objectid: whiteout_oid,
+            child_key_type: BTRFS_ITEM_INODE_ITEM,
+            child_key_offset: 0,
+            file_type: ffs_btrfs::BTRFS_FT_CHRDEV,
+            name: name.to_vec(),
+        };
+        let whiteout_dir_index =
+            self.btrfs_insert_dir_entry(&mut alloc, parent_oid, &whiteout_dir_item)?;
+        Self::btrfs_insert_inode_ref(
+            &mut alloc,
+            whiteout_oid,
+            parent_oid,
+            name,
+            whiteout_dir_index,
+        )?;
+        self.btrfs_touch_inode_times(&mut alloc, parent_oid, secs, nanos)?;
+        drop(alloc);
+
+        Ok(())
+    }
+
     /// Create a hard link in a btrfs filesystem.
     fn btrfs_link(
         &self,
@@ -119673,6 +119823,144 @@ pub(crate) mod scrub;\n";
         assert!(
             ok,
             "btrfs check must accept a RENAME_EXCHANGE swap (no orphan/duplicate INODE_REF or dir-index drift):\n{output}"
+        );
+    }
+
+    #[test]
+    fn btrfs_rename2_whiteout_publishes_caller_owned_char_dev_and_passes_btrfs_check() {
+        let (fs_mem, cx) = open_writable_btrfs();
+        let ops_mem: &dyn FsOps = &fs_mem;
+        let root_mem = InodeNumber(1);
+        let src = ops_mem
+            .create(
+                &cx,
+                &mut RequestScope::empty(),
+                root_mem,
+                OsStr::new("wo_src.txt"),
+                0o644,
+                0,
+                0,
+            )
+            .expect("create wo_src");
+        ops_mem
+            .write(
+                &cx,
+                &mut RequestScope::empty(),
+                src.ino,
+                0,
+                b"whiteout-data",
+            )
+            .expect("write wo_src");
+
+        ops_mem
+            .rename2_with_owner(
+                &cx,
+                &mut RequestScope::empty(),
+                root_mem,
+                OsStr::new("wo_src.txt"),
+                root_mem,
+                OsStr::new("wo_dst.txt"),
+                libc::RENAME_WHITEOUT | libc::RENAME_NOREPLACE,
+                (1000, 1001),
+            )
+            .expect("btrfs RENAME_WHITEOUT | RENAME_NOREPLACE must succeed");
+
+        let moved = ops_mem
+            .lookup(
+                &cx,
+                &mut RequestScope::empty(),
+                root_mem,
+                OsStr::new("wo_dst.txt"),
+            )
+            .expect("moved destination must exist");
+        assert_eq!(moved.ino, src.ino);
+        let data = ops_mem
+            .read(&cx, &mut RequestScope::empty(), moved.ino, 0, 64)
+            .expect("read moved destination");
+        assert_eq!(data, b"whiteout-data");
+
+        let wo = ops_mem
+            .lookup(
+                &cx,
+                &mut RequestScope::empty(),
+                root_mem,
+                OsStr::new("wo_src.txt"),
+            )
+            .expect("whiteout must exist at old name");
+        assert_eq!(wo.kind, FileType::CharDevice);
+        assert_eq!(wo.rdev, 0);
+        assert_eq!((wo.uid, wo.gid), (1000, 1001));
+        assert_ne!(wo.ino, src.ino);
+
+        // RENAME_NOREPLACE | RENAME_WHITEOUT onto existing destination must fail with EEXIST
+        // and leave source intact (no partial whiteout created).
+        let eexist = ops_mem
+            .rename2_with_owner(
+                &cx,
+                &mut RequestScope::empty(),
+                root_mem,
+                OsStr::new("wo_dst.txt"),
+                root_mem,
+                OsStr::new("wo_src.txt"),
+                libc::RENAME_WHITEOUT | libc::RENAME_NOREPLACE,
+                (2000, 2001),
+            )
+            .expect_err("RENAME_NOREPLACE onto existing entry must fail");
+        assert_eq!(eexist.to_errno(), libc::EEXIST);
+        assert_eq!(
+            ops_mem
+                .lookup(
+                    &cx,
+                    &mut RequestScope::empty(),
+                    root_mem,
+                    OsStr::new("wo_dst.txt")
+                )
+                .expect("source stays intact after EEXIST")
+                .ino,
+            src.ino
+        );
+
+        // If btrfs-progs is present, verify full on-disk transaction commit passes `btrfs check`.
+        let Some((fs, dev, _tmp, image)) = open_writable_btrfs_mkfs(256) else {
+            return;
+        };
+        let ops: &dyn FsOps = &fs;
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let f = ops
+            .create(
+                &cx,
+                &mut RequestScope::empty(),
+                root,
+                OsStr::new("orig.bin"),
+                0o644,
+                0,
+                0,
+            )
+            .expect("create orig");
+        ops.write(&cx, &mut RequestScope::empty(), f.ino, 0, b"payload")
+            .expect("write orig");
+        ops.rename2_with_owner(
+            &cx,
+            &mut RequestScope::empty(),
+            root,
+            OsStr::new("orig.bin"),
+            root,
+            OsStr::new("moved.bin"),
+            libc::RENAME_WHITEOUT,
+            (1000, 1000),
+        )
+        .expect("RENAME_WHITEOUT on real btrfs image");
+
+        let _ = fs.flush_mvcc_to_device(&cx);
+        fs.btrfs_full_transaction_commit(&cx, "rename-whiteout-check")
+            .expect("btrfs full transaction commit");
+        std::fs::write(&image, dev.snapshot_bytes()).expect("write modified image");
+        let Some((ok, output)) = run_btrfs_check(&image) else {
+            return;
+        };
+        assert!(
+            ok,
+            "btrfs check must accept RENAME_WHITEOUT commit:\n{output}"
         );
     }
 
