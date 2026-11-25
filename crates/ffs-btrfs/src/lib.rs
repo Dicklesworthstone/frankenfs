@@ -22138,7 +22138,7 @@ mod tests {
                     stored
                 );
             } else {
-                assert!(sb.sys_chunk_array.is_empty());
+                assert_eq!(sb.sys_chunk_array, [] as [u8; 0]);
             }
             // One fitting hole cannot justify a SINGLE fallback on a DUP filesystem.
             let smaller = growth_device(32 * MB, 16 * MB);
