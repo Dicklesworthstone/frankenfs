@@ -42,6 +42,7 @@ use self::dmu_cow::{
     MosFeatureState, PoolSpaceAllocator, StagedBlockWrite, WriteBucket,
     finalize_mos_and_space_maps_to_convergence, zap_optional_u64, zap_required_u64,
 };
+pub(crate) use self::dmu_cow::{dmu_ot_is_byte_array, dmu_ot_is_metadata};
 pub(crate) use self::dsl_ops::dataset_statfs_quota_space;
 use self::dsl_ops::{DslMutation, stage_dsl_mutation};
 pub use self::dsl_ops::{
@@ -2756,6 +2757,12 @@ impl ZfsTransactionEngine {
                     return ZfsTxOutcome::NotCommitted(err);
                 }
             }
+        }
+
+        // Cancellation after staged barriers still precedes native root publication.
+        // Preserve NotCommitted while no uberblock has been touched.
+        if let Err(err) = checkpoint(cx) {
+            return ZfsTxOutcome::NotCommitted(err);
         }
 
         // 3. Synchronized 2-wave 4-label Uberblock publication (`L0..L1` -> sync -> `L2..L3` -> sync).

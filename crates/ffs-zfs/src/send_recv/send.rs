@@ -8,7 +8,7 @@
 
 use crate::reader::dmu::Objects;
 use crate::reader::dmu::zpl::snapshots::SnapshotRoot;
-use crate::transaction::list_bookmarks_in_mos;
+use crate::transaction::{dmu_ot_is_byte_array, dmu_ot_is_metadata, list_bookmarks_in_mos};
 use asupersync::Cx;
 use ffs_error::{FfsError, Result};
 use ffs_ondisk::zfs::crypto::{bp_crypt_iv, bp_crypt_mac, bp_crypt_salt, extract_raw_dnode_bonus};
@@ -21,6 +21,7 @@ use ffs_ondisk::zfs::send_stream::{
     DRR_FLAG_SPILL_BLOCK, DRR_OBJECT_SPILL, DRR_RAW_BYTESWAP, DrrBegin, DrrEnd, DrrFree,
     DrrFreeObjects, DrrObject, DrrObjectRange, DrrRecord, DrrSpill, DrrWrite, DrrWriteEmbedded,
     Fletcher4Stream, ReceiveResumeToken, SendFeatureFlags, StreamCryptoKeydata, StreamHeaderType,
+    StreamMetaDnode,
 };
 use ffs_ondisk::zfs::{BlockPointer, Endian};
 use ffs_ondisk::zfs_dmu::{DMU_OT_DNODE, DNODE_BLOCK_BYTES, DNODE_BYTES, Dnode, dnode_at};
@@ -30,6 +31,7 @@ use std::io::Write;
 
 const MAX_SEND_RECORDS: u64 = 10_000_000;
 const MAX_SEND_TREE_DEPTH: u8 = 8;
+const LEGACY_MAX_BLOCK_BYTES: u64 = 128 * 1024;
 
 /// Incremental send base source (`-i` / `-I`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -303,6 +305,7 @@ struct SubstreamContext<'a, W: Write> {
     raw: bool,
     compressed: bool,
     embedded: bool,
+    large_blocks: bool,
     is_encrypted: bool,
     hole_birth_active: bool,
     resume: Option<ResumeCursor>,
@@ -599,6 +602,26 @@ impl<W: Write> SubstreamContext<'_, W> {
         let emit_obj_header = resume_offset_for_obj.is_none_or(|off| off == 0);
 
         if emit_obj_header {
+            // Native send reblocks large objects for legacy streams. Until
+            // that transformation is implemented, never advertise oversized
+            // object geometry without the LARGE_BLOCKS feature.
+            if !self.raw && !self.large_blocks && dnode.data_bytes() as u64 > LEGACY_MAX_BLOCK_BYTES
+            {
+                return Err(unsupported(
+                    "send of an object block larger than 128 KiB requires large_blocks (-L)",
+                ));
+            }
+            // Typed bonus payloads need native byte-order conversion. SA is
+            // self-describing: its own magic determines attribute byte order.
+            if !self.raw
+                && dn_order != self.writer.order
+                && !dnode.bonus().is_empty()
+                && !dmu_ot_is_byte_array(dnode.bonus_type())
+            {
+                return Err(unsupported(
+                    "non-raw send cannot convert a foreign-order dnode bonus",
+                ));
+            }
             let (raw_bonuslen, bonus_bytes) = if self.raw && self.is_encrypted {
                 match extract_raw_dnode_bonus(dn_block, slot, dn_order)
                     .map_err(|e| parse_err(&e))?
@@ -724,22 +747,23 @@ impl<W: Write> SubstreamContext<'_, W> {
         if bp.dedup() {
             return Err(unsupported("send refuses legacy BP_IS_DEDUP spill pointer"));
         }
-        let use_raw = self.raw;
-        let use_comp = self.compressed && !self.is_encrypted && bp.compression() != 2;
-        if use_raw || use_comp {
+        // OpenZFS dump_spill sets transformed fields only for raw streams.
+        // Even `send -c` sends decoded logical SA spill bytes.
+        if self.raw {
+            if !bp.protected() {
+                return Err(corrupt(
+                    "raw encrypted send encountered an unprotected spill",
+                ));
+            }
             let raw_phys = view.read_verified_physical_block(cx, bp)?;
             let mut flags = 0_u8;
-            if use_raw && bp.payload_order() != self.writer.order {
+            if bp.payload_order() != self.writer.order {
                 flags |= DRR_RAW_BYTESWAP;
             }
-            let (salt, iv, mac) = if use_raw && bp.protected() {
-                if bp.is_encrypted() {
-                    (bp_crypt_salt(bp), bp_crypt_iv(bp), bp_crypt_mac(bp))
-                } else {
-                    ([0; 8], [0; 12], bp_crypt_mac(bp))
-                }
+            let (salt, iv, mac) = if bp.is_encrypted() {
+                (bp_crypt_salt(bp), bp_crypt_iv(bp), bp_crypt_mac(bp))
             } else {
-                ([0; 8], [0; 12], [0; 16])
+                ([0; 8], [0; 12], bp_crypt_mac(bp))
             };
             self.writer.write_record(
                 cx,
@@ -753,16 +777,21 @@ impl<W: Write> SubstreamContext<'_, W> {
                     salt,
                     iv,
                     mac,
-                    object_type: u32::from(bp.object_type()),
+                    object_type: 0,
                 }),
                 &raw_phys,
             )?;
         } else {
-            let Some((logical, _, _)) =
+            let Some((logical, payload_order, _)) =
                 view.read_logical_block(cx, bp, bp.object_type(), bp.logical_bytes(), ceiling)?
             else {
                 return Ok(());
             };
+            if payload_order != self.writer.order && !dmu_ot_is_byte_array(bp.object_type()) {
+                return Err(unsupported(
+                    "non-raw send cannot convert a foreign-order SA spill",
+                ));
+            }
             self.writer.write_record(
                 cx,
                 &DrrRecord::Spill(DrrSpill {
@@ -775,7 +804,7 @@ impl<W: Write> SubstreamContext<'_, W> {
                     salt: [0; 8],
                     iv: [0; 12],
                     mac: [0; 16],
-                    object_type: u32::from(bp.object_type()),
+                    object_type: 0,
                 }),
                 &logical,
             )?;
@@ -890,8 +919,30 @@ impl<W: Write> SubstreamContext<'_, W> {
         }
         self.flush_free_range(cx, obj_id, free_range)?;
 
+        // A resumed stream can omit the OBJECT record, so independently
+        // enforce the negotiated size limit on every emitted data block.
+        if !self.raw && !self.large_blocks && bp.logical_bytes() as u64 > LEGACY_MAX_BLOCK_BYTES {
+            return Err(unsupported(
+                "send of a block larger than 128 KiB requires large_blocks (-L)",
+            ));
+        }
+
+        // File and volume payloads are byte strings. Other admitted DMU
+        // structures may contain native integers and need an explicit encoder
+        // before their payload order can differ from the stream header.
+        if !self.raw && bp.payload_order() != self.writer.order && !dmu_ot_is_byte_array(obj_type) {
+            return Err(unsupported(
+                "non-raw send cannot convert foreign-order structured DMU data",
+            ));
+        }
+
+        if self.raw && bp.embedded() {
+            return Err(corrupt(
+                "raw encrypted send encountered an embedded data block",
+            ));
+        }
         if bp.embedded() {
-            if self.embedded || self.raw {
+            if self.embedded {
                 let (mut payload, lsize) = bp.raw_embedded_bytes().map_err(|e| parse_err(&e))?;
                 let psize =
                     u32::try_from(payload.len()).map_err(|_| corrupt("embedded psize overflow"))?;
@@ -922,7 +973,7 @@ impl<W: Write> SubstreamContext<'_, W> {
                         offset: byte_offset,
                         logical_size: logical.len() as u64,
                         toguid: self.to_guid,
-                        checksumtype: 8,
+                        checksumtype: 2,
                         flags: 0,
                         compressiontype: 0,
                         ddt_key: [0; 40],
@@ -939,8 +990,17 @@ impl<W: Write> SubstreamContext<'_, W> {
         }
 
         let use_raw = self.raw;
-        let use_comp = self.compressed && !self.is_encrypted && bp.compression() != 2;
+        let use_comp = self.compressed
+            && !self.is_encrypted
+            && bp.compression() != 2
+            && !dmu_ot_is_metadata(bp.object_type())
+            && bp.payload_order() == self.writer.order;
         if use_raw || use_comp {
+            if use_raw && !bp.protected() {
+                return Err(corrupt(
+                    "raw encrypted send encountered an unprotected data block",
+                ));
+            }
             let raw_phys = view.read_verified_physical_block(cx, bp)?;
             let mut flags = 0_u8;
             if use_raw && bp.payload_order() != self.writer.order {
@@ -988,7 +1048,11 @@ impl<W: Write> SubstreamContext<'_, W> {
                     offset: byte_offset,
                     logical_size: logical.len() as u64,
                     toguid: self.to_guid,
-                    checksumtype: bp.checksum_type(),
+                    checksumtype: if bp.protected() {
+                        2
+                    } else {
+                        bp.checksum_type()
+                    },
                     flags: 0,
                     compressiontype: 0,
                     ddt_key: [0; 40],
@@ -1226,7 +1290,7 @@ pub fn send_stream(
             full_ds_name.push_str(&String::from_utf8_lossy(comp));
         }
         ds_entry.insert("name".to_owned(), Value::String(full_ds_name));
-        ds_entry.insert("parentfromsnap".to_owned(), Value::String(String::new()));
+        ds_entry.insert("parentfromsnap".to_owned(), Value::Unsigned(0));
         ds_entry.insert("props".to_owned(), Value::List(props_nv));
         let mut snaps_nv = BTreeMap::new();
         let mut snapprops_nv = BTreeMap::new();
@@ -1253,6 +1317,13 @@ pub fn send_stream(
             Value::List(NvList { fields: ds_entry }),
         );
         pkg_fields.insert("fss".to_owned(), Value::List(NvList { fields: fss_map }));
+        // This sender packages snapshots from one explicitly selected dataset,
+        // not a recursive hierarchy. Native libzfs distinguishes those profiles
+        // by the presence of these boolean nvpair keys.
+        pkg_fields.insert("not_recursive".to_owned(), Value::Boolean(true));
+        if raw {
+            pkg_fields.insert("raw".to_owned(), Value::Boolean(true));
+        }
         pkg_fields.insert(
             "tosnap".to_owned(),
             Value::String(String::from_utf8_lossy(&to_snap.info.name).into_owned()),
@@ -1284,6 +1355,28 @@ pub fn send_stream(
         });
         let mut outer = StreamWriter::new(out, req.stream_order, false);
         outer.write_record(cx, &compound_begin, &pkg_bytes)?;
+        // OpenZFS send_prelim_records ends the package header before emitting
+        // any substreams. This END covers BEGIN + nvlist only and has no
+        // per-record checksum; the final zero END terminates the package later.
+        let mut header_checksum = Fletcher4Stream::new(req.stream_order);
+        header_checksum
+            .update(
+                &compound_begin
+                    .encode_header(req.stream_order)
+                    .map_err(|e| parse_err(&e))?,
+            )
+            .map_err(|e| parse_err(&e))?;
+        header_checksum
+            .update(&pkg_bytes)
+            .map_err(|e| parse_err(&e))?;
+        outer.write_record(
+            cx,
+            &DrrRecord::End(DrrEnd {
+                checksum: header_checksum.state(),
+                toguid: 0,
+            }),
+            &[],
+        )?;
         total_records += outer.records_written;
         total_bytes += outer.bytes_written;
     }
@@ -1346,7 +1439,15 @@ pub fn send_stream(
             let info = crypto_info
                 .as_ref()
                 .ok_or_else(|| corrupt("missing crypto info for raw encrypted send"))?;
-            let key_len = info.record.suite.key_len().map_err(|e| parse_err(&e))?;
+            let to_ivset_guid = to_ivset_guid.filter(|&guid| guid != 0).ok_or_else(|| {
+                unsupported("raw encrypted send requires a nonzero source snapshot IV-set GUID")
+            })?;
+            let from_ivset_guid = match sub_base {
+                Some(base) => Some(base.ivset_guid.filter(|&guid| guid != 0).ok_or_else(|| {
+                    unsupported("raw incremental send requires a nonzero base IV-set GUID")
+                })?),
+                None => None,
+            };
             let keydata = StreamCryptoKeydata {
                 suite: info.record.suite,
                 version: info.record.version,
@@ -1356,11 +1457,12 @@ pub fn send_stream(
                 pbkdf2_iters: info.record.pbkdf2_iters,
                 iv: info.record.iv,
                 mac: info.record.mac,
-                wrapped_master_key: info.record.encrypted_master_key[..key_len].to_vec(),
+                wrapped_master_key: info.record.encrypted_master_key,
                 wrapped_hmac_key: info.record.encrypted_hmac_key,
+                meta_dnode: StreamMetaDnode::from_dnode(&os.meta).map_err(|e| parse_err(&e))?,
                 portable_mac,
-                to_ivset_guid: to_ivset_guid.unwrap_or(0),
-                from_ivset_guid: sub_base.as_ref().and_then(|b| b.ivset_guid),
+                to_ivset_guid,
+                from_ivset_guid,
             };
             keydata
                 .to_nvlist()
@@ -1407,6 +1509,7 @@ pub fn send_stream(
             raw: raw && is_encrypted,
             compressed,
             embedded,
+            large_blocks,
             is_encrypted,
             hole_birth_active,
             resume: resume_cursor,

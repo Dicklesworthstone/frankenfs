@@ -201,7 +201,7 @@ impl ZfsFs {
         let obj = state.mutate_snapshot(cx, |engine, dataset| {
             engine.create_snapshot(cx, dataset, snap_name, timestamp)
         })?;
-        state.publish_committed(|state| {
+        state.publish_committed(cx, |state| {
             state.refresh_head(cx)?;
             state.refresh_snapshots(cx)?;
             Ok(obj)
@@ -219,7 +219,7 @@ impl ZfsFs {
         let obj = state.mutate_snapshot(cx, |engine, dataset| {
             engine.destroy_snapshot(cx, dataset, snap_name, defer)
         })?;
-        state.publish_committed(|state| {
+        state.publish_committed(cx, |state| {
             state.refresh_head(cx)?;
             state.refresh_snapshots(cx)?;
             Ok(obj)
@@ -237,7 +237,7 @@ impl ZfsFs {
         let obj = state.mutate_snapshot(cx, |engine, dataset| {
             engine.rename_snapshot(cx, dataset, old_snap_name, new_snap_name)
         })?;
-        state.publish_committed(|state| {
+        state.publish_committed(cx, |state| {
             state.refresh_head(cx)?;
             state.refresh_snapshots(cx)?;
             Ok(obj)
@@ -328,7 +328,7 @@ impl ZfsFs {
                 crate::ZfsDataChecksum::Inherit,
             )
         })?;
-        let attr = state.publish_committed(|state| {
+        let attr = state.publish_committed(cx, |state| {
             state.refresh_head(cx)?;
             let ino = state.head.remember_object(cx, object)?;
             self.attributes(cx, state, ino)
@@ -757,14 +757,16 @@ impl State {
         Ok(())
     }
 
+    /// Finish only the cache and reply work after a known native commit.
+    /// Cancellation remains pending outside this scope; it cannot turn a
+    /// durable mutation into a retryable EINTR while its reply is formed.
     pub(super) fn publish_committed<T>(
         &mut self,
+        cx: &Cx,
         publish: impl FnOnce(&mut Self) -> Result<T>,
     ) -> Result<T> {
-        let result = publish(self);
-        if let Err(error) = &result
-            && !matches!(error, FfsError::Cancelled)
-        {
+        let result = cx.masked(|| publish(self));
+        if result.is_err() {
             // Native persistence already succeeded. An unreadable result must
             // not fall back to the predecessor view or continue mutating it.
             self.recovery_required = true;
@@ -821,7 +823,9 @@ impl State {
 
     pub(super) fn sync(&self, cx: &Cx) -> Result<()> {
         if let Some(writer) = &self.writer {
-            writer.engine.sync_devices(cx)?;
+            // The engine checks cancellation before each member. Once every
+            // barrier succeeds, preserve that result without a reply checkpoint.
+            return writer.engine.sync_devices(cx);
         }
         checkpoint(cx)
     }

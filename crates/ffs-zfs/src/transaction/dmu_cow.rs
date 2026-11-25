@@ -127,11 +127,22 @@ impl AllocatorWriteTopology {
 
 /// Exact OpenZFS `dmu_ot[type].ot_metadata` classification (`libzpool.so.7`).
 #[must_use]
-pub(super) const fn dmu_ot_is_metadata(object_type: u8) -> bool {
+pub(crate) const fn dmu_ot_is_metadata(object_type: u8) -> bool {
     if object_type & 0x80 != 0 {
         object_type & 0x40 != 0
     } else {
         !matches!(object_type, 19 | 23 | 25 | 26 | 49 | 54 | 55)
+    }
+}
+
+/// Native `DMU_BSWAP_UINT8` payloads do not follow the outer block's byte order.
+/// SA attributes are included: their own magic identifies their internal order.
+#[must_use]
+pub(crate) const fn dmu_ot_is_byte_array(object_type: u8) -> bool {
+    if object_type & 0x80 != 0 {
+        object_type & 0x1f == 0
+    } else {
+        matches!(object_type, 0 | 3 | 19 | 23 | 25 | 29 | 34 | 35 | 44 | 49)
     }
 }
 

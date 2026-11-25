@@ -96,7 +96,7 @@ impl ByteDevice for WritableImage {
     fn sync(&self, cx: &Cx) -> Result<()> {
         checkpoint(cx)?;
         self.file.sync_all()?;
-        checkpoint(cx)
+        Ok(())
     }
     fn supports_discard(&self) -> bool {
         self.discard_device
@@ -547,8 +547,10 @@ impl Leaf {
     }
     pub(crate) fn sync_raw(&self, cx: &Cx) -> Result<()> {
         checkpoint(cx)?;
-        self.device.sync(cx)?;
-        checkpoint(cx)
+        // A completed device barrier remains successful if cancellation arrives
+        // with its result. The next member or native write checks cancellation
+        // before starting; only the final completed barrier settles durability.
+        self.device.sync(cx)
     }
     pub(crate) fn begin_durability_commit(&self, cx: &Cx) -> Result<()> {
         self.device.begin_durability_commit(cx)

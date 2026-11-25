@@ -108,6 +108,264 @@ fn expect_errno<T>(result: Result<T>, expected: i32) {
     assert_eq!(result.err().expect("expected refusal").to_errno(), expected);
 }
 
+#[test]
+fn create_open_pins_survive_unlink_until_cancelled_last_release() {
+    for kind in ["fat16", "fat32"] {
+        let (_directory, args, fs) = fixture(kind);
+        let cx = Cx::for_testing();
+        let mut scope = RequestScope::empty();
+        let ops: &dyn FsOps = &fs;
+        assert!(ops.requires_stateful_open());
+        let free_before = clean(&fs);
+        let (attr, first, reply_flags) = ops
+            .create_open(
+                &cx,
+                &mut scope,
+                ROOT,
+                OsStr::new("CREATED.BIN"),
+                0o100644,
+                1000,
+                1000,
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+            )
+            .unwrap();
+        assert_ne!(first, 0);
+        assert_eq!(reply_flags, 0);
+        let mut contents = vec![b'a'; 2048];
+        fs.write(&cx, &mut scope, attr.ino, 0, &contents).unwrap();
+        let second = open(&fs, attr.ino);
+        assert_ne!(first, second);
+        fs.unlink(&cx, &mut scope, ROOT, OsStr::new("CREATED.BIN"))
+            .unwrap();
+        expect_errno(
+            fs.lookup(&cx, &mut scope, ROOT, OsStr::new("CREATED.BIN")),
+            libc::ENOENT,
+        );
+        assert_eq!(fs.getattr(&cx, &mut scope, attr.ino).unwrap().nlink, 0);
+        fs.write(&cx, &mut scope, attr.ino, 10, b"changed").unwrap();
+        contents[10..17].copy_from_slice(b"changed");
+        assert_eq!(read(&fs, attr.ino), contents);
+        let replacement = create(&fs, ROOT, "CREATED.BIN", b"new identity");
+        assert_ne!(replacement, attr.ino);
+        expect_errno(release(&fs, replacement, first), libc::EBADF);
+        assert_eq!(read(&fs, attr.ino), contents);
+
+        let cancelled = Cx::for_testing();
+        cancelled.set_cancel_requested(true);
+        for (index, handle) in [first, second].into_iter().enumerate() {
+            let mut cleanup = ops
+                .begin_request_scope(&cancelled, ffs_core::vfs::RequestOp::Release)
+                .unwrap();
+            ops.release(
+                &cancelled,
+                &mut cleanup,
+                ReleaseRequest {
+                    ino: attr.ino,
+                    fh: handle,
+                    flags: libc::O_RDWR,
+                    lock_owner: None,
+                    flush: false,
+                },
+            )
+            .unwrap();
+            ops.end_request_scope(&cancelled, ffs_core::vfs::RequestOp::Release, cleanup)
+                .unwrap();
+            assert!(
+                cancelled.checkpoint().is_err(),
+                "cleanup must preserve cancellation"
+            );
+            if index == 0 {
+                assert_eq!(read(&fs, attr.ino), contents);
+                assert!(fs.retained(attr.ino).unwrap());
+            }
+        }
+        expect_errno(fs.getattr(&cx, &mut scope, attr.ino), libc::ENOENT);
+        expect_errno(release(&fs, attr.ino, second), libc::EBADF);
+        assert_eq!(read(&fs, replacement), b"new identity");
+        {
+            let state = locked(&fs.lifetime).unwrap();
+            assert!(state.handles.is_empty());
+            assert!(state.counts.is_empty());
+            assert!(state.retained.is_empty());
+        }
+        fs.unlink(&cx, &mut scope, ROOT, OsStr::new("CREATED.BIN"))
+            .unwrap();
+        assert_eq!(clean(&fs), free_before);
+        drop(fs);
+        let reopened = mount(&args);
+        assert_eq!(clean(&reopened), free_before);
+        assert!(
+            reopened
+                .volume
+                .list(&cx, Directory::Root)
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn create_open_preflights_capacity_and_drops_failed_reservations_without_native_changes() {
+    for kind in ["fat16", "fat32"] {
+        let (_directory, args, fs) = fixture(kind);
+        let cx = Cx::for_testing();
+        let mut scope = RequestScope::empty();
+        let ino = create(&fs, ROOT, "KEEP.BIN", b"preserve native data");
+        let before = std::fs::read(&args.image).unwrap();
+        for (name, mode, flags, expected) in [
+            ("NEW.BIN", 0o644, libc::O_ACCMODE, libc::EINVAL),
+            ("NEW.BIN", 0o444, libc::O_RDWR, libc::EACCES),
+            ("invalid?.txt", 0o644, libc::O_RDWR, libc::EINVAL),
+            ("KEEP.BIN", 0o644, libc::O_RDWR, libc::EEXIST),
+        ] {
+            expect_errno(
+                fs.create_open(
+                    &cx,
+                    &mut scope,
+                    ROOT,
+                    OsStr::new(name),
+                    mode,
+                    1000,
+                    1000,
+                    flags,
+                ),
+                expected,
+            );
+            let state = locked(&fs.lifetime).unwrap();
+            assert!(state.handles.is_empty());
+            assert!(state.counts.is_empty());
+        }
+        expect_errno(
+            fs.open(&cx, &mut scope, ino, libc::O_ACCMODE | libc::O_TRUNC),
+            libc::EINVAL,
+        );
+        locked(&fs.lifetime).unwrap().next_handle = u64::MAX;
+        expect_errno(
+            fs.create_open(
+                &cx,
+                &mut scope,
+                ROOT,
+                OsStr::new("NEW.BIN"),
+                0o644,
+                1000,
+                1000,
+                libc::O_RDWR,
+            ),
+            libc::EOVERFLOW,
+        );
+        {
+            let mut state = locked(&fs.lifetime).unwrap();
+            state.next_handle = MAX_HANDLES as u64;
+            for handle in 1..=MAX_HANDLES as u64 {
+                state.handles.insert(handle, ino);
+            }
+            state.counts.insert(ino, MAX_HANDLES as u64);
+        }
+        expect_errno(
+            fs.create_open(
+                &cx,
+                &mut scope,
+                ROOT,
+                OsStr::new("NEW.BIN"),
+                0o644,
+                1000,
+                1000,
+                libc::O_RDWR,
+            ),
+            libc::EMFILE,
+        );
+        {
+            let mut state = locked(&fs.lifetime).unwrap();
+            state.handles.clear();
+            state.counts.clear();
+        }
+        let cancelled = Cx::for_testing();
+        cancelled.set_cancel_requested(true);
+        expect_errno(
+            fs.create_open(
+                &cancelled,
+                &mut scope,
+                ROOT,
+                OsStr::new("NEW.BIN"),
+                0o644,
+                1000,
+                1000,
+                libc::O_RDWR,
+            ),
+            libc::EINTR,
+        );
+        assert_eq!(std::fs::read(&args.image).unwrap(), before);
+        assert_eq!(read(&fs, ino), b"preserve native data");
+        expect_errno(
+            fs.lookup(&cx, &mut scope, ROOT, OsStr::new("NEW.BIN")),
+            libc::ENOENT,
+        );
+
+        let (attr, handle, _) = fs
+            .create_open(
+                &cx,
+                &mut scope,
+                ROOT,
+                OsStr::new("READONLY.BIN"),
+                0o444,
+                1000,
+                1000,
+                libc::O_RDONLY,
+            )
+            .unwrap();
+        assert_ne!(handle, 0);
+        assert_eq!(attr.perm, 0o444);
+        assert!(fs.pinned(attr.ino).unwrap());
+        release(&fs, attr.ino, handle).unwrap();
+        assert!(!fs.pinned(attr.ino).unwrap());
+        clean(&fs);
+    }
+}
+
+#[test]
+fn readonly_open_requires_release_and_cancellation_does_not_leak_its_handle() {
+    for kind in ["fat16", "fat32"] {
+        let (_directory, args, fs) = fixture(kind);
+        create(&fs, ROOT, "READ.BIN", b"immutable native data");
+        drop(fs);
+        let before = std::fs::read(&args.image).unwrap();
+        let cx = Cx::for_testing();
+        let volume = args.open(&cx).unwrap();
+        let fs = FatFs::new(&cx, volume, 1000, 1000).unwrap();
+        let ops: &dyn FsOps = &fs;
+        assert!(ops.requires_stateful_open());
+        let mut scope = RequestScope::empty();
+        let ino = ops
+            .lookup(&cx, &mut scope, ROOT, OsStr::new("READ.BIN"))
+            .unwrap()
+            .ino;
+        let (handle, _) = ops.open(&cx, &mut scope, ino, libc::O_RDONLY).unwrap();
+        assert_ne!(handle, 0);
+        let cancelled = Cx::for_testing();
+        cancelled.set_cancel_requested(true);
+        let mut cleanup = ops
+            .begin_request_scope(&cancelled, ffs_core::vfs::RequestOp::Release)
+            .unwrap();
+        ops.release(
+            &cancelled,
+            &mut cleanup,
+            ReleaseRequest {
+                ino,
+                fh: handle,
+                flags: libc::O_RDONLY,
+                lock_owner: None,
+                flush: false,
+            },
+        )
+        .unwrap();
+        assert!(cancelled.checkpoint().is_err());
+        assert!(locked(&fs.lifetime).unwrap().handles.is_empty());
+        assert!(locked(&fs.lifetime).unwrap().counts.is_empty());
+        assert_eq!(read(&fs, ino), b"immutable native data");
+        assert_eq!(std::fs::read(&args.image).unwrap(), before);
+    }
+}
+
 fn mkdir(fs: &FatFs, parent: InodeNumber, name: &str) -> InodeNumber {
     fs.mkdir(
         &Cx::for_testing(),

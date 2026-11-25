@@ -16,6 +16,8 @@ pub enum Value {
     Unsigned(u64),
     String(String),
     Bytes(Vec<u8>),
+    /// Native DATA_TYPE_UINT8_ARRAY (26), distinct from opaque BYTE_ARRAY (10).
+    UnsignedBytes(Vec<u8>),
     List(NvList),
     Lists(Vec<NvList>),
     UnsignedArray(Vec<u64>),
@@ -128,7 +130,7 @@ impl NvList {
                     pair.extend_from_slice(&21_u32.to_be_bytes());
                     pair.extend_from_slice(&1_u32.to_be_bytes());
                     pair.extend_from_slice(&0_u32.to_be_bytes());
-                    4_usize
+                    8_usize
                 }
                 Value::Unsigned(v) => {
                     pair.extend_from_slice(&8_u32.to_be_bytes());
@@ -157,12 +159,31 @@ impl NvList {
                     pair.resize(pair.len().next_multiple_of(4), 0);
                     bytes.len().next_multiple_of(8)
                 }
+                Value::UnsignedBytes(bytes) => {
+                    if bytes.len() > MAX_BYTE_ARRAY {
+                        return Err(invalid("XDR uint8 array exceeds budget"));
+                    }
+                    let count = u32::try_from(bytes.len())
+                        .map_err(|_| invalid("XDR uint8 array length overflow"))?;
+                    pair.extend_from_slice(&26_u32.to_be_bytes());
+                    pair.extend_from_slice(&count.to_be_bytes());
+                    if count != 0 {
+                        pair.extend_from_slice(&count.to_be_bytes());
+                        // The OpenZFS kernel xdr_char encodes an unsigned byte
+                        // in a zero-extended XDR word, including values >=128.
+                        for &byte in bytes {
+                            pair.extend_from_slice(&u32::from(byte).to_be_bytes());
+                        }
+                    }
+                    bytes.len().next_multiple_of(8)
+                }
                 Value::List(sub) => {
                     pair.extend_from_slice(&19_u32.to_be_bytes());
                     pair.extend_from_slice(&1_u32.to_be_bytes());
-                    let before = pair.len();
                     sub.encode_nested_into(&mut pair, depth + 1, budget)?;
-                    (pair.len() - before).max(24)
+                    // The decoded value contains one nvlist_t, not the encoded
+                    // contents of all its child nvpairs (nvpair.c i_get_value_size).
+                    24
                 }
                 Value::Lists(subs) => {
                     if subs.len() > *budget {
@@ -173,11 +194,11 @@ impl NvList {
                         .map_err(|_| invalid("XDR nvlist array length overflow"))?;
                     pair.extend_from_slice(&20_u32.to_be_bytes());
                     pair.extend_from_slice(&count.to_be_bytes());
-                    let before = pair.len();
                     for sub in subs {
                         sub.encode_nested_into(&mut pair, depth + 1, budget)?;
                     }
-                    (pair.len() - before).max(24)
+                    // Each element reserves a uint64 pointer and one nvlist_t.
+                    subs.len() * 32
                 }
                 Value::UnsignedArray(vals) => {
                     if vals.len() > MAX_ITEMS {
@@ -307,7 +328,7 @@ impl<'a> Cursor<'a> {
             }
             let kind = pair.word()?;
             let elements = pair.word()?;
-            let limit = if kind == 10 {
+            let limit = if matches!(kind, 10 | 26) {
                 MAX_BYTE_ARRAY
             } else {
                 MAX_ITEMS
@@ -340,6 +361,23 @@ impl<'a> Cursor<'a> {
                         return Err(invalid("nonzero XDR byte-array padding"));
                     }
                     Value::Bytes(bytes)
+                }
+                (26, count) => {
+                    if count != 0 && pair.word()? != count {
+                        return Err(invalid("XDR uint8 array counts disagree"));
+                    }
+                    let mut bytes = Vec::new();
+                    for _ in 0..count {
+                        let value = pair.word()?;
+                        // Accept the native xdr_char representations from
+                        // signed- and unsigned-char architectures, with no
+                        // truncation of other out-of-range integers.
+                        if value > 255 && value < 0xffff_ff80 {
+                            return Err(invalid("XDR uint8 array value exceeds one byte"));
+                        }
+                        bytes.push(value.to_be_bytes()[3]);
+                    }
+                    Value::UnsignedBytes(bytes)
                 }
                 (19, 1) => Value::List(pair.list(depth + 1, budget)?),
                 (20, count) => {
@@ -480,6 +518,76 @@ mod tests {
             .is_err()
         );
         assert!(NvList::parse(&packed(&[pair("flag", 21, 1, &2_u32.to_be_bytes())])).is_err());
+    }
+
+    #[test]
+    fn native_uint8_array_wire_vector_preserves_type_counts_and_high_bytes() {
+        // OpenZFS nvpair.c + kernel spl-xdr.c: UINT8_ARRAY uses a repeated
+        // array count and one zero-extended XDR word per byte. The 44-byte
+        // encoded pair occupies 32 decoded bytes, independently of XDR size.
+        let raw = [
+            1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 44, 0, 0, 0, 32, 0, 0, 0, 1, b'k', 0, 0,
+            0, 0, 0, 0, 26, 0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 127, 0, 0, 0, 128, 0, 0,
+            0, 255, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let decoded = NvList::parse_exact(&raw).unwrap();
+        assert_eq!(
+            decoded.fields["k"],
+            Value::UnsignedBytes(vec![0, 127, 128, 255])
+        );
+        assert_eq!(decoded.encode_xdr().unwrap(), raw);
+        for end in 0..raw.len() {
+            assert!(NvList::parse_exact(&raw[..end]).is_err(), "{end}");
+        }
+        let mut bad_count = raw;
+        bad_count[39] = 3;
+        assert!(NvList::parse_exact(&bad_count).is_err());
+        let mut bad_value = raw;
+        bad_value[52..56].copy_from_slice(&256_u32.to_be_bytes());
+        assert!(NvList::parse_exact(&bad_value).is_err());
+
+        // Some userspace XDR implementations sign-extend xdr_char. Preserve
+        // those bytes on input, then normalize output for the kernel decoder.
+        let mut userspace = raw;
+        userspace[48..52].copy_from_slice(&(-128_i32).to_be_bytes());
+        userspace[52..56].copy_from_slice(&(-1_i32).to_be_bytes());
+        assert_eq!(NvList::parse_exact(&userspace).unwrap(), decoded);
+        let empty = NvList {
+            fields: BTreeMap::from([("k".to_owned(), Value::UnsignedBytes(Vec::new()))]),
+        };
+        assert_eq!(
+            NvList::parse_exact(&empty.encode_xdr().unwrap()).unwrap(),
+            empty
+        );
+    }
+
+    #[test]
+    fn native_decoded_sizes_follow_nvlist_structures_not_nested_wire_lengths() {
+        let child = NvList {
+            fields: BTreeMap::from([(
+                "long_child_value".to_owned(),
+                Value::Bytes(vec![0x8d; 256]),
+            )]),
+        };
+        for (value, expected_decoded) in [
+            (Value::Boolean(false), 32_u32),
+            (Value::List(child.clone()), 48),
+            (Value::Lists(Vec::new()), 24),
+            (Value::Lists(vec![child.clone()]), 56),
+            (Value::Lists(vec![child.clone(), child]), 88),
+        ] {
+            let nvl = NvList {
+                fields: BTreeMap::from([("k".to_owned(), value)]),
+            };
+            let encoded = nvl.encode_xdr().unwrap();
+            // Native nvpair header16 + aligned name8, then bool8, nvlist_t24,
+            // or count * (pointer8 + nvlist_t24), irrespective of child bytes.
+            assert_eq!(
+                u32::from_be_bytes(encoded[16..20].try_into().unwrap()),
+                expected_decoded
+            );
+            assert_eq!(NvList::parse_exact(&encoded).unwrap(), nvl);
+        }
     }
 
     #[test]

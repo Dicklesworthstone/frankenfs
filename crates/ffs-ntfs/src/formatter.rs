@@ -531,6 +531,11 @@ pub fn format_device(
     let filetime = opts.timestamp_100ns.unwrap_or(DEFAULT_NTFS_FILETIME);
     let built = system_files::build_bootstrap_volume(cx, &layout, &label_str, filetime)?;
 
+    // The withheld primary boot sector and final publication belong to one
+    // native format epoch. Intermediate verification barriers must not seal
+    // protection over an intentionally incomplete volume.
+    let mut protection = ffs_block::DurabilityCommitDeferral::enter(cx, device.as_ref())?;
+
     // Ensure offset 0..sector_bytes is explicitly zeroed while writing (primary VBR withheld).
     let zero_vbr = vec![0_u8; built.vbr_sector.len()];
     device.write_all_at(cx, ByteOffset(0), &zero_vbr)?;
@@ -611,6 +616,7 @@ pub fn format_device(
     invoke_hook(hook, NtfsFormatStage::PrimaryBootPublished)?;
     device.sync(cx)?;
     invoke_hook(hook, NtfsFormatStage::Synced)?;
+    protection.complete();
 
     Ok(NtfsFormatReport {
         format: "NTFS",

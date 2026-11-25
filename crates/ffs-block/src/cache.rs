@@ -2306,6 +2306,11 @@ impl ArcState {
 ///    contention under typical FUSE workloads (many concurrent reads, few
 ///    writes) remains low.
 ///
+/// A separate flush mutex orders candidate selection, device writes and dirty
+/// retirement. It is acquired before the metadata mutex, never while holding
+/// it. Read hits and cached write-back publication do not take the flush mutex.
+/// Repair notifications run after both locks are released.
+///
 /// **High-core sharding:** [`ShardedArcCache`] shards resident metadata by
 /// `BlockNumber` into N independent `Mutex<ArcState>` segments for workloads
 /// that show metadata lock contention under heavy parallel read bursts. This
@@ -2317,6 +2322,7 @@ impl ArcState {
 pub struct ArcCache<D: BlockDevice> {
     inner: D,
     state: Mutex<ArcState>,
+    flush_lock: Mutex<()>,
     page_locks: PageLockTable,
     write_policy: ArcWritePolicy,
     mvcc_flush_lifecycle: Arc<dyn MvccFlushLifecycle>,
@@ -2747,6 +2753,7 @@ impl<D: BlockDevice> ArcCache<D> {
         let cache = Self {
             inner,
             state: Mutex::new(ArcState::new(capacity_blocks)),
+            flush_lock: Mutex::new(()),
             page_locks: PageLockTable::for_host_parallelism(),
             write_policy,
             mvcc_flush_lifecycle,
@@ -3177,7 +3184,7 @@ impl<D: BlockDevice> ArcCache<D> {
             }
         }
 
-        let pending_flush = guard.take_pending_flush();
+        let pending_flush = !guard.pending_flush.is_empty();
         #[cfg(feature = "s3fifo")]
         {
             // Publish while the same state lock still pins these identities.
@@ -3191,7 +3198,9 @@ impl<D: BlockDevice> ArcCache<D> {
         drop(guard);
         #[cfg(feature = "s3fifo")]
         drop(mutation_guard);
-        self.flush_pending_evictions(cx, pending_flush)?;
+        if pending_flush {
+            self.flush_pending_evictions(cx)?;
+        }
 
         if enforce_backpressure {
             loop {
@@ -3528,6 +3537,10 @@ impl<D: BlockDevice> ArcCache<D> {
 
     fn flush_blocks(&self, cx: &Cx, flushes: &[FlushCandidate]) -> Result<()> {
         let lifecycle = Arc::clone(&self.mvcc_flush_lifecycle);
+        // A completed write can still live only in a volatile device cache.
+        // Keep every version pinned until the entire batch passes its barrier,
+        // then publish persistence before allowing downstream repair refresh.
+        let mut pins = Vec::with_capacity(flushes.len());
         for candidate in flushes {
             cx_checkpoint(cx)?;
             let pin = match lifecycle.pin_for_flush(candidate.block, candidate.commit_seq) {
@@ -3542,8 +3555,12 @@ impl<D: BlockDevice> ArcCache<D> {
                     return Err(err);
                 }
             };
+            pins.push(pin);
             self.inner
                 .write_block(cx, candidate.block, candidate.data.as_slice())?;
+        }
+        self.inner.sync(cx)?;
+        for candidate in flushes {
             if let Err(err) = lifecycle.mark_persisted(candidate.block, candidate.commit_seq) {
                 error!(
                     event = "mvcc_flush_commit_state_update_failed",
@@ -3554,8 +3571,8 @@ impl<D: BlockDevice> ArcCache<D> {
                 );
                 return Err(err);
             }
-            drop(pin);
         }
+        drop(pins);
         Ok(())
     }
 
@@ -3623,7 +3640,21 @@ impl<D: BlockDevice> ArcCache<D> {
         }
     }
 
-    fn flush_pending_evictions(&self, cx: &Cx, pending_flush: Vec<FlushCandidate>) -> Result<()> {
+    fn lock_flush(&self, cx: &Cx) -> Result<parking_lot::MutexGuard<'_, ()>> {
+        loop {
+            cx_checkpoint(cx)?;
+            if let Some(guard) = self.flush_lock.try_lock_for(Duration::from_millis(10)) {
+                cx_checkpoint(cx)?;
+                return Ok(guard);
+            }
+        }
+    }
+
+    fn flush_pending_evictions(&self, cx: &Cx) -> Result<()> {
+        let flush_guard = self.lock_flush(cx)?;
+        // Keep pending payloads visible to every flusher until this owner can
+        // select them. Cancellation while waiting must not remove retry data.
+        let pending_flush = self.state.lock().take_pending_flush();
         if pending_flush.is_empty() {
             return Ok(());
         }
@@ -3641,14 +3672,6 @@ impl<D: BlockDevice> ArcCache<D> {
             return Err(err);
         }
 
-        if let Err(err) = self.notify_repair_flush(cx, &pending_flush) {
-            // Blocks were already written to device by flush_blocks above.
-            // Do NOT restore them as dirty — just log the repair notification
-            // failure and continue. The blocks are persisted; only the repair
-            // system missed the notification.
-            error!(event = "pending_flush_batch_repair_notify_failed", error = %err);
-        }
-
         let mut guard = self.state.lock();
         for candidate in &pending_flush {
             guard.clear_dirty(candidate.block, candidate.seq);
@@ -3660,6 +3683,12 @@ impl<D: BlockDevice> ArcCache<D> {
             dirty_flushes = guard.dirty_flushes
         );
         drop(guard);
+        drop(flush_guard);
+        if let Err(err) = self.notify_repair_flush(cx, &pending_flush) {
+            // Native durability succeeded; repair refresh is a separate
+            // notification and must be allowed to reenter the cache.
+            error!(event = "pending_flush_batch_repair_notify_failed", error = %err);
+        }
         Ok(())
     }
 }
@@ -3730,7 +3759,7 @@ impl<D: BlockDevice> BlockDevice for ArcCache<D> {
             }
             buf
         };
-        let pending_flush = guard.take_pending_flush();
+        let pending_flush = !guard.pending_flush.is_empty();
         #[cfg(feature = "s3fifo")]
         let fast_invalidations = guard.take_fast_invalidations();
         drop(guard);
@@ -3738,16 +3767,21 @@ impl<D: BlockDevice> BlockDevice for ArcCache<D> {
         self.apply_s3_fast_resident_updates(fast_invalidations, fast_insert);
         #[cfg(feature = "s3fifo")]
         drop(mutation_guard);
-        self.flush_pending_evictions(cx, pending_flush)?;
+        if pending_flush {
+            self.flush_pending_evictions(cx)?;
+        }
         Ok(final_buf)
     }
 
     fn write_block(&self, cx: &Cx, block: BlockNumber, data: &[u8]) -> Result<()> {
-        if matches!(self.write_policy, ArcWritePolicy::WriteThrough) {
+        let write_through_guard = if matches!(self.write_policy, ArcWritePolicy::WriteThrough) {
+            let guard = self.lock_flush(cx)?;
             self.inner.write_block(cx, block, data)?;
+            Some(guard)
         } else {
             cx_checkpoint(cx)?;
-        }
+            None
+        };
 
         let mut enforce_backpressure = false;
         #[cfg(feature = "s3fifo")]
@@ -3823,7 +3857,7 @@ impl<D: BlockDevice> BlockDevice for ArcCache<D> {
             }
         }
 
-        let pending_flush = guard.take_pending_flush();
+        let pending_flush = !guard.pending_flush.is_empty();
         #[cfg(feature = "s3fifo")]
         let fast_invalidations = guard.take_fast_invalidations();
         drop(guard);
@@ -3831,7 +3865,10 @@ impl<D: BlockDevice> BlockDevice for ArcCache<D> {
         self.apply_s3_fast_resident_updates(fast_invalidations, fast_insert);
         #[cfg(feature = "s3fifo")]
         drop(mutation_guard);
-        self.flush_pending_evictions(cx, pending_flush)?;
+        drop(write_through_guard);
+        if pending_flush {
+            self.flush_pending_evictions(cx)?;
+        }
 
         if enforce_backpressure {
             // Block writers by synchronously draining until we're back under high watermark.
@@ -3856,9 +3893,12 @@ impl<D: BlockDevice> BlockDevice for ArcCache<D> {
     }
 
     fn sync(&self, cx: &Cx) -> Result<()> {
-        // Flush any deferred dirty blocks before syncing the underlying device.
-        self.flush_dirty(cx)?;
-        self.inner.sync(cx)
+        // A nonempty flush already performs the durability barrier before
+        // publishing persistence. Clean/write-through caches still need sync.
+        if !self.flush_dirty_inner(cx)? {
+            self.inner.sync(cx)?;
+        }
+        Ok(())
     }
 }
 
@@ -3880,10 +3920,14 @@ impl<D: BlockDevice> BlockDevice for ShardedArcCache<D> {
     }
 
     fn sync(&self, cx: &Cx) -> Result<()> {
+        let mut flushed = false;
         for shard in &self.shards {
-            shard.flush_dirty(cx)?;
+            flushed |= shard.flush_dirty_inner(cx)?;
         }
-        self.inner.sync(cx)
+        if !flushed {
+            self.inner.sync(cx)?;
+        }
+        Ok(())
     }
 }
 
@@ -4006,6 +4050,7 @@ impl<D: BlockDevice> ArcCache<D> {
         if max_blocks == 0 {
             return Ok(0);
         }
+        let flush_guard = self.lock_flush(cx)?;
 
         let (flushes, pre_metrics) = {
             let mut guard = self.state.lock();
@@ -4045,10 +4090,15 @@ impl<D: BlockDevice> ArcCache<D> {
             return Err(err);
         }
 
+        let mut guard = self.state.lock();
+        for candidate in &flushes {
+            guard.clear_dirty(candidate.block, candidate.seq);
+        }
+        ArcState::add_usize_to_counter(&mut guard.dirty_flushes, flushes.len());
+        let metrics = guard.snapshot_metrics();
+        drop(guard);
+        drop(flush_guard);
         if let Err(err) = self.notify_repair_flush(cx, &flushes) {
-            // Blocks were already written to device by flush_blocks above.
-            // Do NOT restore them as dirty — the write is durable. Only
-            // the repair notification was lost; log and continue.
             error!(
                 event = "flush_batch_repair_notify_failed",
                 error = %err,
@@ -4057,14 +4107,6 @@ impl<D: BlockDevice> ArcCache<D> {
                 attempted_bytes = flush_bytes
             );
         }
-
-        let mut guard = self.state.lock();
-        for candidate in &flushes {
-            guard.clear_dirty(candidate.block, candidate.seq);
-        }
-        ArcState::add_usize_to_counter(&mut guard.dirty_flushes, flushes.len());
-        let metrics = guard.snapshot_metrics();
-        drop(guard);
         info!(
             event = "mvcc_flush_commit_batch",
             flushed_blocks = flushes.len(),
@@ -4098,7 +4140,13 @@ impl<D: BlockDevice> ArcCache<D> {
     ///
     /// Returns Ok(()) if all dirty blocks were successfully flushed.
     pub fn flush_dirty(&self, cx: &Cx) -> Result<()> {
+        self.flush_dirty_inner(cx).map(|_| ())
+    }
+
+    /// Return whether a batch completed its own backing-device barrier.
+    fn flush_dirty_inner(&self, cx: &Cx) -> Result<bool> {
         cx_checkpoint(cx)?;
+        let flush_guard = self.lock_flush(cx)?;
 
         // Collect all dirty payloads (resident + evicted pending) under lock.
         let flushes = {
@@ -4107,7 +4155,7 @@ impl<D: BlockDevice> ArcCache<D> {
         };
 
         if flushes.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
 
         let flush_bytes: usize = flushes.iter().map(|candidate| candidate.data.len()).sum();
@@ -4129,16 +4177,6 @@ impl<D: BlockDevice> ArcCache<D> {
                 duration_ms = started.elapsed().as_millis()
             );
             return Err(err);
-        }
-
-        if let Err(err) = self.notify_repair_flush(cx, &flushes) {
-            // Blocks already persisted by flush_blocks. Only repair
-            // notification was lost — log and continue.
-            error!(
-                event = "flush_dirty_repair_notify_failed",
-                error = %err,
-                duration_ms = started.elapsed().as_millis()
-            );
         }
 
         let mut guard = self.state.lock();
@@ -4171,7 +4209,16 @@ impl<D: BlockDevice> ArcCache<D> {
             flush_duration_us = started.elapsed().as_micros()
         );
 
-        Ok(())
+        drop(guard);
+        drop(flush_guard);
+        if let Err(err) = self.notify_repair_flush(cx, &flushes) {
+            error!(
+                event = "flush_dirty_repair_notify_failed",
+                error = %err,
+                duration_ms = started.elapsed().as_millis()
+            );
+        }
+        Ok(true)
     }
 
     /// Return the number of currently dirty blocks.

@@ -1187,9 +1187,20 @@ fn qualify_all_seven_profiles_interchange_faults_sigkill_and_workflow_cost() {
     let final_payload: Vec<u8> = (0..12_288_u32)
         .map(|i| ((i * 19 + 5) % 251) as u8)
         .collect();
-    let mutated_payload: Vec<u8> = (0..16_384_u32)
-        .map(|i| ((i * 31 + 11) % 251) as u8)
-        .collect();
+    // Deterministic incompressible payload so OpenZFS default LZ4 compression
+    // stores the block verbatim on disk (matching zio_compress_data fallback),
+    // allowing Phase E to locate and corrupt member-0 payload bytes directly.
+    let mutated_payload: Vec<u8> = {
+        let mut state = 0x5EED_CAFE_u32;
+        (0..16_384_usize)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                (state & 0xFF) as u8
+            })
+            .collect()
+    };
 
     for profile in QualificationProfileId::ALL {
         let work_dir = tempfile::Builder::new()

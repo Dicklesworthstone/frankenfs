@@ -2841,6 +2841,7 @@ mod bd_tqrnc {
             .iter()
             .map(|b| arena.alloc_block(b, 46, 0, birth, order))
             .collect();
+        let reg_bytes: u64 = reg_ptrs.iter().map(bp_allocated_bytes).sum();
         write_dnode_at(
             &mut table,
             9,
@@ -2853,6 +2854,7 @@ mod bd_tqrnc {
             .iter()
             .map(|b| arena.alloc_block(b, 47, 0, birth, order))
             .collect();
+        let lay_bytes: u64 = lay_ptrs.iter().map(bp_allocated_bytes).sum();
         write_dnode_at(
             &mut table,
             10,
@@ -2952,7 +2954,14 @@ mod bd_tqrnc {
         let os_obj = ObjectSet::new(2, 0, meta_dn, ZilHeader::empty(), 1024).unwrap();
         let encoded_os = os_obj.encode(order).unwrap();
         let os_bp = arena.alloc_block(&encoded_os, DMU_OT_OBJSET, 0, birth, order);
-        let referenced = os_obj.meta.used_bytes() + bp_allocated_bytes(&os_bp);
+        let referenced = bp_allocated_bytes(&sa_master_bp)
+            + reg_bytes
+            + lay_bytes
+            + bp_allocated_bytes(&master_bp)
+            + bp_allocated_bytes(&delq_bp)
+            + bp_allocated_bytes(&root_bp)
+            + bp_allocated_bytes(&table_bp)
+            + bp_allocated_bytes(&os_bp);
         (os_bp, referenced)
     }
 

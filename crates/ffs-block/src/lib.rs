@@ -3343,8 +3343,9 @@ impl FlushPinToken {
 
 /// MVCC coordination hook for write-back flush lifecycle.
 ///
-/// Implementations can pin version chains before disk write and mark versions
-/// persisted after successful write completion.
+/// Implementations pin version chains through the backing-device durability
+/// barrier and mark versions persisted only after that barrier succeeds.
+/// A failed write or sync must leave the batch retryable without notification.
 pub trait MvccFlushLifecycle: Send + Sync + std::fmt::Debug {
     fn pin_for_flush(&self, block: BlockNumber, commit_seq: CommitSeq) -> Result<FlushPinToken>;
     fn mark_persisted(&self, block: BlockNumber, commit_seq: CommitSeq) -> Result<()>;
@@ -5593,6 +5594,16 @@ mod tests {
     struct RecordingFlushLifecycle {
         pins: AtomicUsize,
         persisted: AtomicUsize,
+        active_pins: StdArc<AtomicUsize>,
+    }
+
+    #[derive(Debug)]
+    struct RecordingFlushPin(StdArc<AtomicUsize>);
+
+    impl Drop for RecordingFlushPin {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 
     impl RecordingFlushLifecycle {
@@ -5603,6 +5614,10 @@ mod tests {
         fn persisted_count(&self) -> usize {
             self.persisted.load(Ordering::SeqCst)
         }
+
+        fn active_pin_count(&self) -> usize {
+            self.active_pins.load(Ordering::SeqCst)
+        }
     }
 
     impl MvccFlushLifecycle for RecordingFlushLifecycle {
@@ -5612,7 +5627,10 @@ mod tests {
             _commit_seq: CommitSeq,
         ) -> Result<FlushPinToken> {
             self.pins.fetch_add(1, Ordering::SeqCst);
-            Ok(FlushPinToken::new(()))
+            self.active_pins.fetch_add(1, Ordering::SeqCst);
+            Ok(FlushPinToken::new(RecordingFlushPin(StdArc::clone(
+                &self.active_pins,
+            ))))
         }
 
         fn mark_persisted(&self, _block: BlockNumber, _commit_seq: CommitSeq) -> Result<()> {
@@ -5716,6 +5734,43 @@ mod tests {
         }
 
         fn write_block(&self, cx: &Cx, block: BlockNumber, data: &[u8]) -> Result<()> {
+            self.inner.write_block(cx, block, data)
+        }
+
+        fn block_size(&self) -> u32 {
+            self.inner.block_size()
+        }
+
+        fn block_count(&self) -> u64 {
+            self.inner.block_count()
+        }
+
+        fn sync(&self, cx: &Cx) -> Result<()> {
+            self.inner.sync(cx)
+        }
+    }
+
+    #[derive(Debug)]
+    struct PausingFirstWriteBlockDevice<D: BlockDevice> {
+        inner: D,
+        first_write_started: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        first_write_release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl<D: BlockDevice> BlockDevice for PausingFirstWriteBlockDevice<D> {
+        fn read_block(&self, cx: &Cx, block: BlockNumber) -> Result<BlockBuf> {
+            self.inner.read_block(cx, block)
+        }
+
+        fn write_block(&self, cx: &Cx, block: BlockNumber, data: &[u8]) -> Result<()> {
+            let notify = self.first_write_started.lock().take();
+            if let Some(notify) = notify {
+                notify.send(()).expect("notify first write started");
+                self.first_write_release
+                    .lock()
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("release first write before timeout");
+            }
             self.inner.write_block(cx, block, data)
         }
 
@@ -8089,6 +8144,218 @@ mod tests {
     }
 
     #[test]
+    fn arc_cache_overlapping_flushes_cannot_overwrite_a_newer_durable_version() {
+        for policy in [ArcWritePolicy::WriteBack, ArcWritePolicy::WriteThrough] {
+            for first_is_batch in [false, true] {
+                let cx = Cx::for_testing();
+                let faulted = StdArc::new(
+                    SectorFaultDevice::new(MemoryByteDevice::new(4096 * 4), 512)
+                        .expect("fault device"),
+                );
+                let (started_tx, started_rx) = std::sync::mpsc::channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel();
+                let dev = PausingFirstWriteBlockDevice {
+                    inner: ByteBlockDevice::new(StdArc::clone(&faulted), 4096).expect("device"),
+                    first_write_started: Mutex::new(Some(started_tx)),
+                    first_write_release: Mutex::new(release_rx),
+                };
+                let cache = StdArc::new(ArcCache::new_with_policy(dev, 4, policy).expect("cache"));
+                cache
+                    .stage_txn_write(&cx, TxnId(1), BlockNumber(0), &[0x11; 4096])
+                    .expect("stage first version");
+                cache
+                    .commit_staged_txn(&cx, TxnId(1), CommitSeq(1))
+                    .expect("commit first version");
+                let first_cache = StdArc::clone(&cache);
+                let first = std::thread::spawn(move || {
+                    let cx = Cx::for_testing();
+                    if first_is_batch {
+                        first_cache.flush_dirty_batch(&cx, 1).map(|_| ())
+                    } else {
+                        first_cache.flush_dirty(&cx)
+                    }
+                });
+                started_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("old flush reached its device write");
+
+                let (second_started_tx, second_started_rx) = std::sync::mpsc::channel();
+                let (second_done_tx, second_done_rx) = std::sync::mpsc::channel();
+                let second_cache = StdArc::clone(&cache);
+                let second = std::thread::spawn(move || {
+                    second_started_tx.send(()).expect("second writer admitted");
+                    let cx = Cx::for_testing();
+                    let result = second_cache
+                        .write_block(&cx, BlockNumber(0), &[0x22; 4096])
+                        .and_then(|()| second_cache.sync(&cx));
+                    second_done_tx.send(()).expect("second flush completion");
+                    result
+                });
+                second_started_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("start concurrent writer");
+                // The broken implementation finishes the newer flush first.
+                // A serialized flusher waits, so release the gate before either
+                // join instead of making the correct implementation deadlock.
+                let _ = second_done_rx.recv_timeout(Duration::from_millis(500));
+                release_tx.send(()).expect("release old flush");
+                first.join().expect("first worker").expect("first flush");
+                second.join().expect("second worker").expect("second flush");
+
+                assert_eq!(cache.dirty_count(), 0);
+                assert_eq!(faulted.crash(), 0, "completed flushes must be durable");
+                let mut durable = [0_u8; 4096];
+                faulted
+                    .inner()
+                    .read_exact_at(&cx, ByteOffset(0), &mut durable)
+                    .expect("read durable backing independently of cache");
+                assert_eq!(
+                    durable, [0x22; 4096],
+                    "an older flush must not overwrite an acknowledged newer version"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn arc_cache_cancelled_pending_flush_wait_keeps_retry_payloads_visible() {
+        let cx = Cx::for_testing();
+        let faulted = StdArc::new(
+            SectorFaultDevice::new(MemoryByteDevice::new(4096 * 4), 512).expect("fault device"),
+        );
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let dev = PausingFirstWriteBlockDevice {
+            inner: ByteBlockDevice::new(StdArc::clone(&faulted), 4096).expect("device"),
+            first_write_started: Mutex::new(Some(started_tx)),
+            first_write_release: Mutex::new(release_rx),
+        };
+        let failing = FaultInjector::new(dev, 0xA11CE);
+        failing.fail_on_write(BlockNumber(0), FaultMode::OneShot);
+        let cache = StdArc::new(
+            ArcCache::new_with_policy(failing, 4, ArcWritePolicy::WriteBack).expect("cache"),
+        );
+        cache
+            .write_block(&cx, BlockNumber(0), &[0x11; 4096])
+            .unwrap();
+        cache
+            .write_block(&cx, BlockNumber(1), &[0x22; 4096])
+            .unwrap();
+        cache.flush_dirty(&cx).expect_err("seed two retry payloads");
+        assert_eq!(cache.state.lock().pending_flush.len(), 2);
+
+        let first_cache = StdArc::clone(&cache);
+        let first =
+            std::thread::spawn(move || first_cache.flush_dirty_batch(&Cx::for_testing(), 1));
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first retry owns the flush boundary");
+        let request_cx = Cx::for_testing();
+        let read_cx = request_cx.clone();
+        let read_cache = StdArc::clone(&cache);
+        let (read_started_tx, read_started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            read_started_tx.send(()).expect("read request started");
+            let result = read_cache.read_block(&read_cx, BlockNumber(2));
+            done_tx.send(result).expect("read request completion");
+        });
+        read_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        let early = done_rx.recv_timeout(Duration::from_millis(100));
+        request_cx.set_cancel_requested(true);
+        let result = match early {
+            Ok(result) => Ok(result),
+            Err(_) => done_rx.recv_timeout(Duration::from_secs(2)),
+        };
+        let pending_before_release = cache.state.lock().pending_flush.len();
+        release_tx.send(()).expect("release first retry");
+        first.join().expect("first worker").expect("first retry");
+        reader.join().expect("read worker");
+
+        assert!(matches!(
+            result.expect("cancelled lock waiter must finish before device release"),
+            Err(FfsError::Cancelled)
+        ));
+        assert_eq!(
+            pending_before_release, 1,
+            "waiting or cancelled eviction flush must not hide another retry payload"
+        );
+        cache.sync(&cx).expect("retry remaining pending block");
+        assert_eq!(cache.dirty_count(), 0);
+        assert_eq!(faulted.crash(), 0);
+        let mut durable = [0_u8; 8192];
+        faulted
+            .inner()
+            .read_exact_at(&cx, ByteOffset(0), &mut durable)
+            .unwrap();
+        assert_eq!(&durable[..4096], &[0x11; 4096]);
+        assert_eq!(&durable[4096..], &[0x22; 4096]);
+    }
+
+    #[test]
+    fn arc_cache_repair_notification_can_reenter_after_dirty_retirement() {
+        #[derive(Debug, Default)]
+        struct ReentrantRepair {
+            device: Mutex<Option<std::sync::Weak<dyn BlockDevice>>>,
+            entered: AtomicUsize,
+            completed: AtomicUsize,
+        }
+
+        impl RepairFlushLifecycle for ReentrantRepair {
+            fn on_flush_committed(&self, cx: &Cx, _blocks: &[BlockNumber]) -> Result<()> {
+                if self.entered.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let weak = self.device.lock().as_ref().expect("cache attached").clone();
+                    let device = weak.upgrade().expect("cache alive");
+                    device.sync(cx)?;
+                    self.completed.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(())
+            }
+        }
+
+        let cx = Cx::for_testing();
+        let repair = StdArc::new(ReentrantRepair::default());
+        let dev = ByteBlockDevice::new(MemoryByteDevice::new(4096 * 4), 4096).unwrap();
+        let cache = StdArc::new(
+            ArcCache::new_with_policy_and_repair_lifecycle(
+                dev,
+                4,
+                ArcWritePolicy::WriteBack,
+                repair.clone(),
+            )
+            .unwrap(),
+        );
+        let erased: StdArc<dyn BlockDevice> = cache.clone();
+        *repair.device.lock() = Some(StdArc::downgrade(&erased));
+        drop(erased);
+        cache
+            .write_block(&cx, BlockNumber(0), &[0x55; 4096])
+            .unwrap();
+        let worker_cx = cx.clone();
+        let worker_cache = StdArc::clone(&cache);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            done_tx.send(worker_cache.flush_dirty(&worker_cx)).unwrap();
+        });
+        let outcome = match done_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(result) => Ok(result),
+            Err(_) => {
+                // Bound a broken self-deadlock without leaving a live test
+                // worker or depending on the whole test process timing out.
+                cx.set_cancel_requested(true);
+                done_rx.recv_timeout(Duration::from_secs(2))
+            }
+        };
+        worker.join().expect("flush worker");
+        let result = outcome.expect("reentrant notification must terminate");
+        result.unwrap();
+        assert_eq!(repair.completed.load(Ordering::SeqCst), 1);
+        assert_eq!(cache.dirty_count(), 0);
+    }
+
+    #[test]
     fn arc_cache_write_back_replacement_succeeds_after_critical_backpressure_flush() {
         let cx = Cx::for_testing();
         let mem = MemoryByteDevice::new(4096 * 4);
@@ -8624,6 +8891,162 @@ mod tests {
             repair_lifecycle.flushed_blocks(),
             vec![vec![BlockNumber(1), BlockNumber(2)]]
         );
+    }
+
+    #[test]
+    fn arc_cache_flush_barrier_precedes_persistence_and_keeps_versions_pinned() {
+        #[derive(Debug)]
+        struct ObservedBarrierDevice {
+            inner: ByteBlockDevice<StdArc<SectorFaultDevice<MemoryByteDevice>>>,
+            lifecycle: StdArc<RecordingFlushLifecycle>,
+        }
+
+        impl BlockDevice for ObservedBarrierDevice {
+            fn read_block(&self, cx: &Cx, block: BlockNumber) -> Result<BlockBuf> {
+                self.inner.read_block(cx, block)
+            }
+
+            fn write_block(&self, cx: &Cx, block: BlockNumber, data: &[u8]) -> Result<()> {
+                self.inner.write_block(cx, block, data)
+            }
+
+            fn block_size(&self) -> u32 {
+                self.inner.block_size()
+            }
+
+            fn block_count(&self) -> u64 {
+                self.inner.block_count()
+            }
+
+            fn sync(&self, cx: &Cx) -> Result<()> {
+                assert_eq!(self.lifecycle.active_pin_count(), 2);
+                assert_eq!(self.lifecycle.persisted_count(), 0);
+                self.inner.sync(cx)
+            }
+        }
+
+        // Exercise explicit flushing, bounded daemon flushing, and sync through
+        // the public BlockDevice interface against separate volatile/durable bytes.
+        for mode in 0..3 {
+            let cx = Cx::for_testing();
+            let faulted = StdArc::new(
+                SectorFaultDevice::new(MemoryByteDevice::new(4096 * 8), 512).expect("fault device"),
+            );
+            let lifecycle = StdArc::new(RecordingFlushLifecycle::default());
+            let repair = StdArc::new(RecordingRepairFlushLifecycle::default());
+            let dev = ObservedBarrierDevice {
+                inner: ByteBlockDevice::new(StdArc::clone(&faulted), 4096).expect("device"),
+                lifecycle: StdArc::clone(&lifecycle),
+            };
+            let cache = ArcCache::new_with_policy_and_lifecycles(
+                dev,
+                8,
+                ArcWritePolicy::WriteBack,
+                lifecycle.clone(),
+                repair.clone(),
+            )
+            .expect("cache");
+            cache
+                .stage_txn_write(&cx, TxnId(7), BlockNumber(1), &[0xAA; 4096])
+                .expect("stage first block");
+            cache
+                .stage_txn_write(&cx, TxnId(7), BlockNumber(2), &[0xBB; 4096])
+                .expect("stage second block");
+            cache
+                .commit_staged_txn(&cx, TxnId(7), CommitSeq(77))
+                .expect("commit");
+
+            match mode {
+                0 => cache.flush_dirty(&cx).expect("flush all"),
+                1 => {
+                    assert_eq!(cache.flush_dirty_batch(&cx, 2).expect("flush batch"), 2);
+                }
+                _ => cache.sync(&cx).expect("sync"),
+            }
+
+            assert_eq!(faulted.sync_count(), 1, "one barrier per batch");
+            assert_eq!(
+                faulted.crash(),
+                0,
+                "successful flush must survive power loss"
+            );
+            assert_eq!(cache.dirty_count(), 0);
+            assert_eq!(lifecycle.persisted_count(), 2);
+            assert_eq!(lifecycle.active_pin_count(), 0);
+            assert_eq!(repair.call_count(), 1);
+            let mut durable = [0_u8; 8192];
+            faulted
+                .inner()
+                .read_exact_at(&cx, ByteOffset(4096), &mut durable)
+                .expect("read durable backing without cache");
+            assert_eq!(&durable[..4096], &[0xAA; 4096]);
+            assert_eq!(&durable[4096..], &[0xBB; 4096]);
+        }
+    }
+
+    #[test]
+    fn arc_cache_failed_sync_retains_retryable_dirty_blocks_without_notifications() {
+        for batch in [false, true] {
+            let cx = Cx::for_testing();
+            let faulted = StdArc::new(
+                SectorFaultDevice::new(MemoryByteDevice::new(4096 * 8), 512).expect("fault device"),
+            );
+            faulted.add_rule(SectorFaultRule {
+                op: SectorFaultOp::Sync,
+                sector_range: None,
+                trigger_on_match: Some(0),
+                action: SectorFaultAction::FailIo,
+            });
+            let dev = ByteBlockDevice::new(StdArc::clone(&faulted), 4096).expect("device");
+            let lifecycle = StdArc::new(RecordingFlushLifecycle::default());
+            let repair = StdArc::new(RecordingRepairFlushLifecycle::default());
+            let cache = ArcCache::new_with_policy_and_lifecycles(
+                dev,
+                8,
+                ArcWritePolicy::WriteBack,
+                lifecycle.clone(),
+                repair.clone(),
+            )
+            .expect("cache");
+            cache
+                .write_block(&cx, BlockNumber(1), &[0xAA; 4096])
+                .expect("write first block");
+            cache
+                .write_block(&cx, BlockNumber(2), &[0xBB; 4096])
+                .expect("write second block");
+
+            let result = if batch {
+                cache.flush_dirty_batch(&cx, 2).map(|_| ())
+            } else {
+                cache.flush_dirty(&cx)
+            };
+            assert!(matches!(result, Err(FfsError::Io(_))));
+            assert_eq!(cache.dirty_count(), 2);
+            assert_eq!(lifecycle.persisted_count(), 0);
+            assert_eq!(lifecycle.active_pin_count(), 0);
+            assert_eq!(repair.call_count(), 0);
+            assert_eq!(faulted.crash(), 16, "failed sync has no durability claim");
+
+            // A newer version must replace the failed batch's retained payload.
+            cache
+                .write_block(&cx, BlockNumber(1), &[0xCC; 4096])
+                .expect("overwrite after failed sync");
+            cache.sync(&cx).expect("retry successful barrier");
+            assert_eq!(cache.dirty_count(), 0);
+            assert_eq!(lifecycle.persisted_count(), 2);
+            assert_eq!(lifecycle.active_pin_count(), 0);
+            let mut notified = repair.flushed_blocks().concat();
+            notified.sort_unstable();
+            assert_eq!(notified, vec![BlockNumber(1), BlockNumber(2)]);
+            assert_eq!(faulted.crash(), 0);
+            let mut durable = [0_u8; 8192];
+            faulted
+                .inner()
+                .read_exact_at(&cx, ByteOffset(4096), &mut durable)
+                .expect("read durable backing without cache");
+            assert_eq!(&durable[..4096], &[0xCC; 4096]);
+            assert_eq!(&durable[4096..], &[0xBB; 4096]);
+        }
     }
 
     #[test]

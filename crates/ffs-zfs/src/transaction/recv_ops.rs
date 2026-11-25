@@ -8,10 +8,10 @@
 use super::dmu_cow::{
     DatasetCompression, DatasetFeatureUsage, DnodeCowSpec, MosFeatureState, PoolSpaceAllocator,
     SpaceDelta, StagedBlockWrite, StagedLeafUpdate, WriteBucket, allocate_object_id,
-    collect_non_hole_bps_from, cow_update_dnode_with_staged_leaves, enqueue_into_dataset_deadlist,
-    ensure_dnode_table_block_loaded, put_dnode_in_table, read_staged_or_committed_dnode,
-    remove_dnode_from_table, write_dataset_objset_block, write_dataset_objset_block_raw_protected,
-    zap_optional_u64,
+    allocated_leaf_blocks_in_range, collect_non_hole_bps_from, cow_update_dnode_with_staged_leaves,
+    dmu_ot_is_byte_array, enqueue_into_dataset_deadlist, ensure_dnode_table_block_loaded,
+    put_dnode_in_table, read_staged_or_committed_dnode, remove_dnode_from_table,
+    write_dataset_objset_block, write_dataset_objset_block_raw_protected, zap_optional_u64,
 };
 use super::dsl_ops::{
     DMU_OT_DSL_DATASET, DMU_OT_DSL_DIR_CHILD_MAP, DMU_OT_DSL_DS_SNAP_MAP, DMU_OT_DSL_PROPS,
@@ -52,10 +52,10 @@ use ffs_ondisk::zfs::send_stream::{
     DMU_REPLAY_RECORD_BYTES, DRR_FLAG_CI_DATA, DRR_OBJECT_SPILL, DRR_RAW_BYTESWAP, DrrBegin,
     DrrFree, DrrFreeObjects, DrrObject, DrrObjectRange, DrrRecord, DrrSpill, DrrType, DrrWrite,
     DrrWriteEmbedded, Fletcher4Stream, ReceiveResumeToken, StreamCryptoKeydata, StreamHeaderType,
-    detect_stream_endian, validate_toname_snapshot,
+    StreamMetaDnode, detect_stream_endian, validate_toname_snapshot,
 };
 use ffs_ondisk::zfs::{
-    BlockPointer, Endian, MAX_BLOCK_BYTES, ProtectedBlockSpec, RegularBlockSpec,
+    BlockPointer, Endian, MAX_BLOCK_BYTES, ProtectedBlockSpec, RegularBlockSpec, decompress,
 };
 use ffs_ondisk::zfs_dmu::{
     DMU_OT_DNODE, DNODE_BLOCK_BYTES, DNODE_FLAG_USED_BYTES, Dnode, DnodeSpec, ObjectSet, ZilHeader,
@@ -284,6 +284,7 @@ struct StagedSubstreamMeta {
     prev_snap_obj: u64,
     prev_snap_txg: u64,
     is_raw_encrypted: bool,
+    raw_meta_dnode: Option<StreamMetaDnode>,
     crypto_version: u64,
     portable_mac: [u8; 32],
     to_ivset_guid: Option<u64>,
@@ -300,6 +301,203 @@ fn admit_received_compression(compression: u8, features: &MosFeatureState) -> Re
         )));
     }
     DatasetCompression::from_property(u64::from(compression), features).map(|_| ())
+}
+
+/// A stream checksum covers the transmitted bytes, not the validity of the
+/// compressed frame. Validate bounded plaintext transforms before enqueueing a
+/// record, so neither a checkpoint nor promotion can publish an unreadable BP.
+/// Raw encrypted streams deliberately retain their ciphertext without decoding.
+fn validate_received_block_payload(
+    cx: &Cx,
+    logical_size: u64,
+    compression: u8,
+    payload: &[u8],
+    raw_encrypted: bool,
+) -> Result<()> {
+    if !(512..=MAX_BLOCK_BYTES as u64).contains(&logical_size)
+        || !logical_size.is_multiple_of(512)
+        || payload.len() < 512
+        || !payload.len().is_multiple_of(512)
+        || payload.len() as u64 > logical_size
+    {
+        return Err(FfsError::Format(
+            "invalid receive block logical or physical size".into(),
+        ));
+    }
+    let codec = if compression == 0 { 2 } else { compression };
+    if codec == 2 {
+        if payload.len() as u64 != logical_size {
+            return Err(FfsError::Format(
+                "uncompressed receive block length mismatch".into(),
+            ));
+        }
+    } else if !raw_encrypted {
+        checkpoint(cx)?;
+        let logical_bytes =
+            usize::try_from(logical_size).map_err(|_| corrupt("receive logical size overflow"))?;
+        let decoded = decompress(payload, codec, logical_bytes).map_err(|e| parse_err(&e))?;
+        drop(decoded);
+        checkpoint(cx)?;
+    }
+    Ok(())
+}
+
+fn validate_received_embedded_payload(
+    cx: &Cx,
+    rec: &DrrWriteEmbedded,
+    payload: &[u8],
+) -> Result<()> {
+    if !(512..=MAX_BLOCK_BYTES as u64).contains(&rec.length)
+        || !rec.length.is_multiple_of(512)
+        || rec.offset.checked_add(rec.length).is_none()
+        || u64::from(rec.lsize) != rec.length
+        || !(1..=112).contains(&rec.psize)
+        || rec.psize > rec.lsize
+        || !matches!(rec.compression, 2 | 3 | 5..=16)
+    {
+        return Err(FfsError::Format(
+            "invalid DRR_WRITE_EMBEDDED geometry or compression".into(),
+        ));
+    }
+    let packed =
+        usize::try_from(rec.psize).map_err(|_| corrupt("embedded physical size overflow"))?;
+    if payload.len() != packed.next_multiple_of(8) {
+        return Err(FfsError::Format(
+            "DRR_WRITE_EMBEDDED payload length mismatch".into(),
+        ));
+    }
+    checkpoint(cx)?;
+    let logical =
+        usize::try_from(rec.lsize).map_err(|_| corrupt("embedded logical size overflow"))?;
+    let decoded =
+        decompress(&payload[..packed], rec.compression, logical).map_err(|e| parse_err(&e))?;
+    drop(decoded);
+    checkpoint(cx)
+}
+
+fn validate_received_geometry(offset: u64, logical: u64, block_bytes: usize) -> Result<()> {
+    let block_bytes = block_bytes as u64;
+    if block_bytes == 0
+        || !offset.is_multiple_of(block_bytes)
+        || logical != block_bytes
+        || offset.checked_add(logical).is_none()
+    {
+        return Err(FfsError::Format(
+            "receive record geometry disagrees with its dnode".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_received_plain_order(
+    object_type: u8,
+    stream_order: Endian,
+    pool_order: Endian,
+) -> Result<()> {
+    if stream_order != pool_order && !dmu_ot_is_byte_array(object_type) {
+        return Err(unsupported(
+            "cross-endian receive of structured DMU payloads requires byte-swap conversion",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_received_crypto_identity(
+    incoming: &StreamCryptoKeydata,
+    existing: &DslCryptoKeyRecord,
+) -> Result<()> {
+    // Wrapping material may change independently of the underlying dataset key.
+    // Its native key GUID, cipher and encryption format must remain compatible.
+    if incoming.guid != existing.guid
+        || incoming.suite != existing.suite
+        || incoming.version != existing.version
+    {
+        return Err(FfsError::Format(
+            "raw receive crypto identity disagrees with its destination".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_received_base_ivset(
+    cx: &Cx,
+    mos: &mut Objects,
+    keydata: &StreamCryptoKeydata,
+    base_snapshot: u64,
+) -> Result<()> {
+    let expected = keydata
+        .from_ivset_guid
+        .filter(|&guid| guid != 0)
+        .ok_or_else(|| {
+            FfsError::Format("raw incremental receive requires a nonzero from_ivset_guid".into())
+        })?;
+    if mos.dataset_ivset_guid(cx, base_snapshot)? != Some(expected) {
+        return Err(FfsError::Format(
+            "raw incremental from_ivset_guid disagrees with target base snapshot".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn admit_received_meta_dnode(meta: &StreamMetaDnode) -> Result<()> {
+    // The native envelope admits larger profiles; local dnode-table indexing
+    // and the COW writer currently support 16 KiB tables and seven levels.
+    if meta.data_bytes != DNODE_BLOCK_BYTES as u64 || !(1..=7).contains(&meta.levels) {
+        return Err(unsupported(
+            "raw receive requires a 16 KiB meta-dnode with at most seven levels",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_received_raw_object(meta: Option<&StreamMetaDnode>, object: u64) -> Result<()> {
+    if meta.is_some_and(|meta| object / 32 > meta.max_block) {
+        return Err(FfsError::Format(
+            "raw receive object exceeds the source meta-dnode maximum block".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_received_meta_geometry(meta: &StreamMetaDnode, existing: &Dnode) -> Result<()> {
+    // OpenZFS raw receive treats these four properties as immutable once the
+    // object set exists. Selectors and maxblkid are supplied by the new stream.
+    if meta.levels != existing.levels()
+        || meta.data_bytes != existing.data_bytes() as u64
+        || meta.indirect_shift != existing.indirect_shift()
+        || usize::from(meta.nblkptr) != existing.pointers().len()
+    {
+        return Err(FfsError::Format(
+            "raw receive meta-dnode geometry disagrees with its existing object set".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn read_received_objectset(
+    cx: &Cx,
+    mos: &mut Objects,
+    head: &Dnode,
+    ceiling: u64,
+) -> Result<ObjectSet> {
+    let root = head
+        .bonus()
+        .get(128..256)
+        .ok_or_else(|| corrupt("truncated receive dataset root block pointer"))?;
+    let bp = BlockPointer::parse(root, head.order()).map_err(|e| parse_err(&e))?;
+    let (raw, order, _) = mos.read_dataset_objset_block_raw(cx, &bp, ceiling, None, true)?;
+    ObjectSet::parse(&raw, order).map_err(|e| parse_err(&e))
+}
+
+fn received_raw_order(flags: u8, stream_order: Endian) -> Endian {
+    if flags & DRR_RAW_BYTESWAP == 0 {
+        stream_order
+    } else {
+        match stream_order {
+            Endian::Little => Endian::Big,
+            Endian::Big => Endian::Little,
+        }
+    }
 }
 
 // ── ZAP Helpers for Resume State ────────────────────────────────────────────
@@ -422,16 +620,68 @@ fn build_resume_state_from_staging(staging: &RecvStagingDataset) -> Result<ZfsRe
     })
 }
 
-fn extract_compound_props(pkg_nvl: &NvList) -> Vec<(String, ZfsPropertySetValue)> {
-    let mut out = Vec::new();
-    let Some(fss) = pkg_nvl.list("fss") else {
-        return out;
-    };
+struct CompoundMetadata {
+    properties: Vec<(String, ZfsPropertySetValue)>,
+    snapshots: BTreeMap<Vec<u8>, u64>,
+}
+
+fn stream_source_dataset(toname: &[u8]) -> Result<&[u8]> {
+    let snapshot = validate_toname_snapshot(toname).map_err(|e| parse_err(&e))?;
+    let dataset = &toname[..toname.len() - snapshot.len() - 1];
+    if dataset.split(|&b| b == b'/').any(|part| {
+        part.is_empty()
+            || matches!(part, b"." | b"..")
+            || part
+                .iter()
+                .any(|&b| matches!(b, 0..=31 | 127 | b'@' | b'#' | b'\\'))
+    }) {
+        return Err(corrupt("invalid compound stream source dataset name"));
+    }
+    Ok(dataset)
+}
+
+fn extract_compound_metadata(pkg_nvl: &NvList, source: &[u8]) -> Result<CompoundMetadata> {
+    // One receive request owns one destination. A recursive package must never
+    // flatten unrelated source datasets into that destination or borrow the
+    // properties of an arbitrary first nvlist entry.
+    if pkg_nvl.fields.get("not_recursive") != Some(&Value::Boolean(true)) {
+        return Err(unsupported(
+            "recursive compound receive requires dataset hierarchy support",
+        ));
+    }
+    let fss = pkg_nvl
+        .list("fss")
+        .ok_or_else(|| corrupt("compound metadata lacks fss nvlist"))?;
+    if fss.fields.len() != 1 {
+        return Err(unsupported(
+            "compound receive admits exactly one source dataset",
+        ));
+    }
     let Some(Value::List(ds_entry)) = fss.fields.values().next() else {
-        return out;
+        return Err(corrupt("compound source dataset metadata is not an nvlist"));
     };
+    if ds_entry.text("name").map(str::as_bytes) != Some(source) {
+        return Err(corrupt("compound source dataset disagrees with DRR_BEGIN"));
+    }
+    let snaps = ds_entry
+        .list("snaps")
+        .ok_or_else(|| corrupt("compound dataset lacks snapshot identities"))?;
+    let mut snapshots = BTreeMap::new();
+    for (name, value) in &snaps.fields {
+        let Value::Unsigned(guid) = value else {
+            return Err(corrupt("compound snapshot GUID is not a native uint64"));
+        };
+        if *guid == 0 {
+            return Err(corrupt("compound snapshot GUID must be nonzero"));
+        }
+        snapshots.insert(name.as_bytes().to_vec(), *guid);
+    }
+    let mut out = Vec::new();
     let Some(props) = ds_entry.list("props") else {
-        return out;
+        return Ok(CompoundMetadata {
+            properties: out,
+            snapshots,
+        });
     };
     for (k, v) in &props.fields {
         // Security boundary: never let untrusted received properties choose host mountpoints
@@ -477,7 +727,37 @@ fn extract_compound_props(pkg_nvl: &NvList) -> Vec<(String, ZfsPropertySetValue)
             _ => {}
         }
     }
-    out
+    Ok(CompoundMetadata {
+        properties: out,
+        snapshots,
+    })
+}
+
+fn validate_compound_substream(
+    source: &[u8],
+    metadata: Option<&CompoundMetadata>,
+    begin: &DrrBegin,
+    previous_guid: u64,
+) -> Result<()> {
+    if stream_source_dataset(&begin.toname)? != source {
+        return Err(corrupt(
+            "compound substream belongs to a different source dataset",
+        ));
+    }
+    let snapshot = validate_toname_snapshot(&begin.toname).map_err(|e| parse_err(&e))?;
+    if let Some(metadata) = metadata
+        && metadata.snapshots.get(&snapshot) != Some(&begin.toguid)
+    {
+        return Err(corrupt(
+            "compound substream snapshot name/GUID disagrees with metadata",
+        ));
+    }
+    if previous_guid != 0 && (begin.fromguid != previous_guid || begin.toguid == previous_guid) {
+        return Err(corrupt(
+            "compound substreams do not form an incremental snapshot chain",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_target_dataset(target: &[Vec<u8>]) -> Result<()> {
@@ -630,21 +910,81 @@ impl ZfsTransactionEngine {
 
         if first_begin.hdr_type == StreamHeaderType::CompoundStream {
             compound = true;
-            let payload_len = match DrrRecord::Begin(first_begin).expected_payload_len(false) {
-                Ok(n) => n,
-                Err(e) => return ZfsTxOutcome::NotCommitted(parse_err(&e)),
+            if first_begin.features.unsupported_bits() != 0 {
+                return ZfsTxOutcome::NotCommitted(unsupported(format!(
+                    "compound DMU stream requires unsupported feature bits 0x{:x}",
+                    first_begin.features.unsupported_bits()
+                )));
+            }
+            let source_dataset = match stream_source_dataset(&first_begin.toname) {
+                Ok(source) => source,
+                Err(e) => return ZfsTxOutcome::NotCommitted(e),
             };
+            let payload_len =
+                match DrrRecord::Begin(first_begin.clone()).expected_payload_len(false) {
+                    Ok(n) => n,
+                    Err(e) => return ZfsTxOutcome::NotCommitted(parse_err(&e)),
+                };
             let pkg_bytes = match reader.read_exact_bytes(cx, payload_len) {
                 Ok(b) => b,
                 Err(e) => return ZfsTxOutcome::NotCommitted(e),
             };
-            if !pkg_bytes.is_empty() {
-                match NvList::parse_exact(&pkg_bytes) {
-                    Ok(nvl) => compound_props = extract_compound_props(&nvl),
+            // Native compound packages have their own header END immediately
+            // after the nvlist, distinct from the final package terminator.
+            // Validate it before trusting properties or allocating staging state.
+            let mut header_checksum = Fletcher4Stream::new(stream_order);
+            if let Err(e) = header_checksum
+                .update(&first_hdr)
+                .and_then(|()| header_checksum.update(&pkg_bytes))
+            {
+                return ZfsTxOutcome::NotCommitted(parse_err(&e));
+            }
+            let header_end = match reader.read_header_or_eof(cx) {
+                Ok(Some(h)) => h,
+                Ok(None) => {
+                    return ZfsTxOutcome::NotCommitted(FfsError::Format(
+                        "truncated compound DMU stream before header DRR_END".into(),
+                    ));
+                }
+                Err(e) => return ZfsTxOutcome::NotCommitted(e),
+            };
+            let (header_end_record, trailer) =
+                match DrrRecord::parse_header(&header_end, stream_order) {
+                    Ok(r) => r,
                     Err(e) => return ZfsTxOutcome::NotCommitted(parse_err(&e)),
+                };
+            match header_end_record {
+                DrrRecord::End(end)
+                    if end.checksum == header_checksum.state()
+                        && end.toguid == 0
+                        && trailer == [0; 4] => {}
+                DrrRecord::End(_) => {
+                    return ZfsTxOutcome::NotCommitted(FfsError::Format(
+                        "compound DMU header DRR_END checksum or framing mismatch".into(),
+                    ));
+                }
+                _ => {
+                    return ZfsTxOutcome::NotCommitted(FfsError::Format(
+                        "compound DMU nvlist must be followed by its header DRR_END".into(),
+                    ));
                 }
             }
-            total_records += 1;
+            let compound_metadata = if pkg_bytes.is_empty() {
+                None
+            } else {
+                let nvl = match NvList::parse_exact(&pkg_bytes) {
+                    Ok(nvl) => nvl,
+                    Err(e) => return ZfsTxOutcome::NotCommitted(parse_err(&e)),
+                };
+                match extract_compound_metadata(&nvl, source_dataset) {
+                    Ok(metadata) => Some(metadata),
+                    Err(e) => return ZfsTxOutcome::NotCommitted(e),
+                }
+            };
+            if let Some(metadata) = &compound_metadata {
+                compound_props.clone_from(&metadata.properties);
+            }
+            total_records += 2;
 
             loop {
                 let next_hdr = match reader.read_header_or_eof(cx) {
@@ -656,12 +996,18 @@ impl ZfsTransactionEngine {
                     }
                     Err(e) => return ZfsTxOutcome::NotCommitted(e),
                 };
-                let (next_rec, _) = match DrrRecord::parse_header(&next_hdr, stream_order) {
+                let (next_rec, trailer) = match DrrRecord::parse_header(&next_hdr, stream_order) {
                     Ok(r) => r,
                     Err(e) => return ZfsTxOutcome::NotCommitted(parse_err(&e)),
                 };
                 match next_rec {
-                    DrrRecord::End(_) => {
+                    DrrRecord::End(end) => {
+                        if end.checksum != [0; 4] || end.toguid != 0 || trailer != [0; 4] {
+                            return ZfsTxOutcome::NotCommitted(FfsError::Format(
+                                "compound DMU final DRR_END must have zero checksum and GUID"
+                                    .into(),
+                            ));
+                        }
                         total_records += 1;
                         if let Err(e) = reader.assert_eof(cx) {
                             return ZfsTxOutcome::NotCommitted(e);
@@ -678,6 +1024,14 @@ impl ZfsTransactionEngine {
                             return ZfsTxOutcome::NotCommitted(unsupported(
                                 "compound stream exceeds 256 substream bound",
                             ));
+                        }
+                        if let Err(e) = validate_compound_substream(
+                            source_dataset,
+                            compound_metadata.as_ref(),
+                            &sub_begin,
+                            last_snap_guid,
+                        ) {
+                            return ZfsTxOutcome::NotCommitted(e);
                         }
                         let sub_props = if substreams_received == 0 {
                             &compound_props[..]
@@ -891,6 +1245,17 @@ impl ZfsTransactionEngine {
             None
         };
 
+        if is_raw && keydata.is_none() {
+            return ZfsTxOutcome::NotCommitted(FfsError::Format(
+                "raw encrypted receive requires DRR_BEGIN crypt_keydata".into(),
+            ));
+        }
+        if let Some(kd) = &keydata
+            && let Err(error) = admit_received_meta_dnode(&kd.meta_dnode)
+        {
+            return ZfsTxOutcome::NotCommitted(error);
+        }
+
         if keydata.is_some()
             && (!self
                 .mos_features
@@ -1024,13 +1389,47 @@ impl ZfsTransactionEngine {
                     );
                 }
                 DrrRecord::ObjectRange(r) => {
+                    if !is_raw {
+                        return cleanup_on_abort(
+                            self,
+                            FfsError::Format(
+                                "DRR_OBJECT_RANGE requires a raw encrypted stream".into(),
+                            ),
+                        );
+                    }
+                    // This receiver's metadnode uses 16 KiB blocks (32 slots).
+                    // Reject incompatible ranges before expanding any state.
+                    if r.numslots != 32 || !r.firstobj.is_multiple_of(32) {
+                        return cleanup_on_abort(
+                            self,
+                            unsupported(
+                                "DRR_OBJECT_RANGE requires one aligned 32-slot dnode block",
+                            ),
+                        );
+                    }
+                    if received_raw_order(r.flags, stream_order) != self.order {
+                        return cleanup_on_abort(
+                            self,
+                            unsupported(
+                                "raw receive cannot reconstruct foreign-order dnode tables",
+                            ),
+                        );
+                    }
+                    if let Err(error) =
+                        validate_received_raw_object(stage_meta.raw_meta_dnode.as_ref(), r.firstobj)
+                    {
+                        return cleanup_on_abort(self, error);
+                    }
                     if r.toguid != 0 && r.toguid != begin.toguid {
                         return cleanup_on_abort(
                             self,
                             corrupt("DRR_OBJECT_RANGE toguid disagrees with DRR_BEGIN"),
                         );
                     }
-                    if r.firstobj + r.numslots < last_obj {
+                    if r.firstobj
+                        .checked_add(r.numslots)
+                        .is_none_or(|end| end < last_obj)
+                    {
                         return cleanup_on_abort(
                             self,
                             FfsError::Format("out-of-order DRR_OBJECT_RANGE".into()),
@@ -1052,6 +1451,11 @@ impl ZfsTransactionEngine {
                     pending_ops.push(RecvOp::ObjectRange(r));
                 }
                 DrrRecord::Object(o) => {
+                    if let Err(error) =
+                        validate_received_raw_object(stage_meta.raw_meta_dnode.as_ref(), o.object)
+                    {
+                        return cleanup_on_abort(self, error);
+                    }
                     if o.toguid != 0 && o.toguid != begin.toguid {
                         return cleanup_on_abort(
                             self,
@@ -1063,6 +1467,36 @@ impl ZfsTransactionEngine {
                             self,
                             FfsError::Format("DRR_OBJECT cannot target object 0".into()),
                         );
+                    }
+                    let bonus_type = match u8::try_from(o.bonus_type) {
+                        Ok(kind) => kind,
+                        Err(_) => {
+                            return cleanup_on_abort(
+                                self,
+                                corrupt("DRR_OBJECT bonus type overflow"),
+                            );
+                        }
+                    };
+                    if u8::try_from(o.object_type).is_err() || o.object_type == 0 {
+                        return cleanup_on_abort(self, corrupt("invalid DRR_OBJECT type"));
+                    }
+                    if o.compress > 16 {
+                        return cleanup_on_abort(
+                            self,
+                            FfsError::Format("invalid DRR_OBJECT compression selector".into()),
+                        );
+                    }
+                    if let Err(error) =
+                        DatasetCompression::from_property(u64::from(o.compress), &self.mos_features)
+                    {
+                        return cleanup_on_abort(self, error);
+                    }
+                    if !is_raw && o.bonuslen != 0 {
+                        if let Err(error) =
+                            validate_received_plain_order(bonus_type, stream_order, self.order)
+                        {
+                            return cleanup_on_abort(self, error);
+                        }
                     }
                     // Native dnode overrides are limited to legacy checksums.
                     // Newer algorithms remain valid on individual DRR_WRITE BPs.
@@ -1157,6 +1591,11 @@ impl ZfsTransactionEngine {
                     pending_ops.push(RecvOp::FreeObjects(f));
                 }
                 DrrRecord::Write(w) => {
+                    if let Err(error) =
+                        validate_received_raw_object(stage_meta.raw_meta_dnode.as_ref(), w.object)
+                    {
+                        return cleanup_on_abort(self, error);
+                    }
                     if w.toguid != 0 && w.toguid != begin.toguid {
                         return cleanup_on_abort(
                             self,
@@ -1190,13 +1629,50 @@ impl ZfsTransactionEngine {
                     {
                         return cleanup_on_abort(self, error);
                     }
+                    let object_type = match u8::try_from(w.object_type) {
+                        Ok(kind) if kind != 0 => kind,
+                        _ => return cleanup_on_abort(self, corrupt("invalid DRR_WRITE type")),
+                    };
+                    let Some(end_offset) = w.offset.checked_add(w.logical_size) else {
+                        return cleanup_on_abort(self, corrupt("DRR_WRITE offset overflow"));
+                    };
+                    if !is_raw {
+                        if w.flags & DRR_RAW_BYTESWAP != 0 {
+                            return cleanup_on_abort(
+                                self,
+                                corrupt("non-raw DRR_WRITE carries raw byte order"),
+                            );
+                        }
+                        if let Err(error) =
+                            validate_received_plain_order(object_type, stream_order, self.order)
+                        {
+                            return cleanup_on_abort(self, error);
+                        }
+                    }
+                    if let Err(error) = validate_received_block_payload(
+                        cx,
+                        w.logical_size,
+                        w.compressiontype,
+                        &payload,
+                        is_raw,
+                    ) {
+                        return cleanup_on_abort(self, error);
+                    }
                     last_obj = w.object;
-                    last_offset = w.offset.saturating_add(w.logical_size);
+                    last_offset = end_offset;
                     blocks_received += 1;
                     pending_bytes = pending_bytes.saturating_add(payload.len() as u64);
                     pending_ops.push(RecvOp::Write { rec: w, payload });
                 }
                 DrrRecord::WriteEmbedded(e) => {
+                    if is_raw {
+                        return cleanup_on_abort(
+                            self,
+                            FfsError::Format(
+                                "DRR_WRITE_EMBEDDED is forbidden in raw encrypted streams".into(),
+                            ),
+                        );
+                    }
                     if let Err(error) =
                         admit_received_compression(e.compression, &self.mos_features)
                     {
@@ -1236,13 +1712,31 @@ impl ZfsTransactionEngine {
                             unsupported("non-DATA DRR_WRITE_EMBEDDED subtype is unsupported"),
                         );
                     }
+                    if let Some(&blksz) = obj_blksz_map.get(&e.object)
+                        && (!e.offset.is_multiple_of(blksz) || e.length != blksz)
+                    {
+                        return cleanup_on_abort(
+                            self,
+                            FfsError::Format(
+                                "misaligned or mismatched DRR_WRITE_EMBEDDED block size".into(),
+                            ),
+                        );
+                    }
+                    if let Err(error) = validate_received_embedded_payload(cx, &e, &payload) {
+                        return cleanup_on_abort(self, error);
+                    }
                     last_obj = e.object;
-                    last_offset = e.offset.saturating_add(e.length);
+                    last_offset = e.offset + e.length;
                     blocks_received += 1;
                     pending_bytes = pending_bytes.saturating_add(payload.len() as u64 + 128);
                     pending_ops.push(RecvOp::WriteEmbedded { rec: e, payload });
                 }
                 DrrRecord::Free(f) => {
+                    if let Err(error) =
+                        validate_received_raw_object(stage_meta.raw_meta_dnode.as_ref(), f.object)
+                    {
+                        return cleanup_on_abort(self, error);
+                    }
                     if f.toguid != 0 && f.toguid != begin.toguid {
                         return cleanup_on_abort(
                             self,
@@ -1264,6 +1758,11 @@ impl ZfsTransactionEngine {
                 }
                 DrrRecord::Spill(s) => {
                     if let Err(error) =
+                        validate_received_raw_object(stage_meta.raw_meta_dnode.as_ref(), s.object)
+                    {
+                        return cleanup_on_abort(self, error);
+                    }
+                    if let Err(error) =
                         admit_received_compression(s.compressiontype, &self.mos_features)
                     {
                         return cleanup_on_abort(self, error);
@@ -1279,6 +1778,23 @@ impl ZfsTransactionEngine {
                             self,
                             FfsError::Format("reordered DRR_SPILL object".into()),
                         );
+                    }
+                    // Native non-raw SPILL records always carry logical bytes,
+                    // even when the stream permits compressed WRITE records.
+                    if !is_raw && (s.compressiontype != 0 || s.flags & DRR_RAW_BYTESWAP != 0) {
+                        return cleanup_on_abort(
+                            self,
+                            FfsError::Format("non-raw DRR_SPILL must contain logical bytes".into()),
+                        );
+                    }
+                    if let Err(error) = validate_received_block_payload(
+                        cx,
+                        s.length,
+                        s.compressiontype,
+                        &payload,
+                        is_raw,
+                    ) {
+                        return cleanup_on_abort(self, error);
                     }
                     last_obj = s.object;
                     blocks_received += 1;
@@ -1296,7 +1812,9 @@ impl ZfsTransactionEngine {
                 }
             }
 
-            if !pending_ops.is_empty() && (pending_bytes >= checkpoint_limit || saw_end) {
+            if (!pending_ops.is_empty() && pending_bytes >= checkpoint_limit)
+                || (saw_end && (!pending_ops.is_empty() || is_raw))
+            {
                 let next_prog = ChunkProgress {
                     object: last_obj,
                     offset: last_offset,
@@ -1309,6 +1827,7 @@ impl ZfsTransactionEngine {
                     &pending_ops,
                     &substream_object_ranges,
                     &next_prog,
+                    saw_end,
                 ) {
                     ZfsTxOutcome::Committed { .. } => {
                         committed_progress = next_prog;
@@ -1403,7 +1922,7 @@ impl ZfsTransactionEngine {
                 "resuming stream objset type disagrees with persisted staging dataset".into(),
             ));
         }
-        let (staging_head, _) = mos.object_with_ceiling(cx, staging.head_object)?;
+        let (staging_head, staging_ceiling) = mos.object_with_ceiling(cx, staging.head_object)?;
         let staging_entries = dataset_feature_entries(
             cx,
             &mut mos,
@@ -1413,16 +1932,32 @@ impl ZfsTransactionEngine {
         )?;
         let owners = dataset_block_feature_owners(&staging_entries, &self.mos_features)?;
         require_receive_large_blocks(&owners, begin)?;
+        let is_raw = begin.features.contains(DMU_BACKUP_FEATURE_RAW);
+        if state.rawok != is_raw || is_raw != keydata.is_some() {
+            return Err(FfsError::Format(
+                "resuming stream raw mode disagrees with persisted receive state".into(),
+            ));
+        }
+        let staging_crypto = resolve_staging_crypto_info(cx, &mut mos, staging.directory_object)?;
+        if staging_crypto.is_some() != is_raw {
+            return Err(FfsError::Format(
+                "resuming stream encryption disagrees with its staging dataset".into(),
+            ));
+        }
         if let Some(kd) = keydata {
-            if !state.rawok {
-                return Err(FfsError::Format(
-                    "raw resuming stream cannot target a non-raw staging receive".into(),
-                ));
-            }
+            let crypto = staging_crypto
+                .as_ref()
+                .ok_or_else(|| corrupt("raw receive staging dataset lacks crypto identity"))?;
+            validate_received_crypto_identity(kd, &crypto.record)?;
+            let staging_os = read_received_objectset(cx, &mut mos, &staging_head, staging_ceiling)?;
+            validate_received_meta_geometry(&kd.meta_dnode, &staging_os.meta)?;
             if state.ivsetguid.unwrap_or(0) != kd.to_ivset_guid {
                 return Err(FfsError::Format(
                     "resuming raw stream ivset_guid disagrees with persisted receive state".into(),
                 ));
+            }
+            if begin.fromguid != 0 {
+                validate_received_base_ivset(cx, &mut mos, kd, staging.prev_snap_obj)?;
             }
         }
         let (target_dd_obj, target_head_obj) = if staging.is_pct_recv_child {
@@ -1431,7 +1966,7 @@ impl ZfsTransactionEngine {
         } else {
             (staging.directory_object, None)
         };
-        let is_raw_encrypted = state.rawok || keydata.is_some();
+        let is_raw_encrypted = is_raw;
         let (crypto_version, portable_mac, to_ivset_guid) = if let Some(kd) = keydata {
             (kd.version, kd.portable_mac, Some(kd.to_ivset_guid))
         } else {
@@ -1462,6 +1997,7 @@ impl ZfsTransactionEngine {
                 prev_snap_obj: staging.prev_snap_obj,
                 prev_snap_txg: staging.prev_snap_txg,
                 is_raw_encrypted,
+                raw_meta_dnode: keydata.map(|kd| kd.meta_dnode),
                 crypto_version,
                 portable_mac,
                 to_ivset_guid,
@@ -1690,17 +2226,18 @@ impl ZfsTransactionEngine {
                     }
 
                     // Build initial empty ObjectSet (`kind = 2` ZPL or `3` ZVOL).
+                    let raw_meta = kd_cloned.as_ref().map(|kd| kd.meta_dnode);
                     let empty_meta = Dnode::from_spec(DnodeSpec {
                         object_type: DMU_OT_DNODE,
                         bonus_type: 0,
-                        checksum_type: 0,
-                        compress_type: 0,
+                        checksum_type: raw_meta.map_or(0, |mdn| mdn.checksum),
+                        compress_type: raw_meta.map_or(0, |mdn| mdn.compression),
                         flags: DNODE_FLAG_USED_BYTES,
                         order,
-                        levels: 1,
-                        indirect_shift: 17,
+                        levels: raw_meta.map_or(1, |mdn| mdn.levels),
+                        indirect_shift: raw_meta.map_or(17, |mdn| mdn.indirect_shift),
                         data_bytes: DNODE_BLOCK_BYTES,
-                        max_block: 0,
+                        max_block: raw_meta.map_or(0, |mdn| mdn.max_block),
                         used_bytes: 0,
                         slots: 1,
                         pointers: vec![BlockPointer::hole_pointer(); 3],
@@ -1880,6 +2417,7 @@ impl ZfsTransactionEngine {
                         prev_snap_obj: origin_snap_obj,
                         prev_snap_txg: u64::from(origin_snap_obj != 0),
                         is_raw_encrypted: kd_cloned.is_some(),
+                        raw_meta_dnode: kd_cloned.as_ref().map(|kd| kd.meta_dnode),
                         crypto_version: kd_cloned.as_ref().map_or(1, |k| k.version),
                         portable_mac: kd_cloned.as_ref().map_or([0_u8; 32], |k| k.portable_mac),
                         to_ivset_guid: kd_cloned.as_ref().map(|k| k.to_ivset_guid),
@@ -1919,7 +2457,7 @@ impl ZfsTransactionEngine {
                             "incremental receive target has no base snapshot".into(),
                         ));
                     }
-                    let (prev_snap_dn, _) = read_staged_or_committed_dnode(
+                    let (prev_snap_dn, prev_snap_ceiling) = read_staged_or_committed_dnode(
                         cx,
                         mos,
                         &mos_meta,
@@ -1962,16 +2500,14 @@ impl ZfsTransactionEngine {
                                 "raw encrypted incremental cannot target unencrypted dataset".into(),
                             ));
                         };
-                        let _ = tc;
-                        if let Some(expected_from_ivset) = kd.from_ivset_guid {
-                            let actual_from_ivset = mos.dataset_ivset_guid(cx, prev_snap_obj)?;
-                            if actual_from_ivset != Some(expected_from_ivset) {
-                                return Err(FfsError::Format(
-                                    "raw incremental from_ivset_guid disagrees with target base snapshot"
-                                        .into(),
-                                ));
-                            }
-                        }
+                        validate_received_crypto_identity(kd, &tc.record)?;
+                        validate_received_base_ivset(cx, mos, kd, prev_snap_obj)?;
+                        let base_os = read_received_objectset(cx, mos, &prev_snap_dn, prev_snap_ceiling)?;
+                        validate_received_meta_geometry(&kd.meta_dnode, &base_os.meta)?;
+                    } else if target_crypto.is_some() {
+                        return Err(unsupported(
+                            "non-raw incremental receive into an encrypted dataset requires re-encryption",
+                        ));
                     }
 
                     let (target_dd_dn, _) = read_staged_or_committed_dnode(
@@ -2181,7 +2717,8 @@ impl ZfsTransactionEngine {
                         target_head_obj: Some(target_head_obj),
                         prev_snap_obj,
                         prev_snap_txg,
-                        is_raw_encrypted: kd_cloned.is_some() || target_crypto.is_some(),
+                        is_raw_encrypted: kd_cloned.is_some(),
+                        raw_meta_dnode: kd_cloned.as_ref().map(|kd| kd.meta_dnode),
                         crypto_version: kd_cloned.as_ref().map_or(1, |k| k.version),
                         portable_mac: kd_cloned.as_ref().map_or([0_u8; 32], |k| k.portable_mac),
                         to_ivset_guid: kd_cloned.as_ref().map(|k| k.to_ivset_guid),
@@ -2193,7 +2730,7 @@ impl ZfsTransactionEngine {
         )
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn commit_recv_chunk_txg(
         &mut self,
         cx: &Cx,
@@ -2202,6 +2739,7 @@ impl ZfsTransactionEngine {
         ops: &[RecvOp],
         known_object_ranges: &BTreeMap<u64, ObjectRangeMeta>,
         progress: &ChunkProgress,
+        final_chunk: bool,
     ) -> ZfsTxOutcome<()> {
         let stage_cloned = stage.clone();
         let ops_owned = ops.to_vec();
@@ -2231,13 +2769,13 @@ impl ZfsTransactionEngine {
                     .map_err(|e| parse_err(&e))?;
                 let (os_raw, os_order, _) =
                     mos.read_dataset_objset_block_raw(cx, &old_os_bp, head_ceil, None, true)?;
-                let mut preserved_local_mac = [0_u8; 32];
-                if os_raw.len() >= 784 {
-                    preserved_local_mac.copy_from_slice(&os_raw[752..784]);
-                }
                 let mut os = ObjectSet::parse(&os_raw, os_order).map_err(|e| parse_err(&e))?;
                 let old_meta = os.meta.clone();
                 let old_meta_ceil = old_os_bp.birth();
+                let raw_meta = stage_cloned.raw_meta_dnode;
+                if let Some(meta) = raw_meta {
+                    validate_received_meta_geometry(&meta, &old_meta)?;
+                }
 
                 let stage_crypto =
                     resolve_staging_crypto_info(cx, mos, stage_cloned.stage_dd_obj)?;
@@ -2293,7 +2831,7 @@ impl ZfsTransactionEngine {
                     if drafts.contains_key(&obj_id) {
                         return Ok(());
                     }
-                    let existing = read_staged_or_committed_dnode(
+                    let dn = match read_staged_or_committed_dnode(
                         cx,
                         os_view,
                         &old_meta,
@@ -2301,13 +2839,14 @@ impl ZfsTransactionEngine {
                         meta_dirty,
                         obj_id,
                         order,
-                    )
-                    .ok()
-                    .map(|(dn, _)| dn);
-                    let Some(dn) = existing else {
-                        return Err(corrupt(format!(
-                            "receive stream referenced unknown object {obj_id}"
-                        )));
+                    ) {
+                        Ok((dn, _)) => dn,
+                        Err(FfsError::NotFound(_)) => {
+                            return Err(corrupt(format!(
+                                "receive stream referenced unknown object {obj_id}"
+                            )));
+                        }
+                        Err(error) => return Err(error),
                     };
                     let preserved_raw_bonus = if stage_cloned.is_raw_encrypted {
                         let meta_bid = obj_id / 32;
@@ -2370,7 +2909,7 @@ impl ZfsTransactionEngine {
                             }
                         }
                         RecvOp::Object { rec, bonus } => {
-                            let existing = read_staged_or_committed_dnode(
+                            let existing = match read_staged_or_committed_dnode(
                                 cx,
                                 &mut os_view,
                                 &old_meta,
@@ -2378,9 +2917,11 @@ impl ZfsTransactionEngine {
                                 &meta_dirty_blocks,
                                 rec.object,
                                 order,
-                            )
-                            .ok()
-                            .map(|(dn, _)| dn);
+                            ) {
+                                Ok((dn, _)) => Some(dn),
+                                Err(FfsError::NotFound(_)) => None,
+                                Err(error) => return Err(error),
+                            };
                             let slots = usize::from(rec.dn_slots.max(1));
                             let ind_shift = if (10..=17).contains(&rec.indblkshift) {
                                 rec.indblkshift
@@ -2444,7 +2985,7 @@ impl ZfsTransactionEngine {
                                 .ok_or_else(|| corrupt("DRR_FREEOBJECTS overflow"))?;
                             for obj_id in f.firstobj..end {
                                 drafts.remove(&obj_id);
-                                if let Ok((dn, dn_ceil)) = read_staged_or_committed_dnode(
+                                let (dn, dn_ceil) = match read_staged_or_committed_dnode(
                                     cx,
                                     &mut os_view,
                                     &old_meta,
@@ -2453,28 +2994,31 @@ impl ZfsTransactionEngine {
                                     obj_id,
                                     order,
                                 ) {
-                                    collect_non_hole_bps_from(
-                                        cx,
-                                        &mut os_view,
-                                        &dn,
-                                        dn_ceil,
-                                        0,
-                                        true,
-                                        &mut retired_bps,
-                                    )?;
-                                    if let Some(sbp) = dn.spill() {
-                                        retired_bps.push(sbp.clone());
-                                    }
-                                    remove_dnode_from_table(
-                                        cx,
-                                        &mut os_view,
-                                        &old_meta,
-                                        old_meta_ceil,
-                                        &mut meta_dirty_blocks,
-                                        obj_id,
-                                        order,
-                                    )?;
+                                    Ok(existing) => existing,
+                                    Err(FfsError::NotFound(_)) => continue,
+                                    Err(error) => return Err(error),
+                                };
+                                collect_non_hole_bps_from(
+                                    cx,
+                                    &mut os_view,
+                                    &dn,
+                                    dn_ceil,
+                                    0,
+                                    true,
+                                    &mut retired_bps,
+                                )?;
+                                if let Some(sbp) = dn.spill() {
+                                    retired_bps.push(sbp.clone());
                                 }
+                                remove_dnode_from_table(
+                                    cx,
+                                    &mut os_view,
+                                    &old_meta,
+                                    old_meta_ceil,
+                                    &mut meta_dirty_blocks,
+                                    obj_id,
+                                    order,
+                                )?;
                             }
                         }
                         RecvOp::Write { rec, payload } => {
@@ -2485,6 +3029,15 @@ impl ZfsTransactionEngine {
                                 &mut os_view,
                             )?;
                             let d = drafts.get_mut(&rec.object).expect("loaded");
+                            // Incremental and resumed streams may omit OBJECT;
+                            // admission must use the actual preserved dnode too.
+                            validate_received_geometry(rec.offset, rec.logical_size, d.data_bytes)?;
+                            if rec.object_type != u32::from(d.object_type) {
+                                return Err(corrupt("DRR_WRITE type disagrees with its dnode"));
+                            }
+                            if !stage_cloned.is_raw_encrypted {
+                                validate_received_plain_order(d.object_type, stream_order, order)?;
+                            }
                             let blksz = d.data_bytes as u64;
                             let bid = rec.offset / blksz;
                             d.max_block = d.max_block.max(bid);
@@ -2493,6 +3046,8 @@ impl ZfsTransactionEngine {
                                     Endian::Little => Endian::Big,
                                     Endian::Big => Endian::Little,
                                 }
+                            } else if stage_cloned.is_raw_encrypted {
+                                stream_order
                             } else {
                                 order
                             };
@@ -2593,6 +3148,8 @@ impl ZfsTransactionEngine {
                                 &mut os_view,
                             )?;
                             let d = drafts.get_mut(&rec.object).expect("loaded");
+                            validate_received_geometry(rec.offset, rec.length, d.data_bytes)?;
+                            validate_received_plain_order(d.object_type, stream_order, order)?;
                             let blksz = d.data_bytes as u64;
                             let bid = rec.offset / blksz;
                             d.max_block = d.max_block.max(bid);
@@ -2645,13 +3202,23 @@ impl ZfsTransactionEngine {
                                 &mut os_view,
                             )?;
                             let d = drafts.get_mut(&rec.object).expect("loaded");
-                            let obj_type = u8::try_from(rec.object_type)
-                                .map_err(|_| corrupt("DRR_SPILL object_type overflow"))?;
+                            // OpenZFS leaves drr_type zero: spill blocks inherit
+                            // their DMU type (and encryption policy) from the
+                            // owning dnode's bonus type, not its data object type.
+                            let obj_type = d.bonus_type;
+                            if obj_type == 0 || (rec.object_type != 0 && rec.object_type != u32::from(obj_type)) {
+                                return Err(corrupt("DRR_SPILL type disagrees with its dnode bonus type"));
+                            }
+                            if !stage_cloned.is_raw_encrypted {
+                                validate_received_plain_order(obj_type, stream_order, order)?;
+                            }
                             let block_order = if rec.flags & DRR_RAW_BYTESWAP != 0 {
                                 match stream_order {
                                     Endian::Little => Endian::Big,
                                     Endian::Big => Endian::Little,
                                 }
+                            } else if stage_cloned.is_raw_encrypted {
+                                stream_order
                             } else {
                                 order
                             };
@@ -2727,6 +3294,7 @@ impl ZfsTransactionEngine {
 
                 // Flush all modified object dnodes into `meta_dirty_blocks`.
                 for (obj_id, draft) in drafts {
+                    validate_received_raw_object(raw_meta.as_ref(), obj_id)?;
                     let cow_out = cow_update_dnode_with_staged_leaves(
                         cx,
                         &mut os_view,
@@ -2790,24 +3358,67 @@ impl ZfsTransactionEngine {
                     }
                 }
 
-                // Flush `meta_dirty_blocks` into `os.meta`!
-                if !meta_dirty_blocks.is_empty() {
+                // Raw metadata selectors and maximum block come from BEGIN,
+                // including streams with no OBJECT or WRITE records. Preserve
+                // the old upper range until END so later FREEOBJECTS records
+                // can still retire objects when the source table shrank.
+                let target_meta_max = raw_meta.map_or(max_meta_block, |meta| {
+                    if final_chunk {
+                        meta.max_block
+                    } else {
+                        meta.max_block.max(old_meta.max_block())
+                    }
+                });
+                if raw_meta.is_some() && target_meta_max < old_meta.max_block() {
+                    // A hostile header cannot discard allocated objects merely
+                    // by lowering mdn_maxblkid. Their FREEOBJECTS records must
+                    // have retired every child before the table is truncated.
+                    for bid in allocated_leaf_blocks_in_range(
+                        cx, &mut os_view, &old_meta, old_meta_ceil,
+                        target_meta_max + 1, old_meta.max_block(),
+                    )? {
+                        checkpoint(cx)?;
+                        let allocated = if let Some(bytes) = meta_dirty_blocks.get(&bid) {
+                            count_allocated_dnodes(bytes, order).map_err(|e| parse_err(&e))?
+                        } else if let Some((bytes, block_order, _)) = os_view.object_data_block(
+                            cx, &old_meta, old_meta_ceil, bid,
+                        )? {
+                            count_allocated_dnodes(&bytes, block_order).map_err(|e| parse_err(&e))?
+                        } else {
+                            0
+                        };
+                        if allocated != 0 {
+                            return Err(FfsError::Format(
+                                "raw meta-dnode truncation would discard allocated objects".into(),
+                            ));
+                        }
+                    }
+                }
+                if !meta_dirty_blocks.is_empty() || raw_meta.is_some() {
                     let mut meta_leaves: BTreeMap<u64, StagedLeafUpdate> = BTreeMap::new();
                     for (bid, blk_bytes) in meta_dirty_blocks {
-                        let upd = if stage_cloned.is_raw_encrypted {
+                        if bid > target_meta_max {
+                            // Final truncation retires this old table block in
+                            // COW; never allocate an unreachable replacement.
+                            continue;
+                        }
+                        let upd = if stage_cloned.is_raw_encrypted && blk_bytes.iter().all(|&byte| byte == 0) {
+                            // A native hole has no ciphertext or range MAC. In
+                            // particular, FREEOBJECTS may clear an entire old
+                            // table block without a source OBJECT_RANGE record.
+                            StagedLeafUpdate::Hole
+                        } else if stage_cloned.is_raw_encrypted {
                             let rng = object_ranges.get(&bid).ok_or_else(|| {
                                 corrupt(format!(
                                     "raw encrypted receive missing DRR_OBJECT_RANGE for dnode block {bid}"
                                 ))
                             })?;
-                            let blk_order = if rng.flags & DRR_RAW_BYTESWAP != 0 {
-                                match stream_order {
-                                    Endian::Little => Endian::Big,
-                                    Endian::Big => Endian::Little,
-                                }
-                            } else {
-                                order
-                            };
+                            let blk_order = received_raw_order(rng.flags, stream_order);
+                            if blk_order != order {
+                                return Err(unsupported(
+                                    "raw receive cannot reconstruct foreign-order dnode tables",
+                                ));
+                            }
                             let fill = count_allocated_dnodes(&blk_bytes, blk_order)
                                 .map_err(|e| parse_err(&e))?;
                             let dva = alloc.allocate(blk_bytes.len())?;
@@ -2846,12 +3457,12 @@ impl ZfsTransactionEngine {
                             existing: Some((&old_meta, old_meta_ceil)),
                             object_type: DMU_OT_DNODE,
                             bonus_type: 0,
-                            checksum_type: old_meta.checksum_type(),
-                            compress_type: old_meta.compress_type(),
+                            checksum_type: raw_meta.map_or(old_meta.checksum_type(), |meta| meta.checksum),
+                            compress_type: raw_meta.map_or(old_meta.compress_type(), |meta| meta.compression),
                             user_flags: 0,
                             indirect_shift: old_meta.indirect_shift(),
                             data_bytes: DNODE_BLOCK_BYTES,
-                            max_block: max_meta_block,
+                            max_block: target_meta_max,
                             slots: 1,
                             nblkptr: 3,
                             bonus: Vec::new(),
@@ -2865,7 +3476,7 @@ impl ZfsTransactionEngine {
                         0,
                         stage_cloned.compression,
                         None,
-                        raw_enc_ver.map(|v| (v, old_meta.levels())),
+                        raw_enc_ver.map(|v| (v, raw_meta.map_or(old_meta.levels(), |meta| meta.levels))),
                         staged_writes,
                     )?;
                     born_space.add_assign(meta_out.born)?;
@@ -2877,6 +3488,9 @@ impl ZfsTransactionEngine {
                 // Write updated `DMU_OT_OBJSET` root block.
                 retired_bps.push(old_os_bp);
                 let new_os_bp = if stage_cloned.is_raw_encrypted {
+                    // Native raw receive defers local accounting until mount.
+                    // Its MAC is not portable and must never survive a clone.
+                    os.flags &= !1;
                     write_dataset_objset_block_raw_protected(
                         &mut os,
                         alloc,
@@ -2884,7 +3498,7 @@ impl ZfsTransactionEngine {
                         order,
                         new_txg,
                         stage_cloned.portable_mac,
-                        preserved_local_mac,
+                        [0_u8; 32],
                         staged_writes,
                     )?
                 } else {

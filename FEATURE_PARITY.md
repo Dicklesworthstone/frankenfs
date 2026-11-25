@@ -1,5 +1,43 @@
 # FEATURE_PARITY
 
+> **NTFS USN journal publication boundaries (2026-11-24):**
+> `$UsnJrnl:$J` append now COWs from the old logical EOF, preserving initialized
+> records while zeroing the padding exposed by a new USN page. Sparse-head
+> reclamation rounds to both whole clusters and whole 4 KiB USN pages, so
+> sub-page clusters and unaligned `$Max.allocation_delta` values cannot leave
+> the retained journal starting inside a record. An existing journal whose
+> initialized length is below EOF is explicitly refused before publication;
+> bounded initialization of arbitrary existing tails remains unsupported.
+> Three authored regressions cover five cluster geometries, poisoned physical
+> EOF padding, fresh-engine reopen and full consistency checks, and exact
+> unchanged-media/write-count refusal for a partially initialized journal.
+> Pinned rustfmt and `git diff --check` pass for the changed source and tests.
+> Runtime tests and workspace check/Clippy qualification remain unverified
+> after shared-host ENOSPC and executor loss. This advances `bd-h8n46` without
+> claiming its broader native-oracle or writable-transform acceptance.
+
+> **ZFS native compound replication framing (2026-11-24):**
+> Compound sends now emit the OpenZFS header END covering BEGIN plus its nvlist,
+> followed by ordinary substreams and the separate zero-checksum package END.
+> Metadata uses native uint64 `parentfromsnap` and presence-boolean
+> `not_recursive`/`raw` fields. Receive validates the header checksum before
+> staging writes, binds source dataset and snapshot identities, and refuses
+> recursive or multiple-dataset packages that the single-target API cannot
+> represent. Later substreams must continue the preceding snapshot GUID.
+> Zero-payload native intermediary packages remain admitted. An independently
+> constructed wire-format regression covers 17 malformed framing, checksum,
+> metadata and source-identity cases with unchanged-media/write-count assertions,
+> plus property/snapshot reopen and zero-payload positive controls. These tests
+> are authored, not executed. The three changed Rust files pass pinned rustfmt
+> and `git diff --check`; full checking failed during dependency compilation
+> with ENOSPC, followed by executor disconnection. Native OpenZFS interchange,
+> runtime/Clippy qualification and the full `bd-jbo9q` acceptance remain open.
+> The existing receive outcome API also remains incomplete: failure after an
+> earlier compound substream or resumable staging checkpoint publishes can
+> still return `NotCommitted`. A receive-specific durable-prefix/checkpoint
+> outcome and interrupted-package reopen tests are required before callers can
+> distinguish every partial-receive state accurately.
+
 > **ZFS mixed-byte-order write admission (2026-11-23):**
 > Normal COW and final fixed-DVA replay refuse replacing an existing DNODE leaf
 > whose block-pointer payload order differs from commit order. This protects
@@ -3896,3 +3934,150 @@ admission and recovery budgets remain unchanged; the structural audit's bounded
 scan allowance does not widen recovery or native-format compatibility claims.
 At publication these changes are statically reviewed; hosted compilation and
 execution remain pending. The broader bd-h7cme work package stays open.
+
+## NTFS synchronization completion after cancellation
+
+The mounted NTFS adapter now returns the completed result of its backing-device
+barrier through `fsync`, `fsyncdir`, `sync_fs`, periodic commit and orderly
+destruction. A cancellation arriving during a successful barrier remains pending
+for the caller; it no longer replaces that successful result with `Cancelled`.
+Cancellation before admission still refuses the request before backing I/O.
+An actual synchronization failure still propagates and fences the mounted view.
+
+The new `writable_sync_boundaries_preserve_completed_barriers_and_real_failures`
+regression in `crates/ffs-ntfs/tests/persistence_prefix.rs` covers those five
+entry points with both successful and failed barriers, pre-admission cancellation,
+unchanged durable bytes, continued access after success, failure fencing, and
+fresh native-reader consistency/readback.
+
+Qualification for this increment is **source review only**. The regression was
+authored, but did not execute: the shared executor became unavailable during
+dependency compilation for the session's first selected ZFS test. No candidate
+runtime, complete formatting, workspace check or strict Clippy pass is claimed.
+The direct GitHub publication uses the documented emergency gate-bypass path;
+the corresponding commit records that limitation. This does not close the broad
+native recovery, mounted interoperability or six-format acceptance beads.
+
+## ZFS post-commit reply and cache publication
+
+The writable ZFS filesystem adapter now defers cancellation while completing
+cache refresh, returned attributes and open-handle publication after a confirmed
+native TXG commit. The shared `publish_committed` helper covers eleven callers:
+create/open, mkdir, symlink, hard link, setattr, xattr updates/removals, and
+snapshot creation, rename and destruction. Native transaction admission and
+pre-commit cancellation remain unchanged. Pending cancellation is still visible
+after reply publication; a real publication/read failure fences the mounted
+view instead of allowing stale state to continue.
+
+Three new regressions exercise seven metadata operations on ZPL versions 4 and
+5 with durable-byte cold reopen, cancellation before native persistence, and
+actual post-commit read failures on both members of a mirror. Three existing
+cancellation regressions now require successful committed replies while retaining
+their snapshot pin, stale inode, native data, TXG and allocation assertions.
+The create-open regression additionally requires a returned handle and verifies
+open-unlink retention through final release.
+
+Qualification remains **source review only**. The original new-test insertion
+was formatted with the pinned toolchain before executor loss; the final candidate
+has not completed formatting, workspace checking, strict Clippy or runtime tests.
+The baseline selected test never reached a returned runtime result before the
+execution environment became unavailable. The direct GitHub commit records the
+emergency gate bypass. These authored storage-model tests are not mounted FUSE,
+native OpenZFS interchange or device power-loss qualification, and the broad
+ZFS delivery beads remain open.
+
+## ZFS receive dnode lookup error propagation
+
+Receive chunk preparation now distinguishes a genuinely absent dnode from a
+failed read in three paths: OBJECT replacement, lazy draft loading for WRITE
+and related records, and FREEOBJECTS. Only `NotFound` retains the previous
+missing-object behavior; I/O, corruption and cancellation errors propagate
+instead of being converted into an absent object or skipped free.
+
+Two authored integration tests cover I/O and corruption across all three
+lookups. Each arms a one-shot dnode-table fault only after the durable
+`recv_begin` acknowledgment, checks the original diagnostic and unchanged
+checkpoint/TXG/write count/media, then reopens durable bytes, checks the original
+head and zero-progress resume state, aborts and retries. The FREEOBJECTS control
+also requires a truly absent slot to remain a legal no-op.
+
+Qualification is **source review only**: formatting, compiler, strict Clippy and
+runtime validation remain unverified because the execution environment is
+unavailable. The direct GitHub commit records the emergency gate bypass. This
+bounded correction does not address sparse-range traversal, finite FREE edge
+zeroing, receive-begin target lookup error handling, or native interchange
+qualification, and does not close the broad receive/ZFS feature beads.
+
+## ZFS completed device barriers and native publication outcomes
+
+Successful synchronization now retains its actual result through the writable
+image, leaf, mounted state and release-with-flush paths. Each next member/write
+still checks cancellation before starting. A cancellation after the final
+successful Uberblock barrier therefore preserves a committed TXG, while genuine
+publication errors and incomplete mirror barriers still require recovery.
+An explicit check before Uberblock publication preserves `NotCommitted` when
+cancellation is already pending after the staged data/metadata barriers.
+Additional filesystem sync errors retain their existing retryable policy.
+
+Four authored regressions cover six mounted synchronization entry points,
+pre-cancelled admission and release cleanup, cancellation between mirror
+members, real EIO combined with cancellation, and native publication outcomes.
+The successful native final-barrier case reopens durable bytes before any
+additional synchronization; the pre-publication control requires no Uberblock
+write and a usable predecessor view.
+
+Qualification remains **source review only**. No final formatting, compiler,
+strict Clippy or runtime pass is claimed; the execution environment remains
+unavailable and the commit records the gate bypass. Faultable-device tests
+provide deterministic cancellation placement but do not establish an executed
+race inside `std::fs::File::sync_all`, mounted FUSE behavior or native OpenZFS
+interchange qualification.
+
+## Cache durability, mount retirement, and received ZFS limits (2026-11-25)
+
+The write-back ARC cache now synchronizes each nonempty flush batch before
+marking any version persisted, clearing its dirty state, or notifying repair
+refresh. Version pins span the backing-device barrier. A failed write or sync
+keeps the batch available for retry, including when a newer cached version
+replaces a failed payload. Explicit cache synchronization uses the batch's
+completed barrier, while a clean/write-through cache still synchronizes its
+backing device. These are block-cache durability guarantees; they do not replace
+a filesystem's native journal or TXG publication protocol.
+
+Full, bounded, and pending-eviction flushes serialize candidate selection through
+dirty retirement. Write-through updates share this ordering, so an older flush
+cannot overwrite an acknowledged newer version. Cancellation while waiting keeps
+pending payloads visible for retry. Repair callbacks run after the flush and
+metadata locks are released, allowing them to reenter cache synchronization.
+
+Managed FUSE shutdown now serializes dispatch retirement and timeout quarantine
+registration. A timeout arriving after dispatch retirement cannot strand an
+image/device lease while the completion receipt is still in flight. A genuinely
+unfinished dispatch retains its lease until retirement. Lease destruction occurs
+outside the global registry lock because filesystem destruction can join workers.
+
+ZFS inheritance of received `quota`, `refquota`, `reservation`, and
+`refreservation` values now uses the existing direct-update preflight. Restored
+values must satisfy current usage, paired quota/reservation constraints, ancestor
+headroom, and pool capacity before native publication. Clearing a local override
+preserves received-property provenance and updates native accounting without
+creating a replacement local property.
+
+Focused regression entry points:
+
+- `cargo test -p ffs-block --lib arc_cache_flush_barrier`
+- `cargo test -p ffs-block --lib arc_cache_failed_sync`
+- `cargo test -p ffs-block --lib arc_cache_overlapping_flushes`
+- `cargo test -p ffs-fuse --lib quarantine_`
+- `cargo test -p ffs-zfs --test persistence_prefix received_space_`
+
+The regression scope is deterministic lifecycle interleaving and faultable-device
+durability/restart behavior. It does not establish new mounted FUSE,
+hardware-power-loss, performance, or native OpenZFS interchange qualification,
+and does not close the broader writeback, caller-runtime, or ZFS lifecycle beads.
+
+At publication, the local executor was unavailable after repeated failures and
+hosted runners were backlogged. These changes have source review and new
+regressions, but no completed compiler, strict-Clippy, UBS, or runtime result is
+claimed. The FUSE change and existing formatting corrections passed local
+formatting before the outage; subsequent changes await hosted formatting checks.

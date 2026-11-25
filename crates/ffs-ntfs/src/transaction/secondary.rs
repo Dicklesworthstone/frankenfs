@@ -271,6 +271,14 @@ where
         }
     };
 
+    // Advancing ValidDataLength to the new EOF must not expose an existing
+    // uninitialized tail. Supporting it requires zeroing that interval first.
+    if j_init != j_size {
+        return Err(unsupported(
+            "$UsnJrnl:$J append requires a fully initialized existing journal",
+        ));
+    }
+
     let mut cursor = j_size;
     let mut assigned = Vec::with_capacity(records.len());
     let mut staged_encoded = Vec::with_capacity(records.len());
@@ -283,11 +291,13 @@ where
         assigned.push(usn_offset);
         staged_encoded.push((usn_offset, encoded));
     }
-    let first_usn_offset = assigned[0];
     let new_end = cursor;
 
     let cb = u64::from(engine.geometry.cluster_bytes());
-    let start_vcn = first_usn_offset / cb;
+    // The new record can start on the next USN page. Include the old EOF's
+    // cluster so its previously invisible tail is zeroed before the new
+    // initialized length makes that page padding visible.
+    let start_vcn = j_size / cb;
     let end_vcn = new_end.div_ceil(cb);
     let cow_clusters = end_vcn - start_vcn;
     let cow_byte_start = start_vcn * cb;
@@ -403,13 +413,17 @@ where
             .maximum_size
             .saturating_add(max_data.allocation_delta)
     {
-        let trim_step = max_data.allocation_delta.max(cb).max(USN_PAGE_BYTES);
+        // Records cannot cross a USN page, but can cross a smaller cluster.
+        // Reclaim whole clusters and whole pages so the retained head cannot
+        // begin inside a record when $Max's byte-sized delta is unaligned.
+        let trim_granularity = cb.max(USN_PAGE_BYTES);
+        let trim_step = max_data.allocation_delta.max(trim_granularity);
         let trim_to = max_data
             .lowest_valid_usn
             .saturating_add(trim_step)
             .min(start_vcn * cb)
-            / cb
-            * cb;
+            / trim_granularity
+            * trim_granularity;
         let trim_vcns = trim_to / cb;
         if trim_vcns > 0 && trim_to > max_data.lowest_valid_usn {
             let mut trimmed_runs = Vec::new();

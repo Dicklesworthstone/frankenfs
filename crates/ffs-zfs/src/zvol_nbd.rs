@@ -33,8 +33,9 @@ use serde::Serialize;
 
 use crate::reader::dmu::zvol::Zvol;
 use crate::transaction::{
-    MAX_ZVOL_IO_BYTES, ZVOL_LOGICAL_SECTOR_BYTES, ZfsCommitReceipt, ZfsDataChecksum,
-    ZfsDurableToken, ZfsTransactionEngine, ZfsTxOutcome, ZfsZvolCreateOptions, ZfsZvolInfo,
+    MAX_VOLBLOCKSIZE, MAX_ZVOL_IO_BYTES, ZVOL_LOGICAL_SECTOR_BYTES, ZfsCommitReceipt,
+    ZfsDataChecksum, ZfsDurableToken, ZfsTransactionEngine, ZfsTxOutcome, ZfsZvolCreateOptions,
+    ZfsZvolInfo,
 };
 
 // Fixed-newstyle NBD wire protocol constants (big-endian on wire).
@@ -82,12 +83,21 @@ const NBD_CMD_FLAG_FUA: u16 = 1 << 0;
 pub const NBD_OK: u32 = 0;
 pub const NBD_EPERM: u32 = 1;
 pub const NBD_EIO: u32 = 5;
+pub const NBD_ENOMEM: u32 = 12;
 pub const NBD_EINVAL: u32 = 22;
 pub const NBD_ENOSPC: u32 = 28;
 pub const NBD_ESHUTDOWN: u32 = 108;
 
 const MAX_OPTION_PAYLOAD_BYTES: usize = 64 * 1024;
 const MAX_STAGED_VOLATILE_BYTES: usize = 64 * 1024 * 1024;
+// Conservative allowance for map nodes, block keys, and allocation bookkeeping.
+// Holes retain this charge even though their data payload is empty.
+const STAGED_BLOCK_METADATA_BYTES: usize = 512;
+const MAX_STAGED_REQUEST_BLOCKS: usize = MAX_ZVOL_IO_BYTES / ZVOL_LOGICAL_SECTOR_BYTES + 1;
+// A bounded command can retain both full old blocks and per-block undo entries,
+// including two partial edge blocks at the largest admitted volume block size.
+const MAX_STAGED_UNDO_BYTES: usize = 2 * MAX_ZVOL_IO_BYTES + 2 * MAX_VOLBLOCKSIZE;
+const MAX_TRANSPORT_AUDIT_ENTRIES: usize = 4096;
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const IO_POLL_TIMEOUT: Duration = Duration::from_millis(200);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -112,6 +122,7 @@ fn map_error_to_nbd(err: &FfsError) -> u32 {
         FfsError::RequestRejected { errno, .. } => match *errno {
             libc::EPERM | libc::EACCES | libc::EROFS => NBD_EPERM,
             libc::EINVAL => NBD_EINVAL,
+            libc::ENOMEM => NBD_ENOMEM,
             libc::ENOSPC | libc::EDQUOT => NBD_ENOSPC,
             _ => NBD_EIO,
         },
@@ -123,6 +134,10 @@ fn map_nbd_to_error(code: u32, op: &str) -> FfsError {
     match code {
         NBD_EPERM => FfsError::ReadOnly,
         NBD_EINVAL => reject_errno(libc::EINVAL, format!("NBD {op} rejected with EINVAL")),
+        NBD_ENOMEM => reject_errno(
+            libc::ENOMEM,
+            format!("NBD {op} exhausted its memory budget"),
+        ),
         NBD_ENOSPC => FfsError::NoSpace,
         NBD_ESHUTDOWN => FfsError::Cancelled,
         other => FfsError::Io(std::io::Error::other(format!(
@@ -139,8 +154,10 @@ pub enum ZvolSyncPolicy {
     #[default]
     Always,
     /// Explicit writeback staging: non-FUA writes and discards stage dirty `volblocksize`
-    /// blocks in memory (bounded to 64 MiB, serving read-your-own-writes), while `FUA`
-    /// writes and `FLUSH` commit all staged blocks atomically in one durable TXG.
+    /// blocks in memory, serving read-your-own-writes. A volatile acknowledgment retains
+    /// at most 64 MiB of payload-capacity and metadata charges; per-command staging and
+    /// undo have a separate bounded allowance. Memory pressure, `FUA`, and `FLUSH`
+    /// commit all staged blocks atomically in one durable TXG.
     FlushBarrier,
 }
 
@@ -168,6 +185,16 @@ pub struct ZvolTransportAuditEntry {
     pub committed_txg: Option<u64>,
     pub published_slot: Option<usize>,
     pub token: Option<ZfsDurableToken>,
+}
+
+fn push_audit_entry(audit: &mut Vec<ZvolTransportAuditEntry>, entry: ZvolTransportAuditEntry) {
+    if audit.len() >= MAX_TRANSPORT_AUDIT_ENTRIES {
+        // Batch eviction keeps the public chronological slice while avoiding
+        // a full-buffer shift on every command once the retention limit is hit.
+        let remove = audit.len() - MAX_TRANSPORT_AUDIT_ENTRIES / 2;
+        drop(audit.drain(..remove));
+    }
+    audit.push(entry);
 }
 
 struct ManagerState {
@@ -510,6 +537,18 @@ struct StagedEdit<'a> {
     bytes: &'a mut usize,
     original_bytes: usize,
     undo: Vec<ZvolCacheUndo>,
+    undo_bytes: usize,
+}
+
+fn staged_block_bytes(block: &Option<Vec<u8>>) -> usize {
+    STAGED_BLOCK_METADATA_BYTES.saturating_add(block.as_ref().map_or(0, Vec::capacity))
+}
+
+fn writeback_budget_exhausted() -> FfsError {
+    reject_errno(
+        libc::ENOMEM,
+        "ZVOL command exceeds the writeback memory budget",
+    )
 }
 
 impl<'a> StagedEdit<'a> {
@@ -519,18 +558,44 @@ impl<'a> StagedEdit<'a> {
             blocks,
             bytes,
             undo: Vec::new(),
+            undo_bytes: 0,
         }
     }
 
-    fn replace(&mut self, id: u64, block: Option<Vec<u8>>) {
-        let new_bytes = block.as_ref().map_or(0, Vec::len);
+    fn replace(&mut self, id: u64, block: Option<Vec<u8>>) -> Result<()> {
+        let previous = self.blocks.get(&id);
+        let old_bytes = previous.map_or(0, staged_block_bytes);
+        let retained = previous.and_then(Option::as_ref).map_or(0, Vec::capacity);
+        let undo_bytes = self
+            .undo_bytes
+            .saturating_add(STAGED_BLOCK_METADATA_BYTES)
+            .saturating_add(retained);
+        let staged_bytes = self
+            .bytes
+            .checked_sub(old_bytes)
+            .and_then(|bytes| bytes.checked_add(staged_block_bytes(&block)))
+            .ok_or_else(writeback_budget_exhausted)?;
+        if self.undo.len() >= MAX_STAGED_REQUEST_BLOCKS
+            || undo_bytes > MAX_STAGED_UNDO_BYTES
+            || staged_bytes > MAX_STAGED_VOLATILE_BYTES + MAX_STAGED_UNDO_BYTES
+        {
+            return Err(writeback_budget_exhausted());
+        }
+        self.undo
+            .try_reserve(1)
+            .map_err(|_| writeback_budget_exhausted())?;
         let old = self.blocks.insert(id, block);
-        let old_bytes = old.as_ref().and_then(Option::as_ref).map_or(0, Vec::len);
-        *self.bytes = *self.bytes - old_bytes + new_bytes;
+        *self.bytes = staged_bytes;
+        self.undo_bytes = undo_bytes;
         self.undo
             .push(old.map_or(ZvolCacheUndo::Remove(id), |block| {
                 ZvolCacheUndo::Restore(id, block)
             }));
+        Ok(())
+    }
+
+    fn requires_commit(&self, durable: bool) -> bool {
+        durable || self.bytes.saturating_add(self.undo_bytes) > MAX_STAGED_VOLATILE_BYTES
     }
 
     fn finish(
@@ -541,7 +606,7 @@ impl<'a> StagedEdit<'a> {
         checksum: ZfsDataChecksum,
         durable: bool,
     ) -> Result<(ZvolAckKind, Option<ZfsCommitReceipt>)> {
-        let ack = if durable || *self.bytes > MAX_STAGED_VOLATILE_BYTES {
+        let ack = if self.requires_commit(durable) {
             let (receipt, _) = engine
                 .zvol_batch_apply(cx, dataset, self.blocks, checksum)
                 .into_result()?;
@@ -552,6 +617,7 @@ impl<'a> StagedEdit<'a> {
             (ZvolAckKind::StagedVolatile, None)
         };
         self.undo.clear();
+        self.undo_bytes = 0;
         self.original_bytes = *self.bytes;
         Ok(ack)
     }
@@ -666,7 +732,7 @@ impl ZfsZvolSession {
         {
             return Err(reject_errno(
                 libc::EINVAL,
-                "ZVOL request exceeds 16 MiB maximum transfer size",
+                "ZVOL request exceeds 16 MiB per-command resource limit",
             ));
         }
         if offset.checked_add(len).is_none_or(|end| end > self.volsize) {
@@ -779,7 +845,7 @@ impl ZfsZvolSession {
                 let count = (write_end - write_start) as usize;
 
                 if count == self.volblocksize {
-                    edit.replace(bid, Some(data[in_data..in_data + count].to_vec()));
+                    edit.replace(bid, Some(data[in_data..in_data + count].to_vec()))?;
                 } else {
                     let mut buf = match edit.blocks.get(&bid) {
                         Some(Some(existing)) => existing.clone(),
@@ -798,7 +864,7 @@ impl ZfsZvolSession {
                     };
                     buf[in_block..in_block + count]
                         .copy_from_slice(&data[in_data..in_data + count]);
-                    edit.replace(bid, Some(buf));
+                    edit.replace(bid, Some(buf))?;
                 }
             }
         }
@@ -812,7 +878,7 @@ impl ZfsZvolSession {
         )
     }
 
-    /// Sector-aligned discard / TRIM.
+    /// Sector-aligned discard / TRIM with a 16 MiB per-command resource cap.
     pub fn discard(
         &mut self,
         cx: &Cx,
@@ -823,6 +889,7 @@ impl ZfsZvolSession {
     }
 
     /// Discard a range and optionally persist the session's pending I/O before returning.
+    /// Ranges larger than 16 MiB return `EINVAL` and can be split into smaller commands.
     pub fn discard_with_fua(
         &mut self,
         cx: &Cx,
@@ -840,7 +907,7 @@ impl ZfsZvolSession {
                 "TRIM/discard is disabled on this ZVOL session",
             ));
         }
-        self.validate_span(offset, len, None)?;
+        self.validate_span(offset, len, Some(MAX_ZVOL_IO_BYTES))?;
         let mut guard = self
             .state
             .lock()
@@ -868,7 +935,7 @@ impl ZfsZvolSession {
                 let cut_start = offset.max(block_start);
                 let cut_end = end.min(block_end);
                 if cut_start == block_start && cut_end == block_end {
-                    edit.replace(bid, None);
+                    edit.replace(bid, None)?;
                 } else {
                     let mut buf = match edit.blocks.get(&bid) {
                         Some(Some(existing)) => existing.clone(),
@@ -889,7 +956,7 @@ impl ZfsZvolSession {
                     let in_end = (cut_end - block_start) as usize;
                     buf[in_start..in_end].fill(0);
                     let nonzero = buf.iter().any(|&b| b != 0);
-                    edit.replace(bid, nonzero.then_some(buf));
+                    edit.replace(bid, nonzero.then_some(buf))?;
                 }
             }
         }
@@ -1308,7 +1375,8 @@ impl ZfsZvolNbdServer {
         }
     }
 
-    /// Inspect recorded transport audit entries.
+    /// Inspect the recent transport audit window (at most 4096 entries).
+    /// When full, the oldest half is evicted; sequence numbers continue increasing.
     #[must_use]
     pub fn audit_log(&self) -> &[ZvolTransportAuditEntry] {
         &self.audit
@@ -1326,18 +1394,21 @@ impl ZfsZvolNbdServer {
         receipt: Option<&ZfsCommitReceipt>,
     ) {
         self.seq += 1;
-        self.audit.push(ZvolTransportAuditEntry {
-            seq: self.seq,
-            cmd: cmd.to_owned(),
-            offset,
-            length,
-            fua,
-            nbd_error,
-            ack_kind,
-            committed_txg: receipt.map(|r| r.committed_txg),
-            published_slot: receipt.map(|r| r.published_slot),
-            token: receipt.and_then(|r| r.token.clone()),
-        });
+        push_audit_entry(
+            &mut self.audit,
+            ZvolTransportAuditEntry {
+                seq: self.seq,
+                cmd: cmd.to_owned(),
+                offset,
+                length,
+                fua,
+                nbd_error,
+                ack_kind,
+                committed_txg: receipt.map(|r| r.committed_txg),
+                published_slot: receipt.map(|r| r.published_slot),
+                token: receipt.and_then(|r| r.token.clone()),
+            },
+        );
     }
 
     fn accept_next(&self, cx: &Cx) -> Result<NbdStream> {
@@ -1363,6 +1434,7 @@ impl ZfsZvolNbdServer {
     }
 
     /// Run the cancel-aware NBD accept and dispatch loop until `once` completes or `cx` cancels.
+    /// Returns the same bounded recent history exposed by [`Self::audit_log`].
     pub fn serve(&mut self, cx: &Cx) -> Result<Vec<ZvolTransportAuditEntry>> {
         loop {
             let mut stream = match self.accept_next(cx) {
@@ -2182,5 +2254,119 @@ impl ByteDevice for ZfsZvolNbdClient {
 
     fn sync(&self, cx: &Cx) -> Result<()> {
         self.flush(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn writeback_holes_trigger_pressure_and_rollback_keeps_the_prior_cache() {
+        let count = MAX_STAGED_VOLATILE_BYTES / STAGED_BLOCK_METADATA_BYTES - 2;
+        let mut blocks: BTreeMap<_, _> = (0..count as u64).map(|id| (id, None)).collect();
+        let mut bytes = blocks.values().map(staged_block_bytes).sum();
+        let original_bytes = bytes;
+        {
+            let mut edit = StagedEdit::new(&mut blocks, &mut bytes);
+            assert!(!edit.requires_commit(false));
+            edit.replace(count as u64, None).unwrap();
+            assert!(!edit.requires_commit(false));
+            edit.replace(count as u64 + 1, None).unwrap();
+            assert!(edit.requires_commit(false));
+            // Abandoning the command must undo both new tombstones and charges.
+        }
+        assert_eq!(blocks.len(), count);
+        assert_eq!(bytes, original_bytes);
+        assert!(!blocks.contains_key(&(count as u64)));
+    }
+
+    #[test]
+    fn writeback_undo_accounts_retained_capacity_and_restores_after_budget_rejection() {
+        let mut original = Vec::with_capacity(MAX_VOLBLOCKSIZE);
+        original.resize(512, 0x73);
+        let capacity = original.capacity();
+        let mut blocks = BTreeMap::from([(7, Some(original)), (8, None)]);
+        let mut bytes = blocks.values().map(staged_block_bytes).sum();
+        let original_bytes = bytes;
+        let mut rejected = false;
+        {
+            let mut edit = StagedEdit::new(&mut blocks, &mut bytes);
+            // Repeated replacement exercises retained old allocations, even
+            // when each replacement exposes only a small initialized prefix.
+            for _ in 0..=MAX_STAGED_UNDO_BYTES / MAX_VOLBLOCKSIZE {
+                let mut replacement = Vec::with_capacity(MAX_VOLBLOCKSIZE);
+                replacement.resize(512, 0xA5);
+                match edit.replace(7, Some(replacement)) {
+                    Ok(()) => assert!(edit.undo_bytes <= MAX_STAGED_UNDO_BYTES),
+                    Err(FfsError::RequestRejected {
+                        errno: libc::ENOMEM,
+                        ..
+                    }) => {
+                        rejected = true;
+                        break;
+                    }
+                    Err(error) => panic!("unexpected staging error: {error:?}"),
+                }
+            }
+            assert!(rejected, "retained capacity must exhaust the undo budget");
+        }
+        assert_eq!(blocks.len(), 2);
+        let restored = blocks.get(&7).unwrap().as_ref().unwrap();
+        assert_eq!(restored, &[0x73; 512]);
+        assert_eq!(restored.capacity(), capacity);
+        assert_eq!(blocks.get(&8), Some(&None));
+        assert_eq!(bytes, original_bytes);
+    }
+
+    #[test]
+    fn writeback_command_entry_limit_rejects_without_leaking_partial_tombstones() {
+        let mut blocks = BTreeMap::from([(u64::MAX, Some(vec![0x19; 512]))]);
+        let mut bytes = blocks.values().map(staged_block_bytes).sum();
+        let original_bytes = bytes;
+        {
+            let mut edit = StagedEdit::new(&mut blocks, &mut bytes);
+            for id in 0..MAX_STAGED_REQUEST_BLOCKS as u64 {
+                edit.replace(id, None).unwrap();
+            }
+            assert!(matches!(
+                edit.replace(MAX_STAGED_REQUEST_BLOCKS as u64, None),
+                Err(FfsError::RequestRejected {
+                    errno: libc::ENOMEM,
+                    ..
+                })
+            ));
+            assert_eq!(edit.undo.len(), MAX_STAGED_REQUEST_BLOCKS);
+        }
+        assert_eq!(blocks, BTreeMap::from([(u64::MAX, Some(vec![0x19; 512]))]));
+        assert_eq!(bytes, original_bytes);
+    }
+
+    #[test]
+    fn transport_audit_keeps_a_bounded_chronological_tail() {
+        let mut audit = Vec::new();
+        let total = 5 * MAX_TRANSPORT_AUDIT_ENTRIES + 17;
+        for seq in 1..=total as u64 {
+            push_audit_entry(
+                &mut audit,
+                ZvolTransportAuditEntry {
+                    seq,
+                    cmd: "TRIM".to_owned(),
+                    offset: seq * 512,
+                    length: 512,
+                    fua: false,
+                    nbd_error: NBD_EINVAL,
+                    ack_kind: ZvolAckKind::Rejected,
+                    committed_txg: None,
+                    published_slot: None,
+                    token: None,
+                },
+            );
+            assert!(audit.len() <= MAX_TRANSPORT_AUDIT_ENTRIES);
+        }
+        assert!(audit.len() > MAX_TRANSPORT_AUDIT_ENTRIES / 2);
+        assert_eq!(audit.last().unwrap().seq, total as u64);
+        assert!(audit.windows(2).all(|pair| pair[0].seq + 1 == pair[1].seq));
+        assert!(audit.first().unwrap().seq > 1);
     }
 }

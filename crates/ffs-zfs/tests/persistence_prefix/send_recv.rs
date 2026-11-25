@@ -7,7 +7,7 @@ use super::*;
 use ffs_ondisk::zfs::crypto::{ZioEncrypt, verify_objset_macs};
 use ffs_ondisk::zfs::send_stream::{
     DMU_BACKUP_FEATURE_COMPRESSED, DMU_REPLAY_RECORD_BYTES, DrrRecord, Fletcher4Stream,
-    ReceiveResumeToken, StreamHeaderType,
+    ReceiveResumeToken, StreamCryptoKeydata, StreamHeaderType, StreamMetaDnode,
 };
 use ffs_zfs::reader::dmu::properties::PropertyValue;
 use ffs_zfs::reader::dmu::zpl::PathPolicy;
@@ -111,6 +111,347 @@ fn assert_received_feature_owners(
             String::from_utf8_lossy(feature)
         );
     }
+}
+
+// Independent compound-header wire oracle derived from OpenZFS zfs-2.3.1,
+// lib/libzfs/libzfs_sendrecv.c: send_prelim_records/send_conclusion_record.
+// libzfs terminates BEGIN + nvlist with an END carrying that prefix's Fletcher4
+// and a zero trailer. It emits a second, all-zero-checksum END after substreams.
+fn native_compound_end(prefix: &[u8], order: Endian) -> [u8; DMU_REPLAY_RECORD_BYTES] {
+    assert!(prefix.len().is_multiple_of(4));
+    let mut checksum = [0_u64; 4];
+    for word in prefix.chunks_exact(4) {
+        let word: [u8; 4] = word.try_into().unwrap();
+        let word = match order {
+            Endian::Little => u32::from_le_bytes(word),
+            Endian::Big => u32::from_be_bytes(word),
+        };
+        checksum[0] = checksum[0].wrapping_add(u64::from(word));
+        checksum[1] = checksum[1].wrapping_add(checksum[0]);
+        checksum[2] = checksum[2].wrapping_add(checksum[1]);
+        checksum[3] = checksum[3].wrapping_add(checksum[2]);
+    }
+    let mut end = [0_u8; DMU_REPLAY_RECORD_BYTES];
+    end[..4].copy_from_slice(&match order {
+        Endian::Little => 5_u32.to_le_bytes(),
+        Endian::Big => 5_u32.to_be_bytes(),
+    });
+    for (index, word) in checksum.into_iter().enumerate() {
+        end[8 + index * 8..16 + index * 8].copy_from_slice(&order.encode(word));
+    }
+    end
+}
+
+fn assert_native_compound_header(stream: &[u8]) -> usize {
+    use ffs_ondisk::zfs::nvlist::{NvList, Value};
+    let payload_len = u32::from_le_bytes(stream[4..8].try_into().unwrap()) as usize;
+    let header_end = DMU_REPLAY_RECORD_BYTES + payload_len;
+    assert_eq!(
+        &stream[header_end..header_end + DMU_REPLAY_RECORD_BYTES],
+        native_compound_end(&stream[..header_end], Endian::Little),
+        "native compound header END must precede the first substream"
+    );
+    let nvl = NvList::parse_exact(&stream[DMU_REPLAY_RECORD_BYTES..header_end]).unwrap();
+    assert_eq!(nvl.fields["not_recursive"], Value::Boolean(true));
+    let fss = nvl.list("fss").unwrap();
+    assert_eq!(fss.fields.len(), 1);
+    let Value::List(dataset) = fss.fields.values().next().unwrap() else {
+        panic!("compound dataset must be an nvlist");
+    };
+    assert_eq!(dataset.unsigned("parentfromsnap"), Some(0));
+    assert_eq!(
+        &stream[stream.len() - DMU_REPLAY_RECORD_BYTES..],
+        native_compound_end(&[], Endian::Little),
+        "native final package END must retain a zero checksum and trailer"
+    );
+    header_end + DMU_REPLAY_RECORD_BYTES
+}
+
+fn native_compound_package(payload: &[u8], substreams: &[u8]) -> Vec<u8> {
+    let mut native = vec![0_u8; DMU_REPLAY_RECORD_BYTES];
+    native[4..8].copy_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
+    native[8..16].copy_from_slice(&0x0000_0002_f5ba_cbac_u64.to_le_bytes());
+    native[16..24].copy_from_slice(&2_u64.to_le_bytes());
+    let toname = b"ffstestpool/data@wire";
+    native[56..56 + toname.len()].copy_from_slice(toname);
+    native.extend_from_slice(payload);
+    native.extend_from_slice(&native_compound_end(&native, Endian::Little));
+    native.extend_from_slice(substreams);
+    native.extend_from_slice(&native_compound_end(&[], Endian::Little));
+    native
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn compound_native_header_checksum_is_validated_before_any_backing_write() {
+    use ffs_ondisk::zfs::nvlist::{NvList, Value};
+    let cx = Cx::for_testing();
+    let timestamp = Timestamp {
+        seconds: 1_730_000_499,
+        nanos: 0,
+    };
+    let source = vec![b"data".to_vec()];
+    let built = build_clean_zfs_pool(&send_recv_pool_spec(32 * 1024 * 1024));
+    let source_devices: Vec<_> = built
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut sender = open_engine_on_devices(
+        &cx,
+        &source_devices,
+        default_write_opts(built.pool_guid, built.initial_slot),
+    )
+    .unwrap();
+    sender
+        .create_snapshot(&cx, &source, b"wire", timestamp)
+        .into_result()
+        .unwrap();
+    let mut mos = sender.open_read_objects(&cx).unwrap();
+    let mut plain = Vec::new();
+    let mut request = ZfsSendRequest::full(source.clone(), b"wire".to_vec());
+    let report = send_stream(&cx, &mut mos, &request, &mut plain).unwrap();
+    request.properties = true;
+    let mut generated = Vec::new();
+    send_stream(&cx, &mut mos, &request, &mut generated).unwrap();
+    let substream_at = assert_native_compound_header(&generated);
+    assert_eq!(
+        &generated[substream_at..generated.len() - DMU_REPLAY_RECORD_BYTES],
+        plain
+    );
+
+    // Construct a libzfs-shaped package independently of the production sender.
+    // Only the already checksummed ordinary substream comes from send_stream.
+    let dataset = NvList {
+        fields: BTreeMap::from([
+            ("name".into(), Value::String("ffstestpool/data".into())),
+            ("parentfromsnap".into(), Value::Unsigned(0)),
+            (
+                "props".into(),
+                Value::List(NvList {
+                    fields: BTreeMap::from([(
+                        "app:received".into(),
+                        Value::String("native".into()),
+                    )]),
+                }),
+            ),
+            (
+                "snaps".into(),
+                Value::List(NvList {
+                    fields: BTreeMap::from([("wire".into(), Value::Unsigned(report.to_guid))]),
+                }),
+            ),
+        ]),
+    };
+    let payload = NvList {
+        fields: BTreeMap::from([
+            ("not_recursive".into(), Value::Boolean(true)),
+            ("tosnap".into(), Value::String("wire".into())),
+            (
+                "fss".into(),
+                Value::List(NvList {
+                    fields: BTreeMap::from([("dataset".into(), Value::List(dataset))]),
+                }),
+            ),
+        ]),
+    }
+    .encode_xdr()
+    .unwrap();
+    let native = native_compound_package(&payload, &plain);
+    let header_end = DMU_REPLAY_RECORD_BYTES + payload.len();
+
+    let target = build_clean_zfs_pool(&send_recv_pool_spec(32 * 1024 * 1024));
+    let devices: Vec<_> = target
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut receiver = open_engine_on_devices(
+        &cx,
+        &devices,
+        default_write_opts(target.pool_guid, target.initial_slot),
+    )
+    .unwrap();
+    let destination = vec![b"data".to_vec(), b"received".to_vec()];
+    let receive = ZfsRecvRequest::new(destination.clone());
+    let before = snapshot_media_bytes(&devices);
+    let writes: Vec<_> = devices
+        .iter()
+        .map(FaultableMemberDevice::write_calls)
+        .collect();
+    let initial_txg = receiver.committed_txg();
+    for case in 0..10 {
+        let mut bad = native.clone();
+        match case {
+            0 => bad.truncate(header_end),
+            1 => bad.truncate(header_end + DMU_REPLAY_RECORD_BYTES - 1),
+            2 => bad[header_end + 8] ^= 1,
+            3 => bad[56] ^= 1,
+            4 => bad[header_end..header_end + 4].copy_from_slice(&0_u32.to_le_bytes()),
+            5 => bad[header_end + 40] = 1,
+            6 => bad[header_end + 280] = 1,
+            7 => bad[23] |= 0x40,
+            8 => {
+                bad = [
+                    &native[..header_end],
+                    &native[header_end + DMU_REPLAY_RECORD_BYTES..],
+                ]
+                .concat();
+            }
+            9 => {
+                let value = payload
+                    .windows(6)
+                    .position(|bytes| bytes == b"native")
+                    .unwrap();
+                bad[DMU_REPLAY_RECORD_BYTES + value] ^= 1;
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            matches!(
+                receiver.receive_stream(&cx, &receive, &mut Cursor::new(bad)),
+                ZfsTxOutcome::NotCommitted(_)
+            ),
+            "malformed compound header case {case} was accepted"
+        );
+        assert_eq!(receiver.committed_txg(), initial_txg);
+        assert_eq!(
+            devices
+                .iter()
+                .map(FaultableMemberDevice::write_calls)
+                .collect::<Vec<_>>(),
+            writes,
+            "case {case} wrote before compound header validation"
+        );
+        assert_media_unchanged(&devices, &before);
+    }
+    for case in 0..6 {
+        let mut metadata = NvList::parse_exact(&payload).unwrap();
+        if case == 0 {
+            metadata.fields.remove("not_recursive");
+        } else if case == 1 {
+            metadata
+                .fields
+                .insert("not_recursive".into(), Value::Boolean(false));
+        } else {
+            let Value::List(fss) = metadata.fields.get_mut("fss").unwrap() else {
+                unreachable!();
+            };
+            if case == 2 {
+                let other = fss.fields["dataset"].clone();
+                fss.fields.insert("second-dataset".into(), other);
+            } else {
+                let Value::List(dataset) = fss.fields.get_mut("dataset").unwrap() else {
+                    unreachable!();
+                };
+                if case == 3 {
+                    dataset
+                        .fields
+                        .insert("name".into(), Value::String("ffstestpool/other".into()));
+                } else if case == 4 {
+                    let Value::List(snaps) = dataset.fields.get_mut("snaps").unwrap() else {
+                        unreachable!();
+                    };
+                    snaps
+                        .fields
+                        .insert("wire".into(), Value::Unsigned(report.to_guid ^ 1));
+                } else {
+                    dataset.fields.remove("snaps");
+                }
+            }
+        }
+        // Recompute the native header checksum: this must exercise dataset
+        // admission, not accidentally pass because of the checksum gate.
+        let bad = native_compound_package(&metadata.encode_xdr().unwrap(), &plain);
+        assert!(
+            matches!(
+                receiver.receive_stream(&cx, &receive, &mut Cursor::new(bad)),
+                ZfsTxOutcome::NotCommitted(_)
+            ),
+            "compound metadata case {case} was accepted"
+        );
+        assert_eq!(receiver.committed_txg(), initial_txg);
+        assert_eq!(
+            devices
+                .iter()
+                .map(FaultableMemberDevice::write_calls)
+                .collect::<Vec<_>>(),
+            writes
+        );
+        assert_media_unchanged(&devices, &before);
+    }
+    let unrelated = restamp_substream(&plain, false, |mut record, payload| {
+        if let DrrRecord::Begin(begin) = &mut record {
+            begin.toname = b"ffstestpool/other@wire".to_vec();
+        }
+        Some((record, payload))
+    });
+    let mixed_source = native_compound_package(&[], &unrelated);
+    assert!(matches!(
+        receiver.receive_stream(&cx, &receive, &mut Cursor::new(mixed_source)),
+        ZfsTxOutcome::NotCommitted(FfsError::Corruption { .. })
+    ));
+    assert_eq!(
+        devices
+            .iter()
+            .map(FaultableMemberDevice::write_calls)
+            .collect::<Vec<_>>(),
+        writes
+    );
+    assert_media_unchanged(&devices, &before);
+    let (received, token) = receiver
+        .receive_stream(&cx, &receive, &mut Cursor::new(&native))
+        .into_result()
+        .expect("native package framing must be accepted");
+    assert_eq!(received.records_applied, report.records_written + 3);
+    assert_eq!(received.stream_bytes_read, native.len() as u64);
+    let mut reopened = open_mos(&cx, &devices, target.pool_guid, token.published_slot());
+    let properties = reopened
+        .properties(&cx, &destination, None, &["app:received".into()])
+        .unwrap();
+    assert_eq!(
+        properties.values[0].value,
+        Some(PropertyValue::Text(b"native".to_vec()))
+    );
+    let expected = mos
+        .zpl_snapshot(&cx, &source, b"wire")
+        .unwrap()
+        .read(&cx, 4, 0, 8192)
+        .unwrap();
+    assert_eq!(
+        reopened
+            .zpl_snapshot(&cx, &destination, b"wire")
+            .unwrap()
+            .read(&cx, 4, 0, 8192)
+            .unwrap(),
+        expected
+    );
+    assert_pool_scrub_and_allocation_clean(
+        &cx,
+        &devices,
+        target.pool_guid,
+        Some(token.published_slot()),
+    );
+    // Native `-I` without property gathering can have a zero-length package
+    // nvlist. Keep that path, still bound to the outer source dataset.
+    let plain_destination = vec![b"data".to_vec(), b"without-properties".to_vec()];
+    receiver
+        .receive_stream(
+            &cx,
+            &ZfsRecvRequest::new(plain_destination.clone()),
+            &mut Cursor::new(native_compound_package(&[], &plain)),
+        )
+        .into_result()
+        .unwrap();
+    let mut reopened = receiver.open_read_objects(&cx).unwrap();
+    assert_eq!(
+        reopened
+            .zpl_snapshot(&cx, &plain_destination, b"wire")
+            .unwrap()
+            .read(&cx, 4, 0, 8192)
+            .unwrap(),
+        expected
+    );
 }
 
 #[test]
@@ -443,13 +784,32 @@ fn receive_feature_owners_survive_checkpoints_resume_abort_and_destruction() {
     send_stream(&cx, &mut source_mos, &request, &mut incremental).unwrap();
     request.large_blocks = false;
     let mut downconverted_incremental = Vec::new();
-    send_stream(
-        &cx,
-        &mut source_mos,
-        &request,
-        &mut downconverted_incremental,
-    )
-    .unwrap();
+    assert!(matches!(
+        send_stream(
+            &cx,
+            &mut source_mos,
+            &request,
+            &mut downconverted_incremental
+        ),
+        Err(FfsError::UnsupportedFeature(_))
+    ));
+    // The sender refuses unsupported splitting. A separately checksummed hostile
+    // stream still exercises receiver admission when the native flag is removed.
+    let downconverted_incremental =
+        restamp_substream(&incremental, false, |mut record, payload| {
+            if let DrrRecord::Begin(begin) = &mut record {
+                assert!(
+                    begin
+                        .features
+                        .contains(ffs_ondisk::zfs::send_stream::DMU_BACKUP_FEATURE_LARGE_BLOCKS)
+                );
+                begin.features = ffs_ondisk::zfs::send_stream::SendFeatureFlags::from_bits(
+                    begin.features.bits()
+                        & !ffs_ondisk::zfs::send_stream::DMU_BACKUP_FEATURE_LARGE_BLOCKS,
+                );
+            }
+            Some((record, payload))
+        });
 
     {
         let missing = b"org.open-zfs:large_blocks".as_slice();
@@ -864,6 +1224,921 @@ fn stream_with_object_checksum(stream: &[u8], object: u64, checksum: u8) -> Vec<
     output
 }
 
+fn checked_substream_records(stream: &[u8], raw: bool) -> Vec<(usize, DrrRecord, Vec<u8>)> {
+    let mut records = Vec::new();
+    let mut rolling = Fletcher4Stream::new(Endian::Little);
+    let mut offset = 0;
+    while offset < stream.len() {
+        let start = offset;
+        let header = stream[offset..offset + DMU_REPLAY_RECORD_BYTES]
+            .try_into()
+            .unwrap();
+        let (record, _) = DrrRecord::parse_header(header, Endian::Little).unwrap();
+        offset += DMU_REPLAY_RECORD_BYTES;
+        let length = record.expected_payload_len(raw).unwrap();
+        let payload = stream[offset..offset + length].to_vec();
+        offset += length;
+        rolling
+            .verify_record(header, &payload, record.record_type(), true)
+            .unwrap();
+        records.push((start, record, payload));
+    }
+    assert_eq!(offset, stream.len());
+    records
+}
+
+fn restamp_substream(
+    stream: &[u8],
+    raw: bool,
+    mut edit: impl FnMut(DrrRecord, Vec<u8>) -> Option<(DrrRecord, Vec<u8>)>,
+) -> Vec<u8> {
+    let mut output = Vec::new();
+    let mut rolling = Fletcher4Stream::new(Endian::Little);
+    for (_, record, payload) in checked_substream_records(stream, raw) {
+        let Some((record, payload)) = edit(record, payload) else {
+            continue;
+        };
+        assert_eq!(record.expected_payload_len(raw).unwrap(), payload.len());
+        let mut header = record.encode_header(Endian::Little).unwrap();
+        rolling
+            .stamp_record(&mut header, &payload, record.record_type())
+            .unwrap();
+        output.extend_from_slice(&header);
+        output.extend_from_slice(&payload);
+    }
+    // These adversarial streams retain correct per-record and final checksums.
+    // A checksum rejection must not accidentally stand in for payload checks.
+    checked_substream_records(&output, raw);
+    output
+}
+
+fn restamp_raw_keydata(
+    stream: &[u8],
+    mut edit: impl FnMut(&mut ffs_ondisk::zfs::nvlist::NvList),
+) -> Vec<u8> {
+    let mut changed = 0;
+    let output = restamp_substream(stream, true, |mut record, mut payload| {
+        if let DrrRecord::Begin(begin) = &mut record {
+            let mut keydata = ffs_ondisk::zfs::nvlist::NvList::parse_exact(&payload).unwrap();
+            edit(&mut keydata);
+            payload = keydata.encode_xdr().unwrap();
+            begin.payload_len = u32::try_from(payload.len()).unwrap();
+            changed += 1;
+        }
+        Some((record, payload))
+    });
+    assert_eq!(changed, 1);
+    output
+}
+
+fn raw_stream_keydata(stream: &[u8]) -> StreamCryptoKeydata {
+    let (_, record, payload) = checked_substream_records(stream, true)
+        .into_iter()
+        .next()
+        .unwrap();
+    assert!(matches!(record, DrrRecord::Begin(_)));
+    let envelope = ffs_ondisk::zfs::nvlist::NvList::parse_exact(&payload).unwrap();
+    assert_eq!(envelope.fields.len(), 1);
+    let keydata = envelope.list("crypt_keydata").unwrap();
+    for (name, length) in [
+        ("DSL_CRYPTO_IV", 12),
+        ("DSL_CRYPTO_MAC", 16),
+        ("DSL_CRYPTO_MASTER_KEY_1", 32),
+        ("DSL_CRYPTO_HMAC_KEY_1", 64),
+        ("portable_mac", 32),
+    ] {
+        let Some(ffs_ondisk::zfs::nvlist::Value::UnsignedBytes(bytes)) = keydata.fields.get(name)
+        else {
+            panic!("native raw header field {name} must use DATA_TYPE_UINT8_ARRAY (26)");
+        };
+        assert_eq!(bytes.len(), length, "native {name} length");
+    }
+    assert!(
+        keydata
+            .unsigned("to_ivset_guid")
+            .is_some_and(|value| value != 0)
+    );
+    assert!(keydata.unsigned("from_ivset_guid").is_some());
+    StreamCryptoKeydata::from_nvlist(&envelope).unwrap()
+}
+
+fn raw_dataset_objectset(
+    cx: &Cx,
+    mos: &mut ffs_zfs::Objects,
+    device: &FaultableMemberDevice,
+    dataset: &[Vec<u8>],
+    snapshot: Option<&[u8]>,
+) -> (BlockPointer, ObjectSet) {
+    let object = if let Some(snapshot) = snapshot {
+        mos.snapshots(cx, dataset)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.name == snapshot)
+            .unwrap()
+            .object
+    } else {
+        // Public dataset inventory intentionally hides incomplete receives.
+        // Inspect the native DSL path so checkpoints can be checked without
+        // making private staging visible through the filesystem namespace.
+        let mut directory = mos
+            .zap_values(cx, 1)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.name == b"root_dataset")
+            .unwrap()
+            .scalar()
+            .unwrap();
+        for component in dataset {
+            let node = mos.object(cx, directory).unwrap();
+            let children = node.order().u64(node.bonus(), 32).unwrap();
+            directory = mos
+                .zap_values(cx, children)
+                .unwrap()
+                .into_iter()
+                .find(|entry| entry.name == *component)
+                .unwrap()
+                .scalar()
+                .unwrap();
+        }
+        let node = mos.object(cx, directory).unwrap();
+        node.order().u64(node.bonus(), 8).unwrap()
+    };
+    let node = mos.object(cx, object).unwrap();
+    let pointer = BlockPointer::parse(&node.bonus()[128..256], node.order()).unwrap();
+    let media = device.durable_snapshot();
+    let offset = usize::try_from(DATA_OFFSET + pointer.data_dvas().unwrap()[0].offset).unwrap();
+    let raw = ffs_ondisk::zfs::decompress(
+        &media[offset..offset + pointer.physical_bytes()],
+        pointer.compression(),
+        pointer.logical_bytes(),
+    )
+    .unwrap();
+    let objectset = ObjectSet::parse(&raw, pointer.payload_order()).unwrap();
+    (pointer, objectset)
+}
+
+struct RecvDnodeReadFaultDevice {
+    member: FaultableMemberDevice,
+    fault: Arc<Mutex<Option<(u64, FfsError)>>>,
+}
+
+impl ByteDevice for RecvDnodeReadFaultDevice {
+    fn len_bytes(&self) -> u64 {
+        self.member.len_bytes()
+    }
+
+    fn read_exact_at(&self, cx: &Cx, offset: ByteOffset, buf: &mut [u8]) -> Result<()> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        let mut fault = self.fault.lock().unwrap();
+        if fault.as_ref().is_some_and(|(at, _)| *at == offset.0) {
+            return Err(fault.take().unwrap().1);
+        }
+        drop(fault);
+        self.member.read_exact_at(cx, offset, buf)
+    }
+
+    fn write_all_at(&self, cx: &Cx, offset: ByteOffset, buf: &[u8]) -> Result<()> {
+        self.member.write_all_at(cx, offset, buf)
+    }
+
+    fn sync(&self, cx: &Cx) -> Result<()> {
+        self.member.sync(cx)
+    }
+
+    fn begin_durability_commit(&self, cx: &Cx) -> Result<()> {
+        self.member.begin_durability_commit(cx)
+    }
+
+    fn complete_durability_commit(&self) {
+        self.member.complete_durability_commit();
+    }
+
+    fn abort_durability_commit(&self) {
+        self.member.abort_durability_commit();
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn assert_receive_dnode_read_failure_preserves_checkpoint(corruption: bool) {
+    use ffs_ondisk::zfs::send_stream::DrrFreeObjects;
+
+    let cx = Cx::for_testing();
+    let timestamp = Timestamp {
+        seconds: 1_730_000_709,
+        nanos: 0,
+    };
+    let source = vec![b"data".to_vec()];
+    let destination = vec![b"data".to_vec(), b"read_fault".to_vec()];
+    let built = build_clean_zfs_pool(&send_recv_pool_spec(32 * 1024 * 1024));
+    let source_devices: Vec<_> = built
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut sender = open_engine_on_devices(
+        &cx,
+        &source_devices,
+        default_write_opts(built.pool_guid, built.initial_slot),
+    )
+    .unwrap();
+    let before = vec![0x51; 4096];
+    let after = vec![0xA7; 4096];
+    sender
+        .write_file_data(
+            &cx,
+            &source,
+            4,
+            0,
+            &before,
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    sender
+        .create_snapshot(&cx, &source, b"base", timestamp)
+        .into_result()
+        .unwrap();
+    sender
+        .write_file_data(
+            &cx,
+            &source,
+            4,
+            0,
+            &after,
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    sender
+        .create_snapshot(&cx, &source, b"next", timestamp)
+        .into_result()
+        .unwrap();
+    let mut source_mos = sender.open_read_objects(&cx).unwrap();
+    let mut full = Vec::new();
+    send_stream(
+        &cx,
+        &mut source_mos,
+        &ZfsSendRequest::full(source.clone(), b"base".to_vec()),
+        &mut full,
+    )
+    .unwrap();
+    let mut send = ZfsSendRequest::full(source, b"next".to_vec());
+    send.from = Some(ZfsSendFrom::Snapshot(b"base".to_vec()));
+    let mut incremental = Vec::new();
+    send_stream(&cx, &mut source_mos, &send, &mut incremental).unwrap();
+
+    let target = build_clean_zfs_pool(&send_recv_pool_spec(32 * 1024 * 1024));
+    let baseline_devices: Vec<_> = target
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    assert_eq!(baseline_devices.len(), 1);
+    let mut baseline = open_engine_on_devices(
+        &cx,
+        &baseline_devices,
+        default_write_opts(target.pool_guid, target.initial_slot),
+    )
+    .unwrap();
+    baseline
+        .receive_stream(
+            &cx,
+            &ZfsRecvRequest::new(destination.clone()),
+            &mut Cursor::new(&full),
+        )
+        .into_result()
+        .unwrap();
+    let baseline_slot = baseline.committed_slot();
+    let baseline_media = snapshot_media_bytes(&baseline_devices);
+    let mut mos = baseline.open_read_objects(&cx).unwrap();
+    let (_, objectset) =
+        raw_dataset_objectset(&cx, &mut mos, &baseline_devices[0], &destination, None);
+    assert_eq!(objectset.meta.levels(), 1);
+    let table = &objectset.meta.pointers()[0];
+    let table_dvas = table.data_dvas().unwrap();
+    assert_eq!(table_dvas.len(), 1, "fault must exhaust all block copies");
+    let table_offset = DATA_OFFSET + table_dvas[0].offset;
+    let table_start = usize::try_from(table_offset).unwrap();
+    let table_bytes = ffs_ondisk::zfs::decompress(
+        &baseline_media[0][table_start..table_start + table.physical_bytes()],
+        table.compression(),
+        table.logical_bytes(),
+    )
+    .unwrap();
+    assert!(
+        ffs_ondisk::zfs_dmu::dnode_at(&table_bytes, 31, table.payload_order())
+            .unwrap()
+            .is_none()
+    );
+
+    for case in ["object", "write", "freeobjects"] {
+        // Each correctly checksummed probe reaches one lookup before any other
+        // record can cache or stage its dnode table. FREEOBJECTS names an absent
+        // slot: an unreadable table must not masquerade as an absent object.
+        let mut selected = false;
+        let probe = restamp_substream(&incremental, false, |record, payload| match record {
+            DrrRecord::Begin(_) | DrrRecord::End(_) => Some((record, payload)),
+            DrrRecord::Object(object) if object.object == 4 && case == "object" => {
+                selected = true;
+                Some((DrrRecord::Object(object), payload))
+            }
+            DrrRecord::Write(write) if write.object == 4 && case == "write" && !selected => {
+                selected = true;
+                Some((DrrRecord::Write(write), payload))
+            }
+            DrrRecord::Object(object) if object.object == 4 && case == "freeobjects" => {
+                selected = true;
+                Some((
+                    DrrRecord::FreeObjects(DrrFreeObjects {
+                        firstobj: 31,
+                        numobjs: 1,
+                        toguid: object.toguid,
+                    }),
+                    Vec::new(),
+                ))
+            }
+            _ => None,
+        });
+        assert!(selected, "{case}: source record missing");
+        assert_eq!(checked_substream_records(&probe, false).len(), 3);
+
+        let devices: Vec<_> = baseline_media
+            .iter()
+            .cloned()
+            .map(FaultableMemberDevice::new)
+            .collect();
+        let fault = Arc::new(Mutex::new(None));
+        let device = RecvDnodeReadFaultDevice {
+            member: devices[0].clone(),
+            fault: Arc::clone(&fault),
+        };
+        let mut receiver = ZfsTransactionEngine::from_devices(
+            &cx,
+            vec![Box::new(device)],
+            default_write_opts(target.pool_guid, baseline_slot),
+        )
+        .unwrap();
+        let checkpoint = Arc::new(Mutex::new(None));
+        let checkpoint_for_hook = Arc::clone(&checkpoint);
+        let fault_for_hook = Arc::clone(&fault);
+        let member_for_hook = devices[0].clone();
+        let diagnostic = "injected receive dnode read failure";
+        let mut error = Some(if corruption {
+            FfsError::Corruption {
+                block: table_offset,
+                detail: diagnostic.into(),
+            }
+        } else {
+            FfsError::Io(std::io::Error::other(diagnostic))
+        });
+        receiver.with_fault_hook(move |event| {
+            if event.operation == "recv_begin" && event.stage == ZfsPersistenceStage::AckPublished {
+                *checkpoint_for_hook.lock().unwrap() = Some((
+                    event.txg,
+                    member_for_hook.write_calls(),
+                    member_for_hook.durable_snapshot(),
+                ));
+                *fault_for_hook.lock().unwrap() = Some((table_offset, error.take().unwrap()));
+            }
+            Ok(())
+        });
+        let mut receive = ZfsRecvRequest::new(destination.clone());
+        receive.resumable = true;
+        match receiver.receive_stream(&cx, &receive, &mut Cursor::new(&probe)) {
+            ZfsTxOutcome::NotCommitted(error) => assert!(
+                error.to_string().contains(diagnostic),
+                "{case}: original metadata read error was replaced: {error}"
+            ),
+            outcome => panic!("{case}: unreadable dnode was accepted: {outcome:?}"),
+        }
+        assert!(fault.lock().unwrap().is_none(), "{case}: fault not reached");
+        let (checkpoint_txg, checkpoint_writes, checkpoint_media) =
+            checkpoint.lock().unwrap().take().unwrap();
+        assert_eq!(receiver.committed_txg(), checkpoint_txg, "{case}");
+        assert_eq!(devices[0].write_calls(), checkpoint_writes, "{case}");
+        assert_eq!(devices[0].durable_snapshot(), checkpoint_media, "{case}");
+
+        // Reopen only durable bytes: failed preparation must leave the original
+        // head and the zero-progress receive checkpoint usable and abortable.
+        let fresh_devices: Vec<_> = devices
+            .iter()
+            .map(FaultableMemberDevice::fresh_from_durable)
+            .collect();
+        let mut fresh = open_engine_on_devices(
+            &cx,
+            &fresh_devices,
+            default_write_opts(target.pool_guid, receiver.committed_slot()),
+        )
+        .unwrap();
+        let state = fresh
+            .inspect_receive_resume_state(&cx, &destination)
+            .unwrap()
+            .unwrap();
+        assert_eq!((state.object, state.offset, state.bytes), (0, 0, 0));
+        assert!(state.is_pct_recv_child);
+        let mut fresh_mos = fresh.open_read_objects(&cx).unwrap();
+        assert_eq!(
+            fresh_mos
+                .zpl(&cx, &destination)
+                .unwrap()
+                .read(&cx, 4, 0, before.len())
+                .unwrap(),
+            before
+        );
+        assert_eq!(fresh_mos.snapshots(&cx, &destination).unwrap().len(), 1);
+        fresh
+            .abort_receive(&cx, &destination)
+            .into_result()
+            .unwrap();
+        // Without a read error the absent FREEOBJECTS slot remains a legal
+        // no-op; the other cases retry the complete original incremental.
+        let recovery = if case == "freeobjects" {
+            &probe
+        } else {
+            &incremental
+        };
+        fresh
+            .receive_stream(&cx, &receive, &mut Cursor::new(recovery))
+            .into_result()
+            .unwrap();
+        let expected = if case == "freeobjects" {
+            &before
+        } else {
+            &after
+        };
+        let mut fresh_mos = fresh.open_read_objects(&cx).unwrap();
+        assert_eq!(
+            fresh_mos
+                .zpl(&cx, &destination)
+                .unwrap()
+                .read(&cx, 4, 0, expected.len())
+                .unwrap(),
+            *expected
+        );
+        assert!(
+            fresh_mos
+                .zpl(&cx, &destination)
+                .unwrap()
+                .scrub(&cx, ScrubLimits::default())
+                .unwrap()
+                .is_clean()
+        );
+        assert!(
+            fresh
+                .inspect_receive_resume_state(&cx, &destination)
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn incremental_receive_dnode_io_failure_preserves_checkpoint() {
+    assert_receive_dnode_read_failure_preserves_checkpoint(false);
+}
+
+#[test]
+fn incremental_receive_dnode_corruption_preserves_checkpoint() {
+    assert_receive_dnode_read_failure_preserves_checkpoint(true);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn malformed_plain_compressed_records_preserve_the_last_durable_checkpoint() {
+    use ffs_ondisk::zfs::send_stream::DrrWriteEmbedded;
+
+    let cx = Cx::for_testing();
+    let timestamp = Timestamp {
+        seconds: 1_730_000_710,
+        nanos: 0,
+    };
+    let source = vec![b"data".to_vec()];
+    let destination = vec![b"data".to_vec(), b"validated".to_vec()];
+    let spec = PoolFixtureSpec {
+        ashift: 9,
+        ..send_recv_pool_spec(32 * 1024 * 1024)
+    };
+    let built = build_clean_zfs_pool(&spec);
+    let source_devices: Vec<_> = built
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut sender = open_engine_on_devices(
+        &cx,
+        &source_devices,
+        default_write_opts(built.pool_guid, built.initial_slot),
+    )
+    .unwrap();
+    for (name, value) in [("recordsize", 4096), ("compression", 15)] {
+        sender
+            .set_property(&cx, &source, name, ZfsPropertySetValue::Number(value))
+            .into_result()
+            .unwrap();
+    }
+    let content = vec![0xA6; 3 * 4096];
+    sender
+        .write_file_data(
+            &cx,
+            &source,
+            4,
+            0,
+            &content,
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    sender
+        .create_snapshot(&cx, &source, b"validated", timestamp)
+        .into_result()
+        .unwrap();
+    let mut source_mos = sender.open_read_objects(&cx).unwrap();
+    let mut request = ZfsSendRequest::full(source.clone(), b"validated".to_vec());
+    request.compressed = true;
+    request.embedded = true;
+    let mut stream = Vec::new();
+    send_stream(&cx, &mut source_mos, &request, &mut stream).unwrap();
+    stream = restamp_substream(&stream, false, |mut record, payload| {
+        if let DrrRecord::Begin(begin) = &mut record {
+            begin.features = begin
+                .features
+                .with(ffs_ondisk::zfs::send_stream::DMU_BACKUP_FEATURE_ZSTD);
+        }
+        Some((record, payload))
+    });
+    let second_record = checked_substream_records(&stream, false).into_iter().find(|(_, record, _)| {
+        matches!(record, DrrRecord::Write(write) if write.object == 4 && write.offset == 4096)
+    }).unwrap().0;
+    let target = build_clean_zfs_pool(&spec);
+    let mut receive = ZfsRecvRequest::new(destination.clone());
+    receive.resumable = true;
+    receive.checkpoint_bytes = 1;
+    let baseline_devices: Vec<_> = target
+        .members
+        .iter()
+        .cloned()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut baseline = open_engine_on_devices(
+        &cx,
+        &baseline_devices,
+        default_write_opts(target.pool_guid, target.initial_slot),
+    )
+    .unwrap();
+    assert!(matches!(
+        baseline.receive_stream(&cx, &receive, &mut Cursor::new(&stream[..second_record])),
+        ZfsTxOutcome::NotCommitted(_)
+    ));
+    let expected_state = baseline
+        .inspect_receive_resume_state(&cx, &destination)
+        .unwrap()
+        .unwrap();
+    let expected_txg = baseline.committed_txg();
+    assert_eq!(expected_state.object, 4);
+    assert_eq!(expected_state.offset, 4096);
+    for case in 0..8 {
+        let mut changed = 0;
+        let malformed = restamp_substream(&stream, false, |mut record, mut payload| {
+            if let DrrRecord::Write(write) = &mut record
+                && write.object == 4
+                && write.offset == 4096
+            {
+                changed += 1;
+                match case {
+                    0..=2 => {
+                        write.compressiontype = [15, 5, 16][case];
+                        payload.fill(0);
+                        if case == 0 {
+                            payload[..4].copy_from_slice(&u32::MAX.to_be_bytes());
+                        }
+                    }
+                    3 => write.logical_size = 8192,
+                    4 => write.logical_size = ffs_ondisk::zfs::MAX_BLOCK_BYTES as u64 + 512,
+                    5 => write.offset = u64::MAX - 4095,
+                    6 | 7 => {
+                        let embedded = DrrWriteEmbedded {
+                            object: write.object,
+                            offset: write.offset,
+                            length: write.logical_size,
+                            toguid: write.toguid,
+                            compression: 15,
+                            etype: 0,
+                            lsize: if case == 6 { 4096 } else { 8192 },
+                            psize: 8,
+                        };
+                        payload = vec![0xFF; 8];
+                        record = DrrRecord::WriteEmbedded(embedded);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            if let DrrRecord::Begin(begin) = &mut record {
+                begin.features = begin
+                    .features
+                    .with(ffs_ondisk::zfs::send_stream::DMU_BACKUP_FEATURE_ZSTD);
+            }
+            Some((record, payload))
+        });
+        assert_eq!(changed, 1);
+        let devices: Vec<_> = target
+            .members
+            .iter()
+            .cloned()
+            .map(FaultableMemberDevice::new)
+            .collect();
+        let mut receiver = open_engine_on_devices(
+            &cx,
+            &devices,
+            default_write_opts(target.pool_guid, target.initial_slot),
+        )
+        .unwrap();
+        match receiver.receive_stream(&cx, &receive, &mut Cursor::new(&malformed)) {
+            ZfsTxOutcome::NotCommitted(error) => assert!(
+                !error.to_string().contains("Fletcher4"),
+                "case {case}: {error}"
+            ),
+            other => panic!("malformed compressed record {case} was accepted: {other:?}"),
+        }
+        assert_eq!(
+            receiver.committed_txg(),
+            expected_txg,
+            "case {case} advanced durability"
+        );
+        let state = receiver
+            .inspect_receive_resume_state(&cx, &destination)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state, expected_state,
+            "case {case} advanced resume position"
+        );
+        let slot = receiver.committed_slot();
+        drop(receiver);
+        let durable: Vec<_> = devices
+            .iter()
+            .map(FaultableMemberDevice::fresh_from_durable)
+            .collect();
+        let mut reopened =
+            open_engine_on_devices(&cx, &durable, default_write_opts(target.pool_guid, slot))
+                .unwrap();
+        assert_eq!(
+            reopened
+                .inspect_receive_resume_state(&cx, &destination)
+                .unwrap(),
+            Some(expected_state.clone())
+        );
+        if case % 2 == 0 {
+            let mut resume = ZfsSendRequest::full(source.clone(), Vec::new());
+            resume.resume_token = Some(state.token);
+            resume.compressed = true;
+            resume.embedded = true;
+            let mut remaining = Vec::new();
+            send_stream(&cx, &mut source_mos, &resume, &mut remaining).unwrap();
+            reopened
+                .receive_stream(&cx, &receive, &mut Cursor::new(remaining))
+                .into_result()
+                .unwrap();
+            let mut mos = reopened.open_read_objects(&cx).unwrap();
+            assert_eq!(
+                mos.zpl(&cx, &destination)
+                    .unwrap()
+                    .read(&cx, 4, 0, content.len())
+                    .unwrap(),
+                content
+            );
+        } else {
+            reopened
+                .abort_receive(&cx, &destination)
+                .into_result()
+                .unwrap();
+            assert!(
+                reopened
+                    .inspect_receive_resume_state(&cx, &destination)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                !reopened
+                    .open_read_objects(&cx)
+                    .unwrap()
+                    .datasets(&cx)
+                    .unwrap()
+                    .iter()
+                    .any(|row| row.components == destination)
+            );
+        }
+        assert_pool_scrub_and_allocation_clean(
+            &cx,
+            &durable,
+            target.pool_guid,
+            Some(reopened.committed_slot()),
+        );
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn compressed_send_exports_logical_metadata_and_native_untyped_sa_spills() {
+    let cx = Cx::for_testing();
+    let timestamp = Timestamp {
+        seconds: 1_730_000_711,
+        nanos: 0,
+    };
+    let source = vec![b"data".to_vec()];
+    let destination = vec![b"data".to_vec(), b"native-spill".to_vec()];
+    let spec = PoolFixtureSpec {
+        ashift: 9,
+        ..send_recv_pool_spec(32 * 1024 * 1024)
+    };
+    let built = build_clean_zfs_pool(&spec);
+    let source_devices: Vec<_> = built
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut sender = open_engine_on_devices(
+        &cx,
+        &source_devices,
+        default_write_opts(built.pool_guid, built.initial_slot),
+    )
+    .unwrap();
+    let xattr = vec![0x6A; 12 * 1024];
+    sender
+        .set_xattr(
+            &cx,
+            &source,
+            4,
+            "user.native-spill",
+            &xattr,
+            ZfsXattrSetMode::Create,
+            timestamp,
+        )
+        .into_result()
+        .unwrap();
+    sender
+        .rename_entry(
+            &cx,
+            &source,
+            2,
+            b"hello.txt",
+            2,
+            b"renamed",
+            Some(4),
+            timestamp,
+        )
+        .into_result()
+        .unwrap();
+    sender
+        .create_snapshot(&cx, &source, b"wire", timestamp)
+        .into_result()
+        .unwrap();
+    let node = native_zpl_file_dnode(&cx, &sender, &source_devices[0], &source, 4);
+    let spill = node.spill().unwrap();
+    assert_eq!(node.bonus_type(), 44);
+    assert_eq!(spill.compression(), 15);
+    assert!(spill.physical_bytes() < spill.logical_bytes());
+    let directory = native_zpl_file_dnode(&cx, &sender, &source_devices[0], &source, 2);
+    assert!(
+        native_plain_leaf_pointers(&source_devices[0], &directory)
+            .iter()
+            .any(|pointer| pointer.compression() == 15)
+    );
+    let source_media = source_devices[0].durable_snapshot();
+    let physical_offset =
+        usize::try_from(DATA_OFFSET + spill.regular_dvas().unwrap()[0].offset).unwrap();
+    let compressed_spill =
+        source_media[physical_offset..physical_offset + spill.physical_bytes()].to_vec();
+    let logical_spill =
+        ffs_ondisk::zfs::decompress(&compressed_spill, 15, spill.logical_bytes()).unwrap();
+    let mut source_mos = sender.open_read_objects(&cx).unwrap();
+    let mut request = ZfsSendRequest::full(source.clone(), b"wire".to_vec());
+    request.compressed = true;
+    let mut stream = Vec::new();
+    send_stream(&cx, &mut source_mos, &request, &mut stream).unwrap();
+    let mut saw_directory = false;
+    let mut saw_spill = false;
+    for (_, record, payload) in checked_substream_records(&stream, false) {
+        match record {
+            DrrRecord::Write(write) if write.object == 2 => {
+                saw_directory = true;
+                assert_eq!(write.compressiontype, 0);
+                assert_eq!(write.compressed_size, 0);
+                assert_eq!(payload.len() as u64, write.logical_size);
+            }
+            DrrRecord::Spill(record) if record.object == 4 => {
+                saw_spill = true;
+                assert_eq!(
+                    record.object_type, 0,
+                    "native DRR_SPILL leaves this field unused"
+                );
+                assert_eq!(
+                    record.compressiontype, 0,
+                    "-c does not compress nonraw spills"
+                );
+                assert_eq!(record.compressed_size, 0);
+                assert_eq!(record.salt, [0; 8]);
+                assert_eq!(record.iv, [0; 12]);
+                assert_eq!(record.mac, [0; 16]);
+                assert_eq!(payload, logical_spill);
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_directory && saw_spill);
+    let target = build_clean_zfs_pool(&spec);
+    let devices: Vec<_> = target
+        .members
+        .iter()
+        .cloned()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut receiver = open_engine_on_devices(
+        &cx,
+        &devices,
+        default_write_opts(target.pool_guid, target.initial_slot),
+    )
+    .unwrap();
+    receiver
+        .receive_stream(
+            &cx,
+            &ZfsRecvRequest::new(destination.clone()),
+            &mut Cursor::new(&stream),
+        )
+        .into_result()
+        .unwrap();
+    let slot = receiver.committed_slot();
+    drop(receiver);
+    let durable: Vec<_> = devices
+        .iter()
+        .map(FaultableMemberDevice::fresh_from_durable)
+        .collect();
+    let reopened =
+        open_engine_on_devices(&cx, &durable, default_write_opts(target.pool_guid, slot)).unwrap();
+    let mut mos = reopened.open_read_objects(&cx).unwrap();
+    let mut view = mos.zpl(&cx, &destination).unwrap();
+    assert_eq!(view.resolve(&cx, b"/renamed").unwrap(), 4);
+    assert_eq!(
+        view.getxattr(&cx, 4, "user.native-spill").unwrap(),
+        Some(xattr)
+    );
+    assert_eq!(
+        view.read(&cx, 4, 0, 4096).unwrap(),
+        built.snap_hello_expected
+    );
+    assert_pool_scrub_and_allocation_clean(&cx, &durable, target.pool_guid, Some(slot));
+
+    let mut changed = 0;
+    let malformed = restamp_substream(&stream, false, |mut record, mut payload| {
+        if let DrrRecord::Spill(spill) = &mut record
+            && spill.object == 4
+        {
+            changed += 1;
+            spill.compressiontype = 15;
+            spill.compressed_size = compressed_spill.len() as u64;
+            payload = compressed_spill.clone();
+        }
+        Some((record, payload))
+    });
+    assert_eq!(changed, 1);
+    let rejected_devices: Vec<_> = target
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut rejected = open_engine_on_devices(
+        &cx,
+        &rejected_devices,
+        default_write_opts(target.pool_guid, target.initial_slot),
+    )
+    .unwrap();
+    assert!(matches!(
+        rejected.receive_stream(
+            &cx,
+            &ZfsRecvRequest::new(destination.clone()),
+            &mut Cursor::new(malformed)
+        ),
+        ZfsTxOutcome::NotCommitted(_)
+    ));
+    assert!(
+        !rejected
+            .open_read_objects(&cx)
+            .unwrap()
+            .datasets(&cx)
+            .unwrap()
+            .iter()
+            .any(|row| row.components == destination)
+    );
+    assert_pool_scrub_and_allocation_clean(
+        &cx,
+        &rejected_devices,
+        target.pool_guid,
+        Some(rejected.committed_slot()),
+    );
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn receive_preserves_native_checksum_policy_across_incremental_updates_and_rewrites() {
@@ -963,6 +2238,24 @@ fn receive_preserves_native_checksum_policy_across_incremental_updates_and_rewri
     )
     .unwrap();
     let receive = ZfsRecvRequest::new(destination.clone());
+    let invalid_compression = restamp_substream(&full, false, |mut record, payload| {
+        if let DrrRecord::Object(node) = &mut record
+            && node.object == object
+        {
+            node.compress = 255;
+        }
+        Some((record, payload))
+    });
+    assert!(matches!(
+        receiver.receive_stream(&cx, &receive, &mut Cursor::new(invalid_compression)),
+        ZfsTxOutcome::NotCommitted(FfsError::Format(message)) if message.contains("compression selector")
+    ));
+    assert!(
+        receiver
+            .inspect_receive_resume_state(&cx, &destination)
+            .unwrap()
+            .is_none()
+    );
     for invalid_checksum in [9, 11, 255] {
         let invalid = stream_with_object_checksum(&full, object, invalid_checksum);
         assert!(matches!(
@@ -993,6 +2286,94 @@ fn receive_preserves_native_checksum_policy_across_incremental_updates_and_rewri
         .unwrap();
     let node = native_zpl_file_dnode(&cx, &receiver, &target_devices[0], &destination, object);
     assert_eq!(node.checksum_type(), 7);
+    // Incremental streams may omit DRR_OBJECT for an existing object. Validate
+    // writes against the actual staging dnode, not only objects seen on the wire.
+    let mut removed = 0;
+    let without_object = restamp_substream(&incremental, false, |record, payload| {
+        if matches!(&record, DrrRecord::Object(node) if node.object == object) {
+            removed += 1;
+            None
+        } else {
+            Some((record, payload))
+        }
+    });
+    assert_eq!(removed, 1);
+    let write_start = checked_substream_records(&without_object, false)
+        .into_iter()
+        .find(|(_, record, _)| matches!(record, DrrRecord::Write(write) if write.object == object))
+        .unwrap()
+        .0;
+    let mut resumable = ZfsRecvRequest::new(destination.clone());
+    resumable.resumable = true;
+    resumable.checkpoint_bytes = 1;
+    let control_txg = receiver.committed_txg();
+    assert!(matches!(
+        receiver.receive_stream(
+            &cx,
+            &resumable,
+            &mut Cursor::new(&without_object[..write_start])
+        ),
+        ZfsTxOutcome::NotCommitted(_)
+    ));
+    let expected_commits = receiver.committed_txg() - control_txg;
+    let expected_state = receiver
+        .inspect_receive_resume_state(&cx, &destination)
+        .unwrap()
+        .unwrap();
+    receiver
+        .abort_receive(&cx, &destination)
+        .into_result()
+        .unwrap();
+    for case in 0..3 {
+        let mut changed = 0;
+        let invalid = restamp_substream(&without_object, false, |mut record, mut payload| {
+            if let DrrRecord::Write(write) = &mut record
+                && write.object == object
+            {
+                changed += 1;
+                match case {
+                    0 => {
+                        write.logical_size /= 2;
+                        payload.truncate(usize::try_from(write.logical_size).unwrap());
+                    }
+                    1 => write.offset = 512,
+                    2 => write.object_type = 23,
+                    _ => unreachable!(),
+                }
+            }
+            Some((record, payload))
+        });
+        assert_eq!(changed, 1);
+        let before = receiver.committed_txg();
+        assert!(
+            matches!(
+                receiver.receive_stream(&cx, &resumable, &mut Cursor::new(invalid)),
+                ZfsTxOutcome::NotCommitted(_)
+            ),
+            "existing-object geometry case {case}"
+        );
+        assert_eq!(
+            receiver.committed_txg() - before,
+            expected_commits,
+            "invalid existing-object write reached a checkpoint"
+        );
+        assert_eq!(
+            receiver
+                .inspect_receive_resume_state(&cx, &destination)
+                .unwrap(),
+            Some(expected_state.clone())
+        );
+        let mut view = receiver
+            .open_read_objects(&cx)
+            .unwrap()
+            .zpl(&cx, &destination)
+            .unwrap();
+        assert_eq!(view.read(&cx, object, 0, initial.len()).unwrap(), initial);
+        receiver
+            .abort_receive(&cx, &destination)
+            .into_result()
+            .unwrap();
+    }
     receiver
         .receive_stream(&cx, &receive, &mut Cursor::new(&incremental))
         .into_result()
@@ -1071,7 +2452,7 @@ fn receive_preserves_native_checksum_policy_across_incremental_updates_and_rewri
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn zpl_full_incremental_bookmark_intermediary_properties_and_big_endian_roundtrip() {
+fn zpl_full_incremental_bookmark_intermediary_properties_and_foreign_order_refusal() {
     let cx = Cx::for_testing();
     let ts = Timestamp {
         seconds: 1_730_000_000,
@@ -1355,7 +2736,7 @@ fn zpl_full_incremental_bookmark_intermediary_properties_and_big_endian_roundtri
     expected_blob_s2[4096..4096 + blob_s2_patch.len()].copy_from_slice(blob_s2_patch);
 
     // 2. Emit full stream @s1 with -c -e -L -p, incremental bookmark stream #bm1 -> @s2,
-    //    intermediary compound stream -I @s1 @s3, and a big-endian full stream @s1.
+    //    intermediary compound stream -I @s1 @s3, and refuse unconverted foreign-order metadata.
     let mut src_mos = open_mos(
         &cx,
         &src_devs,
@@ -1393,8 +2774,10 @@ fn zpl_full_incremental_bookmark_intermediary_properties_and_big_endian_roundtri
     let mut be_full_bytes = Vec::new();
     let mut be_req = ZfsSendRequest::full(src_ds.clone(), b"s1".to_vec());
     be_req.stream_order = Endian::Big;
-    let be_report = send_stream(&cx, &mut src_mos, &be_req, &mut be_full_bytes).unwrap();
-    assert_eq!(be_report.to_guid, full_report.to_guid);
+    assert!(matches!(
+        send_stream(&cx, &mut src_mos, &be_req, &mut be_full_bytes),
+        Err(FfsError::UnsupportedFeature(_))
+    ));
 
     // 3. Build completely independent destination pool and receive full + bookmark-incremental!
     let dst_built = build_clean_zfs_pool(&send_recv_pool_spec(32 * 1024 * 1024));
@@ -1514,16 +2897,16 @@ fn zpl_full_incremental_bookmark_intermediary_properties_and_big_endian_roundtri
         assert_eq!(zpl_head.read(&cx, a2, 0, 32).unwrap(), b"created-in-s2");
     }
 
-    // 4. Receive big-endian full @s1 into `data/dst_inter` then `-I @s1 @s3` intermediary compound!
+    // 4. Receive native-order full @s1 into `data/dst_inter` then `-I @s1 @s3` intermediary compound.
     let dst_inter = vec![b"data".to_vec(), b"dst_inter".to_vec()];
     dst_engine
         .receive_stream(
             &cx,
             &ZfsRecvRequest::new(dst_inter.clone()),
-            &mut Cursor::new(&be_full_bytes),
+            &mut Cursor::new(&full_s1_bytes),
         )
         .into_result()
-        .expect("receive big-endian full @s1");
+        .expect("receive native-order full @s1");
     let (rec_inter, tok_inter) = dst_engine
         .receive_stream(
             &cx,
@@ -1722,7 +3105,7 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
     };
     let wrapping_key = ZfsKeyMaterial::Raw([0x3C_u8; 32]);
 
-    // 1. Source encrypted dataset with two snapshots @e1 and @e2.
+    // 1. Source encrypted dataset with data snapshots and an unchanged @e3-empty.
     let src_built = build_clean_zfs_pool(&send_recv_pool_spec(32 * 1024 * 1024));
     let src_devs: Vec<_> = src_built
         .members
@@ -1806,6 +3189,54 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
         )
         .into_result()
         .unwrap();
+    let secret_xattr = vec![0xD8; 12 * 1024];
+    src_engine
+        .set_xattr(
+            &cx,
+            &vault_src,
+            sec_obj,
+            "user.raw-spill",
+            &secret_xattr,
+            ZfsXattrSetMode::Create,
+            ts,
+        )
+        .into_result()
+        .unwrap();
+
+    // Grow beyond the three direct metadata leaves, then free every upper
+    // object. The source retains its two-level metadata tree and high-water
+    // mark even though only table zero remains allocated. Raw receive must
+    // reproduce that authenticated shape rather than infer it from OBJECTs.
+    for index in 0..96 {
+        let name = format!("meta-shape-{index:03}");
+        src_engine
+            .create_file(
+                &cx,
+                &vault_src,
+                root_obj,
+                name.as_bytes(),
+                0o600,
+                0,
+                0,
+                ts,
+                ZfsDataChecksum::Inherit,
+            )
+            .into_result()
+            .unwrap();
+    }
+    for index in 0..96 {
+        let name = format!("meta-shape-{index:03}");
+        src_engine
+            .unlink_entry(&cx, &vault_src, root_obj, name.as_bytes(), false, ts)
+            .into_result()
+            .unwrap();
+    }
+    assert_pool_scrub_and_allocation_clean(
+        &cx,
+        &src_devs,
+        src_built.pool_guid,
+        Some(src_engine.committed_slot()),
+    );
     src_engine
         .create_snapshot(&cx, &vault_src, b"e1", ts)
         .into_result()
@@ -1841,6 +3272,10 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
         .create_snapshot(&cx, &vault_src, b"e2", ts)
         .into_result()
         .unwrap();
+    src_engine
+        .create_snapshot(&cx, &vault_src, b"e3-empty", ts)
+        .into_result()
+        .unwrap();
 
     // 2. Open FRESH KEYLESS reader on source (`key_status == Unavailable`) and emit raw `-w` streams!
     let mut keyless_src_mos = open_mos(
@@ -1854,12 +3289,73 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
         ZfsKeyStatus::Unavailable
     );
 
+    let (_, source_e1) = raw_dataset_objectset(
+        &cx,
+        &mut keyless_src_mos,
+        &src_devs[0],
+        &vault_src,
+        Some(b"e1"),
+    );
+    assert!(source_e1.meta.levels() >= 2);
+    assert!(source_e1.meta.max_block() >= 3);
+    assert!(
+        source_e1.meta.pointers()[1..]
+            .iter()
+            .all(BlockPointer::hole)
+    );
+    let meta_indirect = &source_e1.meta.pointers()[0];
+    assert_eq!(meta_indirect.level(), 1);
+    let allocated_meta_leaves: Vec<_> = {
+        let source_media = src_devs[0].durable_snapshot();
+        let meta_offset =
+            usize::try_from(DATA_OFFSET + meta_indirect.data_dvas().unwrap()[0].offset).unwrap();
+        let meta_payload = ffs_ondisk::zfs::decompress(
+            &source_media[meta_offset..meta_offset + meta_indirect.physical_bytes()],
+            meta_indirect.compression(),
+            meta_indirect.logical_bytes(),
+        )
+        .unwrap();
+        meta_payload
+            .chunks_exact(128)
+            .enumerate()
+            .filter_map(|(block, bytes)| {
+                let pointer = BlockPointer::parse(bytes, meta_indirect.payload_order()).unwrap();
+                (!pointer.hole()).then_some(block)
+            })
+            .collect()
+    };
+    assert_eq!(
+        allocated_meta_leaves,
+        vec![0],
+        "source must retain sparse overheight with no allocated upper metadata leaves"
+    );
     let mut raw_e1 = Vec::new();
     let mut req_e1 = ZfsSendRequest::full(vault_src.clone(), b"e1".to_vec());
     req_e1.raw = true;
     req_e1.large_blocks = true;
     let report_e1 = send_stream(&cx, &mut keyless_src_mos, &req_e1, &mut raw_e1).unwrap();
     assert!(report_e1.raw);
+    let keydata_e1 = raw_stream_keydata(&raw_e1);
+    assert_eq!(
+        keydata_e1.meta_dnode,
+        StreamMetaDnode::from_dnode(&source_e1.meta).unwrap()
+    );
+    assert_eq!(keydata_e1.portable_mac, source_e1.portable_mac().unwrap());
+    let mut raw_spills = 0;
+    for (_, record, _) in checked_substream_records(&raw_e1, true) {
+        if let DrrRecord::Spill(spill) = record
+            && spill.object == sec_obj
+        {
+            assert_eq!(
+                spill.object_type, 0,
+                "native raw SPILL also leaves its type field unused"
+            );
+            assert_eq!(spill.compressiontype, 15);
+            assert!(spill.compressed_size < spill.length);
+            raw_spills += 1;
+        }
+    }
+    assert_eq!(raw_spills, 1);
 
     let mut raw_e2 = Vec::new();
     let mut req_e2 = ZfsSendRequest::full(vault_src.clone(), b"e2".to_vec());
@@ -1868,6 +3364,34 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
     req_e2.large_blocks = true;
     let report_e2 = send_stream(&cx, &mut keyless_src_mos, &req_e2, &mut raw_e2).unwrap();
     assert!(report_e2.raw && report_e2.from_guid == report_e1.to_guid);
+    let keydata_e2 = raw_stream_keydata(&raw_e2);
+    let (_, source_e2) = raw_dataset_objectset(
+        &cx,
+        &mut keyless_src_mos,
+        &src_devs[0],
+        &vault_src,
+        Some(b"e2"),
+    );
+    assert_eq!(
+        keydata_e2.meta_dnode,
+        StreamMetaDnode::from_dnode(&source_e2.meta).unwrap()
+    );
+    assert_eq!(keydata_e2.from_ivset_guid, Some(keydata_e1.to_ivset_guid));
+    let mut req_e3 = ZfsSendRequest::full(vault_src.clone(), b"e3-empty".to_vec());
+    req_e3.from = Some(ZfsSendFrom::Snapshot(b"e2".to_vec()));
+    req_e3.raw = true;
+    let mut raw_e3 = Vec::new();
+    send_stream(&cx, &mut keyless_src_mos, &req_e3, &mut raw_e3).unwrap();
+    let records_e3 = checked_substream_records(&raw_e3, true);
+    assert_eq!(
+        records_e3.len(),
+        2,
+        "unchanged snapshot must emit only BEGIN and END"
+    );
+    assert!(matches!(records_e3[1].1, DrrRecord::End(_)));
+    let keydata_e3 = raw_stream_keydata(&raw_e3);
+    assert_eq!(keydata_e3.meta_dnode, keydata_e2.meta_dnode);
+    assert_eq!(keydata_e3.from_ivset_guid, Some(keydata_e2.to_ivset_guid));
 
     // Raw compressed WRITE records retain the source BP algorithm and logical
     // geometry. Refuse either missing feature without publishing the dataset.
@@ -1921,7 +3445,7 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
         );
     }
 
-    // 3. Receive BOTH raw encrypted streams on a fresh KEYLESS destination pool!
+    // 3. Receive the raw encrypted streams on a fresh KEYLESS destination pool.
     let dst_built = build_clean_zfs_pool(&send_recv_pool_spec(32 * 1024 * 1024));
     let dst_devs: Vec<_> = dst_built
         .members
@@ -1939,6 +3463,107 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
     let mut receive = ZfsRecvRequest::new(vault_dst.clone());
     receive.resumable = true;
     receive.checkpoint_bytes = 1;
+    let before_missing_keydata = snapshot_media_bytes(&dst_devs);
+    let missing_keydata = restamp_substream(&raw_e1, true, |mut record, mut payload| {
+        if let DrrRecord::Begin(begin) = &mut record {
+            begin.payload_len = 0;
+            payload.clear();
+        }
+        Some((record, payload))
+    });
+    assert!(matches!(
+        dst_engine.receive_stream(&cx, &receive, &mut Cursor::new(missing_keydata)),
+        ZfsTxOutcome::NotCommitted(_)
+    ));
+    assert_media_unchanged(&dst_devs, &before_missing_keydata);
+    assert!(
+        dst_engine
+            .inspect_receive_resume_state(&cx, &vault_dst)
+            .unwrap()
+            .is_none()
+    );
+    for (field, value) in [
+        ("mdn_nlevels", None),
+        ("mdn_blksz", Some(8192)),
+        ("mdn_nlevels", Some(8)),
+        ("to_ivset_guid", Some(0)),
+    ] {
+        let invalid = restamp_raw_keydata(&raw_e1, |envelope| {
+            use ffs_ondisk::zfs::nvlist::Value;
+            let Some(Value::List(keydata)) = envelope.fields.get_mut("crypt_keydata") else {
+                panic!("missing source keydata")
+            };
+            if let Some(value) = value {
+                keydata
+                    .fields
+                    .insert(field.to_owned(), Value::Unsigned(value));
+            } else {
+                assert!(keydata.fields.remove(field).is_some());
+            }
+        });
+        let before = snapshot_media_bytes(&dst_devs);
+        assert!(
+            matches!(
+                dst_engine.receive_stream(&cx, &receive, &mut Cursor::new(invalid)),
+                ZfsTxOutcome::NotCommitted(_)
+            ),
+            "invalid raw field {field}={value:?}"
+        );
+        assert_media_unchanged(&dst_devs, &before);
+        assert!(
+            dst_engine
+                .inspect_receive_resume_state(&cx, &vault_dst)
+                .unwrap()
+                .is_none()
+        );
+    }
+    for malformed_range in 0..3 {
+        let mut changed = false;
+        let malformed = restamp_substream(&raw_e1, true, |mut record, payload| {
+            if let DrrRecord::ObjectRange(range) = &mut record
+                && !changed
+            {
+                match malformed_range {
+                    0 => range.firstobj = 1,
+                    1 => range.numslots = u64::MAX,
+                    2 => range.flags ^= ffs_ondisk::zfs::send_stream::DRR_RAW_BYTESWAP,
+                    _ => unreachable!(),
+                }
+                changed = true;
+            }
+            Some((record, payload))
+        });
+        assert!(changed);
+        assert!(matches!(
+            dst_engine.receive_stream(
+                &cx,
+                &ZfsRecvRequest::new(vault_dst.clone()),
+                &mut Cursor::new(malformed)
+            ),
+            ZfsTxOutcome::NotCommitted(_)
+        ));
+        assert!(
+            dst_engine
+                .inspect_receive_resume_state(&cx, &vault_dst)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !dst_engine
+                .open_read_objects(&cx)
+                .unwrap()
+                .datasets(&cx)
+                .unwrap()
+                .iter()
+                .any(|row| row.components == vault_dst)
+        );
+        assert_pool_scrub_and_allocation_clean(
+            &cx,
+            &dst_devs,
+            dst_built.pool_guid,
+            Some(dst_engine.committed_slot()),
+        );
+    }
     assert!(matches!(
         dst_engine.receive_stream(
             &cx,
@@ -1948,22 +3573,150 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
         ZfsTxOutcome::NotCommitted(_)
     ));
     assert_eq!(&dsl_block_feature_counts(&cx, &dst_engine)[..2], &[1, 1]);
+    let mut checkpoint_mos = dst_engine.open_read_objects(&cx).unwrap();
+    let (_, checkpoint_os) =
+        raw_dataset_objectset(&cx, &mut checkpoint_mos, &dst_devs[0], &vault_dst, None);
+    assert_eq!(
+        StreamMetaDnode::from_dnode(&checkpoint_os.meta).unwrap(),
+        keydata_e1.meta_dnode
+    );
     let state = dst_engine
         .inspect_receive_resume_state(&cx, &vault_dst)
         .unwrap()
         .expect("raw feature-bearing checkpoint");
     let mut resume = ZfsSendRequest::full(vault_src.clone(), Vec::new());
-    resume.resume_token = Some(state.token);
+    resume.resume_token = Some(state.token.clone());
     resume.raw = true;
     resume.large_blocks = true;
     let mut resumed_e1 = Vec::new();
     send_stream(&cx, &mut keyless_src_mos, &resume, &mut resumed_e1).unwrap();
+    assert_eq!(
+        raw_stream_keydata(&resumed_e1).meta_dnode,
+        keydata_e1.meta_dnode
+    );
+    let changed_resume_geometry = restamp_raw_keydata(&resumed_e1, |envelope| {
+        use ffs_ondisk::zfs::nvlist::Value;
+        let Some(Value::List(keydata)) = envelope.fields.get_mut("crypt_keydata") else {
+            panic!("missing source keydata")
+        };
+        keydata.fields.insert(
+            "mdn_nlevels".to_owned(),
+            Value::Unsigned(u64::from(keydata_e1.meta_dnode.levels) + 1),
+        );
+    });
+    let before_geometry = snapshot_media_bytes(&dst_devs);
+    assert!(matches!(
+        dst_engine.receive_stream(&cx, &receive, &mut Cursor::new(changed_resume_geometry)),
+        ZfsTxOutcome::NotCommitted(_)
+    ));
+    assert_media_unchanged(&dst_devs, &before_geometry);
+    let downgraded = restamp_substream(&resumed_e1, true, |mut record, payload| {
+        if let DrrRecord::Begin(begin) = &mut record {
+            begin.features = ffs_ondisk::zfs::send_stream::SendFeatureFlags::from_bits(
+                begin.features.bits() & !ffs_ondisk::zfs::send_stream::DMU_BACKUP_FEATURE_RAW,
+            );
+        }
+        Some((record, payload))
+    });
+    let checkpoint_media = snapshot_media_bytes(&dst_devs);
+    assert!(matches!(
+        dst_engine.receive_stream(&cx, &receive, &mut Cursor::new(downgraded)),
+        ZfsTxOutcome::NotCommitted(_)
+    ));
+    assert_media_unchanged(&dst_devs, &checkpoint_media);
+    assert_eq!(
+        dst_engine
+            .inspect_receive_resume_state(&cx, &vault_dst)
+            .unwrap(),
+        Some(state)
+    );
     let (r_e1, _) = dst_engine
         .receive_stream(&cx, &receive, &mut Cursor::new(&resumed_e1))
         .into_result()
         .expect("keyless raw recv @e1");
     assert!(r_e1.raw && r_e1.final_snapshot == "e1");
     assert_eq!(&dsl_block_feature_counts(&cx, &dst_engine)[..2], &[2, 2]);
+    let mut full_mos = dst_engine.open_read_objects(&cx).unwrap();
+    let (_, full_os) = raw_dataset_objectset(&cx, &mut full_mos, &dst_devs[0], &vault_dst, None);
+    assert_eq!(
+        StreamMetaDnode::from_dnode(&full_os.meta).unwrap(),
+        keydata_e1.meta_dnode
+    );
+
+    for case in 0..5 {
+        let invalid = restamp_raw_keydata(&raw_e2, |envelope| {
+            use ffs_ondisk::zfs::nvlist::Value;
+            let Some(Value::List(keydata)) = envelope.fields.get_mut("crypt_keydata") else {
+                panic!("missing source keydata")
+            };
+            match case {
+                0 => {
+                    let guid = keydata.unsigned("DSL_CRYPTO_GUID").unwrap();
+                    keydata
+                        .fields
+                        .insert("DSL_CRYPTO_GUID".to_owned(), Value::Unsigned(guid ^ 1));
+                }
+                1 => {
+                    assert!(keydata.fields.remove("from_ivset_guid").is_some());
+                }
+                2 => {
+                    keydata
+                        .fields
+                        .insert("from_ivset_guid".to_owned(), Value::Unsigned(0));
+                }
+                3 => {
+                    let ivset = keydata.unsigned("from_ivset_guid").unwrap();
+                    keydata
+                        .fields
+                        .insert("from_ivset_guid".to_owned(), Value::Unsigned(ivset ^ 1));
+                }
+                4 => {
+                    keydata
+                        .fields
+                        .insert("mdn_indblkshift".to_owned(), Value::Unsigned(16));
+                }
+                _ => unreachable!(),
+            }
+        });
+        let before = snapshot_media_bytes(&dst_devs);
+        assert!(
+            matches!(
+                dst_engine.receive_stream(
+                    &cx,
+                    &ZfsRecvRequest::new(vault_dst.clone()),
+                    &mut Cursor::new(invalid)
+                ),
+                ZfsTxOutcome::NotCommitted(_)
+            ),
+            "raw identity case {case}"
+        );
+        assert_media_unchanged(&dst_devs, &before);
+    }
+    let mut plain_source = src_engine.open_read_objects(&cx).unwrap();
+    plain_source
+        .load_key(&cx, &vault_src, &wrapping_key)
+        .unwrap();
+    let mut plain_request = ZfsSendRequest::full(vault_src.clone(), b"e2".to_vec());
+    plain_request.from = Some(ZfsSendFrom::Snapshot(b"e1".to_vec()));
+    plain_request.large_blocks = true;
+    let mut plain_incremental = Vec::new();
+    send_stream(
+        &cx,
+        &mut plain_source,
+        &plain_request,
+        &mut plain_incremental,
+    )
+    .unwrap();
+    let before_plain = snapshot_media_bytes(&dst_devs);
+    assert!(matches!(
+        dst_engine.receive_stream(
+            &cx,
+            &ZfsRecvRequest::new(vault_dst.clone()),
+            &mut Cursor::new(plain_incremental)
+        ),
+        ZfsTxOutcome::NotCommitted(_)
+    ));
+    assert_media_unchanged(&dst_devs, &before_plain);
 
     let (r_e2, tok_e2) = dst_engine
         .receive_stream(
@@ -1975,9 +3728,58 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
         .expect("keyless raw incremental recv @e2");
     assert!(r_e2.raw && r_e2.final_snapshot == "e2");
     assert_eq!(&dsl_block_feature_counts(&cx, &dst_engine)[..2], &[3, 3]);
+    let mut before_empty_mos =
+        open_mos(&cx, &dst_devs, dst_built.pool_guid, tok_e2.published_slot());
+    let (before_empty_root, before_empty_os) =
+        raw_dataset_objectset(&cx, &mut before_empty_mos, &dst_devs[0], &vault_dst, None);
+    assert_eq!(
+        StreamMetaDnode::from_dnode(&before_empty_os.meta).unwrap(),
+        keydata_e2.meta_dnode
+    );
+    let (empty_report, tok_e3) = dst_engine
+        .receive_stream(
+            &cx,
+            &ZfsRecvRequest::new(vault_dst.clone()),
+            &mut Cursor::new(&raw_e3),
+        )
+        .into_result()
+        .unwrap();
+    assert_eq!(empty_report.final_snapshot, "e3-empty");
+    let mut after_empty_mos = dst_engine.open_read_objects(&cx).unwrap();
+    let (after_empty_root, after_empty_os) =
+        raw_dataset_objectset(&cx, &mut after_empty_mos, &dst_devs[0], &vault_dst, None);
+    assert!(
+        after_empty_root.birth() > before_empty_root.birth(),
+        "even an empty raw stream must publish its ObjectSet authentication metadata"
+    );
+    assert_eq!(
+        StreamMetaDnode::from_dnode(&after_empty_os.meta).unwrap(),
+        keydata_e3.meta_dnode
+    );
+    assert_eq!(after_empty_os.portable_mac(), Some(keydata_e3.portable_mac));
+    assert_eq!(after_empty_os.local_mac(), Some([0; 32]));
+    assert_eq!(after_empty_os.flags & 1, 0);
+    assert_eq!(&dsl_block_feature_counts(&cx, &dst_engine)[..2], &[4, 4]);
 
     // 4. Verify locked behavior, keyless scrub, and exact keyed decryption + MAC verification!
-    let mut dst_mos = open_mos(&cx, &dst_devs, dst_built.pool_guid, tok_e2.published_slot());
+    let fresh_dst: Vec<_> = dst_devs
+        .iter()
+        .map(FaultableMemberDevice::fresh_from_durable)
+        .collect();
+    let mut dst_mos = open_mos(
+        &cx,
+        &fresh_dst,
+        dst_built.pool_guid,
+        tok_e3.published_slot(),
+    );
+    let (_, reopened_os) =
+        raw_dataset_objectset(&cx, &mut dst_mos, &fresh_dst[0], &vault_dst, None);
+    assert_eq!(
+        StreamMetaDnode::from_dnode(&reopened_os.meta).unwrap(),
+        keydata_e3.meta_dnode
+    );
+    assert_eq!(reopened_os.portable_mac(), Some(keydata_e3.portable_mac));
+    assert_eq!(reopened_os.local_mac(), Some([0; 32]));
     assert_eq!(
         dst_mos.key_status(&cx, &vault_dst).unwrap(),
         ZfsKeyStatus::Unavailable
@@ -1999,6 +3801,14 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
     assert_eq!(
         dst_mos.key_status(&cx, &vault_dst).unwrap(),
         ZfsKeyStatus::Available
+    );
+    assert_eq!(
+        dst_mos
+            .zpl(&cx, &vault_dst)
+            .unwrap()
+            .getxattr(&cx, sec_obj, "user.raw-spill")
+            .unwrap(),
+        Some(secret_xattr)
     );
     {
         let ds_row = dst_mos
@@ -2047,7 +3857,7 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
         &cx,
         &dst_devs,
         dst_built.pool_guid,
-        Some(tok_e2.published_slot()),
+        Some(tok_e3.published_slot()),
     );
 }
 
