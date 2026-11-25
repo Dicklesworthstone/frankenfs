@@ -1481,7 +1481,7 @@ impl FsOps for ZfsFs {
         }
         state.reap_closed_orphan(cx, request.ino)?;
         if request.flush {
-            state.sync(cx)?;
+            return state.sync(cx);
         }
         checkpoint(cx)
     }

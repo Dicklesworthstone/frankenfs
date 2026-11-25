@@ -3147,6 +3147,438 @@ fn late_cancellation_preserves_durable_create_reply_and_open_handle() {
     assert_pool_scrub_and_allocation_clean(&next, &devices, POOL_GUID, None);
 }
 
+struct CancelAfterMemberSync {
+    device: FaultableMemberDevice,
+    cancel_after_sync: Arc<AtomicBool>,
+}
+
+impl ByteDevice for CancelAfterMemberSync {
+    fn len_bytes(&self) -> u64 {
+        self.device.len_bytes()
+    }
+
+    fn read_exact_at(&self, cx: &Cx, offset: ByteOffset, bytes: &mut [u8]) -> Result<()> {
+        self.device.read_exact_at(cx, offset, bytes)
+    }
+
+    fn write_all_at(&self, cx: &Cx, offset: ByteOffset, bytes: &[u8]) -> Result<()> {
+        self.device.write_all_at(cx, offset, bytes)
+    }
+
+    fn sync(&self, cx: &Cx) -> Result<()> {
+        let outcome = self.device.sync(cx);
+        if self.cancel_after_sync.swap(false, Ordering::SeqCst) {
+            cx.cancel_with(
+                asupersync::types::CancelKind::User,
+                Some("member sync returned before cancellation"),
+            );
+        }
+        outcome
+    }
+
+    fn begin_durability_commit(&self, cx: &Cx) -> Result<()> {
+        self.device.begin_durability_commit(cx)
+    }
+
+    fn complete_durability_commit(&self) {
+        self.device.complete_durability_commit();
+    }
+
+    fn abort_durability_commit(&self) {
+        self.device.abort_durability_commit();
+    }
+}
+
+fn sync_cancellation_fixture(
+    cx: &Cx,
+) -> (
+    ZfsTransactionEngine,
+    Vec<FaultableMemberDevice>,
+    Vec<Arc<AtomicBool>>,
+) {
+    let built = build_clean_zfs_pool(&PoolFixtureSpec {
+        mirror_width: 2,
+        ..PoolFixtureSpec::default()
+    });
+    let devices: Vec<_> = built
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let controls: Vec<_> = devices
+        .iter()
+        .map(|_| Arc::new(AtomicBool::new(false)))
+        .collect();
+    let members = devices
+        .iter()
+        .cloned()
+        .zip(controls.iter().cloned())
+        .map(|(device, cancel_after_sync)| {
+            Box::new(CancelAfterMemberSync {
+                device,
+                cancel_after_sync,
+            }) as Box<dyn ByteDevice>
+        })
+        .collect();
+    let engine = ZfsTransactionEngine::from_devices(
+        cx,
+        members,
+        default_write_opts(built.pool_guid, built.initial_slot),
+    )
+    .unwrap();
+    (engine, devices, controls)
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn mounted_sync_preserves_success_after_final_member_cancellation() {
+    for operation in ["fsync", "fsyncdir", "sync_fs", "periodic", "destroy", "release"] {
+        let cx = Cx::for_testing();
+        let request = Cx::for_testing();
+        let (engine, devices, controls) = sync_cancellation_fixture(&cx);
+        let fs = ZfsFs::with_writer(&cx, engine, vec![b"data".to_vec()]).unwrap();
+        let mut scope = RequestScope::empty();
+        let file = create(&fs, &cx, ROOT, "synced");
+        fs.write(&cx, &mut scope, file.ino, 0, b"already durable")
+            .unwrap();
+        let token = fs.last_durable_token().unwrap().unwrap();
+        let (handle, _) = fs.open(&cx, &mut scope, file.ino, libc::O_RDWR).unwrap();
+        let before = io_counts(&devices);
+        controls[1].store(true, Ordering::SeqCst);
+        let result = match operation {
+            "fsync" => fs.fsync(&request, &mut scope, file.ino, handle, false),
+            "fsyncdir" => fs.fsyncdir(&request, &mut scope, ROOT, 0, false),
+            "sync_fs" => fs.sync_fs(&request, &mut scope),
+            "periodic" => fs
+                .periodic_commit(&request)
+                .map(|committed| assert!(committed)),
+            "destroy" => fs.flush_on_destroy(&request),
+            "release" => fs.release(
+                &request,
+                &mut scope,
+                ReleaseRequest {
+                    ino: file.ino,
+                    fh: handle,
+                    flags: libc::O_RDWR,
+                    lock_owner: None,
+                    flush: true,
+                },
+            ),
+            _ => unreachable!(),
+        };
+        assert!(result.is_ok(), "{operation}: {result:?}");
+        assert!(request.checkpoint().is_err());
+        assert!(!controls[1].load(Ordering::SeqCst));
+        let expected: Vec<_> = before
+            .iter()
+            .map(|&(writes, syncs)| (writes, syncs + 1))
+            .collect();
+        assert_eq!(io_counts(&devices), expected, "{operation}");
+        assert_eq!(fs.last_durable_token().unwrap().unwrap(), token);
+        assert_eq!(read(&fs, &cx, file.ino), b"already durable");
+
+        // Success must not consume cancellation or authorize another operation.
+        assert!(matches!(
+            fs.sync_fs(&request, &mut scope),
+            Err(FfsError::Cancelled)
+        ));
+        assert_eq!(io_counts(&devices), expected);
+        if operation == "release" {
+            assert_eq!(
+                fs.release(
+                    &cx,
+                    &mut scope,
+                    ReleaseRequest {
+                        ino: file.ino,
+                        fh: handle,
+                        flags: libc::O_RDWR,
+                        lock_owner: None,
+                        flush: false,
+                    },
+                )
+                .unwrap_err()
+                .to_errno(),
+                libc::EBADF
+            );
+        } else {
+            release(&fs, &cx, file.ino, handle);
+        }
+        fs.fsync(&cx, &mut scope, file.ino, 0, false).unwrap();
+        assert_eq!(fs.last_durable_token().unwrap().unwrap(), token);
+
+        let fresh: Vec<_> = devices
+            .iter()
+            .map(FaultableMemberDevice::fresh_from_durable)
+            .collect();
+        let reopened = open_engine_on_devices(
+            &cx,
+            &fresh,
+            default_write_opts(POOL_GUID, token.published_slot()),
+        )
+        .unwrap();
+        let mut objects = reopened.open_read_objects(&cx).unwrap();
+        let mut view = objects.zpl(&cx, &[b"data".to_vec()]).unwrap();
+        let object = view.resolve(&cx, b"/synced").unwrap();
+        assert_eq!(view.read(&cx, object, 0, 64).unwrap(), b"already durable");
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn mounted_sync_refuses_cancelled_or_incomplete_barriers_and_preserves_io_errors() {
+    for scenario in ["before", "between", "failed"] {
+        let cx = Cx::for_testing();
+        let request = Cx::for_testing();
+        let (engine, devices, controls) = sync_cancellation_fixture(&cx);
+        let fs = ZfsFs::with_writer(&cx, engine, vec![b"data".to_vec()]).unwrap();
+        let mut scope = RequestScope::empty();
+        let file = create(&fs, &cx, ROOT, "synced");
+        fs.write(&cx, &mut scope, file.ino, 0, b"prior native commit")
+            .unwrap();
+        let token = fs.last_durable_token().unwrap().unwrap();
+        let before = io_counts(&devices);
+        match scenario {
+            "before" => {
+                request.cancel_with(
+                    asupersync::types::CancelKind::User,
+                    Some("before synchronization"),
+                );
+            }
+            "between" => controls[0].store(true, Ordering::SeqCst),
+            "failed" => {
+                devices[1].set_fault(DeviceFault::FailSyncOnCall {
+                    sync_index: before[1].1,
+                });
+                controls[1].store(true, Ordering::SeqCst);
+            }
+            _ => unreachable!(),
+        }
+        let error = fs
+            .fsync(&request, &mut scope, file.ino, 0, false)
+            .unwrap_err();
+        if scenario == "failed" {
+            assert_eq!(error.to_errno(), libc::EIO);
+        } else {
+            assert!(matches!(error, FfsError::Cancelled));
+        }
+        assert!(request.checkpoint().is_err());
+        let mut expected = before.clone();
+        if scenario != "before" {
+            expected[0].1 += 1;
+        }
+        if scenario == "failed" {
+            expected[1].1 += 1;
+        }
+        assert_eq!(io_counts(&devices), expected, "{scenario}");
+        assert_eq!(fs.last_durable_token().unwrap().unwrap(), token);
+        assert!(controls.iter().all(|flag| !flag.load(Ordering::SeqCst)));
+
+        // RELEASE always consumes its real lifetime pin, including a cancelled
+        // no-flush request. Each case uses a different handle, never a retry of
+        // an already released handle for a successful flush.
+        for flush in [false, true] {
+            let (handle, _) = fs.open(&cx, &mut scope, file.ino, libc::O_RDWR).unwrap();
+            let release_request = ReleaseRequest {
+                ino: file.ino,
+                fh: handle,
+                flags: libc::O_RDWR,
+                lock_owner: None,
+                flush,
+            };
+            assert!(matches!(
+                fs.release(&request, &mut scope, release_request),
+                Err(FfsError::Cancelled)
+            ));
+            assert_eq!(
+                fs.release(&cx, &mut scope, release_request)
+                    .unwrap_err()
+                    .to_errno(),
+                libc::EBADF
+            );
+            assert_eq!(io_counts(&devices), expected);
+        }
+
+        // These are extra barriers after a known native commit, not uncertain
+        // TXG publication. Preserve the existing retryable error policy.
+        devices[1].set_fault(DeviceFault::None);
+        fs.fsync(&cx, &mut scope, file.ino, 0, false).unwrap();
+        for member in &mut expected {
+            member.1 += 1;
+        }
+        assert_eq!(io_counts(&devices), expected);
+        assert_eq!(fs.last_durable_token().unwrap().unwrap(), token);
+        assert_eq!(read(&fs, &cx, file.ino), b"prior native commit");
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn native_final_barrier_cancellation_preserves_only_fully_committed_outcomes() {
+    for scenario in ["complete", "incomplete", "failed"] {
+        let cx = Cx::for_testing();
+        let request = Cx::for_testing();
+        let (mut engine, devices, controls) = sync_cancellation_fixture(&cx);
+        let member = usize::from(scenario != "incomplete");
+        let cancel_after_sync = Arc::clone(&controls[member]);
+        let failed_device = devices[member].clone();
+        let tripped = Arc::new(AtomicBool::new(false));
+        let hook_tripped = Arc::clone(&tripped);
+        engine.with_fault_hook(move |event| {
+            if event.stage
+                == (ZfsPersistenceStage::UberblockBarrier {
+                    member_index: member,
+                    wave: 2,
+                })
+            {
+                assert!(!hook_tripped.swap(true, Ordering::SeqCst));
+                if scenario == "failed" {
+                    let sync_index = failed_device.state.lock().unwrap().sync_calls;
+                    failed_device.set_fault(DeviceFault::FailSyncOnCall { sync_index });
+                }
+                cancel_after_sync.store(true, Ordering::SeqCst);
+            }
+            Ok(())
+        });
+        let outcome = engine.create_file(
+            &request,
+            &[b"data".to_vec()],
+            2,
+            b"committed-at-barrier",
+            0o600,
+            0,
+            0,
+            Timestamp {
+                seconds: 1_715_000_000,
+                nanos: 0,
+            },
+            ZfsDataChecksum::Inherit,
+        );
+        assert!(tripped.load(Ordering::SeqCst), "{scenario}");
+        assert!(!controls[member].load(Ordering::SeqCst), "{scenario}");
+        assert!(request.checkpoint().is_err());
+        match outcome {
+            ZfsTxOutcome::Committed { value, token } if scenario == "complete" => {
+                assert_eq!(token.committed_txg(), INITIAL_TXG + 1);
+                assert_eq!(engine.committed_txg(), token.committed_txg());
+                assert!(!engine.requires_recovery());
+                engine.verify_token(&token).unwrap();
+                let fresh: Vec<_> = devices
+                    .iter()
+                    .map(FaultableMemberDevice::fresh_from_durable)
+                    .collect();
+                let reopened = open_engine_on_devices(
+                    &cx,
+                    &fresh,
+                    default_write_opts(POOL_GUID, token.published_slot()),
+                )
+                .unwrap();
+                let mut objects = reopened.open_read_objects(&cx).unwrap();
+                let mut view = objects.zpl(&cx, &[b"data".to_vec()]).unwrap();
+                let object = view.resolve(&cx, b"/committed-at-barrier").unwrap();
+                assert_eq!(object, value);
+                assert!(view.read(&cx, object, 0, 1).unwrap().is_empty());
+                assert_pool_scrub_and_allocation_clean(
+                    &cx,
+                    &fresh,
+                    POOL_GUID,
+                    Some(token.published_slot()),
+                );
+                // The durable-byte reopen above precedes any additional sync.
+                // A fresh caller can then use the still-healthy native owner.
+                engine.sync_devices(&cx).unwrap();
+            }
+            ZfsTxOutcome::Uncertain {
+                reason, target_txg, ..
+            } if scenario != "complete" => {
+                if scenario == "failed" {
+                    assert_eq!(reason.to_errno(), libc::EIO);
+                } else {
+                    assert!(matches!(reason, FfsError::Cancelled));
+                }
+                assert_eq!(target_txg, INITIAL_TXG + 1);
+                assert_eq!(engine.committed_txg(), INITIAL_TXG);
+                assert!(engine.requires_recovery());
+                let before = io_counts(&devices);
+                assert!(engine.sync_devices(&cx).is_err());
+                assert_eq!(io_counts(&devices), before);
+            }
+            other => panic!("{scenario}: unexpected native outcome {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn cancellation_after_staged_root_sync_does_not_begin_uberblock_publication() {
+    let cx = Cx::for_testing();
+    let request = Cx::for_testing();
+    let (mut engine, devices, controls) = sync_cancellation_fixture(&cx);
+    let original_slot = engine.committed_slot();
+    let mut original = engine.open_read_objects(&cx).unwrap();
+    let mut original_view = original.zpl(&cx, &[b"data".to_vec()]).unwrap();
+    let original_file = original_view.resolve(&cx, b"/hello.txt").unwrap();
+    let expected = original_view.read(&cx, original_file, 0, 65_536).unwrap();
+    let cancel_after_sync = Arc::clone(&controls[1]);
+    let tripped = Arc::new(AtomicBool::new(false));
+    let hook_tripped = Arc::clone(&tripped);
+    engine.with_fault_hook(move |event| {
+        if event.stage == (ZfsPersistenceStage::MosRootBarrier { member_index: 1 }) {
+            assert!(!hook_tripped.swap(true, Ordering::SeqCst));
+            cancel_after_sync.store(true, Ordering::SeqCst);
+        }
+        Ok(())
+    });
+    let outcome = engine.create_file(
+        &request,
+        &[b"data".to_vec()],
+        2,
+        b"not-published",
+        0o600,
+        0,
+        0,
+        Timestamp {
+            seconds: 1_715_000_000,
+            nanos: 0,
+        },
+        ZfsDataChecksum::Inherit,
+    );
+    assert!(
+        matches!(outcome, ZfsTxOutcome::NotCommitted(FfsError::Cancelled)),
+        "staged-only cancellation changed the native outcome: {outcome:?}"
+    );
+    assert!(tripped.load(Ordering::SeqCst));
+    assert!(!controls[1].load(Ordering::SeqCst));
+    assert!(request.checkpoint().is_err());
+    assert_eq!(engine.committed_txg(), INITIAL_TXG);
+    assert_eq!(engine.committed_slot(), original_slot);
+    assert!(!engine.requires_recovery());
+    assert!(!engine.persistence_events().iter().any(|event| matches!(
+        event.stage,
+        ZfsPersistenceStage::UberblockWrite { .. }
+            | ZfsPersistenceStage::UberblockBarrier { .. }
+            | ZfsPersistenceStage::BeforeAcknowledge
+            | ZfsPersistenceStage::AckPublished
+    )));
+    let fresh: Vec<_> = devices
+        .iter()
+        .map(FaultableMemberDevice::fresh_from_durable)
+        .collect();
+    let reopened = open_engine_on_devices(
+        &cx,
+        &fresh,
+        default_write_opts(POOL_GUID, original_slot),
+    )
+    .unwrap();
+    let mut objects = reopened.open_read_objects(&cx).unwrap();
+    let mut view = objects.zpl(&cx, &[b"data".to_vec()]).unwrap();
+    assert!(matches!(
+        view.resolve(&cx, b"/not-published"),
+        Err(FfsError::NotFound(_))
+    ));
+    let object = view.resolve(&cx, b"/hello.txt").unwrap();
+    assert_eq!(view.read(&cx, object, 0, 65_536).unwrap(), expected);
+    assert_pool_scrub_and_allocation_clean(&cx, &fresh, POOL_GUID, Some(original_slot));
+}
+
 #[test]
 fn fsync_propagates_member_flush_failures_after_a_known_commit_and_can_retry() {
     let cx = Cx::for_testing();

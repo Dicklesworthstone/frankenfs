@@ -2614,6 +2614,12 @@ impl ZfsTransactionEngine {
             }
         }
 
+        // Cancellation after staged barriers still precedes native root publication.
+        // Preserve NotCommitted while no uberblock has been touched.
+        if let Err(err) = checkpoint(cx) {
+            return ZfsTxOutcome::NotCommitted(err);
+        }
+
         // 3. Synchronized 2-wave 4-label Uberblock publication (`L0..L1` -> sync -> `L2..L3` -> sync).
         // Errors after starting a write and before all publication barriers succeed
         // are `Uncertain`. After the final barrier, the commit is known durable.

@@ -4007,3 +4007,28 @@ unavailable. The direct GitHub commit records the emergency gate bypass. This
 bounded correction does not address sparse-range traversal, finite FREE edge
 zeroing, receive-begin target lookup error handling, or native interchange
 qualification, and does not close the broad receive/ZFS feature beads.
+
+## ZFS completed device barriers and native publication outcomes
+
+Successful synchronization now retains its actual result through the writable
+image, leaf, mounted state and release-with-flush paths. Each next member/write
+still checks cancellation before starting. A cancellation after the final
+successful Uberblock barrier therefore preserves a committed TXG, while genuine
+publication errors and incomplete mirror barriers still require recovery.
+An explicit check before Uberblock publication preserves `NotCommitted` when
+cancellation is already pending after the staged data/metadata barriers.
+Additional filesystem sync errors retain their existing retryable policy.
+
+Four authored regressions cover six mounted synchronization entry points,
+pre-cancelled admission and release cleanup, cancellation between mirror
+members, real EIO combined with cancellation, and native publication outcomes.
+The successful native final-barrier case reopens durable bytes before any
+additional synchronization; the pre-publication control requires no Uberblock
+write and a usable predecessor view.
+
+Qualification remains **source review only**. No final formatting, compiler,
+strict Clippy or runtime pass is claimed; the execution environment remains
+unavailable and the commit records the gate bypass. Faultable-device tests
+provide deterministic cancellation placement but do not establish an executed
+race inside `std::fs::File::sync_all`, mounted FUSE behavior or native OpenZFS
+interchange qualification.

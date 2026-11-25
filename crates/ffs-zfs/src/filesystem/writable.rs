@@ -823,7 +823,9 @@ impl State {
 
     pub(super) fn sync(&self, cx: &Cx) -> Result<()> {
         if let Some(writer) = &self.writer {
-            writer.engine.sync_devices(cx)?;
+            // The engine checks cancellation before each member. Once every
+            // barrier succeeds, preserve that result without a reply checkpoint.
+            return writer.engine.sync_devices(cx);
         }
         checkpoint(cx)
     }
