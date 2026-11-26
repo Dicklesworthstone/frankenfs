@@ -665,7 +665,7 @@ pub fn rewrite_inline_data(inode: &mut Ext4Inode, value: Option<&[u8]>) -> Resul
         if *value_inum == 0 && !entry.value.is_empty() {
             let raw = &inode.xattr_ibody[record.clone()];
             let start = usize::from(u16::from_le_bytes([raw[2], raw[3]])) + INLINE_HEADER_LEN;
-            if start < offset + 4 || start % 4 != 0 {
+            if start < offset + 4 || !start.is_multiple_of(4) {
                 return Err(corrupt("inode-body value overlaps entries or is unaligned"));
             }
         }
