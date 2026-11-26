@@ -944,91 +944,143 @@ fn file_capability_xattr_update(
         _ => return Err(unsupported("unsupported ZPL bonus representation")),
     }
     .map_err(|error| parse_err(&error))?;
-    if source.directory != 0 {
-        // Validate the entire committed ownership graph before staging either
-        // store. Aliases and extra hard links cannot authorize freeing a value.
-        let mut private = private_xattr_ownership(
-            cx,
-            view,
-            meta,
-            ceiling,
-            dirty,
-            context.sa_registry.as_ref(),
-            context.root_dir,
-            file_obj,
-            source.directory,
-            order,
-        )?;
-        let mut entries = view.zap_values(cx, source.directory)?;
-        if entries.len().saturating_add(source.inline.len()) > XATTR_COUNT {
-            return Err(unsupported("xattr catalog exceeds 4096 native names"));
-        }
-        if let Some(position) = entries
-            .iter()
-            .position(|entry| entry.name == b"security.capability")
-        {
-            let (directory, dir_loaded) = private
-                .pop()
-                .ok_or_else(|| corrupt("missing validated private xattr directory"))?;
-            let reference = entries
-                .remove(position)
-                .scalar()
-                .map_err(|error| parse_err(&error))?;
-            let (value_object, _) =
-                directory_reference(reference).map_err(|error| parse_err(&error))?;
-            let (_, value) = private
-                .into_iter()
-                .find(|(object, _)| *object == value_object)
-                .ok_or_else(|| {
-                    corrupt("capability value is outside its validated private graph")
-                })?;
-            let mut metadata = dir_loaded.metadata.clone();
-            metadata.size = entries.len() as u64 + 2;
-            metadata.times[1] = timestamp;
-            metadata.times[2] = timestamp;
-            // Keep the directory attached, including when it becomes empty.
-            // Final unlink reclaims it through the same native ownership path.
-            let node = flush_dir_node(
-                cx,
-                view,
-                alloc,
-                directory,
-                &dir_loaded,
-                &metadata,
-                &entries,
-                context.sa_registry.as_ref(),
-                acct_flags,
-                order,
-                new_txg,
-                context.compression,
-                context.write_crypto.as_mut(),
-                staged_writes,
-                born,
-                retired,
-                quota_deltas,
-            )?;
-            put_dnode_in_table(cx, view, meta, ceiling, dirty, directory, &node)?;
-            // Charge this object's actual owners and retain historical blocks
-            // through the dataset deadlist, exactly like final-link retirement.
-            retire_zpl_object(
-                cx,
-                view,
-                meta,
-                ceiling,
-                dirty,
-                value_object,
-                &value,
-                order,
-                retired,
-                quota_deltas,
-            )?;
-        }
-    }
+    remove_directory_xattrs(
+        cx,
+        view,
+        context,
+        meta,
+        ceiling,
+        dirty,
+        file_obj,
+        source.directory,
+        source.inline.len(),
+        &[b"security.capability"],
+        timestamp,
+        alloc,
+        acct_flags,
+        order,
+        new_txg,
+        staged_writes,
+        born,
+        retired,
+        quota_deltas,
+    )?;
     Ok(source
         .inline
         .remove("security.capability")
         .is_some()
         .then_some(source.inline))
+}
+
+/// Retire every selected native name, including compatibility aliases, in the
+/// same TXG as the owner's SA update. A shadow in either store must not reappear
+/// after replacement/removal, and shared or malformed private objects cannot
+/// authorize reclamation.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn remove_directory_xattrs(
+    cx: &Cx,
+    view: &mut Objects,
+    context: &mut DatasetContext,
+    meta: &Dnode,
+    ceiling: u64,
+    dirty: &mut BTreeMap<u64, Vec<u8>>,
+    owner: u64,
+    directory: u64,
+    inline_count: usize,
+    names: &[&[u8]],
+    timestamp: Timestamp,
+    alloc: &mut PoolSpaceAllocator,
+    acct_flags: u8,
+    order: Endian,
+    new_txg: u64,
+    staged_writes: &mut Vec<StagedBlockWrite>,
+    born: &mut SpaceDelta,
+    retired: &mut Vec<BlockPointer>,
+    quota_deltas: &mut Vec<QuotaDelta>,
+) -> Result<()> {
+    if directory == 0 {
+        return Ok(());
+    }
+    let mut private = private_xattr_ownership(
+        cx,
+        view,
+        meta,
+        ceiling,
+        dirty,
+        context.sa_registry.as_ref(),
+        context.root_dir,
+        owner,
+        directory,
+        order,
+    )?;
+    let mut entries = view.zap_values(cx, directory)?;
+    if entries.len().saturating_add(inline_count) > XATTR_COUNT {
+        return Err(unsupported("xattr catalog exceeds 4096 native names"));
+    }
+    let removed: Vec<_> = entries
+        .iter()
+        .filter(|entry| names.contains(&entry.name.as_slice()))
+        .map(|entry| {
+            let reference = entry.scalar().map_err(|error| parse_err(&error))?;
+            directory_reference(reference)
+                .map(|(object, _)| object)
+                .map_err(|error| parse_err(&error))
+        })
+        .collect::<Result<_>>()?;
+    if removed.is_empty() {
+        return Ok(());
+    }
+    entries.retain(|entry| !names.contains(&entry.name.as_slice()));
+    let (_, dir_loaded) = private
+        .pop()
+        .ok_or_else(|| corrupt("missing validated private xattr directory"))?;
+    let mut private: BTreeMap<_, _> = private.into_iter().collect();
+    let mut metadata = dir_loaded.metadata.clone();
+    metadata.size = entries.len() as u64 + 2;
+    metadata.times[1] = timestamp;
+    metadata.times[2] = timestamp;
+    // Keep the directory attached, including when empty. Final unlink reclaims
+    // it through the same validated native ownership path.
+    let node = flush_dir_node(
+        cx,
+        view,
+        alloc,
+        directory,
+        &dir_loaded,
+        &metadata,
+        &entries,
+        context.sa_registry.as_ref(),
+        acct_flags,
+        order,
+        new_txg,
+        context.compression,
+        context.write_crypto.as_mut(),
+        staged_writes,
+        born,
+        retired,
+        quota_deltas,
+    )?;
+    put_dnode_in_table(cx, view, meta, ceiling, dirty, directory, &node)?;
+    for object in removed {
+        let value = private
+            .remove(&object)
+            .ok_or_else(|| corrupt("xattr value is outside its validated private graph"))?;
+        // Debit the value's actual owners; snapshots keep historical blocks
+        // through the dataset deadlist rather than losing their private data.
+        retire_zpl_object(
+            cx,
+            view,
+            meta,
+            ceiling,
+            dirty,
+            object,
+            &value,
+            order,
+            retired,
+            quota_deltas,
+        )?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4365,19 +4417,21 @@ fn stage_sa_xattr_mutation(
         .and_then(|attrs| attrs.xattrs())
         .map_err(|e| parse_err(&e))?;
 
-    if xattr_dir != 0 {
-        let dir_entries = os_view.zap_values(cx, xattr_dir)?;
-        if dir_entries
-            .iter()
-            .any(|e| e.name == name.as_bytes() || e.name == suffix.as_bytes())
-        {
-            return Err(unsupported(
-                "mutating legacy directory-backed xattr entries on an SA object is unavailable",
-            ));
-        }
+    let directory_entries = if xattr_dir == 0 {
+        Vec::new()
+    } else {
+        os_view.zap_values(cx, xattr_dir)?
+    };
+    let inline_count = inline.len();
+    if directory_entries.len().saturating_add(inline_count) > XATTR_COUNT {
+        return Err(unsupported("xattr catalog exceeds 4096 native names"));
     }
-
-    let existed = inline.contains_key(name) || inline.contains_key(suffix);
+    let directory_matches = directory_entries
+        .iter()
+        .filter(|entry| entry.name == name.as_bytes() || entry.name == suffix.as_bytes())
+        .count();
+    let existed =
+        inline.contains_key(name) || inline.contains_key(suffix) || directory_matches != 0;
     if let Some((val, mode)) = set_op {
         match mode {
             ZfsXattrSetMode::Create if existed => return Err(FfsError::Exists),
@@ -4391,19 +4445,46 @@ fn stage_sa_xattr_mutation(
         }
         inline.remove(suffix);
         inline.insert(name.to_owned(), val.to_vec());
-        if inline.len() > XATTR_COUNT {
+        if inline.len() + directory_entries.len() - directory_matches > XATTR_COUNT {
             return Err(FfsError::NoSpace);
         }
     } else {
         let removed_prefixed = inline.remove(name).is_some();
         let removed_compat = inline.remove(suffix).is_some();
-        if !removed_prefixed && !removed_compat {
+        if !removed_prefixed && !removed_compat && directory_matches == 0 {
             return Err(FfsError::RequestRejected {
                 errno: libc::ENODATA,
                 detail: "ZPL user xattr not found".into(),
             });
         }
     }
+
+    // The public user namespace gives SA entries priority over directory
+    // fallbacks, including unprefixed compatibility names. Publish one new SA
+    // value (or no value) and retire every old private alias in the same TXG;
+    // a later SA removal must never reveal stale native bytes.
+    let acct_flags = objectset_user_accounting_flags(&ds_ctx.os, order)?;
+    remove_directory_xattrs(
+        cx,
+        os_view,
+        ds_ctx,
+        zpl_meta_base,
+        zpl_ceiling,
+        zpl_dirty_dnodes,
+        target_obj,
+        xattr_dir,
+        inline_count,
+        &[name.as_bytes(), suffix.as_bytes()],
+        timestamp,
+        alloc,
+        acct_flags,
+        order,
+        new_txg,
+        staged_writes,
+        zpl_born,
+        zpl_retired,
+        quota_deltas,
+    )?;
 
     let mut new_meta = loaded.metadata.clone();
     new_meta.times[2] = timestamp;

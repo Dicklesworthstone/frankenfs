@@ -4947,3 +4947,418 @@ fn private_xattr_root_aliases_refuse_killpriv_and_reclamation_before_writes() {
         }
     }
 }
+
+#[test]
+fn sa_xattr_migration_retires_native_aliases_and_accounts_for_their_actual_owners() {
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    let timestamp = Timestamp {
+        seconds: 1_715_000_980,
+        nanos: 73,
+    };
+    for (first_name, second_name, shadow) in [
+        (b"user.retained".as_slice(), None, false),
+        (b"retained".as_slice(), None, false),
+        (
+            b"retained".as_slice(),
+            Some(b"user.retained".as_slice()),
+            true,
+        ),
+    ] {
+        for remove in [false, true] {
+            let mut inline = BTreeMap::from([("user.keep".to_owned(), b"untouched".to_vec())]);
+            if shadow {
+                inline.insert("user.retained".to_owned(), b"SA preferred".to_vec());
+                inline.insert("retained".to_owned(), b"SA fallback".to_vec());
+            }
+            let (mut engine, devices) = writer_fixture(
+                &cx,
+                &PoolFixtureSpec {
+                    mirror_width: 2,
+                    ashift: 12,
+                    project_accounting: true,
+                    additional_write_features: vec![(b"org.zfsonlinux:project_quota", 1)],
+                    deadlist_mode: DeadlistMode::NativeDeadlist,
+                    auxiliary_ownership: Some((4, AuxiliaryOwnership::XattrDirectory)),
+                    auxiliary_xattr_owner_ids: Some((2001, 3001)),
+                    auxiliary_xattr_names: Some((first_name, second_name)),
+                    hello_sa_xattrs: inline,
+                    ..PoolFixtureSpec::default()
+                },
+            );
+            let before = native_accounting_snapshot(&cx, &engine, &devices[0]).1;
+            let original_node = native_zpl_file_dnode(&cx, &engine, &devices[0], &dataset, 4);
+            let retired_objects = if second_name.is_some() { 2 } else { 1 };
+            let retired_bytes: u64 = (14..14 + retired_objects)
+                .map(|object| {
+                    native_zpl_file_dnode(&cx, &engine, &devices[0], &dataset, object).used_bytes()
+                        + DNODE_BYTES as u64
+                })
+                .sum();
+            let replacement = vec![0x6B; 3000];
+            let outcome = if remove {
+                engine.remove_xattr(&cx, &dataset, 4, "user.retained", timestamp)
+            } else {
+                engine.set_xattr(
+                    &cx,
+                    &dataset,
+                    4,
+                    "user.retained",
+                    &replacement,
+                    ffs_zfs::ZfsXattrSetMode::Replace,
+                    timestamp,
+                )
+            };
+            let (_, token) = outcome.into_result().unwrap();
+            assert_eq!(token.committed_txg(), INITIAL_TXG + 1);
+            let after = native_accounting_snapshot(&cx, &engine, &devices[0]).1;
+            for (index, owner) in [(0, b"7d1".as_slice()), (1, b"bb9".as_slice())] {
+                let count_key = [b"obj-".as_slice(), owner].concat();
+                assert_eq!(
+                    after[index].get(owner).copied().unwrap_or(0),
+                    before[index][owner] - retired_bytes,
+                );
+                assert_eq!(
+                    after[index].get(&count_key).copied().unwrap_or(0),
+                    before[index][&count_key] - retired_objects,
+                );
+            }
+            assert_eq!(
+                after[2][b"obj-0".as_slice()],
+                before[2][b"obj-0".as_slice()] - retired_objects,
+            );
+            drop(engine);
+            let fresh: Vec<_> = devices
+                .iter()
+                .map(FaultableMemberDevice::fresh_from_durable)
+                .collect();
+            let mut reopened = open_engine_on_devices(
+                &cx,
+                &fresh,
+                default_write_opts(POOL_GUID, token.published_slot()),
+            )
+            .unwrap();
+            let owner = native_zpl_file_dnode(&cx, &reopened, &fresh[0], &dataset, 4);
+            assert_eq!(owner.pointers(), original_node.pointers());
+            let directory = native_zpl_file_dnode(&cx, &reopened, &fresh[0], &dataset, 13);
+            let metadata = Metadata::legacy(directory.bonus(), directory.order()).unwrap();
+            assert_eq!((metadata.parent, metadata.links, metadata.size), (4, 2, 2));
+            assert_eq!(metadata.times[1], timestamp);
+            let mut head = file_range_head(&cx, &reopened);
+            assert_eq!(
+                head.getxattr(&cx, 4, "user.retained").unwrap(),
+                (!remove).then_some(replacement),
+            );
+            assert_eq!(
+                head.getxattr(&cx, 4, "user.keep").unwrap(),
+                Some(b"untouched".to_vec()),
+            );
+            assert_eq!(head.read(&cx, 4, 0, 8192).unwrap(), b"SNAPDATA".repeat(512));
+            assert_eq!(head.stat(&cx, 4).unwrap().0.times[2], timestamp);
+            for object in 14..14 + retired_objects {
+                assert!(
+                    native_zpl_file_slot(&cx, &reopened, &fresh[0], &dataset, object).is_none()
+                );
+            }
+            let mut snapshot = head.open_snapshot(&cx, b"before").unwrap();
+            assert_eq!(
+                snapshot.getxattr(&cx, 4, "user.retained").unwrap(),
+                Some(if shadow {
+                    b"SA preferred".to_vec()
+                } else {
+                    b"private value survives namespace changes".to_vec()
+                }),
+            );
+            // Removing the migrated SA value cannot reveal a stale directory alias.
+            if !remove {
+                reopened
+                    .remove_xattr(&cx, &dataset, 4, "user.retained", timestamp)
+                    .into_result()
+                    .unwrap();
+                let mut head = file_range_head(&cx, &reopened);
+                assert_eq!(head.getxattr(&cx, 4, "user.retained").unwrap(), None);
+                assert_eq!(head.listxattr(&cx, 4).unwrap(), ["user.keep"]);
+            }
+            assert_pool_scrub_and_allocation_clean(&cx, &fresh, POOL_GUID, None);
+        }
+    }
+}
+
+#[test]
+fn sa_xattr_migration_fsops_preserves_unrelated_private_values_and_native_errors() {
+    use ffs_core::XattrSetMode;
+
+    let cx = Cx::for_testing();
+    let (engine, devices) = writer_fixture(
+        &cx,
+        &PoolFixtureSpec {
+            deadlist_mode: DeadlistMode::NativeDeadlist,
+            auxiliary_ownership: Some((4, AuxiliaryOwnership::CapabilityXattr)),
+            auxiliary_capability_with_retained_value: true,
+            ..PoolFixtureSpec::default()
+        },
+    );
+    let capability_before =
+        native_zpl_file_dnode(&cx, &engine, &devices[0], &[b"data".to_vec()], 14);
+    let fs = ZfsFs::with_writer(&cx, engine, vec![b"data".to_vec()]).unwrap();
+    let file = lookup(&fs, &cx, ROOT, "hello.txt");
+    let original = read(&fs, &cx, file.ino);
+    let mut scope = RequestScope::empty();
+    let before = io_counts(&devices);
+    for (name, mode, errno) in [
+        ("user.retained", XattrSetMode::Create, libc::EEXIST),
+        ("user.absent", XattrSetMode::Replace, libc::ENODATA),
+        ("security.capability", XattrSetMode::Set, libc::EOPNOTSUPP),
+        ("user.security.capability", XattrSetMode::Set, libc::EINVAL),
+        ("user.trusted.secret", XattrSetMode::Set, libc::EINVAL),
+        (
+            "user.system.posix_acl_access",
+            XattrSetMode::Set,
+            libc::EINVAL,
+        ),
+        ("user.freebsd:acl", XattrSetMode::Set, libc::EINVAL),
+        ("user.user.retained", XattrSetMode::Set, libc::EINVAL),
+    ] {
+        assert_eq!(
+            fs.setxattr(&cx, &mut scope, file.ino, name, b"refused", mode)
+                .unwrap_err()
+                .to_errno(),
+            errno,
+        );
+    }
+    assert!(
+        !fs.removexattr(&cx, &mut scope, file.ino, "user.absent")
+            .unwrap()
+    );
+    assert_eq!(io_counts(&devices), before);
+    fs.setxattr(
+        &cx,
+        &mut scope,
+        file.ino,
+        "user.retained",
+        b"replacement",
+        XattrSetMode::Replace,
+    )
+    .unwrap();
+    assert_eq!(
+        fs.getxattr(&cx, file.ino, "user.retained").unwrap(),
+        Some(b"replacement".to_vec()),
+    );
+    assert_eq!(read(&fs, &cx, file.ino), original);
+    assert!(
+        fs.removexattr(&cx, &mut scope, file.ino, "user.retained")
+            .unwrap()
+    );
+    assert_eq!(fs.getxattr(&cx, file.ino, "user.retained").unwrap(), None);
+    let token = fs.last_durable_token().unwrap().unwrap();
+    drop(fs);
+    let reopened = open_engine_on_devices(
+        &cx,
+        &devices,
+        default_write_opts(POOL_GUID, token.published_slot()),
+    )
+    .unwrap();
+    let mut head = file_range_head(&cx, &reopened);
+    assert!(head.has_file_capabilities(&cx, 4).unwrap());
+    let capability_after =
+        native_zpl_file_dnode(&cx, &reopened, &devices[0], &[b"data".to_vec()], 14);
+    assert_eq!(capability_after.pointers(), capability_before.pointers());
+    assert_eq!(capability_after.bonus(), capability_before.bonus());
+    assert!(native_zpl_file_slot(&cx, &reopened, &devices[0], &[b"data".to_vec()], 15).is_none());
+    assert_eq!(
+        head.open_snapshot(&cx, b"before")
+            .unwrap()
+            .getxattr(&cx, 4, "user.retained")
+            .unwrap(),
+        Some(b"private value survives namespace changes".to_vec()),
+    );
+    assert_pool_scrub_and_allocation_clean(&cx, &devices, POOL_GUID, Some(token.published_slot()));
+}
+
+#[test]
+fn sa_xattr_migration_rejects_unowned_or_malformed_private_graphs_without_writes() {
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    let timestamp = Timestamp {
+        seconds: 1_715_000_981,
+        nanos: 0,
+    };
+    for fault in [
+        XattrOwnershipFault::DirectoryRootAlias,
+        XattrOwnershipFault::ValueRootAlias,
+        XattrOwnershipFault::DirectoryParent,
+        XattrOwnershipFault::DirectorySize,
+        XattrOwnershipFault::ValueLinks,
+        XattrOwnershipFault::DuplicateValue,
+        XattrOwnershipFault::ValueExternalAcl,
+        XattrOwnershipFault::OversizedValue,
+    ] {
+        let (mut engine, devices) = writer_fixture(
+            &cx,
+            &PoolFixtureSpec {
+                deadlist_mode: DeadlistMode::NativeDeadlist,
+                auxiliary_ownership: Some((4, AuxiliaryOwnership::XattrDirectory)),
+                auxiliary_xattr_fault: Some(fault),
+                hello_sa_xattrs: BTreeMap::from([(
+                    "user.retained".to_owned(),
+                    b"SA shadow".to_vec(),
+                )]),
+                ..PoolFixtureSpec::default()
+            },
+        );
+        let errno = if matches!(
+            fault,
+            XattrOwnershipFault::ValueExternalAcl | XattrOwnershipFault::OversizedValue
+        ) {
+            libc::EOPNOTSUPP
+        } else {
+            libc::EIO
+        };
+        let before: Vec<_> = devices
+            .iter()
+            .map(FaultableMemberDevice::durable_snapshot)
+            .collect();
+        assert_native_write_refused(&mut engine, &devices, errno, |writer| {
+            writer.set_xattr(
+                &cx,
+                &dataset,
+                4,
+                "user.retained",
+                b"new",
+                ffs_zfs::ZfsXattrSetMode::Replace,
+                timestamp,
+            )
+        });
+        assert_native_write_refused(&mut engine, &devices, errno, |writer| {
+            writer.remove_xattr(&cx, &dataset, 4, "user.retained", timestamp)
+        });
+        for (device, original) in devices.iter().zip(before) {
+            assert_eq!(device.durable_snapshot(), original, "{fault:?}");
+        }
+    }
+}
+
+#[test]
+fn sa_xattr_migration_persistence_cuts_keep_value_and_private_retirement_atomic() {
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    let timestamp = Timestamp {
+        seconds: 1_715_000_982,
+        nanos: 0,
+    };
+    let built = build_clean_zfs_pool(&PoolFixtureSpec {
+        mirror_width: 2,
+        deadlist_mode: DeadlistMode::NativeDeadlist,
+        auxiliary_ownership: Some((4, AuxiliaryOwnership::XattrDirectory)),
+        auxiliary_xattr_names: Some((b"retained", Some(b"user.retained"))),
+        hello_sa_xattrs: BTreeMap::from([("user.keep".to_owned(), b"preserved".to_vec())]),
+        ..PoolFixtureSpec::default()
+    });
+    for remove in [false, true] {
+        for stage in 0..6_u8 {
+            let devices: Vec<_> = built
+                .members
+                .iter()
+                .cloned()
+                .map(FaultableMemberDevice::new)
+                .collect();
+            let mut engine = open_engine_on_devices(
+                &cx,
+                &devices,
+                default_write_opts(POOL_GUID, built.initial_slot),
+            )
+            .unwrap();
+            let tripped = Arc::new(AtomicBool::new(false));
+            let observed = Arc::clone(&tripped);
+            engine.with_fault_hook(move |event| {
+                if matches!(
+                    (stage, event.stage),
+                    (0, ZfsPersistenceStage::ChildBlocksWrite { .. })
+                        | (1, ZfsPersistenceStage::DatasetMetadataBarrier { .. })
+                        | (2, ZfsPersistenceStage::MosSpaceMapBarrier { .. })
+                        | (3, ZfsPersistenceStage::MosRootBarrier { .. })
+                        | (4, ZfsPersistenceStage::UberblockWrite { label: 2, .. })
+                        | (5, ZfsPersistenceStage::BeforeAcknowledge)
+                ) {
+                    observed.store(true, Ordering::SeqCst);
+                    Err(FfsError::Cancelled)
+                } else {
+                    Ok(())
+                }
+            });
+            let outcome = if remove {
+                engine.remove_xattr(&cx, &dataset, 4, "user.retained", timestamp)
+            } else {
+                engine.set_xattr(
+                    &cx,
+                    &dataset,
+                    4,
+                    "user.retained",
+                    b"new SA value",
+                    ffs_zfs::ZfsXattrSetMode::Replace,
+                    timestamp,
+                )
+            };
+            assert!(tripped.load(Ordering::SeqCst), "missed xattr cut {stage}");
+            let committed = stage >= 4;
+            let slot = match outcome {
+                ZfsTxOutcome::NotCommitted(FfsError::Cancelled) if !committed => built.initial_slot,
+                ZfsTxOutcome::Uncertain {
+                    target_txg,
+                    target_slot,
+                    ..
+                } if stage == 4 => {
+                    assert_eq!(target_txg, INITIAL_TXG + 1);
+                    assert!(engine.requires_recovery());
+                    target_slot
+                }
+                ZfsTxOutcome::Committed { value: 4, token } if stage == 5 => token.published_slot(),
+                other => panic!("unexpected xattr cut {stage}: {other:?}"),
+            };
+            drop(engine);
+            let fresh: Vec<_> = devices
+                .iter()
+                .map(FaultableMemberDevice::fresh_from_durable)
+                .collect();
+            let mut options = default_write_opts(POOL_GUID, slot);
+            options.reconcile_torn_uberblocks = stage == 4;
+            let recovered = open_engine_on_devices(&cx, &fresh, options).unwrap();
+            assert_eq!(
+                recovered.committed_txg(),
+                INITIAL_TXG + u64::from(committed)
+            );
+            let mut head = file_range_head(&cx, &recovered);
+            let expected = if committed {
+                (!remove).then_some(b"new SA value".to_vec())
+            } else {
+                Some(b"private value survives namespace changes".to_vec())
+            };
+            assert_eq!(head.getxattr(&cx, 4, "user.retained").unwrap(), expected);
+            assert_eq!(
+                head.getxattr(&cx, 4, "user.keep").unwrap(),
+                Some(b"preserved".to_vec()),
+            );
+            for object in [14, 15] {
+                assert_eq!(
+                    native_zpl_file_slot(&cx, &recovered, &fresh[0], &dataset, object).is_some(),
+                    !committed,
+                );
+            }
+            assert_eq!(
+                head.read(&cx, 4, 0, 8192).unwrap(),
+                built.snap_hello_expected
+            );
+            let mut snapshot = head.open_snapshot(&cx, b"before").unwrap();
+            assert_eq!(
+                snapshot.getxattr(&cx, 4, "user.retained").unwrap(),
+                Some(b"private value survives namespace changes".to_vec()),
+            );
+            assert_pool_scrub_and_allocation_clean(
+                &cx,
+                &fresh,
+                POOL_GUID,
+                Some(recovered.committed_slot()),
+            );
+        }
+    }
+}

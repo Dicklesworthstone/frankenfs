@@ -1495,6 +1495,9 @@ impl ZfsTransactionEngine {
     }
 
     /// Set or replace a ZPL `user.*` extended attribute in SA (`ZPL_DXATTR` inline or spill).
+    /// On an SA-formatted ZPL v5 owner, replacement also retires matching private
+    /// directory values and unprefixed compatibility aliases in the same TXG.
+    /// Snapshots retain their old values and native owner usage is reconciled.
     #[allow(clippy::too_many_arguments)]
     pub fn set_xattr(
         &mut self,
@@ -1519,7 +1522,8 @@ impl ZfsTransactionEngine {
         )
     }
 
-    /// Remove a ZPL `user.*` extended attribute from SA (`ZPL_DXATTR`).
+    /// Remove a ZPL `user.*` extended attribute from both native stores of an
+    /// SA-formatted ZPL v5 owner, including unprefixed compatibility aliases.
     pub fn remove_xattr(
         &mut self,
         cx: &Cx,
