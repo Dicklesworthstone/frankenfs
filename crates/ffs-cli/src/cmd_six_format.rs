@@ -1209,11 +1209,9 @@ pub fn maybe_route_fsck_cmd(
             "--repair on a --partition slice is refused; extract or repair an offline standalone volume"
         );
     }
-    if repair && matches!(kind, FsFormatKind::Ntfs | FsFormatKind::Zfs) {
+    if repair && matches!(kind, FsFormatKind::Zfs) {
         bail!(
-            "--repair is not supported for {} (FrankenFS provides read-only verification for {})",
-            kind.as_str(),
-            kind.as_str()
+            "--repair is not supported for zfs via fsck (use native ZFS pool scrub/resilver or sidecar protection)"
         );
     }
 
@@ -1263,41 +1261,61 @@ pub fn maybe_route_fsck_cmd(
             }
         }
         FsFormatKind::Ntfs => {
-            let volume = ffs_ntfs::NtfsVolume::open_with_options(&cx, path, offset, length, false)?;
-            let alloc = volume.check_allocations(
-                &cx,
-                ffs_ntfs::reader::allocation::AllocationLimits::default(),
-            )?;
-            let mirror = volume.check_mft_mirror(
-                &cx,
-                ffs_ntfs::reader::allocation::RecordOwnershipLimits::default(),
-            )?;
-            let ownership = volume.check_record_ownership(
-                &cx,
-                ffs_ntfs::reader::allocation::RecordOwnershipLimits::default(),
-            )?;
-            let namespace = volume.check_namespace(
-                &cx,
-                ffs_ntfs::reader::allocation::NamespaceLimits::default(),
-            )?;
-            let clean = alloc.is_consistent()
-                && mirror.is_consistent()
-                && ownership.is_consistent()
-                && namespace.is_consistent();
-            let summary = serde_json::json!({
-                "allocation_consistent": alloc.is_consistent(),
-                "mft_mirror_consistent": mirror.is_consistent(),
-                "record_ownership_consistent": ownership.is_consistent(),
-                "namespace_consistent": namespace.is_consistent(),
-                "allocated_records_examined": alloc.allocated_records_examined,
-                "referenced_clusters": alloc.referenced_clusters,
-                "bitmap_allocated_clusters": alloc.bitmap_allocated_clusters,
-                "cross_linked_clusters": alloc.cross_linked_clusters,
-                "referenced_free_clusters": alloc.referenced_free_clusters,
-                "allocated_without_reference": alloc.allocated_without_reference,
-                "mft_mirror_records_checked": mirror.record_pairs_examined,
-            });
-            (clean, summary)
+            if repair {
+                if !six.offline_image {
+                    bail!("--offline-image is required for NTFS fsck --repair");
+                }
+                let (plan, after) = ffs_ntfs::apply_bounded_repair(
+                    &cx,
+                    path,
+                    0,
+                    None,
+                    true,
+                    true,
+                    ffs_ntfs::NtfsCheckLimits::default(),
+                )?;
+                (
+                    after.clean,
+                    serde_json::json!({ "repair_plan": plan, "post_repair_check": after }),
+                )
+            } else {
+                let volume =
+                    ffs_ntfs::NtfsVolume::open_with_options(&cx, path, offset, length, false)?;
+                let alloc = volume.check_allocations(
+                    &cx,
+                    ffs_ntfs::reader::allocation::AllocationLimits::default(),
+                )?;
+                let mirror = volume.check_mft_mirror(
+                    &cx,
+                    ffs_ntfs::reader::allocation::RecordOwnershipLimits::default(),
+                )?;
+                let ownership = volume.check_record_ownership(
+                    &cx,
+                    ffs_ntfs::reader::allocation::RecordOwnershipLimits::default(),
+                )?;
+                let namespace = volume.check_namespace(
+                    &cx,
+                    ffs_ntfs::reader::allocation::NamespaceLimits::default(),
+                )?;
+                let clean = alloc.is_consistent()
+                    && mirror.is_consistent()
+                    && ownership.is_consistent()
+                    && namespace.is_consistent();
+                let summary = serde_json::json!({
+                    "allocation_consistent": alloc.is_consistent(),
+                    "mft_mirror_consistent": mirror.is_consistent(),
+                    "record_ownership_consistent": ownership.is_consistent(),
+                    "namespace_consistent": namespace.is_consistent(),
+                    "allocated_records_examined": alloc.allocated_records_examined,
+                    "referenced_clusters": alloc.referenced_clusters,
+                    "bitmap_allocated_clusters": alloc.bitmap_allocated_clusters,
+                    "cross_linked_clusters": alloc.cross_linked_clusters,
+                    "referenced_free_clusters": alloc.referenced_free_clusters,
+                    "allocated_without_reference": alloc.allocated_without_reference,
+                    "mft_mirror_records_checked": mirror.record_pairs_examined,
+                });
+                (clean, summary)
+            }
         }
         FsFormatKind::Zfs => {
             let (_pool, mut objects) =
@@ -3741,6 +3759,75 @@ mod tests {
             ntfs_chk.clean,
             "grown ntfs must pass check: {:?}",
             ntfs_chk.issues
+        );
+
+        // 2b. Unified `ffs fsck --repair` on NTFS repairs bounded backup-boot corruption and refuses without `--offline-image`.
+        let ntfs_repair_img = dir.path().join("repair_ntfs.img");
+        fs::copy(&ntfs_src, &ntfs_repair_img).expect("copy ntfs for bounded repair test");
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&ntfs_repair_img)
+                .expect("open ntfs copy");
+            let len = f.metadata().expect("metadata").len();
+            f.seek(SeekFrom::Start(len - 512))
+                .expect("seek backup boot");
+            f.write_all(&[0xEE_u8; 512]).expect("corrupt backup boot");
+            f.sync_all().expect("sync corrupt backup boot");
+        }
+        let corrupt_chk = ffs_ntfs::check_image_file(
+            &cx,
+            &ntfs_repair_img,
+            0,
+            None,
+            ffs_ntfs::NtfsCheckLimits::default(),
+        )
+        .expect("check damaged ntfs");
+        assert!(
+            !corrupt_chk.clean,
+            "corrupted backup boot sector must be detected"
+        );
+        let repair_flags = crate::FsckFlags::empty().with_repair(true).with_json(true);
+        let damaged_sha = sha256_regular_file(&ntfs_repair_img).expect("damaged sha");
+        maybe_route_fsck_cmd(
+            &ntfs_repair_img,
+            FsckCommandOptions {
+                flags: repair_flags,
+                block_group: None,
+            },
+            &online,
+        )
+        .expect_err("NTFS fsck --repair without --offline-image must fail closed");
+        assert_eq!(
+            sha256_regular_file(&ntfs_repair_img),
+            Some(damaged_sha),
+            "refused NTFS fsck --repair must not mutate image"
+        );
+        assert!(
+            maybe_route_fsck_cmd(
+                &ntfs_repair_img,
+                FsckCommandOptions {
+                    flags: repair_flags,
+                    block_group: None,
+                },
+                &offline,
+            )
+            .expect("NTFS fsck --repair --offline-image")
+        );
+        let repaired_chk = ffs_ntfs::check_image_file(
+            &cx,
+            &ntfs_repair_img,
+            0,
+            None,
+            ffs_ntfs::NtfsCheckLimits::default(),
+        )
+        .expect("check repaired ntfs");
+        assert!(
+            repaired_chk.clean,
+            "repaired ntfs must pass full structural check: {:?}",
+            repaired_chk.issues
         );
 
         let zfs_resize_out = dir.path().join("resize_refused.zfs");
