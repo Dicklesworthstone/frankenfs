@@ -26137,6 +26137,143 @@ impl OpenFs {
         Ok(inline_data[start..end].to_vec())
     }
 
+    /// Validate the native inline-file layout before interpreting `i_block` as data.
+    /// Even an empty file must have its inode-body `system.data` entry.
+    fn ext4_inline_file_payload(&self, inode: &Ext4Inode) -> ffs_error::Result<Vec<u8>> {
+        let corrupt = |detail: &str| FfsError::Corruption {
+            block: 0,
+            detail: format!("ext4 inline file: {detail}"),
+        };
+        let sb = self
+            .ext4_superblock()
+            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
+        if !inode.is_regular()
+            || !Self::ext4_inode_uses_inline_data(inode)
+            || !sb.has_incompat(ffs_ondisk::Ext4IncompatFeatures::INLINE_DATA)
+            || inode.flags & (ffs_types::EXT4_EXTENTS_FL | ffs_types::EXT4_INDEX_FL) != 0
+            || inode.extent_bytes.len() != 60
+        {
+            return Err(corrupt("inconsistent inode type, flags or inline head"));
+        }
+        let entries = ffs_ondisk::parse_ibody_xattrs_with_inum(inode)
+            .map_err(|_| corrupt("invalid inode-body attributes"))?;
+        let mut continuation = None;
+        for (entry, value_inum) in &entries {
+            if entry.name_index == ffs_types::EXT4_XATTR_INDEX_SYSTEM
+                && entry.name == b"data"
+                && (continuation.replace(entry.value.as_slice()).is_some() || *value_inum != 0)
+            {
+                return Err(corrupt("system.data must be one inode-body value"));
+            }
+        }
+        let continuation = continuation.ok_or_else(|| corrupt("missing system.data attribute"))?;
+        let size = usize::try_from(inode.size).map_err(|_| corrupt("file size exceeds usize"))?;
+        let mut payload = inode.extent_bytes.to_vec();
+        payload.extend_from_slice(continuation);
+        if size > payload.len() || inode.size > u64::from(sb.block_size) {
+            return Err(corrupt("file size exceeds inline storage capacity"));
+        }
+        payload.truncate(size);
+        Ok(payload)
+    }
+
+    /// Keep the file inline if its actual inode-body capacity permits it.
+    /// `NoSpace` is a request to promote; all other errors indicate bad metadata.
+    fn ext4_try_store_inline_file(
+        inode: &mut Ext4Inode,
+        payload: &[u8],
+    ) -> ffs_error::Result<bool> {
+        let continuation = payload.get(60..).unwrap_or_default();
+        match ffs_xattr::rewrite_inline_data(inode, Some(continuation)) {
+            Ok(()) => {}
+            Err(FfsError::NoSpace) => return Ok(false),
+            Err(error) => return Err(error),
+        }
+        inode.extent_bytes.fill(0);
+        let head = payload.len().min(60);
+        inode.extent_bytes[..head].copy_from_slice(&payload[..head]);
+        inode.size = u64::try_from(payload.len())
+            .map_err(|_| FfsError::Format("inline file size does not fit u64".into()))?;
+        Ok(true)
+    }
+
+    /// Move an inline file into its first ordinary data block. The caller's
+    /// transaction owns allocation, block contents and the final inode together.
+    #[allow(clippy::too_many_arguments)]
+    fn ext4_promote_inline_file(
+        &self,
+        cx: &Cx,
+        dev: &dyn BlockDevice,
+        alloc: &mut Ext4AllocState,
+        ino: InodeNumber,
+        inode: &mut Ext4Inode,
+        payload: &[u8],
+    ) -> ffs_error::Result<()> {
+        let mut converted = inode.clone();
+        ffs_xattr::rewrite_inline_data(&mut converted, None)?;
+        let geo = alloc.geo.clone();
+        let block_size = usize::try_from(geo.block_size)
+            .map_err(|_| FfsError::Format("block size does not fit usize".into()))?;
+        if payload.len() > block_size {
+            return Err(FfsError::Corruption {
+                block: 0,
+                detail: "inline file payload exceeds one data block".into(),
+            });
+        }
+        let indirect = !geo
+            .feature_incompat
+            .contains(ffs_ondisk::Ext4IncompatFeatures::EXTENTS);
+        converted.flags &= !ffs_types::EXT4_INLINE_DATA_FL;
+        let mut root = [0_u8; 60];
+        if !indirect {
+            converted.flags |= ffs_types::EXT4_EXTENTS_FL;
+            root[..2].copy_from_slice(&0xF30A_u16.to_le_bytes());
+            root[4..6].copy_from_slice(&4_u16.to_le_bytes());
+        }
+        if !payload.is_empty() {
+            converted.blocks = Self::ext4_blocks_after_adding_data(
+                inode,
+                ino,
+                1,
+                u64::from(geo.block_size / EXT4_SECTOR_SIZE),
+            )?;
+            let ino_u32 = u32::try_from(ino.0)
+                .map_err(|_| FfsError::Format("inode number exceeds ext4 32-bit limit".into()))?;
+            let hint = self.numa_allocation_hint(
+                &geo,
+                AllocHint {
+                    goal_group: Some(ffs_types::inode_to_group(ino, geo.inodes_per_group)),
+                    ..AllocHint::default()
+                },
+                "ext4_inline_file_conversion",
+                Some(ino),
+            );
+            let mut backend = SingleLockDirAlloc { alloc };
+            let allocated = backend.dir_alloc_blocks(cx, dev, 1, &hint)?;
+            Self::ext4_dir_map_extent(
+                cx,
+                dev,
+                &mut backend,
+                indirect,
+                &mut root,
+                Ext4Extent {
+                    logical_block: 0,
+                    raw_len: 1,
+                    physical_start: allocated.start.0,
+                },
+                ino_u32,
+                inode.generation,
+                hint,
+            )?;
+            let mut block = vec![0_u8; block_size];
+            block[..payload.len()].copy_from_slice(payload);
+            dev.write_block(cx, allocated.start, &block)?;
+        }
+        Self::set_extent_root(&mut converted, &root);
+        *inode = converted;
+        Ok(())
+    }
+
     /// Read the payload of an EA-inode-backed xattr value (the EA_INODE
     /// feature). A large attribute value is stored as the file data of a
     /// dedicated "EA inode" (referenced by `e_value_inum`); its `i_size` is the
@@ -37116,6 +37253,95 @@ impl OpenFs {
         unreachable!("the final SDK write attempt returns its result")
     }
 
+    /// Update both inline regions, or promote and resume the ordinary writer.
+    /// Allocation and cache changes stay owned by the caller's transaction.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn ext4_write_inline_file(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        alloc: &mut Ext4AllocState,
+        ino: InodeNumber,
+        mut inode: Ext4Inode,
+        offset: u64,
+        data: &[u8],
+    ) -> ffs_error::Result<u32> {
+        let written = u32::try_from(data.len())
+            .map_err(|_| FfsError::Format("write length exceeds u32".into()))?;
+        let end = offset
+            .checked_add(u64::from(written))
+            .ok_or_else(|| FfsError::Format("write range overflow".into()))?;
+        let payload = self.ext4_inline_file_payload(&inode)?;
+        // This upper bound only avoids allocating a sparse file in memory.
+        // The xattr serializer decides the exact available inline capacity.
+        let bound = inode.extent_bytes.len() + inode.xattr_ibody.len();
+        let mut stayed_inline = false;
+        if end <= bound as u64 {
+            let new_size = usize::try_from(inode.size.max(end))
+                .map_err(|_| FfsError::Format("inline size does not fit usize".into()))?;
+            let mut updated = payload.clone();
+            updated.resize(new_size, 0);
+            let start = usize::try_from(offset)
+                .map_err(|_| FfsError::Format("inline offset does not fit usize".into()))?;
+            updated[start..start + data.len()].copy_from_slice(data);
+            stayed_inline = Self::ext4_try_store_inline_file(&mut inode, &updated)?;
+        }
+        Self::with_ext4_block_counts(self, scope, alloc, |scope, working| {
+            {
+                let base = self.block_device_adapter();
+                let snapshot_dev;
+                let tx_dev;
+                let dev: &dyn BlockDevice = if let Some(tx) = &mut scope.tx {
+                    snapshot_dev =
+                        RegisteredSnapshotBlockAdapter::new(&base, &self.mvcc_store, tx.snapshot());
+                    tx_dev = TransactionBlockAdapter {
+                        base: &snapshot_dev,
+                        tx: Mutex::new(tx),
+                    };
+                    &tx_dev
+                } else {
+                    &base
+                };
+                if stayed_inline {
+                    let (secs, nanos) = Self::now_timestamp();
+                    ffs_inode::touch_mtime_ctime(&mut inode, secs, nanos);
+                } else {
+                    self.ext4_promote_inline_file(cx, dev, working, ino, &mut inode, &payload)?;
+                }
+                let csum_seed = self
+                    .ext4_superblock()
+                    .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?
+                    .csum_seed();
+                ffs_inode::write_inode(
+                    cx,
+                    dev,
+                    &working.geo,
+                    &working.groups,
+                    ino,
+                    &inode,
+                    csum_seed,
+                )?;
+            }
+            if scope.tx.is_some() {
+                scope.ext4_staged.xattr_invalidate_inodes.push(ino);
+                scope
+                    .ext4_staged
+                    .xattr_refresh_inodes
+                    .push((ino, inode.clone()));
+            } else {
+                self.invalidate_ext4_inode_xattr_cache(ino);
+                self.ext4_refresh_inode_xattr_cache(cx, ino, &inode)?;
+            }
+            if stayed_inline {
+                Ok(written)
+            } else {
+                // The scoped read observes the staged ordinary block map. Any
+                // later allocation failure aborts conversion and the write.
+                self.ext4_write_locked(cx, scope, working, ino, offset, data)
+            }
+        })
+    }
+
     /// Stage one write using the caller's allocator exclusion and transaction.
     #[allow(clippy::too_many_lines, clippy::single_match_else)]
     fn ext4_write_locked(
@@ -37219,9 +37445,7 @@ impl OpenFs {
             );
         }
         if Self::ext4_inode_uses_inline_data(&inode) {
-            return Err(FfsError::UnsupportedFeature(
-                "ext4 inline-data write-side mutation is not supported".into(),
-            ));
+            return self.ext4_write_inline_file(cx, scope, alloc, ino, inode, offset, data);
         }
 
         if (inode.flags & ffs_types::EXT4_EXTENTS_FL) == 0 {
@@ -39079,6 +39303,9 @@ impl OpenFs {
         let csum_seed = sb.csum_seed();
 
         let mut inode = self.read_inode_with_scope(cx, scope, ino)?;
+        if attrs.size.is_some() && Self::ext4_inode_uses_inline_data(&inode) {
+            return self.ext4_setattr_with_acl(cx, scope, ino, attrs);
+        }
         let ext4_original_size = inode.size;
 
         // Immutable files reject metadata changes too (chmod/chown/utimes), not
@@ -39511,8 +39738,8 @@ impl OpenFs {
     }
 
     /// Stage a size change through the transaction's exact inode/data view.
-    /// The ordinary no-mode setattr path retains its existing dispatch; this
-    /// combined path refuses storage layouts it cannot update atomically.
+    /// Inline-file truncation also uses this path so promotion, xattrs and
+    /// allocation are published together, including a combined chmod request.
     #[allow(clippy::too_many_lines)]
     fn ext4_stage_setattr_size(
         &self,
@@ -39542,11 +39769,25 @@ impl OpenFs {
             return Ok(());
         }
         Self::ext4_reject_encrypted(inode)?;
-        if Self::ext4_inode_uses_inline_data(inode)
-            || inode.flags & (ffs_types::EXT4_COMPR_FL | ffs_types::EXT4_COMPRBLK_FL) != 0
-        {
+        if Self::ext4_inode_uses_inline_data(inode) {
+            let payload = self.ext4_inline_file_payload(inode)?;
+            let bound = inode.extent_bytes.len() + inode.xattr_ibody.len();
+            if new_size <= bound as u64 {
+                let mut updated = payload.clone();
+                updated.resize(
+                    usize::try_from(new_size)
+                        .map_err(|_| FfsError::Format("inline size does not fit usize".into()))?,
+                    0,
+                );
+                if Self::ext4_try_store_inline_file(inode, &updated)? {
+                    return Ok(());
+                }
+            }
+            self.ext4_promote_inline_file(cx, dev, alloc, ino, inode, &payload)?;
+        }
+        if inode.flags & (ffs_types::EXT4_COMPR_FL | ffs_types::EXT4_COMPRBLK_FL) != 0 {
             return Err(FfsError::UnsupportedFeature(
-                "atomic chmod with a size change on inline or compressed ext4 data".into(),
+                "atomic chmod with a size change on compressed ext4 data".into(),
             ));
         }
         let uses_extents = inode.flags & ffs_types::EXT4_EXTENTS_FL != 0;
@@ -39906,10 +40147,10 @@ impl OpenFs {
         // Remove first so an already-cached inode can replace itself even when
         // the bounded cache is full; a cache admission failure is transparent.
         self.ext4_inode_xattr_cache.remove(&ino.0);
-        // Namespace edits change an inline directory's system.data outside
+        // Namespace edits and file writes change inline system.data outside
         // xattr transactions. Never retain that unversioned catalog: a reader
         // that began before conversion must not reinstall it after publication.
-        if !(inode.is_dir() && Self::ext4_inode_uses_inline_data(inode)) {
+        if !Self::ext4_inode_uses_inline_data(inode) {
             self.ext4_inode_xattr_cache.insert_within(
                 ino.0,
                 Arc::clone(&entries),
@@ -67275,6 +67516,306 @@ mod tests {
         assert_eq!(dev.snapshot_bytes(), bytes);
     }
 
+    /// Independently encode the native 60-byte head and system.data continuation.
+    /// The regular file's inode has 96 bytes of ibody space and a user.keep xattr.
+    fn open_writable_inline_file_fixture(full: bool, extents: bool) -> (OpenFs, TestDevice) {
+        let (_, seed) = open_writable_inline_dir_fixture(full);
+        let mut image = seed.snapshot_bytes();
+        if !extents {
+            let offset = EXT4_SUPERBLOCK_OFFSET + 0x60;
+            image[offset..offset + 4].copy_from_slice(&(0x0002_u32 | 0x8000).to_le_bytes());
+        }
+        let inode = &mut image[4 * 4096 + 10 * 256..4 * 4096 + 11 * 256];
+        inode.fill(0);
+        inode[..2].copy_from_slice(&0o100_644_u16.to_le_bytes());
+        inode[4..8].copy_from_slice(&80_u32.to_le_bytes());
+        inode[0x1A..0x1C].copy_from_slice(&1_u16.to_le_bytes());
+        inode[0x20..0x24].copy_from_slice(&ffs_types::EXT4_INLINE_DATA_FL.to_le_bytes());
+        inode[0x28..0x64].copy_from_slice(&(0_u8..60).collect::<Vec<_>>());
+        inode[0x80..0x82].copy_from_slice(&32_u16.to_le_bytes());
+        let ibody = &mut inode[160..];
+        ibody[..4].copy_from_slice(&0xEA02_0000_u32.to_le_bytes());
+        ibody[4] = 4;
+        ibody[5] = ffs_types::EXT4_XATTR_INDEX_SYSTEM;
+        ibody[6..8].copy_from_slice(&72_u16.to_le_bytes());
+        ibody[12..16].copy_from_slice(&20_u32.to_le_bytes());
+        ibody[20..24].copy_from_slice(b"data");
+        ibody[24] = 4;
+        ibody[25] = ffs_types::EXT4_XATTR_INDEX_USER;
+        ibody[26..28].copy_from_slice(&60_u16.to_le_bytes());
+        ibody[32..36].copy_from_slice(&4_u32.to_le_bytes());
+        ibody[40..44].copy_from_slice(b"keep");
+        ibody[64..68].copy_from_slice(b"kept");
+        ibody[76..96].copy_from_slice(&(60_u8..80).collect::<Vec<_>>());
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let mut fs =
+            OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default()).unwrap();
+        fs.enable_writes(&cx).unwrap();
+        (fs, dev)
+    }
+
+    #[test]
+    fn ext4_inline_file_write_truncate_and_promotion_preserve_data_and_xattrs() {
+        for extents in [true, false] {
+            let (fs, dev) = open_writable_inline_file_fixture(false, extents);
+            let cx = Cx::for_testing();
+            let ino = InodeNumber(11);
+            let mut expected: Vec<u8> = (0_u8..80).collect();
+            assert_eq!(fs.read(&cx, ino, 0, 100).unwrap(), expected);
+            fs.setxattr(&cx, ino, "user.external", &[0xA5; 512], XattrSetMode::Set)
+                .unwrap();
+            let original = fs.read_inode(&cx, ino).unwrap();
+            let external = fs
+                .read_block_vec(&cx, BlockNumber(original.file_acl))
+                .unwrap();
+            let free = fs.statfs(&cx, ino).unwrap().blocks_free;
+            assert_ne!(original.file_acl, 0);
+            assert_eq!(original.blocks, 8);
+            let before_empty = fs.current_snapshot();
+            assert_eq!(fs.write(&cx, ino, u64::MAX, &[]).unwrap(), 0);
+            assert_eq!(fs.current_snapshot(), before_empty);
+
+            fs.write(&cx, ino, 58, b"crossing").unwrap();
+            expected[58..66].copy_from_slice(b"crossing");
+            fs.write(&cx, ino, 94, b"gap").unwrap();
+            expected.resize(97, 0);
+            expected[94..].copy_from_slice(b"gap");
+            assert_eq!(fs.read(&cx, ino, 0, 128).unwrap(), expected);
+            assert_ne!(
+                fs.read_inode(&cx, ino).unwrap().flags & ffs_types::EXT4_INLINE_DATA_FL,
+                0
+            );
+            for size in [55, 100, 0, 80] {
+                fs.setattr(
+                    &cx,
+                    ino,
+                    &SetAttrRequest {
+                        size: Some(size),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                expected.resize(size as usize, 0);
+                assert_eq!(fs.read(&cx, ino, 0, 128).unwrap(), expected);
+                let inode = fs.read_inode(&cx, ino).unwrap();
+                assert_ne!(inode.flags & ffs_types::EXT4_INLINE_DATA_FL, 0);
+                assert_eq!(inode.blocks, original.blocks);
+                assert_eq!(
+                    fs.getxattr(&cx, ino, "system.data").unwrap(),
+                    Some(expected.get(60..).unwrap_or_default().to_vec())
+                );
+            }
+            fs.write(&cx, ino, 0, b"retained").unwrap();
+            expected[..8].copy_from_slice(b"retained");
+            let earlier = RequestScope::with_snapshot(fs.current_snapshot());
+            let old_inode = fs.read_inode_with_scope(&cx, &earlier, ino).unwrap();
+            let old_data = expected.clone();
+            fs.write(&cx, ino, 4099, b"tail").unwrap();
+            expected.resize(4103, 0);
+            expected[4099..].copy_from_slice(b"tail");
+            let converted = fs.read_inode(&cx, ino).unwrap();
+            assert_eq!(converted.flags & ffs_types::EXT4_INLINE_DATA_FL, 0);
+            assert_eq!(converted.flags & ffs_types::EXT4_EXTENTS_FL != 0, extents);
+            assert_eq!(converted.blocks, original.blocks + 16);
+            assert_eq!(converted.file_acl, original.file_acl);
+            assert_eq!(fs.statfs(&cx, ino).unwrap().blocks_free, free - 2);
+            assert_eq!(fs.read(&cx, ino, 0, 8192).unwrap(), expected);
+            assert_eq!(fs.read_file(&cx, &earlier, ino, 0, 128).unwrap(), old_data);
+            // A delayed reader must not reinstall an inline catalog after conversion.
+            fs.ext4_refresh_inode_xattr_cache(&cx, ino, &old_inode)
+                .unwrap();
+            assert_eq!(fs.getxattr(&cx, ino, "system.data").unwrap(), None);
+            assert_eq!(
+                fs.read_block_vec(&cx, BlockNumber(converted.file_acl))
+                    .unwrap(),
+                external
+            );
+            fs.flush_mvcc_to_device(&cx).unwrap();
+            let reopened = OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(dev.snapshot_bytes())),
+                &OpenOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(reopened.read(&cx, ino, 0, 8192).unwrap(), expected);
+            assert_eq!(
+                reopened.getxattr(&cx, ino, "user.keep").unwrap(),
+                Some(b"kept".to_vec())
+            );
+            assert_eq!(
+                reopened.getxattr(&cx, ino, "user.external").unwrap(),
+                Some(vec![0xA5; 512])
+            );
+        }
+    }
+
+    #[test]
+    fn ext4_inline_file_full_disk_promotion_errors_leave_all_state_unchanged() {
+        let (fs, dev) = open_writable_inline_file_fixture(true, true);
+        let cx = Cx::for_testing();
+        let ino = InodeNumber(11);
+        assert_eq!(fs.statfs(&cx, ino).unwrap().blocks_free, 0);
+        fs.write(&cx, ino, 1, b"fits").unwrap();
+        fs.setattr(
+            &cx,
+            ino,
+            &SetAttrRequest {
+                size: Some(30),
+                mode: Some(0o600),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let before = fs.read_inode(&cx, ino).unwrap();
+        let data = fs.read(&cx, ino, 0, 128).unwrap();
+        let high = fs.current_snapshot();
+        let groups = format!("{:?}", fs.require_alloc_state().unwrap().read().groups);
+        let bytes = dev.snapshot_bytes();
+        for operation in ["write", "truncate", "chmod-truncate"] {
+            let result = match operation {
+                "write" => fs.write(&cx, ino, 4096, b"overflow").map(|_| ()),
+                _ => fs
+                    .setattr(
+                        &cx,
+                        ino,
+                        &SetAttrRequest {
+                            size: Some(4096),
+                            mode: (operation == "chmod-truncate").then_some(0o644),
+                            ..Default::default()
+                        },
+                    )
+                    .map(|_| ()),
+            };
+            assert!(matches!(result, Err(FfsError::NoSpace)), "{operation}");
+            assert_eq!(fs.current_snapshot(), high);
+            assert_eq!(fs.read_inode(&cx, ino).unwrap(), before);
+            assert_eq!(fs.read(&cx, ino, 0, 128).unwrap(), data);
+            assert_eq!(dev.snapshot_bytes(), bytes);
+            assert_eq!(
+                format!("{:?}", fs.require_alloc_state().unwrap().read().groups),
+                groups
+            );
+        }
+        // An empty file has no retained data to move. Sparse extension must
+        // still succeed when there is no free data block at all.
+        for size in [0, 8192] {
+            fs.setattr(
+                &cx,
+                ino,
+                &SetAttrRequest {
+                    size: Some(size),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+        let sparse = fs.read_inode(&cx, ino).unwrap();
+        assert_eq!(sparse.flags & ffs_types::EXT4_INLINE_DATA_FL, 0);
+        assert_eq!(sparse.blocks, 0);
+        assert_eq!(fs.read(&cx, ino, 0, 8192).unwrap(), vec![0; 8192]);
+        assert_eq!(fs.statfs(&cx, ino).unwrap().blocks_free, 0);
+    }
+
+    #[test]
+    fn ext4_inline_file_batch_reads_its_writes_and_aborts_conversion() {
+        let (fs, _) = open_writable_inline_file_fixture(false, true);
+        let cx = Cx::for_testing();
+        let ino = InodeNumber(11);
+        let original = fs.read_inode(&cx, ino).unwrap();
+        let original_data: Vec<u8> = (0_u8..80).collect();
+        let before = fs.current_snapshot();
+        let free = fs.statfs(&cx, ino).unwrap().blocks_free;
+        let groups = format!("{:?}", fs.require_alloc_state().unwrap().read().groups);
+        let mut expected = original_data.clone();
+        expected[58..65].copy_from_slice(b"changed");
+        expected.resize(4102, 0);
+        expected[4098..].copy_from_slice(b"tail");
+        for finish in ["abort", "cancel", "commit"] {
+            let mut scope = fs.begin_writeback_batch_scope(&cx).unwrap();
+            FsOps::write(&fs, &cx, &mut scope, ino, 58, b"changed").unwrap();
+            FsOps::write(&fs, &cx, &mut scope, ino, 4098, b"tail").unwrap();
+            assert_eq!(
+                FsOps::read(&fs, &cx, &mut scope, ino, 0, 8192).unwrap(),
+                expected
+            );
+            assert_eq!(fs.current_snapshot(), before);
+            assert_eq!(fs.read_inode(&cx, ino).unwrap(), original);
+            assert_eq!(fs.read(&cx, ino, 0, 128).unwrap(), original_data);
+            assert_eq!(fs.statfs(&cx, ino).unwrap().blocks_free, free);
+            match finish {
+                "abort" => fs.abort_writeback_batch_scope(&cx, scope).unwrap(),
+                "cancel" => {
+                    let cancelled = Cx::for_testing();
+                    cancelled.set_cancel_requested(true);
+                    assert!(matches!(
+                        fs.commit_writeback_batch_scope(&cancelled, scope),
+                        Err(FfsError::Cancelled)
+                    ));
+                }
+                _ => {
+                    fs.commit_writeback_batch_scope(&cx, scope).unwrap();
+                }
+            }
+            if finish != "commit" {
+                assert_eq!(fs.current_snapshot(), before);
+                assert_eq!(fs.read_inode(&cx, ino).unwrap(), original);
+                assert_eq!(
+                    format!("{:?}", fs.require_alloc_state().unwrap().read().groups),
+                    groups
+                );
+            }
+        }
+        assert_eq!(fs.current_snapshot().high.0, before.high.0 + 1);
+        assert_eq!(fs.read(&cx, ino, 0, 8192).unwrap(), expected);
+        assert_eq!(fs.statfs(&cx, ino).unwrap().blocks_free, free - 2);
+        assert_eq!(fs.getxattr(&cx, ino, "system.data").unwrap(), None);
+        assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+    }
+
+    #[test]
+    fn ext4_inline_file_missing_or_external_continuation_never_publishes() {
+        for defect in ["missing", "external", "oversized"] {
+            let (fs, dev) = open_writable_inline_file_fixture(false, true);
+            let cx = Cx::for_testing();
+            let ino = InodeNumber(11);
+            let mut inode = fs.read_inode(&cx, ino).unwrap();
+            inode.size = 30; // Exercise validation even when all reads fit i_block.
+            match defect {
+                "missing" => inode.xattr_ibody[5] = ffs_types::EXT4_XATTR_INDEX_USER,
+                "external" => inode.xattr_ibody[8..12].copy_from_slice(&12_u32.to_le_bytes()),
+                "oversized" => inode.size = 4096,
+                _ => unreachable!(),
+            }
+            fs.persist_ext4_inode_for_testing(&cx, ino, &inode).unwrap();
+            let before = fs.read_inode(&cx, ino).unwrap();
+            let high = fs.current_snapshot();
+            let free = fs.statfs(&cx, ino).unwrap().blocks_free;
+            let bytes = dev.snapshot_bytes();
+            for result in [
+                fs.write(&cx, ino, 0, b"new").map(|_| ()),
+                fs.setattr(
+                    &cx,
+                    ino,
+                    &SetAttrRequest {
+                        size: Some(1),
+                        ..Default::default()
+                    },
+                )
+                .map(|_| ()),
+            ] {
+                assert!(
+                    matches!(result, Err(FfsError::Corruption { .. })),
+                    "{defect}"
+                );
+            }
+            assert_eq!(fs.current_snapshot(), high);
+            assert_eq!(fs.read_inode(&cx, ino).unwrap(), before);
+            assert_eq!(fs.statfs(&cx, ino).unwrap().blocks_free, free);
+            assert_eq!(dev.snapshot_bytes(), bytes);
+        }
+    }
+
     fn open_native_inline_directory_fixture() -> Option<(OpenFs, TestDevice, tempfile::TempDir)> {
         let tmp = tempfile::TempDir::new().unwrap();
         let image = tmp.path().join("inline.ext4");
@@ -67543,6 +68084,235 @@ mod tests {
                 reopened.lookup(&cx, root, OsStr::new(name)),
                 Err(FfsError::NotFound(_))
             ));
+        }
+    }
+
+    #[test]
+    fn ext4_inline_file_native_layout_mutations_reopen_and_pass_e2fsck() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let image = tmp.path().join("inline-files.ext4");
+        std::fs::File::create(&image)
+            .and_then(|file| file.set_len(32 * 1024 * 1024))
+            .unwrap();
+        let Ok(output) = spawn_gated_output(
+            std::process::Command::new("mkfs.ext4")
+                .args([
+                    "-q",
+                    "-F",
+                    "-b",
+                    "4096",
+                    "-I",
+                    "256",
+                    "-O",
+                    "inline_data,metadata_csum",
+                ])
+                .arg(&image),
+        ) else {
+            oracle_unavailable("mkfs.ext4");
+            return;
+        };
+        assert!(
+            output.status.success(),
+            "mkfs.ext4 failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let payload: Vec<u8> = (0_u8..80).collect();
+        let input = tmp.path().join("payload");
+        std::fs::write(&input, &payload).unwrap();
+        let names = ["inline", "empty", "grown", "sparse"];
+        let mut commands = String::new();
+        for name in names {
+            commands.push_str(&format!("write {} /{name}\n", input.display()));
+            commands.push_str(&format!("ea_set /{name} user.keep kept\n"));
+        }
+        let script = tmp.path().join("debugfs.commands");
+        std::fs::write(&script, commands).unwrap();
+        let Ok(output) = spawn_gated_output(
+            std::process::Command::new("debugfs")
+                .arg("-w")
+                .arg("-f")
+                .arg(&script)
+                .arg(&image),
+        ) else {
+            oracle_unavailable("debugfs");
+            return;
+        };
+        assert!(
+            output.status.success(),
+            "debugfs failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let Some((clean, output)) = run_e2fsck(&image) else {
+            return;
+        };
+        assert!(
+            clean,
+            "native inline-file fixture must start clean:\n{output}"
+        );
+        let dev = TestDevice::from_vec(std::fs::read(&image).unwrap());
+        let cx = Cx::for_testing();
+        let mut fs = OpenFs::from_device(
+            &cx,
+            Box::new(dev.clone()),
+            &OpenOptions {
+                ext4_journal_replay_mode: Ext4JournalReplayMode::Apply,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        fs.enable_writes(&cx).unwrap();
+        let mut files = Vec::new();
+        for name in names {
+            let ino = fs
+                .lookup(&cx, InodeNumber(2), OsStr::new(name))
+                .unwrap()
+                .ino;
+            let native = fs.read_inode(&cx, ino).unwrap();
+            assert_ne!(native.flags & ffs_types::EXT4_INLINE_DATA_FL, 0, "{name}");
+            assert_eq!(fs.read(&cx, ino, 0, 128).unwrap(), payload);
+            let (_, continuation, value_inum) = ffs_ondisk::find_ibody_xattr_by_index_name(
+                &native,
+                ffs_types::EXT4_XATTR_INDEX_SYSTEM,
+                b"data",
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(value_inum, 0);
+            assert!(continuation.starts_with(&payload[60..]));
+            fs.setxattr(&cx, ino, "user.external", &[0xA5; 512], XattrSetMode::Set)
+                .unwrap();
+            let before = fs.read_inode(&cx, ino).unwrap();
+            let external = fs
+                .read_block_vec(&cx, BlockNumber(before.file_acl))
+                .unwrap();
+            files.push((name, ino, before, external));
+        }
+        fs.flush_mvcc_to_device(&cx).unwrap();
+        let seeded = tmp.path().join("seeded.ext4");
+        std::fs::write(&seeded, dev.snapshot_bytes()).unwrap();
+        let Some((clean, output)) = run_e2fsck(&seeded) else {
+            return;
+        };
+        assert!(clean, "external-xattr control must start clean:\n{output}");
+
+        let mut expected = Vec::new();
+        for (name, ino, before, external) in &files {
+            let mut data = payload.clone();
+            match *name {
+                "inline" => {
+                    fs.write(&cx, *ino, 58, b"crossing").unwrap();
+                    data[58..66].copy_from_slice(b"crossing");
+                    fs.write(&cx, *ino, 94, b"gap").unwrap();
+                    data.resize(97, 0);
+                    data[94..].copy_from_slice(b"gap");
+                    for size in [62, 100] {
+                        fs.setattr(
+                            &cx,
+                            *ino,
+                            &SetAttrRequest {
+                                size: Some(size),
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap();
+                        data.resize(size as usize, 0);
+                    }
+                }
+                "empty" => {
+                    fs.setattr(
+                        &cx,
+                        *ino,
+                        &SetAttrRequest {
+                            size: Some(0),
+                            mode: Some(0o600),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                    data.clear();
+                }
+                "grown" => {
+                    fs.setattr(
+                        &cx,
+                        *ino,
+                        &SetAttrRequest {
+                            size: Some(8192),
+                            mode: Some(0o640),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                    data.resize(8192, 0);
+                }
+                "sparse" => {
+                    fs.write(&cx, *ino, 4099, b"tail").unwrap();
+                    data.resize(4103, 0);
+                    data[4099..].copy_from_slice(b"tail");
+                }
+                _ => unreachable!(),
+            }
+            let after = fs.read_inode(&cx, *ino).unwrap();
+            let inline = matches!(*name, "inline" | "empty");
+            assert_eq!(after.flags & ffs_types::EXT4_INLINE_DATA_FL != 0, inline);
+            let extra_sectors = match *name {
+                "grown" => 8,
+                "sparse" => 16,
+                _ => 0,
+            };
+            assert_eq!(after.blocks, before.blocks + extra_sectors);
+            assert_eq!(after.file_acl, before.file_acl);
+            assert_eq!(
+                fs.read_block_vec(&cx, BlockNumber(after.file_acl)).unwrap(),
+                *external
+            );
+            assert_eq!(fs.read(&cx, *ino, 0, 8192).unwrap(), data);
+            assert_eq!(
+                fs.getxattr(&cx, *ino, "system.data").unwrap(),
+                inline.then(|| data.get(60..).unwrap_or_default().to_vec())
+            );
+            expected.push(data);
+        }
+        fs.flush_mvcc_to_device(&cx).unwrap();
+        let bytes = dev.snapshot_bytes();
+        let mutated = tmp.path().join("mutated.ext4");
+        std::fs::write(&mutated, &bytes).unwrap();
+        let Some((clean, output)) = run_e2fsck(&mutated) else {
+            return;
+        };
+        assert!(
+            clean,
+            "inline-file mutations must remain native-clean:\n{output}"
+        );
+        let reopened = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(bytes)),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        for ((name, ino, _, _), data) in files.iter().zip(&expected) {
+            assert_eq!(reopened.read(&cx, *ino, 0, 8192).unwrap(), *data);
+            assert_eq!(
+                reopened.getxattr(&cx, *ino, "user.keep").unwrap(),
+                Some(b"kept".to_vec())
+            );
+            assert_eq!(
+                reopened.getxattr(&cx, *ino, "user.external").unwrap(),
+                Some(vec![0xA5; 512])
+            );
+            let dump = tmp.path().join(format!("{name}.dump"));
+            let output = spawn_gated_output(
+                std::process::Command::new("debugfs")
+                    .arg("-R")
+                    .arg(format!("dump /{name} {}", dump.display()))
+                    .arg(&mutated),
+            )
+            .unwrap();
+            assert!(output.status.success());
+            assert_eq!(
+                std::fs::read(&dump).unwrap(),
+                *data,
+                "native dump of {name}"
+            );
         }
     }
 
