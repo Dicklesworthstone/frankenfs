@@ -12,8 +12,9 @@ mod metadata;
 mod publication;
 mod ranges;
 pub use creation::{
-    MkdirArgs, RenameArgs, RmdirArgs, UnlinkArgs, mkdir_in_volume, rename_in_volume,
-    rmdir_in_volume, run_mkdir, run_rename, run_rmdir, run_unlink, unlink_in_volume,
+    MkdirArgs, RenameArgs, RmdirArgs, UnlinkArgs, mkdir_in_volume, mkdir_in_volume_with_mode,
+    rename_in_volume, rmdir_in_volume, run_mkdir, run_rename, run_rmdir, run_unlink,
+    unlink_in_volume,
 };
 pub use metadata::set_attr_in_volume;
 pub use ranges::{truncate_in_volume, write_range_in_volume};

@@ -312,6 +312,7 @@ impl DirectoryCreation {
                 .resolve(cx, &self.path)?
                 .context("created directory is missing from native readback")?;
             if !entry.native.is_directory()
+                || entry.native.attributes != self.updated[11]
                 || entry.native.first_cluster != self.directory_cluster
                 || entry.native.short_name != self.namespace.name.short
                 || entry.native.case_flags != self.namespace.name.flags
@@ -436,7 +437,23 @@ pub fn mkdir_in_volume(
     now: u64,
     dry_run: bool,
 ) -> Result<serde_json::Value> {
-    let plan = DirectoryCreation::prepare(cx, volume, path, now)?;
+    mkdir_in_volume_with_mode(cx, volume, path, now, false, dry_run)
+}
+
+pub fn mkdir_in_volume_with_mode(
+    cx: &Cx,
+    volume: &super::super::super::FatVolume,
+    path: &str,
+    now: u64,
+    read_only: bool,
+    dry_run: bool,
+) -> Result<serde_json::Value> {
+    let mut plan = DirectoryCreation::prepare(cx, volume, path, now)?;
+    // Publish permissions with the initial directory record, not as a second
+    // mutation after a writable directory has already been committed and verified.
+    if read_only {
+        plan.updated[11] |= 1;
+    }
     if dry_run {
         return Ok(plan.report(volume, true));
     }

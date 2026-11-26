@@ -294,6 +294,7 @@ struct ImageState {
     bytes: Vec<u8>,
     durable: Vec<u8>,
     operations: usize,
+    clean_start: Option<usize>,
     fail: Option<usize>,
     tear: usize,
     drop_write_at: Option<u64>,
@@ -312,6 +313,7 @@ impl FaultDevice {
                 durable: bytes.clone(),
                 bytes,
                 operations: 0,
+                clean_start: None,
                 fail: None,
                 tear: 0,
                 drop_write_at: None,
@@ -363,6 +365,14 @@ impl ByteDevice for FaultDevice {
         if dropped {
             state.dropped_writes.push((at.0, count));
         } else {
+            if at.0 == 0
+                && count > 37
+                && state.bytes[37] & 1 != 0
+                && bytes[37] & 1 == 0
+                && state.clean_start.is_none()
+            {
+                state.clean_start = Some(state.operations);
+            }
             state.bytes[at.0 as usize..at.0 as usize + count].copy_from_slice(&bytes[..count]);
         }
         if state.cancel == Some(state.operations) {
@@ -474,21 +484,41 @@ fn cancelled_or_dropped_spelling_publication_is_never_reported_as_success() {
         false,
     )
     .unwrap();
-    let operations = success.0.lock().unwrap().operations;
+    let (operations, clean_start) = {
+        let state = success.0.lock().unwrap();
+        (state.operations, state.clean_start.unwrap())
+    };
+    assert!(clean_start > 1 && clean_start < operations);
     for cut in 1..operations {
         let device = FaultDevice::new(bytes.clone());
         let volume = device.volume();
         device.0.lock().unwrap().cancel = Some(cut);
-        assert!(
-            rename_in_volume(
-                &Cx::for_testing(),
-                &volume,
-                "/HELLO.TXT",
-                "/hello.txt",
-                false
-            )
-            .is_err()
-        );
+        let cx = Cx::for_testing();
+        let outcome = rename_in_volume(&cx, &volume, "/HELLO.TXT", "/hello.txt", false);
+        if cut < clean_start {
+            assert!(
+                outcome.is_err(),
+                "pre-finalization cancellation cut {cut} must fail"
+            );
+        } else {
+            // Once final clean-state publication begins inside NativeMutation::finish,
+            // late cancellation must finish cleanly and preserve the pending signal.
+            outcome.unwrap();
+            assert!(
+                matches!(checkpoint(&cx), Err(FfsError::Cancelled)),
+                "post-commit cancellation cut {cut} must preserve pending cancel"
+            );
+            assert_eq!(
+                volume
+                    .resolve(&Cx::for_testing(), "/hello.txt")
+                    .unwrap()
+                    .unwrap()
+                    .name()
+                    .unwrap(),
+                "hello.txt"
+            );
+            healthy(&volume);
+        }
     }
     // Target the native SFN case-flags byte, independent of how many dirty-state
     // writes or barriers precede it. Dropping that acknowledged sector write

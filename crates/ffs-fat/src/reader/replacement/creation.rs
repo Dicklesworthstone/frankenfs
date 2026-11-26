@@ -8,8 +8,9 @@
 mod mkdir;
 mod names;
 pub use mkdir::{
-    MkdirArgs, RenameArgs, RmdirArgs, UnlinkArgs, mkdir_in_volume, rename_in_volume,
-    rmdir_in_volume, run_mkdir, run_rename, run_rmdir, run_unlink, unlink_in_volume,
+    MkdirArgs, RenameArgs, RmdirArgs, UnlinkArgs, mkdir_in_volume, mkdir_in_volume_with_mode,
+    rename_in_volume, rmdir_in_volume, run_mkdir, run_rename, run_rmdir, run_unlink,
+    unlink_in_volume,
 };
 
 use super::super::{Directory, FatVolume, MAX_DIRECTORY_SLOTS};

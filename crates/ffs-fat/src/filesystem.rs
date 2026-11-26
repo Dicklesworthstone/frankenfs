@@ -9,8 +9,8 @@ mod immutable;
 mod lifetime;
 
 use super::reader::replacement::{
-    create_in_volume, mkdir_in_volume, rename_in_volume, rmdir_in_volume, set_attr_in_volume,
-    sync_volume, truncate_in_volume, unlink_in_volume, write_range_in_volume,
+    create_in_volume, mkdir_in_volume_with_mode, rename_in_volume, rmdir_in_volume,
+    set_attr_in_volume, sync_volume, truncate_in_volume, unlink_in_volume, write_range_in_volume,
 };
 use super::reader::{Directory, Entry, FatVolume, FileChain, MAX_CHAIN_CLUSTERS, checkpoint};
 use asupersync::Cx;
@@ -1119,7 +1119,7 @@ impl FsOps for FatFs {
         let parent_node = self.node(cx, parent)?;
         let parent_dir = parent_node.directory()?;
         let (path, name_str) = self.child_path(parent, name)?;
-        mkdir_in_volume(cx, &self.volume, &path, now_unix_secs(), read_only)
+        mkdir_in_volume_with_mode(cx, &self.volume, &path, now_unix_secs(), read_only, false)
             .map_err(map_mutation_error)?;
         operation.publish_committed(cx, || {
             self.state()?.free_clusters = None;

@@ -749,19 +749,29 @@ fn lost_initialization_and_failed_cache_publication_never_report_success() {
             disk.cancel_after_clean = cancel;
             disk.fail_read_after_clean = !cancel;
         }
-        assert!(
-            fs.fallocate(
-                &Cx::for_testing(),
-                &mut RequestScope::empty(),
-                ino,
-                0,
-                1500,
-                1
-            )
-            .is_err()
-        );
-        stopped(&fs, &image, ino);
-        image.device.disk.lock().unwrap().fail_read = false;
+        let cx = Cx::for_testing();
+        let outcome = fs.fallocate(&cx, &mut RequestScope::empty(), ino, 0, 1500, 1);
+        if cancel {
+            // Once clean-state publication has committed, late cancellation
+            // must finish mounted cache publication rather than quarantine or
+            // report EINTR, while preserving the pending cancel signal.
+            outcome.unwrap();
+            assert!(matches!(checkpoint(&cx), Err(FfsError::Cancelled)));
+            let fresh = Cx::for_testing();
+            let attr = fs
+                .getattr(&fresh, &mut RequestScope::empty(), ino)
+                .unwrap();
+            assert_eq!((attr.size, attr.blocks), (4, 3));
+            assert_eq!(
+                fs.read(&fresh, &mut RequestScope::empty(), ino, 0, 1500)
+                    .unwrap(),
+                b"SAFE"
+            );
+        } else {
+            assert!(outcome.is_err());
+            stopped(&fs, &image, ino);
+            image.device.disk.lock().unwrap().fail_read = false;
+        }
         let reopened = image.volume();
         let cx = Cx::for_testing();
         let entry = reopened.resolve(&cx, "/KEEP.BIN").unwrap().unwrap();
