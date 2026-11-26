@@ -967,16 +967,19 @@ fn clone_with_own_snapshot_cow_of_origin_block_preserves_head_and_snap_breakdown
         let mut mos = engine.open_read_objects(&cx).unwrap();
         let root_dd = mos.object(&cx, 2).unwrap();
         let root_cz = root_dd.order().u64(root_dd.bonus(), 32).unwrap();
-        let data_dd_obj = mos
+        let parent_dir_obj = mos
             .zap(&cx, root_cz)
             .unwrap()
             .into_iter()
             .find(|e| e.name == b"data")
             .unwrap()
             .value;
-        let data_dd = mos.object(&cx, data_dd_obj).unwrap();
-        let data_cz = data_dd.order().u64(data_dd.bonus(), 32).unwrap();
-        mos.zap(&cx, data_cz)
+        let parent_dir_dnode = mos.object(&cx, parent_dir_obj).unwrap();
+        let parent_child_zap = parent_dir_dnode
+            .order()
+            .u64(parent_dir_dnode.bonus(), 32)
+            .unwrap();
+        mos.zap(&cx, parent_child_zap)
             .unwrap()
             .into_iter()
             .find(|e| e.name == b"fork")
