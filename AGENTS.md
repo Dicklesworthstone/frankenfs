@@ -281,32 +281,32 @@ If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to f
 
 ## FrankenFS — This Project
 
-**This is the project you're working on.** FrankenFS (ffs) is a memory-safe, clean-room Rust reimplementation of ext4 and btrfs with a higher-level architecture that combines mount-compatible behavior, MVCC + copy-on-write internals, and self-healing durability via fountain-code-based repair workflows.
+**This is the project you're working on.** FrankenFS (ffs) is a memory-safe, clean-room Rust filesystem suite built on ext4 and btrfs (with MVCC + copy-on-write internals and fountain-code self-healing durability) and expanded with native clean-room Rust engines for FAT16, FAT32, NTFS, and OpenZFS.
 
 ### What It Does
 
-Provides a unified filesystem that can mount ext4/btrfs images in Linux userspace (FUSE), with MVCC/COW transaction semantics for concurrent writers and fountain-code-based self-healing repair for durability.
+Provides a unified userspace filesystem (`ffs`, `ffs-cli`, companion CLIs `ffs-fat`/`ffs-ntfs`/`ffs-zfs`, and `ffs-protected-mount`) that can inspect, check, format, resize, scrub, repair, and mount ext4, btrfs, FAT16/FAT32, NTFS, and ZFS images in Linux userspace (FUSE), with MVCC/COW transaction semantics and RaptorQ self-healing durability.
 
 ### Architecture
 
 ```
 Image/VFS I/O
-  -> Format adapters (ext4 + btrfs parsers/encoders)
-  -> MVCC/COW transaction engine
-  -> Self-healing durability layer (repair symbols + decode proofs)
+  -> Format adapters (ext4 + btrfs + FAT16/32 + NTFS + OpenZFS)
+  -> MVCC/COW transaction engine (ext4/btrfs) + native TXG/log engines (ZFS/NTFS/FAT)
+  -> Self-healing durability layer (native + sidecar RaptorQ repair symbols + decode proofs)
   -> FUSE mount surface (Linux userspace)
-  -> CLI + harness + conformance + perf gates
+  -> Unified CLI + companion CLIs + 6-format TUI + conformance harness + perf gates
 ```
 
 ### Workspace Structure
 
 ```
 frankenfs/
-├── Cargo.toml                     # Workspace root
+├── Cargo.toml                     # Workspace root (25 workspace members)
 ├── crates/
 │   ├── ffs-types/                 # On-disk type definitions, constants, flag fields
 │   ├── ffs-error/                 # Unified error types (thiserror-derived)
-│   ├── ffs-ondisk/                # Superblock, group descriptor, on-disk structure parsing
+│   ├── ffs-ondisk/                # On-disk structure parsing/encoding (ext4/btrfs/FAT/NTFS/ZFS)
 │   ├── ffs-block/                 # Block I/O layer, block cache
 │   ├── ffs-journal/               # Journal/transaction commit, replay, recovery
 │   ├── ffs-mvcc/                  # MVCC snapshot isolation, COW engine
@@ -317,14 +317,19 @@ frankenfs/
 │   ├── ffs-extent/                # Extent tree operations
 │   ├── ffs-xattr/                 # Extended attributes
 │   ├── ffs-fuse/                  # FUSE mount surface
-│   ├── ffs-repair/                # Self-healing repair (fountain codes)
-│   ├── ffs-core/                  # High-level orchestration
-│   ├── ffs/                       # Facade crate (thin re-export of `ffs-core` public API)
-│   ├── ffs-cli/                   # CLI binary
-│   ├── ffs-tui/                   # TUI diagnostics (frankentui)
-│   ├── ffs-harness/               # Conformance harness + benchmarks
+│   ├── ffs-repair/                # Self-healing repair (RaptorQ native + multi-format sidecar)
+│   ├── ffs-core/                  # High-level ext4/btrfs orchestration & FsOps trait
+│   ├── ffs-fat/                   # Native FAT16/FAT32 engine (RO/RW, LFN, check, format, resize)
+│   ├── ffs-ntfs/                  # Native NTFS 3.0/3.1 engine (RO/RW, $LogFile, $Secure, WOF/LZNT1/EFS, format, check, resize)
+│   ├── ffs-zfs/                   # Native OpenZFS v5000 engine (RO/RW, TXG, ZPL, ZVOL NBD, AES-GCM/CCM, send/recv, dRAID/RAIDZ)
+│   ├── ffs/                       # Public facade crate (6-format detection, inspection, RO/RW opens)
+│   ├── ffs-cli/                   # Unified CLI (`ffs-cli`), `ffs-protected-mount`, and `ffs-{fat,ntfs,zfs}`
+│   ├── ffs-tui/                   # Six-format TUI diagnostics (frankentui)
+│   ├── ffs-harness/               # Conformance harness, §22.1 canonical gates + benchmarks
 │   ├── ffs-ext4/                  # Legacy ext4 extraction reference
 │   └── ffs-btrfs/                 # Btrfs tree/mutation layer + legacy extraction reference
+├── tools/
+│   └── ffs-ops/                   # Standalone ops/conformance helper crate
 ├── conformance/                   # Shared sparse parser/conformance fixtures
 │   ├── fixtures/                  # Sparse JSON fixtures used by ffs-harness
 │   └── golden/                    # Additional conformance artifacts
@@ -341,7 +346,7 @@ frankenfs/
 |-------|------------|---------|
 | `ffs-types` | Primitives | On-disk type definitions, size constants, flag field bitflags |
 | `ffs-error` | Errors | Unified `FfsError` enum across all crates (thiserror-derived) |
-| `ffs-ondisk` | Parsing | Superblock, group descriptors, on-disk structure serialization/deserialization |
+| `ffs-ondisk` | Parsing | Superblock, group descriptors, FAT/NTFS/ZFS/ext4/btrfs on-disk structures |
 | `ffs-block` | Storage | Block device I/O abstraction, block cache, read/write paths |
 | `ffs-journal` | Durability | Journal transaction commit/abort, log replay, crash recovery |
 | `ffs-mvcc` | Concurrency | MVCC snapshot isolation, copy-on-write engine, conflict detection |
@@ -353,8 +358,11 @@ frankenfs/
 | `ffs-xattr` | Attributes | Extended attribute get/set/list/remove |
 | `ffs-fuse` | Mount | FUSE userspace mount surface, VFS dispatch |
 | `ffs-repair` | Healing | Fountain-code-based self-healing, repair symbol generation, decode proofs |
-| `ffs-core` | Orchestration | High-level filesystem operations, format adapter coordination |
-| `ffs-harness` | Testing | Conformance harness, fixture-driven golden tests, benchmark suite |
+| `ffs-core` | Orchestration | High-level ext4/btrfs operations, `FsOps` trait, format adapter coordination |
+| `ffs-fat` | FAT16/32 | Native FAT16/FAT32 RO/RW engine, check/recover, format, offline resize |
+| `ffs-ntfs` | NTFS | Native NTFS 3.0/3.1 RO/RW engine, `$LogFile`, `$Secure`, WOF/LZNT1/EFS, format, check, resize |
+| `ffs-zfs` | OpenZFS | Native ZFS v5000 RO/RW engine, metaslab/TXG, ZPL/ZVOL, AES-GCM/CCM, send/recv, RAIDZ/dRAID |
+| `ffs-harness` | Testing | Conformance harness, fixture-driven golden tests, §22.1 gates, benchmark suite |
 
 ### Core Types Quick Reference
 

@@ -27,7 +27,7 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` complete.
 - [x] Canonicalize crate naming across all docs (no phantom crates like `ffs-ops`, `ffs-cache`, `ffs-io`, `ffs-async`)
 - [x] Canonicalize all normative type definitions (single source for `TxnId`, `CommitSeq`, `Snapshot`, `BlockNumber`, `InodeNumber`, `BlockVersion`)
 - [x] Canonicalize all normative trait definitions (single source for `BlockDevice`, MVCC interfaces, repair interfaces) — `BlockDevice` in ffs-block, `FsOps` in ffs-core, MVCC interfaces in ffs-mvcc, repair interfaces in ffs-repair; each trait canonically defined in its owning crate
-- [x] Reconcile doc claims vs workspace reality (21 workspace crates: 19 core + `ffs-ext4`/`ffs-btrfs` wrappers)
+- [x] Reconcile doc claims vs workspace reality (25 workspace members: 24 crates under `crates/` including `ffs-fat`/`ffs-ntfs`/`ffs-zfs` + `tools/ffs-ops`)
 - [x] Reconcile ext4/btrfs scope statements (both formats are in-scope; btrfs phased)
 - [x] Reconcile explicit exclusion rows with current tracked parity/runtime scope (`fscrypt` nokey acceptance, ext4 inline-data read compatibility, and btrfs multi-device/decompression/send-stream parsing are no longer globally excluded)
 - [x] Fix math/spec errors in Section 18 (probabilistic conflict model) to be dimensionally correct and assumption-explicit
@@ -52,7 +52,7 @@ operational readiness.
 
 - [x] `bd-rchk1` docs/status reconciliation: keep README, feature parity, spec, conformance notes, discrepancy notes, xfstests notes, and tracker wording explicit about tracked parity versus runtime readiness.
 - [x] `bd-rchk2` btrfs delayed refs: resolve `DISC-004` with executable evidence, or narrow it into accepted/split follow-up work.
-- [ ] `bd-rchk3` xfstests baseline: run a fresh dated baseline, capture commands/artifacts, and turn real failures into beads. 2026-05-01 status: subset/regression gate is documented, but real execution is blocked by unbuilt xfstests helpers and the current dpkg lock blocking `xfslibs-dev`/`libaio-dev` install.
+- [x] `bd-rchk3` xfstests baseline: executed continuously in `.github/workflows/xfstests.yml` against `scripts/e2e/xfstests_baseline.json` (ext4) and `scripts/e2e/xfstests_baseline_btrfs.json` (btrfs), with real failures tracked as concrete fixes/beads (e.g. `generic/078` btrfs atomic `RENAME_WHITEOUT`, `bd-en7ic` for `generic/069`/`generic/531`).
 - [x] `bd-rchk4` mounted FUSE CI: make critical mounted ext4/btrfs paths run in a permissioned CI or RCH workflow, with visible skip diagnostics when local FUSE permissions are absent. Verified in `.github/workflows/ci.yml` (`FUSE E2E` job `135312202623` on `b4b527049`) with `FFS_REQUIRE_FUSE=1`.
 - [x] `bd-rchk5` performance baselines: re-measure representative throughput/latency targets against current code and record environment metadata (`baselines/baseline-20261119-section-9-5-perf-gates.md`, CI job `135312202623` on `b4b527049`).
 - [x] `bd-rchk6` mounted self-healing lifecycle: implemented explicit mounted automatic repair via `--background-repair --background-scrub-ledger <jsonl>`, with read-write repair routed through the mounted MVCC repair-writeback serializer.

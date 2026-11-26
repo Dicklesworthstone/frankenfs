@@ -1080,13 +1080,17 @@ blanket property of every existing path.
 
 The multi-format plan deliberately separates native compatibility from
 FrankenFS-specific improvements. FAT directory creation (`mkdir`), offline
-`unlink`/`rmdir`/`rename`/`resize`, pure-Rust `format`, bounded MBR/GPT
-`--partition` slice discovery, and unified six-format read/inspect/check/scrub
-routing in `ffs-cli` are implemented. The remaining high-impact work includes
-FAT Windows naming/mounted power-cut qualification; broader NTFS writable-profile
-coverage; ZFS mounted writes, ZIL writing and pool lifecycle;
-broader writable profiles through the unified `ffs` API; and executable native-interchange,
-crash/reopen and mounted-operation evidence for each admitted profile.
+`unlink`/`rmdir`/`rename`/`resize`, pure-Rust `format` (FAT16/FAT32, NTFS,
+and single-leaf OpenZFS `v5000`), unified offline `ffs-cli resize` (FAT16/FAT32
+and NTFS), bounded MBR/GPT `--partition` slice discovery, unified six-format
+read/inspect/check/scrub routing in `ffs-cli`, and six-format headless
+`ffs-cli tui --snapshot-json` telemetry are implemented. The remaining
+high-impact work includes FAT Windows naming/mounted power-cut qualification;
+live Windows/OpenZFS interoperability qualification for NTFS and ZFS writable
+profiles; ZFS ZIL writing and `device_rebuild`/`fast_dedup` write support;
+multi-device btrfs RW; mounted kernel performance parity (`ext4`/`btrfs`);
+and executable native-interchange, crash/reopen and mounted-operation evidence
+for each admitted profile.
 
 The [comprehensive plan](COMPREHENSIVE_PLAN_FOR_NTFS_FAT16_FAT32_AND_ZFS.md),
 [implementation workpackages](docs/NTFS_FAT_ZFS_IMPLEMENTATION_WORKPACKAGES.md),
@@ -1124,10 +1128,12 @@ explicit `Gate-Bypass: <reason>` commit trailer on `HEAD`, which is recorded in
 `artifacts/gates/<timestamp>/summary.json`. On GitHub,
 `.github/workflows/ci.yml`, `.github/workflows/xfstests.yml` and
 `.github/workflows/artifact-gates.yml` execute automatically on every push to
-`main` (latest completed runs on `f08ef460a`:
-[Artifact Gates `42977453821`](https://github.com/Dicklesworthstone/frankenfs/actions/runs/42977453821) `success`,
-[xfstests `42977453888`](https://github.com/Dicklesworthstone/frankenfs/actions/runs/42977453888) `success`,
-and [CI `42977453897`](https://github.com/Dicklesworthstone/frankenfs/actions/runs/42977453897) `failure` — `Clippy` fixed in `4b0731725`; `FUSE E2E` live CLI telemetry mount teardown remains host-blocked under the Ubuntu 24.04 runner AppArmor `fusermount3` policy in `bd-dzbsp`).
+`main` (including strict workspace Clippy, differential FAT/NTFS/ZFS native
+reader/mount oracle checks, sandboxed inspection, canonical §22.1 gates, and
+ext4/btrfs `xfstests` regression baselines). See
+[docs/reality-check-bridge-writeup.md](docs/reality-check-bridge-writeup.md)
+for the current dated audit of verified execution receipts versus remaining
+live-qualification gaps.
 
 ### Source inventory
 
