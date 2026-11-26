@@ -919,7 +919,7 @@ fn encode_zpl_bonus_for_fixture(
                 Some(arena.alloc_raw_compressed(&sraw, &compressed, 44, 0, 3, 7, birth, order))
             } else if let SaSpillFixture::ProjectCompact(project_id) = spill_profile {
                 sraw[56..64].copy_from_slice(&order.encode(project_id));
-                let (compressed, comp_algo) = ffs_ondisk::zfs::compress_block(
+                let (compressed, comp_algo) = ffs_ondisk::zfs::crypto::compress_block(
                     &sraw,
                     15,
                     None,
