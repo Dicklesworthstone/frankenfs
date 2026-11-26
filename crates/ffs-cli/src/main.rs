@@ -11930,7 +11930,7 @@ fn build_live_tui_snapshot_with_six_format(
         }
         Err(_) => None,
     };
-    if let Some((kind, detected, part_entry, _part_dev)) = target
+    if let Some((kind, detected, part_entry, part_dev)) = target
         && (part_entry.is_some()
             || matches!(
                 kind,
@@ -12029,15 +12029,8 @@ fn build_live_tui_snapshot_with_six_format(
                     (report.verified_blocks, report.errors, report.issues.len())
                 }
                 ffs_core::FsFormatKind::Ext4 | ffs_core::FsFormatKind::Btrfs => {
-                    let byte_dev = FileByteDevice::open_read_only(image_path)?;
-                    let slice_len =
-                        length.unwrap_or_else(|| byte_dev.len_bytes().saturating_sub(offset));
-                    let vol = ffs_block::VolumeDevice::new(
-                        Arc::new(byte_dev),
-                        ffs_types::ByteOffset(offset),
-                        slice_len,
-                        ffs_block::io_engine::VolumeAccess::ReadOnly,
-                    )?;
+                    let part_dev = part_dev.context("partitioned TUI scrub requires partition")?;
+                    let slice_len = part_dev.len_bytes();
                     let (flavor, block_size) = match &detected {
                         ffs_core::DetectedFilesystem::Ext4(sb) => {
                             (FsFlavor::Ext4(sb.clone()), sb.block_size)
@@ -12052,7 +12045,7 @@ fn build_live_tui_snapshot_with_six_format(
                         }
                         _ => unreachable!(),
                     };
-                    let block_dev = ByteBlockDevice::new(vol, block_size)?;
+                    let block_dev = ByteBlockDevice::new(part_dev, block_size)?;
                     let validator: Box<dyn ffs_repair::scrub::BlockValidator> = match &flavor {
                         FsFlavor::Ext4(_) => {
                             Box::new(ffs_repair::scrub::Ext4SuperblockValidator::new(block_size))
