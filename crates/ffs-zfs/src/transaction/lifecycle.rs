@@ -658,20 +658,30 @@ pub fn create_pool_on_leaves(
     let mut arena = CreateArena::new(spec.ashift, primary_asize, primary_topo.clone())?;
 
     // Minimal ZPL root dataset (Objects 1=MASTER_NODE, 2=SA_MASTER, 3=SA_REG, 4=SA_LAYOUTS, 5=root_dir)
+    // Track exact SpaceDelta across every initial root ZPL block before moving
+    // the pointers so subsequent COW mutations (which may compress metadata
+    // smaller than their initial uncompressed allocation) update `dsl_dataset`
+    // and `dsl_dir` space counters without underflow.
+    let mut root_space = SpaceDelta::default();
     let master_raw = mzap(
         &[(b"VERSION", 5), (b"ROOT", 5), (b"SA_ATTRS", 2)],
         0x201,
         order,
     )?;
     let master_bp = arena.alloc_bp(&master_raw, DMU_OT_MASTER_NODE, 1, order)?;
+    root_space.add_assign(SpaceDelta::from_bp(&master_bp)?)?;
     let sa_master_raw = mzap(&[(b"LAYOUTS", 4), (b"REGISTRY", 3)], 0x202, order)?;
     let sa_master_bp = arena.alloc_bp(&sa_master_raw, DMU_OT_SA_MASTER_NODE, 1, order)?;
+    root_space.add_assign(SpaceDelta::from_bp(&sa_master_bp)?)?;
     let sa_reg_raw = mzap(&[], 0x203, order)?;
     let sa_reg_bp = arena.alloc_bp(&sa_reg_raw, DMU_OT_SA_ATTR_REGISTRATION, 1, order)?;
+    root_space.add_assign(SpaceDelta::from_bp(&sa_reg_bp)?)?;
     let sa_lay_raw = mzap(&[], 0x204, order)?;
     let sa_lay_bp = arena.alloc_bp(&sa_lay_raw, DMU_OT_SA_ATTR_LAYOUTS, 1, order)?;
+    root_space.add_assign(SpaceDelta::from_bp(&sa_lay_bp)?)?;
     let root_dir_raw = mzap(&[], 0x205, order)?;
     let root_dir_bp = arena.alloc_bp(&root_dir_raw, DMU_OT_DIRECTORY_CONTENTS, 1, order)?;
+    root_space.add_assign(SpaceDelta::from_bp(&root_dir_bp)?)?;
 
     // Canonical 264-byte legacy znode bonus for root dir (`S_IFDIR | 0o755`, parent=5, links=2).
     let root_znode_bonus = ffs_ondisk::zfs_zpl::Metadata {
@@ -761,6 +771,7 @@ pub fn create_pool_on_leaves(
     .map_err(|e| parse_err(&e))?;
 
     let zpl_table_bp = arena.alloc_bp(&zpl_table, DMU_OT_DNODE, 5, order)?;
+    root_space.add_assign(SpaceDelta::from_bp(&zpl_table_bp)?)?;
     let zpl_meta = make_dnode(
         DMU_OT_DNODE,
         DNODE_BLOCK_BYTES,
@@ -774,23 +785,7 @@ pub fn create_pool_on_leaves(
         .map_err(|e| parse_err(&e))?;
     let zpl_os_bytes = zpl_os.encode(order).map_err(|e| parse_err(&e))?;
     let zpl_os_bp = arena.alloc_bp(&zpl_os_bytes, DMU_OT_OBJSET, zpl_os.meta_fill(), order)?;
-
-    // Account for every initial ZPL root dataset block so subsequent COW
-    // mutations (which may compress metadata blocks smaller than their initial
-    // uncompressed allocation) update `dsl_dataset` and `dsl_dir` space
-    // counters accurately without underflow.
-    let mut root_space = SpaceDelta::default();
-    for bp in [
-        &master_bp,
-        &sa_master_bp,
-        &sa_reg_bp,
-        &sa_lay_bp,
-        &root_dir_bp,
-        &zpl_table_bp,
-        &zpl_os_bp,
-    ] {
-        root_space.add_assign(SpaceDelta::from_bp(bp)?)?;
-    }
+    root_space.add_assign(SpaceDelta::from_bp(&zpl_os_bp)?)?;
 
     // Build MOS dnode tables (metaslab space maps start strictly after all
     // secondary `metaslab_array` objects `31..=30+vdevs.len()`).
