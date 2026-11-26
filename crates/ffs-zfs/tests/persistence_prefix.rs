@@ -170,6 +170,7 @@ struct PoolFixtureSpec {
     auxiliary_xattr_fault: Option<XattrOwnershipFault>,
     auxiliary_xattr_owner_ids: Option<(u64, u64)>,
     auxiliary_capability_with_retained_value: bool,
+    auxiliary_xattr_names: Option<(&'static [u8], Option<&'static [u8]>)>,
 }
 
 impl Default for PoolFixtureSpec {
@@ -221,6 +222,7 @@ impl Default for PoolFixtureSpec {
             auxiliary_xattr_fault: None,
             auxiliary_xattr_owner_ids: None,
             auxiliary_capability_with_retained_value: false,
+            auxiliary_xattr_names: None,
         }
     }
 }
@@ -1509,7 +1511,8 @@ fn build_zpl_objectset(
                 } else if auxiliary == AuxiliaryOwnership::CapabilityXattr {
                     b"security.capability"
                 } else {
-                    b"user.retained"
+                    spec.auxiliary_xattr_names
+                        .map_or(b"user.retained".as_slice(), |(name, _)| name)
                 };
                 let value_object = if fault == Some(XattrOwnershipFault::ValueAlias) {
                     owner
@@ -1522,8 +1525,13 @@ fn build_zpl_objectset(
                 if fault == Some(XattrOwnershipFault::DuplicateValue) {
                     pairs.push((b"user.aliased", value_reference));
                 }
-                if spec.auxiliary_capability_with_retained_value {
+                let extra_name = if spec.auxiliary_capability_with_retained_value {
                     assert_eq!(auxiliary, AuxiliaryOwnership::CapabilityXattr);
+                    Some(b"user.retained".as_slice())
+                } else {
+                    spec.auxiliary_xattr_names.and_then(|(_, name)| name)
+                };
+                if let Some(extra_name) = extra_name {
                     let retained_bp = arena.alloc_block(&padded, 19, 0, birth, order);
                     let retained = make_dnode(
                         19,
@@ -1537,7 +1545,7 @@ fn build_zpl_objectset(
                     );
                     write_dnode_at(&mut table, 15, &retained).unwrap();
                     pairs.push((
-                        b"user.retained",
+                        extra_name,
                         encode_directory_reference(15, Kind::Regular).unwrap(),
                     ));
                 }
@@ -4916,6 +4924,16 @@ fn native_zpl_file_dnode(
     dataset: &[Vec<u8>],
     object: u64,
 ) -> Dnode {
+    native_zpl_file_slot(cx, engine, device, dataset, object).expect("allocated native ZPL dnode")
+}
+
+fn native_zpl_file_slot(
+    cx: &Cx,
+    engine: &ZfsTransactionEngine,
+    device: &FaultableMemberDevice,
+    dataset: &[Vec<u8>],
+    object: u64,
+) -> Option<Dnode> {
     let mut mos = engine.open_read_objects(cx).unwrap();
     let dataset = mos
         .datasets(cx)
@@ -4946,7 +4964,6 @@ fn native_zpl_file_dnode(
         slot % slots_per_block,
         table_pointer.payload_order(),
     )
-    .unwrap()
     .unwrap()
 }
 
@@ -9596,6 +9613,9 @@ fn native_openzfs_zdb_oracle_verifies_committed_pool_and_space_maps() {
         image_bytes: 64 * 1024 * 1024,
         deadlist_mode: DeadlistMode::NativeDeadlist,
         user_accounting: true,
+        auxiliary_ownership: Some((4, AuxiliaryOwnership::XattrDirectory)),
+        auxiliary_xattr_owner_ids: Some((2001, 3001)),
+        auxiliary_xattr_names: Some((b"retained", Some(b"user.retained"))),
         ..PoolFixtureSpec::default()
     });
     std::fs::write(&img_path, &built.members[0]).unwrap();
@@ -9650,7 +9670,33 @@ fn native_openzfs_zdb_oracle_verifies_committed_pool_and_space_maps() {
         )
         .into_result()
         .unwrap();
+    // Native block accounting must also accept the simultaneous retirement of
+    // both private aliases and migration into an SA spill, with snapshots still
+    // retaining the private values under their original owners.
+    let replacement = vec![0x6B; 3000];
+    eng.set_xattr(
+        &cx,
+        &ds,
+        hello_obj,
+        "user.retained",
+        &replacement,
+        ffs_zfs::ZfsXattrSetMode::Replace,
+        ts,
+    )
+    .into_result()
+    .unwrap();
     let mut head = eng.open_read_objects(&cx).unwrap().zpl(&cx, &ds).unwrap();
+    assert_eq!(
+        head.getxattr(&cx, hello_obj, "user.retained").unwrap(),
+        Some(replacement),
+    );
+    assert_eq!(
+        head.open_snapshot(&cx, b"before")
+            .unwrap()
+            .getxattr(&cx, hello_obj, "user.retained")
+            .unwrap(),
+        Some(b"private value survives namespace changes".to_vec()),
+    );
     let retained = ZfsUnlinkedObject {
         object: fobj,
         generation: head.stat(&cx, fobj).unwrap().0.generation,
@@ -9678,6 +9724,18 @@ fn native_openzfs_zdb_oracle_verifies_committed_pool_and_space_maps() {
     )
     .unwrap();
     assert_eq!(eng.pending_unlinks(&cx, &ds).unwrap(), vec![retained]);
+    eng.remove_xattr(&cx, &ds, hello_obj, "user.retained", ts)
+        .into_result()
+        .unwrap();
+    assert_eq!(
+        eng.open_read_objects(&cx)
+            .unwrap()
+            .zpl(&cx, &ds)
+            .unwrap()
+            .getxattr(&cx, hello_obj, "user.retained")
+            .unwrap(),
+        None,
+    );
     eng.reap_unlinked_file(&cx, &ds, retained)
         .into_result()
         .unwrap();

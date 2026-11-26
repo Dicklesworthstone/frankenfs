@@ -721,6 +721,16 @@ for objects in touched dnode blocks refuses mutation before backing writes.
 Dataset quotas, quota administration, native interchange and broader lifecycle
 qualification remain separate work; this does not close the writer milestone.
 
+User xattr replacement and removal on SA-formatted ZPL v5 objects also handle
+existing private directory values. The transaction recognizes native prefixed
+names and the reader's admitted compatibility aliases, migrates replacement
+values into SA storage, and retires obsolete private values together with the
+owner update. Private ownership, quota deltas and snapshot/deadlist retention
+use the same checked paths as object reclamation; unrelated xattrs remain
+attached. Create/replace-only semantics are checked across both stores before
+publication. This increment does not add generic legacy-ZPL xattr creation or
+qualify native OpenZFS interchange.
+
 Native mutation now checks the actual payload order of every committed DNODE
 leaf being replaced, in both ordinary COW and final fixed-DVA MOS replay. An
 ObjectSet-level comparison alone cannot protect heterogeneous native trees.
