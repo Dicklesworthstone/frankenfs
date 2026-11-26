@@ -4841,7 +4841,7 @@ mod bd_tqrnc {
             },
         )
         .expect("format fat32 with explicit serial");
-        protect(&cx, &fat32_img, &fat32_rq, &SidecarOptions::default()).expect("protect fat32");
+        protect(&cx, &fat32_img, &fat32_rq, SidecarOptions::default()).expect("protect fat32");
 
         let storage_set = ProtectedStorageSet::open_standalone(
             &cx,
