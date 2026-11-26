@@ -620,6 +620,109 @@ pub fn remove_xattr(
     Ok(true)
 }
 
+/// Replace or remove an inline file's mandatory inode-body `system.data` value.
+///
+/// Unlike a generic xattr update, this never spills data into an external xattr
+/// block. Unrelated entries retain their native headers, including EA-inode
+/// references, value lengths and hashes; their values are only relocated within
+/// the same inode. The caller owns the inode/data-layout transition and publishes
+/// the returned inode atomically with any newly allocated data blocks.
+///
+/// # Errors
+/// Returns corruption for missing, duplicate or EA-inode-backed `system.data`,
+/// malformed inode-body entries, and `NoSpace` if a replacement cannot fit. Every
+/// error leaves the inode unchanged.
+#[allow(clippy::too_many_lines)]
+pub fn rewrite_inline_data(inode: &mut Ext4Inode, value: Option<&[u8]>) -> Result<()> {
+    let corrupt = |detail: &str| FfsError::Corruption {
+        block: 0,
+        detail: format!("ext4 inline data: {detail}"),
+    };
+    let entries = ffs_ondisk::parse_ibody_xattrs_with_inum(inode)
+        .map_err(|_| corrupt("invalid inode-body attributes"))?;
+    let mut target = None;
+    let mut records = Vec::with_capacity(entries.len());
+    let mut offset = INLINE_HEADER_LEN;
+    for (index, (entry, value_inum)) in entries.iter().enumerate() {
+        let end = offset
+            .checked_add(align4(XATTR_ENTRY_HEADER_LEN + entry.name.len()))
+            .filter(|end| *end <= inode.xattr_ibody.len())
+            .ok_or_else(|| corrupt("truncated inode-body entry"))?;
+        records.push(offset..end);
+        offset = end;
+        if entry.name_index == EXT4_XATTR_INDEX_SYSTEM
+            && entry.name == b"data"
+            && (target.replace(index).is_some() || *value_inum != 0)
+        {
+            return Err(corrupt("system.data must be one inode-body value"));
+        }
+    }
+    let target = target.ok_or_else(|| corrupt("missing system.data attribute"))?;
+    if inode.xattr_ibody.get(offset..offset + 4) != Some(&[0; 4]) {
+        return Err(corrupt("missing inode-body entry terminator"));
+    }
+    for ((entry, value_inum), record) in entries.iter().zip(&records) {
+        if *value_inum == 0 && !entry.value.is_empty() {
+            let raw = &inode.xattr_ibody[record.clone()];
+            let start = usize::from(u16::from_le_bytes([raw[2], raw[3]])) + INLINE_HEADER_LEN;
+            if start < offset + 4 || !start.is_multiple_of(4) {
+                return Err(corrupt("inode-body value overlaps entries or is unaligned"));
+            }
+        }
+    }
+    if value.is_some_and(|bytes| bytes.len() > XATTR_VALUE_MAX) {
+        return Err(FfsError::NoSpace);
+    }
+
+    let removed_len = if value.is_none() {
+        records[target].len()
+    } else {
+        0
+    };
+    let table_end = offset + 4 - removed_len;
+    let mut out = vec![0_u8; inode.xattr_ibody.len()];
+    out[..INLINE_HEADER_LEN].copy_from_slice(&EXT4_XATTR_MAGIC.to_le_bytes());
+    let mut destination = INLINE_HEADER_LEN;
+    let mut value_tail = out.len() & !3;
+    for (index, ((entry, value_inum), record)) in entries.iter().zip(&records).enumerate() {
+        if index == target && value.is_none() {
+            continue;
+        }
+        let end = destination + record.len();
+        out[destination..end].copy_from_slice(&inode.xattr_ibody[record.clone()]);
+        if *value_inum == 0 {
+            let bytes = if index == target {
+                value.expect("removed target was skipped")
+            } else {
+                &entry.value
+            };
+            if !bytes.is_empty() {
+                value_tail = value_tail
+                    .checked_sub(align4(bytes.len()))
+                    .filter(|start| *start >= table_end)
+                    .ok_or(FfsError::NoSpace)?;
+                out[value_tail..value_tail + bytes.len()].copy_from_slice(bytes);
+            }
+            let value_offset =
+                u16::try_from(value_tail - INLINE_HEADER_LEN).map_err(|_| FfsError::NoSpace)?;
+            out[destination + 2..destination + 4].copy_from_slice(&value_offset.to_le_bytes());
+            if index == target {
+                let value_size = u32::try_from(bytes.len()).map_err(|_| FfsError::NoSpace)?;
+                out[destination + 8..destination + 12].copy_from_slice(&value_size.to_le_bytes());
+                // Inode-body values need no entry hash; the inode checksum
+                // covers the new data. Preserve every unrelated native hash.
+                out[destination + 12..destination + 16].fill(0);
+            }
+        }
+        destination = end;
+    }
+    if value.is_none() && entries.len() == 1 && inode.file_acl == 0 {
+        out[..INLINE_HEADER_LEN].fill(0);
+    }
+    inode.xattr_ibody = out;
+    Ok(())
+}
+
 /// Whether this inode carries ANY extended attribute, in either of the two
 /// places ext4 can put one.
 ///
@@ -944,6 +1047,91 @@ mod tests {
             storage[240..244].copy_from_slice(b"old!");
         }
         storage
+    }
+
+    fn inline_data_with_native_ea_reference() -> Ext4Inode {
+        let mut inode = make_inode(256);
+        inode.file_acl = 123;
+        inode.blocks = 8;
+        inode.xattr_ibody = ea_inode_storage(INLINE_HEADER_LEN, true, 9000);
+        // Add system.data after the two independently encoded existing entries.
+        let entry = 4 + 20 + 24;
+        inode.xattr_ibody[entry] = 4;
+        inode.xattr_ibody[entry + 1] = EXT4_XATTR_INDEX_SYSTEM;
+        inode.xattr_ibody[entry + 2..entry + 4].copy_from_slice(&224_u16.to_le_bytes());
+        inode.xattr_ibody[entry + 8..entry + 12].copy_from_slice(&5_u32.to_le_bytes());
+        inode.xattr_ibody[entry + 16..entry + 20].copy_from_slice(b"data");
+        inode.xattr_ibody[228..233].copy_from_slice(b"tail!");
+        inode
+    }
+
+    #[test]
+    fn inline_data_rewrite_preserves_native_ea_references_and_external_ownership() {
+        for replacement in [
+            Some(&b"longer inline continuation"[..]),
+            Some(&b""[..]),
+            None,
+        ] {
+            let mut inode = inline_data_with_native_ea_reference();
+            let original_reference = inode.xattr_ibody[4..24].to_vec();
+            rewrite_inline_data(&mut inode, replacement).unwrap();
+            assert_eq!(inode.file_acl, 123);
+            assert_eq!(inode.blocks, 8);
+            assert_eq!(&inode.xattr_ibody[4..24], original_reference);
+            let entries = ffs_ondisk::parse_ibody_xattrs_with_inum(&inode).unwrap();
+            assert_eq!(entries[0].1, 77);
+            assert_eq!(entries[1].0.value, b"old!");
+            let data = entries.iter().find(|(entry, _)| {
+                entry.name_index == EXT4_XATTR_INDEX_SYSTEM && entry.name == b"data"
+            });
+            assert_eq!(data.map(|(entry, _)| entry.value.as_slice()), replacement);
+        }
+    }
+
+    #[test]
+    fn inline_data_rewrite_rejects_capacity_and_malformed_layout_without_mutation() {
+        let original = inline_data_with_native_ea_reference();
+        let mut inode = original.clone();
+        assert!(matches!(
+            rewrite_inline_data(&mut inode, Some(&[0xFF; 256])),
+            Err(FfsError::NoSpace)
+        ));
+        assert_eq!(inode, original);
+        for defect in [
+            "missing",
+            "duplicate",
+            "external-value",
+            "missing-terminator",
+            "overlapping-value",
+            "unaligned-value",
+        ] {
+            let mut inode = original.clone();
+            let entry = 48;
+            match defect {
+                "missing" => inode.xattr_ibody[entry + 1] = EXT4_XATTR_INDEX_USER,
+                "duplicate" => {
+                    let copy = inode.xattr_ibody[entry..entry + 20].to_vec();
+                    inode.xattr_ibody[entry + 20..entry + 40].copy_from_slice(&copy);
+                }
+                "external-value" => {
+                    inode.xattr_ibody[entry + 4..entry + 8].copy_from_slice(&99_u32.to_le_bytes());
+                }
+                "missing-terminator" => inode.xattr_ibody[entry + 22] = 1,
+                "overlapping-value" => {
+                    inode.xattr_ibody[entry + 2..entry + 4].copy_from_slice(&4_u16.to_le_bytes());
+                }
+                "unaligned-value" => {
+                    inode.xattr_ibody[entry + 2..entry + 4].copy_from_slice(&225_u16.to_le_bytes());
+                }
+                _ => unreachable!(),
+            }
+            let before = inode.clone();
+            assert!(matches!(
+                rewrite_inline_data(&mut inode, Some(b"new")),
+                Err(FfsError::Corruption { .. })
+            ));
+            assert_eq!(inode, before, "{defect}");
+        }
     }
 
     #[test]
