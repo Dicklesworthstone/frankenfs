@@ -251,7 +251,7 @@ exclusion is deliberate and documented to prevent scope creep.
 | **Quota subsystem** | Disk quotas (usrquota, grpquota, prjquota) are an administrative feature. Excluding them removes ~3K LOC of quota tracking code. |
 | **btrfs receive-side application + production-hardened multi-device RW** | V1 requires multi-device reads. Clean attached-device routing, nested reads and RAID5/6 erasure recovery have kernel-image/library-FUSE and public CLI evidence; the README profile matrix records the tested combinations. Count reconciliation has formatted-image OpenFs evidence for CRC32C/xxHash64 and full/tree-log commits. Seed/sprout routing, the two-checksum profile cohort, all 42 affected core controls and the read-only OS descriptor control passed independent qualification (`bd-hk5w3`; receipts in `FEATURE_PARITY.md`). Transparent decompression, subvolume mount, tree-log replay and send-stream parsing exist. `OpenFs::enable_writes` refuses multiple devices and profiles other than Single/DUP before mutable allocation setup, including when read validation is skipped. Receive-stream application and multi-device mutation remain later phases. |
 | **NFS export support** | NFS export requires stable file handle generation across remounts. This is a protocol concern orthogonal to filesystem correctness. |
-| **ext4 inline-data range allocation** | Regular inline files support writes, truncation, sparse growth, and automatic conversion to extents or legacy block pointers within the caller's transaction. Inline `fallocate` and its range operations remain outside the supported contract. |
+| **ext4 legacy indirect-file range shifts** | Regular inline files support writes, truncation, sparse growth, and `fallocate` through transactional conversion to extents or legacy block pointers. Allocation, keep-size reservation, hole punching, and zeroing share that transaction. `COLLAPSE_RANGE` and `INSERT_RANGE` require extent mappings and remain unsupported for legacy indirect files. |
 | **ext4 e2compr rare legacy codecs (`lzv1`, `bzip2`, `lzrw3a`)** | FrankenFS V1 supports e2compr gzip, LZO, and passthrough none read/write behavior. Method indices 0 (`lzv1`), 4 (`bzip2`), and 8 (`lzrw3a`) remain outside the V1 codec set and reject with codec-specific `EOPNOTSUPP` for both compression and decompression instead of falling through as hidden stubs. |
 | **External volume-manager orchestration** | FrankenFS can interpret btrfs-native multi-device chunk maps, but it does not orchestrate LVM/mdraid/device-mapper topologies or present itself as a general multi-device volume manager. |
 | **DAX / direct access** | Persistent-memory (pmem) direct access mode is excluded. FUSE does not support DAX. |
@@ -310,7 +310,7 @@ Source: Linux v6.19 `fs/btrfs/` (kernel.org; gitignored locally due to size)
 The reduction from ~205K C LOC to ~45.5K Rust LOC reflects:
 
 - **Exclusions:** ~30% of legacy code covers excluded features (quota, resize,
-  NFS export, verity/DAX, full key-managed fscrypt flows, inline-data range allocation,
+  NFS export, verity/DAX, full key-managed fscrypt flows,
   and external volume-manager orchestration).
 - **No kernel boilerplate:** Kernel module registration, sysfs, procfs, ioctl
   handlers, memory allocation wrappers, and spinlock ceremony are eliminated.

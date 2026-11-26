@@ -36303,8 +36303,9 @@ impl OpenFs {
         Ok(attr)
     }
 
-    /// Preallocate or punch file space.
-    #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
+    /// Publish an SDK range operation in the same transaction as its allocation
+    /// and inode changes. A caller-owned scope retains its own publication.
+    #[allow(clippy::significant_drop_tightening)]
     fn ext4_fallocate(
         &self,
         cx: &Cx,
@@ -36314,6 +36315,78 @@ impl OpenFs {
         length: u64,
         mode: i32,
     ) -> ffs_error::Result<()> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        let mut alloc = self.require_alloc_state()?.write();
+        if scope.tx.is_some() {
+            return self
+                .ext4_fallocate_locked(cx, scope, &mut alloc, ino, offset, length, mode)?
+                .map_or(Ok(()), Err);
+        }
+
+        // Hold allocator exclusion from the snapshot through publication, as
+        // the ordinary writer does. Conversion must never publish separately
+        // from the range operation that requested it.
+        const MAX_ATTEMPTS: u32 = 16;
+        for attempt in 1..=MAX_ATTEMPTS {
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            let base = self.block_device_adapter();
+            let (tx, snapshot_pin) = RegisteredSnapshotBlockAdapter::begin(&base, &self.mvcc_store);
+            let tx_id = tx.id();
+            let mut range_scope = RequestScope::with_transaction(tx);
+            range_scope.isolation_mode = self.mvcc_isolation_mode();
+            let staged = self.ext4_fallocate_locked(
+                cx,
+                &mut range_scope,
+                &mut alloc,
+                ino,
+                offset,
+                length,
+                mode,
+            );
+            let write_blocks = if self.repair_flush_lifecycle.is_some() {
+                range_scope
+                    .tx
+                    .as_ref()
+                    .map_or_else(Vec::new, |tx| tx.write_set().keys().copied().collect())
+            } else {
+                Vec::new()
+            };
+            // An extent reservation may own a valid prefix when space runs
+            // out. Publish that prefix before returning its allocation error;
+            // all other staging failures, including promotion failures, abort.
+            let result = staged.and_then(|allocation_error| {
+                cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+                self.commit_scope_with_ext4_block_counts_locked(&mut range_scope, &mut alloc)
+                    .map(|seq| (allocation_error, seq))
+            });
+            match result {
+                Err(FfsError::MvccConflict { .. }) if attempt < MAX_ATTEMPTS => {}
+                Err(error) => return Err(error),
+                Ok((allocation_error, seq)) => {
+                    drop(snapshot_pin);
+                    drop(alloc);
+                    self.prune_mvcc_after_commit_if_due(seq);
+                    self.notify_repair_flush_lifecycle_with_cx(cx, tx_id, &write_blocks)?;
+                    return allocation_error.map_or(Ok(()), Err);
+                }
+            }
+        }
+        unreachable!("the final SDK fallocate attempt returns its result")
+    }
+
+    /// Stage a range operation under allocator exclusion. Only a completely
+    /// owned, written-back allocation prefix may return `Ok(Some(NoSpace))`.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn ext4_fallocate_locked(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        alloc: &mut Ext4AllocState,
+        ino: InodeNumber,
+        offset: u64,
+        length: u64,
+        mode: i32,
+    ) -> ffs_error::Result<Option<FfsError>> {
         const KEEP_SIZE: i32 = 0x01;
         const PUNCH_HOLE: i32 = 0x02;
         const COLLAPSE_RANGE: i32 = 0x08;
@@ -36323,7 +36396,6 @@ impl OpenFs {
         #[allow(clippy::cast_possible_truncation)] // 32767 always fits u32
         const MAX_EXTENT_COUNT: u32 = 32_767;
 
-        let alloc_mutex = self.require_alloc_state()?;
         let block_dev = self.block_device_adapter();
         let (tstamp_secs, tstamp_nanos) = Self::now_timestamp();
 
@@ -36335,7 +36407,7 @@ impl OpenFs {
         let sectors_per_block = u64::from(sb.block_size / EXT4_SECTOR_SIZE);
 
         if length == 0 {
-            return Ok(());
+            return Ok(None);
         }
         let end = offset
             .checked_add(length)
@@ -36424,10 +36496,19 @@ impl OpenFs {
                 detail: "cannot alter existing data in an append-only inode".into(),
             });
         }
+        if scope.tx.is_some() {
+            // A reader can refill a mapping cache while this operation is
+            // staged. Invalidate again at publication, including unchanged
+            // inode roots whose external extent-tree nodes were edited.
+            scope
+                .ext4_staged
+                .extent_invalidate_inodes
+                .push(inode.clone());
+        }
         if Self::ext4_inode_uses_inline_data(&inode) {
-            return Err(FfsError::UnsupportedFeature(
-                "ext4 inline-data fallocate mutation is not supported".into(),
-            ));
+            return self.ext4_fallocate_inline_file(
+                cx, scope, alloc, ino, inode, offset, length, mode,
+            );
         }
         // e2compr compressed files are indirect-mapped but their blocks hold
         // compressed cluster data, not plain file bytes — fallocate (alloc/zero/
@@ -36440,31 +36521,39 @@ impl OpenFs {
         }
         if (inode.flags & ffs_types::EXT4_EXTENTS_FL) == 0 {
             // Legacy indirect-block-mapped file (bd-laay3 increment 4).
-            return self.ext4_fallocate_indirect(
-                cx,
-                scope,
-                ino,
-                inode,
-                offset,
-                end,
-                keep_size,
-                punch_hole,
-                zero_range,
-                collapse_range,
-                insert_range,
-                block_size,
-                tstamp_secs,
-                tstamp_nanos,
-            );
+            return self
+                .ext4_fallocate_indirect(
+                    cx,
+                    scope,
+                    alloc,
+                    ino,
+                    inode,
+                    offset,
+                    end,
+                    keep_size,
+                    punch_hole,
+                    zero_range,
+                    collapse_range,
+                    insert_range,
+                    block_size,
+                    tstamp_secs,
+                    tstamp_nanos,
+                )
+                .map(|()| None);
         }
 
         let mut root_bytes = Self::extent_root(&inode);
-        let mut alloc = alloc_mutex.write();
-        Self::with_ext4_block_counts(self, scope, &mut alloc, |scope, alloc| {
+        Self::with_ext4_block_counts(self, scope, alloc, |scope, alloc| {
+            let snapshot_dev;
             let tx_dev;
             let dev: &dyn BlockDevice = if let Some(tx) = &mut scope.tx {
+                snapshot_dev = RegisteredSnapshotBlockAdapter::new(
+                    &block_dev,
+                    &self.mvcc_store,
+                    tx.snapshot(),
+                );
                 tx_dev = TransactionBlockAdapter {
-                    base: &block_dev,
+                    base: &snapshot_dev,
                     tx: Mutex::new(tx),
                 };
                 &tx_dev
@@ -36866,6 +36955,14 @@ impl OpenFs {
                                 "ext4_fallocate",
                                 Some(ino),
                             );
+                            // A failed tree insertion may already own data blocks.
+                            // Only an untouched failed attempt can retain the earlier prefix.
+                            let free_before: u64 = alloc
+                                .groups
+                                .iter()
+                                .map(|group| u64::from(group.free_blocks))
+                                .sum();
+                            let root_before = root_bytes;
                             let attempt = {
                                 let Ext4AllocState {
                                     geo,
@@ -36890,6 +36987,17 @@ impl OpenFs {
                             };
                             let alloc_mapping = match attempt {
                                 Ok(mapping) => mapping,
+                                Err(FfsError::NoSpace)
+                                    if root_bytes != root_before
+                                        || alloc
+                                            .groups
+                                            .iter()
+                                            .map(|group| u64::from(group.free_blocks))
+                                            .sum::<u64>()
+                                            != free_before =>
+                                {
+                                    return Err(FfsError::NoSpace);
+                                }
                                 // Fragmented, not full: take a smaller extent
                                 // (see the preallocation loop below).
                                 Err(FfsError::NoSpace) if chunk > 1 => {
@@ -37047,6 +37155,14 @@ impl OpenFs {
                             "ext4_fallocate",
                             Some(ino),
                         );
+                        // A failed tree insertion may already own data blocks.
+                        // Only an untouched failed attempt can retain the earlier prefix.
+                        let free_before: u64 = alloc
+                            .groups
+                            .iter()
+                            .map(|group| u64::from(group.free_blocks))
+                            .sum();
+                        let root_before = root_bytes;
                         let attempt = {
                             let Ext4AllocState {
                                 geo,
@@ -37071,6 +37187,17 @@ impl OpenFs {
                         };
                         let alloc_mapping = match attempt {
                             Ok(mapping) => mapping,
+                            Err(FfsError::NoSpace)
+                                if root_bytes != root_before
+                                    || alloc
+                                        .groups
+                                        .iter()
+                                        .map(|group| u64::from(group.free_blocks))
+                                        .sum::<u64>()
+                                        != free_before =>
+                            {
+                                return Err(FfsError::NoSpace);
+                            }
                             // No group holds `chunk` contiguous free blocks:
                             // fragmented, not full. Ask for less, as kernel ext4
                             // takes whatever extent it can find (xfstests
@@ -37153,7 +37280,82 @@ impl OpenFs {
                 "fallocate completed"
             );
 
-            prealloc_error.map_or(Ok(()), Err)
+            Ok(prealloc_error)
+        })
+    }
+
+    /// Convert native inline storage and resume range mutation in the same
+    /// transaction. Linux ext4 converts inline files for every fallocate mode.
+    #[allow(clippy::too_many_arguments)]
+    fn ext4_fallocate_inline_file(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        alloc: &mut Ext4AllocState,
+        ino: InodeNumber,
+        mut inode: Ext4Inode,
+        offset: u64,
+        length: u64,
+        mode: i32,
+    ) -> ffs_error::Result<Option<FfsError>> {
+        let payload = self.ext4_inline_file_payload(&inode)?;
+        let sb = self
+            .ext4_superblock()
+            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
+        let block_size = u64::from(sb.block_size);
+        if mode & (libc::FALLOC_FL_COLLAPSE_RANGE | libc::FALLOC_FL_INSERT_RANGE) != 0 {
+            if !sb.has_incompat(ffs_ondisk::Ext4IncompatFeatures::EXTENTS) {
+                return Err(FfsError::UnsupportedFeature(
+                    "ext4 collapse_range/insert_range require an extent-mapped file".into(),
+                ));
+            }
+            let collapse = mode & libc::FALLOC_FL_COLLAPSE_RANGE != 0;
+            if !offset.is_multiple_of(block_size)
+                || !length.is_multiple_of(block_size)
+                || (collapse && offset + length >= inode.size)
+                || (!collapse && offset >= inode.size)
+            {
+                return Err(FfsError::RequestRejected {
+                    errno: libc::EINVAL,
+                    detail: "inline range shift requires an aligned range before EOF".into(),
+                });
+            }
+            if !collapse {
+                let new_size = inode.size.checked_add(length).ok_or_else(|| {
+                    FfsError::Format("insert_range file size overflow".to_owned())
+                })?;
+                Self::ext4_reject_oversized_file(new_size, block_size)?;
+            }
+        }
+        Self::with_ext4_block_counts(self, scope, alloc, |scope, working| {
+            {
+                let base = self.block_device_adapter();
+                let txn = scope.tx.as_mut().ok_or_else(|| {
+                    FfsError::Format("inline fallocate requires a transaction".into())
+                })?;
+                let snapshot_dev =
+                    RegisteredSnapshotBlockAdapter::new(&base, &self.mvcc_store, txn.snapshot());
+                let tx_dev = TransactionBlockAdapter {
+                    base: &snapshot_dev,
+                    tx: Mutex::new(txn),
+                };
+                self.ext4_promote_inline_file(cx, &tx_dev, working, ino, &mut inode, &payload)?;
+                ffs_inode::write_inode(
+                    cx,
+                    &tx_dev,
+                    &working.geo,
+                    &working.groups,
+                    ino,
+                    &inode,
+                    sb.csum_seed(),
+                )?;
+            }
+            scope.ext4_staged.xattr_invalidate_inodes.push(ino);
+            scope
+                .ext4_staged
+                .xattr_refresh_inodes
+                .push((ino, inode));
+            self.ext4_fallocate_locked(cx, scope, working, ino, offset, length, mode)
         })
     }
 
@@ -38069,6 +38271,7 @@ impl OpenFs {
         &self,
         cx: &Cx,
         scope: &mut RequestScope,
+        alloc: &mut Ext4AllocState,
         ino: InodeNumber,
         mut inode: Ext4Inode,
         offset: u64,
@@ -38088,7 +38291,6 @@ impl OpenFs {
             ));
         }
 
-        let alloc_mutex = self.require_alloc_state()?;
         let mut block_dev = self.block_device_adapter();
         let sb = self
             .ext4_superblock()
@@ -38098,8 +38300,7 @@ impl OpenFs {
             .map_err(|_| FfsError::Format("block size does not fit usize".into()))?;
         let sectors_per_block = block_size / u64::from(EXT4_SECTOR_SIZE);
 
-        let mut alloc = alloc_mutex.write();
-        Self::with_ext4_block_counts(self, scope, &mut alloc, |scope, alloc| {
+        Self::with_ext4_block_counts(self, scope, alloc, |scope, alloc| {
             if punch_hole {
                 // Unaligned ranges are supported (bd-xnel9), mirroring the
                 // extent-mapped punch path and the kernel's ext4 indirect punch:
@@ -67774,6 +67975,375 @@ mod tests {
     }
 
     #[test]
+    fn ext4_inline_fallocate_modes_promote_once_and_preserve_xattrs() {
+        for extents in [true, false] {
+            for (name, offset, length, mode, blocks, size) in [
+                ("reserve", 4096, 8192, 0, 3, 12288),
+                ("keep", 4096, 8192, libc::FALLOC_FL_KEEP_SIZE, 3, 80),
+                ("zero", 58, 4101, libc::FALLOC_FL_ZERO_RANGE, 2, 4159),
+                (
+                    "punch",
+                    58,
+                    17,
+                    libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                    1,
+                    80,
+                ),
+                (
+                    "punch-all",
+                    0,
+                    4096,
+                    libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                    0,
+                    80,
+                ),
+                ("insert", 0, 4096, libc::FALLOC_FL_INSERT_RANGE, 1, 4176),
+            ] {
+                if name == "insert" && !extents {
+                    continue;
+                }
+                let (fs, dev) = open_writable_inline_file_fixture(false, extents);
+                let cx = Cx::for_testing();
+                let ino = InodeNumber(11);
+                fs.setxattr(&cx, ino, "user.external", &[0xA5; 512], XattrSetMode::Set)
+                    .unwrap();
+                let before = fs.read_inode(&cx, ino).unwrap();
+                let free = fs.statfs(&cx, ino).unwrap().blocks_free;
+                let old_scope = RequestScope::with_snapshot(fs.current_snapshot());
+                let old_data: Vec<u8> = (0_u8..80).collect();
+                let mut expected = old_data.clone();
+                expected.resize(usize::try_from(size).unwrap(), 0);
+                match name {
+                    "zero" => expected[58..].fill(0),
+                    "punch" => expected[58..75].fill(0),
+                    "punch-all" => expected.fill(0),
+                    "insert" => {
+                        expected.fill(0);
+                        expected[4096..].copy_from_slice(&old_data);
+                    }
+                    _ => {}
+                }
+                let high = fs.current_snapshot();
+                fs.fallocate(&cx, ino, offset, length, mode)
+                    .unwrap_or_else(|error| panic!("{name}, extents={extents}: {error}"));
+                assert_eq!(fs.current_snapshot().high.0, high.high.0 + 1, "{name}");
+                let after = fs.read_inode(&cx, ino).unwrap();
+                assert_eq!(after.flags & ffs_types::EXT4_INLINE_DATA_FL, 0, "{name}");
+                assert_eq!(after.flags & ffs_types::EXT4_EXTENTS_FL != 0, extents);
+                assert_eq!(after.size, size, "{name}");
+                assert_eq!(after.blocks, before.blocks + blocks * 8, "{name}");
+                assert_eq!(after.file_acl, before.file_acl, "{name}");
+                assert_eq!(fs.statfs(&cx, ino).unwrap().blocks_free, free - blocks);
+                assert_eq!(fs.read(&cx, ino, 0, 16384).unwrap(), expected, "{name}");
+                assert_eq!(
+                    fs.read_file(&cx, &old_scope, ino, 0, 128).unwrap(),
+                    old_data
+                );
+                fs.ext4_refresh_inode_xattr_cache(&cx, ino, &before).unwrap();
+                assert_eq!(fs.getxattr(&cx, ino, "system.data").unwrap(), None);
+                if name == "insert" {
+                    fs.fallocate(&cx, ino, 0, 4096, libc::FALLOC_FL_COLLAPSE_RANGE)
+                        .unwrap();
+                    expected = old_data;
+                    assert_eq!(fs.read(&cx, ino, 0, 16384).unwrap(), expected);
+                    assert_eq!(fs.statfs(&cx, ino).unwrap().blocks_free, free - blocks);
+                }
+                fs.flush_mvcc_to_device(&cx).unwrap();
+                let reopened = OpenFs::from_device(
+                    &cx,
+                    Box::new(TestDevice::from_vec(dev.snapshot_bytes())),
+                    &OpenOptions::default(),
+                )
+                .unwrap();
+                assert_eq!(reopened.read(&cx, ino, 0, 16384).unwrap(), expected);
+                assert_eq!(
+                    reopened.getxattr(&cx, ino, "user.keep").unwrap(),
+                    Some(b"kept".to_vec())
+                );
+                assert_eq!(
+                    reopened.getxattr(&cx, ino, "user.external").unwrap(),
+                    Some(vec![0xA5; 512])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ext4_inline_fallocate_full_disk_and_invalid_ranges_never_publish() {
+        for extents in [true, false] {
+            let (fs, dev) = open_writable_inline_file_fixture(true, extents);
+            let cx = Cx::for_testing();
+            let ino = InodeNumber(11);
+            let before = fs.read_inode(&cx, ino).unwrap();
+            let high = fs.current_snapshot();
+            let bytes = dev.snapshot_bytes();
+            let groups = format!("{:?}", fs.require_alloc_state().unwrap().read().groups);
+            for (offset, length, mode) in [
+                (0, 8192, 0),
+                (4096, 4096, libc::FALLOC_FL_KEEP_SIZE),
+                (58, 17, libc::FALLOC_FL_ZERO_RANGE),
+                (
+                    58,
+                    17,
+                    libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                ),
+            ] {
+                assert!(matches!(
+                    fs.fallocate(&cx, ino, offset, length, mode),
+                    Err(FfsError::NoSpace)
+                ));
+            }
+            if extents {
+                for (offset, length, mode) in [
+                    (0, 4096, libc::FALLOC_FL_COLLAPSE_RANGE),
+                    (1, 4096, libc::FALLOC_FL_INSERT_RANGE),
+                    (4096, 4096, libc::FALLOC_FL_INSERT_RANGE),
+                    (0, 1, libc::FALLOC_FL_PUNCH_HOLE),
+                ] {
+                    assert_eq!(
+                        fs.fallocate(&cx, ino, offset, length, mode)
+                            .unwrap_err()
+                            .to_errno(),
+                        libc::EINVAL
+                    );
+                }
+                assert!(matches!(
+                    fs.fallocate(&cx, ino, 0, 4096, libc::FALLOC_FL_INSERT_RANGE),
+                    Err(FfsError::NoSpace)
+                ));
+            } else {
+                assert!(matches!(
+                    fs.fallocate(&cx, ino, 0, 4096, libc::FALLOC_FL_INSERT_RANGE),
+                    Err(FfsError::UnsupportedFeature(_))
+                ));
+            }
+            assert_eq!(fs.current_snapshot(), high);
+            assert_eq!(fs.read_inode(&cx, ino).unwrap(), before);
+            assert_eq!(fs.read(&cx, ino, 0, 128).unwrap(), (0_u8..80).collect::<Vec<_>>());
+            assert_eq!(fs.statfs(&cx, ino).unwrap().blocks_free, 0);
+            assert_eq!(dev.snapshot_bytes(), bytes);
+            assert_eq!(
+                format!("{:?}", fs.require_alloc_state().unwrap().read().groups),
+                groups
+            );
+        }
+    }
+
+    #[test]
+    fn ext4_inline_fallocate_enospc_keeps_only_owned_extent_reservations() {
+        for extents in [true, false] {
+            let (fs, dev) = open_writable_inline_file_fixture(false, extents);
+            let cx = Cx::for_testing();
+            let ino = InodeNumber(11);
+            let before = fs.read_inode(&cx, ino).unwrap();
+            let free = fs.statfs(&cx, ino).unwrap().blocks_free;
+            let reserve =
+                ffs_alloc::reserved_metadata_blocks(&fs.require_alloc_state().unwrap().read().geo);
+            let high = fs.current_snapshot();
+            let groups = format!("{:?}", fs.require_alloc_state().unwrap().read().groups);
+            let bytes = dev.snapshot_bytes();
+            assert!(free > 2);
+            // Promotion consumes one block, leaving insufficient room for the
+            // requested reservation even before legacy pointer-block overhead.
+            assert!(matches!(
+                fs.fallocate(&cx, ino, 4096, free * 4096, 0),
+                Err(FfsError::NoSpace)
+            ));
+            assert_eq!(fs.read(&cx, ino, 0, 128).unwrap(), (0_u8..80).collect::<Vec<_>>());
+            assert_eq!(
+                fs.getxattr(&cx, ino, "user.keep").unwrap(),
+                Some(b"kept".to_vec())
+            );
+            if extents {
+                let after = fs.read_inode(&cx, ino).unwrap();
+                assert_eq!(fs.current_snapshot().high.0, high.high.0 + 1);
+                assert_eq!(after.flags & ffs_types::EXT4_INLINE_DATA_FL, 0);
+                assert_eq!(after.size, before.size);
+                assert_eq!(after.blocks, (free - reserve) * 8);
+                assert_eq!(fs.statfs(&cx, ino).unwrap().blocks_free, reserve);
+                assert!(
+                    fs.collect_extents(&cx, &after)
+                        .unwrap()
+                        .iter()
+                        .any(|extent| extent.is_unwritten())
+                );
+                fs.fallocate(
+                    &cx,
+                    ino,
+                    0,
+                    (free + 1) * 4096,
+                    libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                )
+                .unwrap();
+                assert_eq!(fs.statfs(&cx, ino).unwrap().blocks_free, free);
+                assert_eq!(fs.read_inode(&cx, ino).unwrap().blocks, 0);
+                assert_eq!(fs.read(&cx, ino, 0, 128).unwrap(), vec![0; 80]);
+            } else {
+                // An indirect failure has no completed inode publication.
+                // Its private data and pointer allocations must all abort.
+                assert_eq!(fs.current_snapshot(), high);
+                assert_eq!(fs.read_inode(&cx, ino).unwrap(), before);
+                assert_eq!(fs.statfs(&cx, ino).unwrap().blocks_free, free);
+                assert_eq!(
+                    format!("{:?}", fs.require_alloc_state().unwrap().read().groups),
+                    groups
+                );
+                assert_eq!(dev.snapshot_bytes(), bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn ext4_inline_fallocate_extent_growth_enospc_aborts_owned_prefix() {
+        for mode in [0, libc::FALLOC_FL_ZERO_RANGE] {
+            for free_blocks in [5_u32, 6, 7] {
+                let (_, seed) = open_writable_inline_file_fixture(false, true);
+                let mut image = seed.snapshot_bytes();
+                // A 32-block filesystem has no metadata reserve. Five isolated
+                // blocks hold promotion plus four data extents. Growing the
+                // full inode root then needs two external leaves: fail before
+                // either leaf or after the first, and retain a success control.
+                image[EXT4_SUPERBLOCK_OFFSET + 0x04..EXT4_SUPERBLOCK_OFFSET + 0x08]
+                    .copy_from_slice(&32_u32.to_le_bytes());
+                image[EXT4_SUPERBLOCK_OFFSET + 0x0C..EXT4_SUPERBLOCK_OFFSET + 0x10]
+                    .copy_from_slice(&free_blocks.to_le_bytes());
+                image[4096 + 0x0C..4096 + 0x0E]
+                    .copy_from_slice(&u16::try_from(free_blocks).unwrap().to_le_bytes());
+                image[2 * 4096..3 * 4096].fill(0xFF);
+                for index in 0..usize::try_from(free_blocks).unwrap() {
+                    let block = 16 + 2 * index;
+                    image[2 * 4096 + block / 8] &= !(1_u8 << (block % 8));
+                }
+                let dev = TestDevice::from_vec(image);
+                let cx = Cx::for_testing();
+                let opts = OpenOptions::default();
+                let mut fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &opts).unwrap();
+                fs.enable_writes(&cx).unwrap();
+                let ino = InodeNumber(11);
+                let before = fs.read_inode(&cx, ino).unwrap();
+                let high = fs.current_snapshot();
+                let bytes = dev.snapshot_bytes();
+                let groups = format!("{:?}", fs.require_alloc_state().unwrap().read().groups);
+                assert_eq!(
+                    fs.statfs(&cx, ino).unwrap().blocks_free,
+                    u64::from(free_blocks)
+                );
+                let reserve = ffs_alloc::reserved_metadata_blocks(
+                    &fs.require_alloc_state().unwrap().read().geo,
+                );
+                assert_eq!(reserve, 0);
+                let result = fs.fallocate(&cx, ino, 4096, 4 * 4096, mode);
+                if free_blocks == 7 {
+                    result.unwrap();
+                    let after = fs.read_inode(&cx, ino).unwrap();
+                    assert_eq!(fs.current_snapshot().high.0, high.high.0 + 1);
+                    assert_eq!(after.flags & ffs_types::EXT4_INLINE_DATA_FL, 0);
+                    assert_eq!(after.blocks, 7 * 8);
+                    assert_eq!(fs.statfs(&cx, ino).unwrap().blocks_free, 0);
+                    let mut expected: Vec<u8> = (0_u8..80).collect();
+                    expected.resize(5 * 4096, 0);
+                    assert_eq!(fs.read(&cx, ino, 0, 5 * 4096).unwrap(), expected);
+                } else {
+                    assert!(matches!(result, Err(FfsError::NoSpace)));
+                    assert_eq!(fs.current_snapshot(), high);
+                    assert_eq!(fs.read_inode(&cx, ino).unwrap(), before);
+                    assert_eq!(
+                        fs.read(&cx, ino, 0, 128).unwrap(),
+                        (0_u8..80).collect::<Vec<_>>()
+                    );
+                    assert_eq!(
+                        fs.statfs(&cx, ino).unwrap().blocks_free,
+                        u64::from(free_blocks)
+                    );
+                    assert_eq!(dev.snapshot_bytes(), bytes);
+                    assert_eq!(
+                        format!("{:?}", fs.require_alloc_state().unwrap().read().groups),
+                        groups
+                    );
+                }
+                assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn ext4_inline_fallocate_batch_reads_its_writes_and_aborts_conversion() {
+        for extents in [true, false] {
+            let (fs, _) = open_writable_inline_file_fixture(false, extents);
+            let cx = Cx::for_testing();
+            let ino = InodeNumber(11);
+            let original = fs.read_inode(&cx, ino).unwrap();
+            let original_data: Vec<u8> = (0_u8..80).collect();
+            let before = fs.current_snapshot();
+            let free = fs.statfs(&cx, ino).unwrap().blocks_free;
+            let groups = format!("{:?}", fs.require_alloc_state().unwrap().read().groups);
+            let mut expected = original_data.clone();
+            expected[58..75].fill(0);
+            expected.resize(4102, 0);
+            expected[4098..].copy_from_slice(b"tail");
+            for finish in ["abort", "cancel", "commit"] {
+                let mut scope = fs.begin_writeback_batch_scope(&cx).unwrap();
+                FsOps::fallocate(
+                    &fs,
+                    &cx,
+                    &mut scope,
+                    ino,
+                    4096,
+                    4096,
+                    libc::FALLOC_FL_KEEP_SIZE,
+                )
+                .unwrap();
+                FsOps::write(&fs, &cx, &mut scope, ino, 4098, b"tail").unwrap();
+                FsOps::fallocate(
+                    &fs,
+                    &cx,
+                    &mut scope,
+                    ino,
+                    58,
+                    17,
+                    libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                )
+                .unwrap();
+                assert_eq!(
+                    FsOps::read(&fs, &cx, &mut scope, ino, 0, 8192).unwrap(),
+                    expected
+                );
+                assert_eq!(fs.current_snapshot(), before);
+                assert_eq!(fs.read_inode(&cx, ino).unwrap(), original);
+                assert_eq!(fs.read(&cx, ino, 0, 128).unwrap(), original_data);
+                assert_eq!(fs.statfs(&cx, ino).unwrap().blocks_free, free);
+                match finish {
+                    "abort" => fs.abort_writeback_batch_scope(&cx, scope).unwrap(),
+                    "cancel" => {
+                        let cancelled = Cx::for_testing();
+                        cancelled.set_cancel_requested(true);
+                        assert!(matches!(
+                            fs.commit_writeback_batch_scope(&cancelled, scope),
+                            Err(FfsError::Cancelled)
+                        ));
+                    }
+                    _ => {
+                        fs.commit_writeback_batch_scope(&cx, scope).unwrap();
+                    }
+                }
+                if finish != "commit" {
+                    assert_eq!(fs.current_snapshot(), before);
+                    assert_eq!(fs.read_inode(&cx, ino).unwrap(), original);
+                    assert_eq!(
+                        format!("{:?}", fs.require_alloc_state().unwrap().read().groups),
+                        groups
+                    );
+                }
+            }
+            assert_eq!(fs.current_snapshot().high.0, before.high.0 + 1);
+            assert_eq!(fs.read(&cx, ino, 0, 8192).unwrap(), expected);
+            assert_eq!(fs.statfs(&cx, ino).unwrap().blocks_free, free - 2);
+            assert_eq!(fs.getxattr(&cx, ino, "system.data").unwrap(), None);
+            assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+        }
+    }
+
+    #[test]
     fn ext4_inline_file_missing_or_external_continuation_never_publishes() {
         for defect in ["missing", "external", "oversized"] {
             let (fs, dev) = open_writable_inline_file_fixture(false, true);
@@ -67794,6 +68364,7 @@ mod tests {
             let bytes = dev.snapshot_bytes();
             for result in [
                 fs.write(&cx, ino, 0, b"new").map(|_| ()),
+                fs.fallocate(&cx, ino, 0, 8192, 0),
                 fs.setattr(
                     &cx,
                     ino,
@@ -68119,7 +68690,9 @@ mod tests {
         let payload: Vec<u8> = (0_u8..80).collect();
         let input = tmp.path().join("payload");
         std::fs::write(&input, &payload).unwrap();
-        let names = ["inline", "empty", "grown", "sparse"];
+        let names = [
+            "inline", "empty", "grown", "sparse", "reserve", "keep", "zero", "punch", "insert",
+        ];
         let mut commands = String::new();
         for name in names {
             commands.push_str(&format!("write {} /{name}\n", input.display()));
@@ -68249,14 +68822,46 @@ mod tests {
                     data.resize(4103, 0);
                     data[4099..].copy_from_slice(b"tail");
                 }
+                "reserve" => {
+                    fs.fallocate(&cx, *ino, 4096, 8192, 0).unwrap();
+                    data.resize(12288, 0);
+                }
+                "keep" => {
+                    fs.fallocate(&cx, *ino, 4096, 8192, libc::FALLOC_FL_KEEP_SIZE)
+                        .unwrap();
+                }
+                "zero" => {
+                    fs.fallocate(&cx, *ino, 58, 4101, libc::FALLOC_FL_ZERO_RANGE)
+                        .unwrap();
+                    data.resize(4159, 0);
+                    data[58..].fill(0);
+                }
+                "punch" => {
+                    fs.fallocate(
+                        &cx,
+                        *ino,
+                        58,
+                        17,
+                        libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                    )
+                    .unwrap();
+                    data[58..75].fill(0);
+                }
+                "insert" => {
+                    fs.fallocate(&cx, *ino, 0, 4096, libc::FALLOC_FL_INSERT_RANGE)
+                        .unwrap();
+                    data = vec![0; 4096];
+                    data.extend_from_slice(&payload);
+                }
                 _ => unreachable!(),
             }
             let after = fs.read_inode(&cx, *ino).unwrap();
             let inline = matches!(*name, "inline" | "empty");
             assert_eq!(after.flags & ffs_types::EXT4_INLINE_DATA_FL != 0, inline);
             let extra_sectors = match *name {
-                "grown" => 8,
-                "sparse" => 16,
+                "grown" | "punch" | "insert" => 8,
+                "sparse" | "zero" => 16,
+                "reserve" | "keep" => 24,
                 _ => 0,
             };
             assert_eq!(after.blocks, before.blocks + extra_sectors);
@@ -68265,7 +68870,7 @@ mod tests {
                 fs.read_block_vec(&cx, BlockNumber(after.file_acl)).unwrap(),
                 *external
             );
-            assert_eq!(fs.read(&cx, *ino, 0, 8192).unwrap(), data);
+            assert_eq!(fs.read(&cx, *ino, 0, 16384).unwrap(), data);
             assert_eq!(
                 fs.getxattr(&cx, *ino, "system.data").unwrap(),
                 inline.then(|| data.get(60..).unwrap_or_default().to_vec())
@@ -68290,7 +68895,7 @@ mod tests {
         )
         .unwrap();
         for ((name, ino, _, _), data) in files.iter().zip(&expected) {
-            assert_eq!(reopened.read(&cx, *ino, 0, 8192).unwrap(), *data);
+            assert_eq!(reopened.read(&cx, *ino, 0, 16384).unwrap(), *data);
             assert_eq!(
                 reopened.getxattr(&cx, *ino, "user.keep").unwrap(),
                 Some(b"kept".to_vec())
