@@ -2950,7 +2950,7 @@ fn usn_publication_trims_only_complete_pages_and_clusters() {
             &cx,
             Arc::clone(&dev) as Arc<dyn ByteDevice>,
             0,
-            vol_bytes,
+            dev.len_bytes(),
             NtfsCheckLimits::default(),
         )
         .unwrap();
@@ -3067,7 +3067,7 @@ fn usn_publication_initializes_previous_page_padding_before_extending_journal() 
             &cx,
             Arc::clone(&dev) as Arc<dyn ByteDevice>,
             0,
-            vol_bytes,
+            dev.len_bytes(),
             NtfsCheckLimits::default(),
         )
         .unwrap();

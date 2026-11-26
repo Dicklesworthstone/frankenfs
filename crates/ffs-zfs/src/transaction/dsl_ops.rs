@@ -1741,6 +1741,7 @@ pub(super) fn stage_head_space(
         directory_object,
         order,
     )?;
+    let dd_origin_obj = order.u64(dir.bonus(), 24).map_err(|e| parse_err(&e))?;
     let props = order.u64(dir.bonus(), 80).map_err(|e| parse_err(&e))?;
     let refreservation = if props == 0 {
         0
@@ -1748,9 +1749,19 @@ pub(super) fn stage_head_space(
         effective_local_numeric_prop(&mos.zap_values(cx, props)?, "refreservation")?.unwrap_or(0)
     };
     let mut bonus = head.bonus().to_vec();
+    let prev_snap_obj = order.u64(&bonus, 8).map_err(|e| parse_err(&e))?;
     let old_unique = order.u64(&bonus, 96).map_err(|e| parse_err(&e))?;
     let unique_delta = i128::from(born.dsize) - i128::from(freed.dsize);
     let ref_delta = unique_delta - i128::from(retained.dsize);
+    // On a clone with no snapshots of its own (`prev_snap_obj == dd_origin_obj`),
+    // blocks retained at `<= origin_txg` belong to the origin dataset, not this
+    // clone's `DD_USED_HEAD` or `DD_USED_SNAP`. Retiring an origin block during
+    // COW only charges newly born unique blocks to the clone's `DD_USED_HEAD`.
+    let (dir_head_delta, dir_snap_delta) = if dd_origin_obj != 0 && prev_snap_obj == dd_origin_obj {
+        (unique_delta, 0_i128)
+    } else {
+        (ref_delta, i128::from(retained.dsize))
+    };
     let comp_delta = i128::from(born.comp) - i128::from(freed.comp);
     let uncomp_delta = i128::from(born.uncomp) - i128::from(freed.uncomp);
     for (offset, delta) in [
@@ -1797,8 +1808,8 @@ pub(super) fn stage_head_space(
         ceiling,
         mos_dirty_dnodes,
         directory_object,
-        ref_delta,
-        i128::from(retained.dsize),
+        dir_head_delta,
+        dir_snap_delta,
         0,
         0,
         reservation_delta,

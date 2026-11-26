@@ -994,17 +994,7 @@ fn build_zpl_objectset(
     if head_object == 18
         && let Some((objectset_order, contents_order)) = spec.zvol_orders
     {
-        let (bp, bytes, raw) =
-            mixed_order::build_zvol_objectset(arena, birth, objectset_order, contents_order);
-        return (
-            bp,
-            DatasetSpaceTotals {
-                dsize: bytes,
-                comp: bytes,
-                uncomp: bytes,
-            },
-            raw,
-        );
+        return mixed_order::build_zvol_objectset(arena, birth, objectset_order, contents_order);
     }
     let objectset_order = spec.zpl_order.unwrap_or(order);
     let order = spec.zpl_contents_order.unwrap_or(objectset_order);
@@ -1306,9 +1296,23 @@ fn build_zpl_objectset(
             encode_directory_reference(5, Kind::Regular).unwrap(),
         ));
 
-        // Object 6: `sub` empty directory
+        // Object 6: `sub` empty directory (use native metadata ON compression
+        // so the initial accounting baseline matches subsequent COW updates).
         let sub_raw = mzap(&[], 0x77, order);
-        let sub_bp = arena.alloc_block(&sub_raw, 20, 0, birth, order);
+        let meta_algo = if spec.lz4_feature.is_some_and(|count| count != 0) {
+            15_u8
+        } else {
+            3_u8
+        };
+        let (sub_phys, sub_comp) = ffs_ondisk::zfs::crypto::compress_block(
+            &sub_raw,
+            meta_algo,
+            None,
+            1_usize << spec.ashift,
+        )
+        .expect("compress fixture sub dir");
+        let sub_bp =
+            arena.alloc_raw_compressed(&sub_raw, &sub_phys, 20, 0, sub_comp, 7, birth, order);
         let sub_meta = Metadata {
             kind: Kind::Directory,
             mode: (Kind::Directory.to_tag() << 12) | 0o755,
@@ -1697,7 +1701,20 @@ fn build_zpl_objectset(
         });
 
     let root_raw = mzap(&root_entries, 0x88, order);
-    let root_bp = arena.alloc_block(&root_raw, 20, 0, birth, order);
+    let root_meta_algo = if spec.lz4_feature.is_some_and(|count| count != 0) {
+        15_u8
+    } else {
+        3_u8
+    };
+    let (root_phys, root_comp) = ffs_ondisk::zfs::crypto::compress_block(
+        &root_raw,
+        root_meta_algo,
+        None,
+        1_usize << spec.ashift,
+    )
+    .expect("compress fixture root dir");
+    let root_bp =
+        arena.alloc_raw_compressed(&root_raw, &root_phys, 20, 0, root_comp, 7, birth, order);
     let root_meta = Metadata {
         kind: Kind::Directory,
         mode: (Kind::Directory.to_tag() << 12) | 0o755,
@@ -6638,9 +6655,15 @@ fn native_large_records_and_sha512_activate_on_first_block_and_survive_property_
         let image = devices[0].durable_snapshot();
         let dva = indirect.regular_dvas().unwrap()[0];
         let offset = usize::try_from(DATA_OFFSET + dva.offset).unwrap();
+        let indirect_bytes = ffs_ondisk::zfs::decompress(
+            &image[offset..offset + indirect.physical_bytes()],
+            indirect.compression(),
+            indirect.logical_bytes(),
+        )
+        .unwrap();
         for index in 0..3 {
             let pointer = BlockPointer::parse(
-                &image[offset + index * 128..offset + (index + 1) * 128],
+                &indirect_bytes[index * 128..(index + 1) * 128],
                 indirect.payload_order(),
             )
             .unwrap();
@@ -10977,7 +11000,17 @@ fn dsl_quota_refquota_reservation_and_inherit_enforcement() {
         )
         .into_result()
         .expect("set root refreservation");
-    let huge_buf = vec![0xCD_u8; 768 * 1024];
+    // Deterministic incompressible bytes so default `compression=on` still
+    // allocates 768 KiB > 512 KiB free headroom and trips ENOSPC.
+    let mut prng = 0xDEAD_BEEF_u32;
+    let huge_buf: Vec<u8> = (0..768 * 1024)
+        .map(|_| {
+            prng ^= prng << 13;
+            prng ^= prng >> 17;
+            prng ^= prng << 5;
+            prng.to_le_bytes()[0]
+        })
+        .collect();
     assert_native_write_refused(
         &mut engine,
         std::slice::from_ref(&device),
@@ -11749,7 +11782,7 @@ fn file_range_edits_preserve_edges_snapshots_links_and_exact_allocation() {
                 deadlist_mode,
                 with_sa_spill_timestamps: zpl_version == 5,
                 user_accounting: true,
-                data_properties: vec![(b"recordsize", BLOCK as u64)],
+                data_properties: vec![(b"recordsize", BLOCK as u64), (b"compression", 2)],
                 image_bytes: 24 * 1024 * 1024,
                 ..PoolFixtureSpec::default()
             },
@@ -12118,7 +12151,7 @@ fn file_range_reclaims_project_quota_bytes_without_changing_object_counts() {
             project_accounting: true,
             sa_project_id: Some(42),
             additional_write_features: vec![(b"org.zfsonlinux:project_quota", 1)],
-            data_properties: vec![(b"recordsize", 4096)],
+            data_properties: vec![(b"recordsize", 4096), (b"compression", 2)],
             deadlist_mode: DeadlistMode::NativeDeadlist,
             ..PoolFixtureSpec::default()
         },
@@ -12303,7 +12336,7 @@ fn file_range_persistence_cuts_keep_exact_old_or_new_bytes_and_snapshot_ownershi
     let (mut seed, seed_devices) = file_range_fixture(
         &cx,
         &PoolFixtureSpec {
-            data_properties: vec![(b"recordsize", 4096)],
+            data_properties: vec![(b"recordsize", 4096), (b"compression", 2)],
             deadlist_mode: DeadlistMode::NativeDeadlist,
             user_accounting: true,
             ..PoolFixtureSpec::default()

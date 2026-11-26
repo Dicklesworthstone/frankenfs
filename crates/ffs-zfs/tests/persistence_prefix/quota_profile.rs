@@ -67,13 +67,24 @@ fn owner_quota_profiles_reject_new_objects_and_byte_growth_before_backing_writes
         // Object limits do not prohibit allocating bytes in an existing file.
         // Byte limits also apply to files outside an inheriting directory.
         if index < 3 {
+            // Deterministic incompressible bytes so default `compression=on`
+            // still allocates 8 KiB past the byte-quota ceiling.
+            let mut prng = 0x51A7_A701_u32;
+            let growth_bytes: Vec<u8> = (0..8192)
+                .map(|_| {
+                    prng ^= prng << 13;
+                    prng ^= prng >> 17;
+                    prng ^= prng << 5;
+                    prng.to_le_bytes()[0]
+                })
+                .collect();
             assert_native_write_refused(&mut engine, &devices, libc::EDQUOT, |writer| {
                 writer.write_file_data(
                     &cx,
                     &dataset,
                     4,
                     4096,
-                    &[0xA7; 8192],
+                    &growth_bytes,
                     TIME,
                     ZfsDataChecksum::Fletcher4,
                 )

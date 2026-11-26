@@ -2723,6 +2723,7 @@ fn postcommit_cancellation_returns_success_for_metadata_publication() {
                 &cx,
                 &PoolFixtureSpec {
                     zpl_version,
+                    deadlist_mode: DeadlistMode::NativeDeadlist,
                     ..PoolFixtureSpec::default()
                 },
             );
@@ -3198,6 +3199,7 @@ fn sync_cancellation_fixture(
 ) {
     let built = build_clean_zfs_pool(&PoolFixtureSpec {
         mirror_width: 2,
+        deadlist_mode: DeadlistMode::NativeDeadlist,
         ..PoolFixtureSpec::default()
     });
     let devices: Vec<_> = built

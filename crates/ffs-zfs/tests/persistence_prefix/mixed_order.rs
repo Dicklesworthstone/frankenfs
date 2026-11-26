@@ -36,7 +36,7 @@ pub fn build_zvol_objectset(
     birth: u64,
     objectset_order: Endian,
     contents_order: Endian,
-) -> (BlockPointer, u64, Vec<u8>) {
+) -> (BlockPointer, DatasetSpaceTotals, Vec<u8>) {
     let mut table = vec![0; DNODE_BLOCK_BYTES];
     for (object, kind, payload) in [
         (1, 23, vec![0x6a; 512]),
@@ -55,6 +55,8 @@ pub fn build_zvol_objectset(
         );
         write_dnode_at(&mut table, object, &node).unwrap();
     }
+    let mut space_totals = DatasetSpaceTotals::default();
+    space_totals.add_dnode_table(&table, contents_order);
     let pointer = arena.alloc_block(&table, DMU_OT_DNODE, 0, birth, contents_order);
     let meta = make_dnode(
         DMU_OT_DNODE,
@@ -69,8 +71,11 @@ pub fn build_zvol_objectset(
     let objectset = ObjectSet::new(3, 0, meta, ZilHeader::empty(), 1024).unwrap();
     let bytes = objectset.encode(objectset_order).unwrap();
     let root = arena.alloc_block(&bytes, DMU_OT_OBJSET, 0, birth, objectset_order);
-    let referenced = objectset.meta.used_bytes() + bp_allocated_bytes(&root);
-    (root, referenced, Vec::new())
+    for bp in objectset.meta.pointers() {
+        space_totals.add_assign(DatasetSpaceTotals::from_bp(bp));
+    }
+    space_totals.add_assign(DatasetSpaceTotals::from_bp(&root));
+    (root, space_totals, Vec::new())
 }
 
 #[test]

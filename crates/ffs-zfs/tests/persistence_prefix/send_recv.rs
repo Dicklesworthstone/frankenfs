@@ -3520,20 +3520,31 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
     }
     for malformed_range in 0..3 {
         let mut changed = false;
-        let malformed = restamp_substream(&raw_e1, true, |mut record, payload| {
+        let mut malformed = Vec::new();
+        let mut rolling = Fletcher4Stream::new(Endian::Little);
+        for (_, mut record, payload) in checked_substream_records(&raw_e1, true) {
+            let mut raw_patch = None;
             if let DrrRecord::ObjectRange(range) = &mut record
                 && !changed
             {
                 match malformed_range {
-                    0 => range.firstobj = 1,
-                    1 => range.numslots = u64::MAX,
+                    0 => raw_patch = Some((8_usize, 1_u64)),
+                    1 => raw_patch = Some((16_usize, u64::MAX)),
                     2 => range.flags ^= ffs_ondisk::zfs::send_stream::DRR_RAW_BYTESWAP,
                     _ => unreachable!(),
                 }
                 changed = true;
             }
-            Some((record, payload))
-        });
+            let mut header = record.encode_header(Endian::Little).unwrap();
+            if let Some((offset, value)) = raw_patch {
+                header[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+            }
+            rolling
+                .stamp_record(&mut header, &payload, record.record_type())
+                .unwrap();
+            malformed.extend_from_slice(&header);
+            malformed.extend_from_slice(&payload);
+        }
         assert!(changed);
         assert!(matches!(
             dst_engine.receive_stream(

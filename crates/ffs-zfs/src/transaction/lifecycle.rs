@@ -51,9 +51,9 @@ use serde::Serialize;
 
 use super::dmu_cow::{
     AllocatorWriteTopology, DMU_OT_OBJECT_ARRAY, DMU_OT_OBJSET, DMU_OT_PACKED_NVLIST,
-    DMU_OT_SPACE_MAP, DMU_OT_SPACE_MAP_HEADER, DnodeCowSpec, PoolSpaceAllocator, StagedBlockWrite,
-    WriteBucket, allocate_object_id, cow_update_dnode, encode_zap_blocks_for_dnode,
-    put_dnode_in_table, zap_optional_u64, zap_required_u64,
+    DMU_OT_SPACE_MAP, DMU_OT_SPACE_MAP_HEADER, DnodeCowSpec, PoolSpaceAllocator, SpaceDelta,
+    StagedBlockWrite, WriteBucket, allocate_object_id, cow_update_dnode,
+    encode_zap_blocks_for_dnode, put_dnode_in_table, zap_optional_u64, zap_required_u64,
 };
 use super::{
     ZfsPersistenceStage, ZfsTopologyKind, ZfsTransactionEngine, ZfsTxOutcome, checkpoint, corrupt,
@@ -775,6 +775,23 @@ pub fn create_pool_on_leaves(
     let zpl_os_bytes = zpl_os.encode(order).map_err(|e| parse_err(&e))?;
     let zpl_os_bp = arena.alloc_bp(&zpl_os_bytes, DMU_OT_OBJSET, zpl_os.meta_fill(), order)?;
 
+    // Account for every initial ZPL root dataset block so subsequent COW
+    // mutations (which may compress metadata blocks smaller than their initial
+    // uncompressed allocation) update `dsl_dataset` and `dsl_dir` space
+    // counters accurately without underflow.
+    let mut root_space = SpaceDelta::default();
+    for bp in [
+        &master_bp,
+        &sa_master_bp,
+        &sa_reg_bp,
+        &sa_lay_bp,
+        &root_dir_bp,
+        &zpl_table_bp,
+        &zpl_os_bp,
+    ] {
+        root_space.add_assign(SpaceDelta::from_bp(bp)?)?;
+    }
+
     // Build MOS dnode tables (metaslab space maps start strictly after all
     // secondary `metaslab_array` objects `31..=30+vdevs.len()`).
     // Only metaslab 0 (`sm_base_id`) is allocated at pool creation; sizing the
@@ -804,6 +821,9 @@ pub fn create_pool_on_leaves(
     dd_bonus[0..8].copy_from_slice(&order.encode(1_700_000_000));
     dd_bonus[8..16].copy_from_slice(&order.encode(3)); // head_dataset_obj
     dd_bonus[32..40].copy_from_slice(&order.encode(4)); // child_dir_zapobj
+    dd_bonus[40..48].copy_from_slice(&order.encode(root_space.dsize)); // dd_used_bytes
+    dd_bonus[48..56].copy_from_slice(&order.encode(root_space.comp)); // dd_compressed_bytes
+    dd_bonus[56..64].copy_from_slice(&order.encode(root_space.uncomp)); // dd_uncompressed_bytes
     dd_bonus[80..88].copy_from_slice(&order.encode(14)); // props_zapobj
     set_mos(
         &mut mos_tables,
@@ -825,6 +845,10 @@ pub fn create_pool_on_leaves(
     dataset_bonus[48..56].copy_from_slice(&order.encode(1_700_000_000 + INITIAL_TXG)); // ds_creation_time
     dataset_bonus[56..64].copy_from_slice(&order.encode(INITIAL_TXG)); // ds_creation_txg
     dataset_bonus[64..72].copy_from_slice(&order.encode(13)); // ds_deadlist_obj -> empty_bpobj
+    dataset_bonus[72..80].copy_from_slice(&order.encode(root_space.dsize)); // ds_referenced_bytes
+    dataset_bonus[80..88].copy_from_slice(&order.encode(root_space.comp)); // ds_compressed_bytes
+    dataset_bonus[88..96].copy_from_slice(&order.encode(root_space.uncomp)); // ds_uncompressed_bytes
+    dataset_bonus[96..104].copy_from_slice(&order.encode(root_space.dsize)); // ds_unique_bytes
     dataset_bonus[104..112].copy_from_slice(&order.encode(root_ds_guid ^ 0x55AA)); // ds_fsid_guid
     dataset_bonus[112..120].copy_from_slice(&order.encode(root_ds_guid)); // ds_guid
     dataset_bonus[128..256].copy_from_slice(&zpl_os_bp.encode(order)); // ds_bp
