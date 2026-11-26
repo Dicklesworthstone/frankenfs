@@ -1,5 +1,59 @@
 # Reality-Check Bridge: Closing the Gap Between Claims and Code
 
+## Reality check — 2026-11-25 (`23af30414`)
+
+**Verdict: Between November 11 (`c7fc0ddc4`, `907,428` `.rs` LOC) and November 25 (`23af30414`, `1,175,141` tracked `.rs` LOC across 25 workspace members; `68` fuzz targets; `174` Rust benchmark files; zero `tokio`; zero workspace `unsafe`), FrankenFS closed its biggest six-format architectural gaps — landing native writable engines across all 6 formats (`ext4`, `btrfs`, `FAT16/32`, `NTFS 3.0/3.1`, and `OpenZFS v5000`), wiring unified CLI `format`/`resize`/`tui` surfaces, fixing live production bugs across btrfs/FAT/NTFS/ZFS, restoring a 25/25 workspace strict Clippy green build (`exit 0`), and passing 1,800+ freshly executed RCH unit and persistence-prefix integration tests (`570/570` `ffs-fat --lib`, `455/455` `ffs-ntfs --lib`, `360/360` `ffs-zfs --lib`, `158/158` `ffs-ntfs --test persistence_prefix`, `10/10` `ffs-ntfs --test ntfs_check_format_resize`, `193/193` `ffs-zfs --test persistence_prefix`, `61/61` `ffs-tui --lib`, `64/64` `ffs --lib`, `9/9` `readme_quantitative_claims`, `2/2` `six_format_qualification`, `4/4` `ci_workflow_contracts`). What remains honestly open (`61` active beads: `49` open + `12` in_progress, `0` dependency cycles) is real heavy work: mounted head-to-head kernel performance wins (`0W` on symmetric ext4/btrfs scorecards), ZFS native ZIL writer, multi-device btrfs RW, external native OS (`Windows`/OpenZFS) and hardware power-cut qualification, `ffs-core` monolith decomposition, and full live canonical `gate1`..`gate7` bindings.**
+
+This section supersedes conflicting dated status below while preserving 100% of prior historical audits verbatim.
+
+### Concrete Fixes & Wired Capabilities Shipped (`0adbe1fcd`..`23af30414`)
+
+1. **Workspace strict Clippy, CI & contract gates restored green**:
+   - Resolved all strict `clippy --locked --workspace --all-targets -- -D warnings` errors across all 25 workspace members (clean `exit 0` at `23af30414`, `hz4`, `1m 21s`, clean-overlay receipt `tree=49eb4524e1013a00c7eaedcabdeadad1ad177cf3`).
+   - Added missing `scripts/verify_fat_read.py` CI oracle and enforced its presence in `crates/ffs-harness/tests/ci_workflow_contracts.rs` (`4/4` passing).
+   - Aligned `ffs-protected-mount` integration assertions, `six_format_qualification` ZFS LZ4 incompressible corruption injection (`2/2` passing), and `README.md` / `README_EXT4_BTRFS.md` / `AGENTS.md` / `PLAN_TO_PORT_FRANKENFS_TO_RUST.md` doc parity (`readme_quantitative_claims` `9/9` passing).
+   - Local tracker hygiene (`./scripts/e2e/ffs_tracker_source_hygiene_e2e.sh`) and perf-ledger preflight (`python3 scripts/perf_ledger_preflight.py --self-test`, 107 policy checks) both pass `exit 0`.
+2. **Btrfs & ext4 core production fixes**:
+   - Fixed btrfs `get_fslabel`/`set_fslabel`, `btrfs_send`, atomic `RENAME_WHITEOUT`, staged zero-address `ROOT_ITEM` parsing, and read-only `set_fs_label` refusal on both ext4 and btrfs handles.
+   - Verified ext4 Unicode 12.1 casefold end-to-end (`fuse_e2e` live mount + `ffs-core`/`ffs-ondisk` tests) and closed `bd-vsuni.3`.
+   - Verified structured `asupersync` `&Cx` lifecycle and cancellation discipline across crates and closed `bd-in31y`.
+3. **Unified six-format CLI (`ffs-cli`) & TUI (`ffs-tui`)**:
+   - Wired native ZFS pool creation into `ffs-cli format --filesystem zfs`.
+   - Wired unified FAT16/32 and NTFS offline resize into `ffs-cli resize`.
+   - Extended `ffs-tui` (`DashboardSnapshot::from_read_only_fs`) and `ffs-cli tui --snapshot-json` to sample all 6 formats natively (`61/61` `ffs-tui --lib` passing).
+4. **FAT16/32 production bug fix (`crates/ffs-fat`)**:
+   - Fixed `FatFs::mkdir` (`crates/ffs-fat/src/filesystem.rs:1122`) passing `read_only` into `mkdir_in_volume`'s `dry_run` parameter by adding `mkdir_in_volume_with_mode` with readback attribute verification; aligned post-commit late-cancellation assertions (`570/570` `ffs-fat --lib` passing).
+5. **NTFS production & persistence-prefix fixes (`crates/ffs-ntfs`)**:
+   - Fixed signed run-length width in mapping pairs and empty MFT slot formatting (`f6e79aa8e`), and aligned 512B-cluster backup-boot `check_volume_device` length (`2a6cb7f6d`).
+   - Fresh RCH receipts: `455/455` `ffs-ntfs --lib`, `158/158` `ffs-ntfs --test persistence_prefix`, `10/10` `ffs-ntfs --test ntfs_check_format_resize`.
+6. **OpenZFS v5000 production bug fixes (`crates/ffs-zfs`)**:
+   - Fixed `create_pool_on_leaves` MOS dnode table sizing, `slab_shift` scaling, and level-2 MOS indirect support (`f64b834f0`).
+   - Fixed `create_pool_on_leaves` leaving initial root dataset `ds_*_bytes` and `dd_used_*` at `0` (accumulating exact `SpaceDelta` across all 7 initial root ZPL blocks, `2a6cb7f6d` + `41df5a858`).
+   - Fixed `stage_head_space` in `crates/ffs-zfs/src/transaction/dsl_ops.rs` so clone COW of origin-snapshot blocks does not underflow `dd_used_breakdown[HEAD]` (`2a6cb7f6d`).
+   - Fixed resumable raw encrypted receive (`crates/ffs-zfs/src/transaction/recv_ops.rs:3284`, `714cc7f5b`) where a checkpoint between `DRR_OBJECT` (`DRR_OBJECT_SPILL`) and `DRR_SPILL` captured the 128 zero bytes reserved for the spill pointer via `extract_raw_dnode_bonus` and failed `write_raw_dnode_bonus` capacity validation; now validates trailing bytes are zero and trims cleanly while still rejecting non-zero colliding ciphertext.
+   - Fresh RCH receipts: `360/360` `ffs-zfs --lib`, `193/193` `ffs-zfs --test persistence_prefix` (`190/193` at `41df5a858` + `12/12` covering all 3 resolved failures and 9 project/permission controls at `23af30414`, `vmi1152480`, `85.31s`).
+
+### Fresh Executed Verification Receipts (`2026-11-25`, Non-Mocked RCH & Local Runs)
+
+| Suite / Gate | Revision | Execution Target | Result |
+|--------------|----------|------------------|--------|
+| `cargo clippy --locked --workspace --all-targets -- -D warnings` | `23af30414` | `rch` (`hz4`, clean-overlay) | **`exit 0`** (25/25 workspace members, `1m 21s`, `tree=49eb4524...`) |
+| `cargo test --locked -p ffs-zfs --test persistence_prefix` (12 targeted: 3 fixes + 9 project/perm controls) | `23af30414` | `rch` (`vmi1152480`, clean-overlay) | **`12 passed; 0 failed`** (`85.31s`, completing `193/193` green) |
+| `cargo test --locked -p ffs-ntfs --test ntfs_check_format_resize` & `--test persistence_prefix` & `ffs-zfs --test persistence_prefix` | `41df5a858` | `rch` (`vmi1153651`, clean-overlay) | NTFS `10/10` + `158/158` (`0 failed`); ZFS `190/193` (final 3 fixed & passed at `23af30414`) |
+| `cargo test --locked -p ffs-harness --test readme_quantitative_claims --test six_format_qualification` | `94a05b5a5` | `rch` (`hz4`) | `9/9` (`0.40s`) + `2/2` (`158.29s`, `1` ignored) |
+| `cargo test --locked -p ffs-tui -p ffs-ntfs -p ffs-zfs --lib` | `76d86b32b` | `rch` (`hz4`) | TUI `61/61`, NTFS `455/455`, ZFS `360/360` (`0 failed`) |
+| `cargo test --locked -p ffs-fat --lib` & `-p ffs --lib` | `636b1bf12` / `aed6be07c` | `rch` (`vmi1149989`) | FAT `570/570` (`0 failed`); `ffs` `64/64` (`2` ignored) |
+| `ffs-cli` + `ffs-protected-mount` (live `/dev/fuse`) + `ci_workflow_contracts` + `fuse_e2e` casefold + `ffs-core`/`ffs-fuse` targeted | `f64b834f0` / `b4bbd847b` | `rch` | All passed (`0 failed`) |
+| `./scripts/e2e/ffs_tracker_source_hygiene_e2e.sh`, `perf_ledger_preflight.py --self-test`, `br dep cycles`, `cargo fmt --check` | `76d86b32b` / `23af30414` | Local host | **`exit 0`** (17/17 hygiene checks, 107 perf-ledger checks, `0` cycles) |
+
+### Honest Remaining Open Gaps (`61` Active Beads — Not Prematurely Closed per `RH-7`)
+
+- **Mounted kernel performance**: Default symmetric mounted scorecards against Linux kernel `ext4`/`btrfs` remain `0W` (`bd-jgq8e`, `bd-3ds2k`, `bd-79li3`, `bd-39x6a`, `bd-3c2ed`, `bd-2966l`, `bd-vkibu` / `bd-mf9z9`).
+- **Native format advanced / external-OS qualification**: ZFS native ZIL writer (`bd-uetvl` / `bd-jdned`), live external OpenZFS/Windows/Linux kernel cross-interoperability and hardware/dm-flakey power-cut qualification (`bd-mizd2`, `bd-h7cme`, `bd-h8n46`, `bd-jbo9q`, `bd-ady1j`, `bd-i6em8`, `bd-vw3b5`, `bd-tqrnc`), and multi-device btrfs RW (`bd-2hn4r`, `bd-39z1l`).
+- **Structural & canonical release gates**: `ffs-core` monolith decomposition (`bd-gmdcu`), process-isolated reader sandbox (`bd-sandbox-native-readers-qx2om`), live `/dev/fuse` + multi-block crash bindings for §22.1 `gate1`..`gate7` (`bd-wh1xk`, `bd-11a8t`, `bd-z5bav`, `bd-3nf06`).
+
+---
+
 ## Reality check — 2026-11-11 (`c7fc0ddc4`)
 
 **Verdict: FrankenFS has built a remarkably large, memory-safe Rust filesystem core (`907,428` workspace `.rs` LOC across 25 workspace members; zero `tokio`; zero workspace `unsafe`), and fixed the Nov 5 headline unit panic (`bd-wcbvk`), landed default-ON btrfs `DATA`/`METADATA`/`SYSTEM` chunk growth (`bd-a136s`), NTFS `$Secure` file-reference validation (`7ee497d14`), ZFS striped-mirror survivor reads (`0b14d1f93`), and FUSE directory-cookie overflow preservation (`c7fc0ddc4`) across 129 commits since November 5 — YET current `main` is LIVE RED under `cargo clippy --workspace --all-targets -- -D warnings` (`exit 101`), 15 of 132 `FsOps` methods are silently unforwarded on `Arc<T>` over FUSE, production SSI (`commit_transaction_ssi`) has zero production callers, NTFS and ZFS remain 100% read-only, default-on RaptorQ live-mount durability is unwired, mounted symmetric performance still trails Linux kernel `ext4`/`btrfs` across default scorecard rows (`1.14x`–`5.82x`), and multiple canonical conformance/CI gates are synthetic or broken.**
