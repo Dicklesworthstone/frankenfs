@@ -3262,6 +3262,7 @@ fn execute_command(
                 snapshot_json,
                 scrub,
                 refresh_ms,
+                six_format,
                 log_format,
             )
         }
@@ -11908,24 +11909,46 @@ fn build_live_tui_snapshot(
     image_path: &Path,
     run_scrub: bool,
 ) -> Result<ffs_tui::DashboardSnapshot> {
+    let default_six = cmd_six_format::SixFormatCliArgs {
+        offline_image: true,
+        ..cmd_six_format::SixFormatCliArgs::default()
+    };
+    build_live_tui_snapshot_with_six_format(image_path, run_scrub, &default_six)
+}
+
+#[allow(clippy::too_many_lines)]
+fn build_live_tui_snapshot_with_six_format(
+    image_path: &Path,
+    run_scrub: bool,
+    six: &cmd_six_format::SixFormatCliArgs,
+) -> Result<ffs_tui::DashboardSnapshot> {
     let cx = cli_cx();
-    if let Ok(detected) = ffs_core::detect_all_filesystems_at_path(&cx, image_path)
-        && matches!(
-            detected.kind(),
-            ffs_core::FsFormatKind::Fat16
-                | ffs_core::FsFormatKind::Fat32
-                | ffs_core::FsFormatKind::Ntfs
-                | ffs_core::FsFormatKind::Zfs
-        )
+    let target = match cmd_six_format::detect_target_format(&cx, image_path, six) {
+        Ok(found) => Some(found),
+        Err(err) if six.partition.is_some() || six.has_zfs_flags() || six.has_ntfs_flags() => {
+            return Err(err);
+        }
+        Err(_) => None,
+    };
+    if let Some((kind, detected, part_entry, _part_dev)) = target
+        && (part_entry.is_some()
+            || matches!(
+                kind,
+                ffs_core::FsFormatKind::Fat16
+                    | ffs_core::FsFormatKind::Fat32
+                    | ffs_core::FsFormatKind::Ntfs
+                    | ffs_core::FsFormatKind::Zfs
+            ))
     {
-        let ro = ffs::open_read_only(&cx, image_path, &ffs::ReadOnlyOpenOptions::default())
-            .with_context(|| {
-                format!(
-                    "failed to open native {} image for TUI snapshot: {}",
-                    detected.kind().as_str(),
-                    image_path.display()
-                )
-            })?;
+        six.validate_format_compatibility(kind)?;
+        let ro_opts = six.build_read_only_options(kind, None, &[], 0, 0)?;
+        let ro = ffs::open_read_only(&cx, image_path, &ro_opts).with_context(|| {
+            format!(
+                "failed to open native {} image for TUI snapshot: {}",
+                kind.as_str(),
+                image_path.display()
+            )
+        })?;
         let mut scope = ffs_core::RequestScope::empty();
         let _ = ro.filesystem.getattr(&cx, &mut scope, InodeNumber(1));
         if let Ok(entries) = ro.filesystem.readdir(&cx, &mut scope, InodeNumber(1), 0) {
@@ -11935,13 +11958,16 @@ fn build_live_tui_snapshot(
         }
         let _ = ro.filesystem.statfs(&cx, &mut scope, InodeNumber(1));
 
+        let (offset, length) = part_entry
+            .as_ref()
+            .map_or((0_u64, None), |p| (p.start_byte, Some(p.byte_len)));
         let (scrub_blocks_scanned, scrub_blocks_corrupt, scrub_findings_count) = if run_scrub {
-            match detected.kind() {
+            match kind {
                 ffs_core::FsFormatKind::Fat16 | ffs_core::FsFormatKind::Fat32 => {
                     let img = ffs_fat::ImageArgs {
                         image: image_path.to_path_buf(),
-                        offset: 0,
-                        length: None,
+                        offset,
+                        length,
                         oem_code_page: ffs_ondisk::fat::FatOemCodePage::Ascii,
                         sidecar: None,
                     };
@@ -11958,8 +11984,8 @@ fn build_live_tui_snapshot(
                     let chk = ffs_ntfs::check_image_file(
                         &cx,
                         image_path,
-                        0,
-                        None,
+                        offset,
+                        length,
                         ffs_ntfs::NtfsCheckLimits::default(),
                     )
                     .context("NTFS TUI scrub check failed")?;
@@ -11971,16 +11997,24 @@ fn build_live_tui_snapshot(
                     )
                 }
                 ffs_core::FsFormatKind::Zfs => {
-                    let leaf = ffs_zfs::reader::Leaf::open(&cx, image_path, 0, None)
-                        .context("open ZFS leaf for TUI scrub")?;
-                    let pool = ffs_zfs::reader::Pool::from_leaves(vec![leaf])
-                        .context("import ZFS pool for TUI scrub")?;
-                    let mut objects = pool
-                        .import_objects(&cx, None)
-                        .context("open ZFS MOS for TUI scrub")?;
-                    let zpl = objects
-                        .zpl(&cx, &[])
-                        .context("open ZFS root ZPL for TUI scrub")?;
+                    let (_pool, mut objects) = cmd_six_format::open_zfs_pool_and_objects(
+                        &cx,
+                        image_path,
+                        part_entry.as_ref(),
+                        six,
+                    )
+                    .context("open ZFS pool for TUI scrub")?;
+                    let ds = cmd_six_format::parse_zfs_dataset_components(
+                        six.zfs_dataset.as_deref().unwrap_or(""),
+                    )?;
+                    let zpl = match six.zfs_snapshot.as_deref() {
+                        Some(snap) => objects
+                            .zpl_snapshot(&cx, &ds, snap.as_bytes())
+                            .context("open ZFS snapshot ZPL for TUI scrub")?,
+                        None => objects
+                            .zpl(&cx, &ds)
+                            .context("open ZFS dataset ZPL for TUI scrub")?,
+                    };
                     let report = zpl
                         .scrub(
                             &cx,
@@ -11994,7 +12028,46 @@ fn build_live_tui_snapshot(
                         .context("ZFS TUI scrub failed")?;
                     (report.verified_blocks, report.errors, report.issues.len())
                 }
-                ffs_core::FsFormatKind::Ext4 | ffs_core::FsFormatKind::Btrfs => (0, 0, 0),
+                ffs_core::FsFormatKind::Ext4 | ffs_core::FsFormatKind::Btrfs => {
+                    let byte_dev = FileByteDevice::open_read_only(image_path)?;
+                    let slice_len =
+                        length.unwrap_or_else(|| byte_dev.len_bytes().saturating_sub(offset));
+                    let vol = ffs_block::VolumeDevice::new(
+                        Arc::new(byte_dev),
+                        ffs_types::ByteOffset(offset),
+                        slice_len,
+                        ffs_block::io_engine::VolumeAccess::ReadOnly,
+                    )?;
+                    let (flavor, block_size) = match &detected {
+                        ffs_core::DetectedFilesystem::Ext4(sb) => {
+                            (FsFlavor::Ext4(sb.clone()), sb.block_size)
+                        }
+                        ffs_core::DetectedFilesystem::Btrfs(sb) => {
+                            let bs = choose_btrfs_scrub_block_size(
+                                slice_len,
+                                sb.nodesize,
+                                sb.sectorsize,
+                            )?;
+                            (FsFlavor::Btrfs(sb.clone()), bs)
+                        }
+                        _ => unreachable!(),
+                    };
+                    let block_dev = ByteBlockDevice::new(vol, block_size)?;
+                    let validator: Box<dyn ffs_repair::scrub::BlockValidator> = match &flavor {
+                        FsFlavor::Ext4(_) => {
+                            Box::new(ffs_repair::scrub::Ext4SuperblockValidator::new(block_size))
+                        }
+                        FsFlavor::Btrfs(_) => scrub_validator(&flavor, block_size),
+                    };
+                    let report = Scrubber::new(&block_dev, &*validator)
+                        .scrub_all(&cx)
+                        .context("partitioned TUI scrub pass failed")?;
+                    (
+                        report.blocks_scanned,
+                        report.blocks_corrupt,
+                        report.findings.len(),
+                    )
+                }
             }
         } else {
             (0, 0, 0)
@@ -12079,6 +12152,7 @@ fn tui_cmd(
     snapshot_json: bool,
     run_scrub: bool,
     refresh_ms: u64,
+    six_format: &cmd_six_format::SixFormatCliArgs,
     log_format: LogFormat,
 ) -> Result<()> {
     let command_span = info_span!(
@@ -12115,10 +12189,10 @@ fn tui_cmd(
         arguments.push(image_path.as_os_str().to_owned());
         arguments.push(mountpoint.as_os_str().to_owned());
         let mount = Cli::try_parse_from(arguments).context("configure live read-only mount")?;
-        return execute_command(mount.command, &mount.six_format, log_format);
+        return execute_command(mount.command, six_format, log_format);
     }
 
-    let snap = build_live_tui_snapshot(image_path, run_scrub)?;
+    let snap = build_live_tui_snapshot_with_six_format(image_path, run_scrub, six_format)?;
     println!(
         "{}",
         serde_json::to_string_pretty(&snap).context("serialize live TUI snapshot")?

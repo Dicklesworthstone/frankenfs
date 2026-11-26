@@ -1145,7 +1145,7 @@ pub fn maybe_route_walk_cmd(
     Ok(true)
 }
 
-fn open_zfs_pool_and_objects(
+pub(crate) fn open_zfs_pool_and_objects(
     cx: &Cx,
     path: &Path,
     part_entry: Option<&PartitionEntry>,
@@ -3869,5 +3869,25 @@ mod tests {
                 "{expected_fs_type} TUI snapshot must not mutate image"
             );
         }
+
+        // 4. Verify `build_live_tui_snapshot_with_six_format` enforces six-format compatibility
+        //    and respects `--offline-image` + `--zfs-dataset` without dropping flags.
+        let wrong_flags = SixFormatCliArgs {
+            offline_image: true,
+            recover_logfile: true,
+            ..SixFormatCliArgs::default()
+        };
+        crate::build_live_tui_snapshot_with_six_format(&zfs_img, false, &wrong_flags)
+            .expect_err("NTFS-only --recover-logfile must fail closed on ZFS TUI snapshot");
+        let zfs_six = SixFormatCliArgs {
+            offline_image: true,
+            zfs_dataset: Some(String::new()),
+            ..SixFormatCliArgs::default()
+        };
+        let zfs_snap = crate::build_live_tui_snapshot_with_six_format(&zfs_img, true, &zfs_six)
+            .expect("ZFS TUI snapshot with explicit six_format flags");
+        assert_eq!(zfs_snap.fs_type, "zfs");
+        assert!(zfs_snap.scrub_blocks_scanned > 0);
+        assert_eq!(zfs_snap.scrub_blocks_corrupt, 0);
     }
 }
