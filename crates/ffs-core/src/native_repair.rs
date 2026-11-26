@@ -4311,14 +4311,7 @@ impl OpenFs {
                             native_sealed_generation(cx, &dev, &id, &temp_baseline, tail, false)?;
                         } else {
                             native_codec_budget(&id, &storage, tail, codec_budget, true)?;
-                            native_sealed_generation(
-                                cx,
-                                &dev,
-                                &id,
-                                &temp_baseline,
-                                tail,
-                                true,
-                            )?;
+                            native_sealed_generation(cx, &dev, &id, &temp_baseline, tail, true)?;
                             needs_source_heal.push(index);
                         }
                         validations.push(ValidationAdmission {
