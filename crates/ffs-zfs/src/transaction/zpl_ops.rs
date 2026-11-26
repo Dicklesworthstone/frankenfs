@@ -1401,19 +1401,22 @@ fn encode_new_zpl_bonus(
     context: &mut DatasetContext,
     order: Endian,
 ) -> Result<(u8, usize, Vec<u8>, u64)> {
+    // ACL inheritance applies independently of project inheritance and of the
+    // parent's legacy/SA representation. A fresh mode-only ACL cannot replace
+    // inheritable native ACEs. Native symlinks deliberately inherit no ACEs.
+    if matches!(new_meta.kind, Kind::Regular | Kind::Directory)
+        && parent_loaded.metadata.flags & ZFS_INHERIT_ACE != 0
+    {
+        return Err(unsupported(
+            "creation with inheritable native ACL entries is unavailable",
+        ));
+    }
+
     // zfs_mknode inherits both ID and flag for regular files and directories.
     // Symlinks keep the default project, even inside a project tree.
     if matches!(new_meta.kind, Kind::Regular | Kind::Directory)
         && parent_loaded.metadata.flags & ZFS_PROJINHERIT != 0
     {
-        // Native ACL inheritance is independent of project inheritance. Until
-        // inherited ACEs are implemented, a fresh mode-only ACL must not replace
-        // the parent's inheritable access policy. Native symlinks inherit none.
-        if parent_loaded.metadata.flags & ZFS_INHERIT_ACE != 0 {
-            return Err(unsupported(
-                "project creation with inheritable native ACL entries is unavailable",
-            ));
-        }
         let mut metadata = new_meta.clone();
         metadata.flags |= ZFS_PROJID | ZFS_PROJINHERIT;
         let registry = context

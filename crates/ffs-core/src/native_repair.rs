@@ -2283,9 +2283,23 @@ fn read_native_baseline(fs: &OpenFs, cx: &Cx) -> Result<NativeBaseline, FfsError
             "whole-plan validation is uninitialized or pending",
         ));
     };
+    read_native_group_baseline(cx, &dev, &id, storage, generation, epoch, plan_root)
+}
+
+/// Bind every local validation table to one previously persisted whole-plan
+/// root before using any table to authorize source recovery.
+fn read_native_group_baseline(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    id: &NativeFsIdentity,
+    storage: NativeRepairStorage,
+    generation: u32,
+    epoch: u32,
+    plan_root: [u8; 32],
+) -> Result<NativeBaseline, FfsError> {
     let mut admissions = Vec::with_capacity(storage.tails.len());
     for tail in &storage.tails {
-        let (root, table) = read_sealed_table(cx, &dev, &id, &storage, generation, tail)?;
+        let (root, table) = read_sealed_table(cx, dev, id, &storage, generation, tail)?;
         let local_epoch = u32::from_le_bytes(table[68..72].try_into().expect("checked table"));
         if local_epoch == 0 || local_epoch > epoch {
             return Err(validation_error(
@@ -2299,7 +2313,7 @@ fn read_native_baseline(fs: &OpenFs, cx: &Cx) -> Result<NativeBaseline, FfsError
             intent: ValidationIntent::Sealed(root),
         });
     }
-    if validation_plan_root(&id, &storage, generation, epoch, &admissions)? != plan_root {
+    if validation_plan_root(id, &storage, generation, epoch, &admissions)? != plan_root {
         return Err(validation_error(
             &storage.tails[0],
             "sealed whole-plan root mismatch",
@@ -2315,6 +2329,43 @@ fn read_native_baseline(fs: &OpenFs, cx: &Cx) -> Result<NativeBaseline, FfsError
         roots,
         group_epochs,
     })
+}
+
+/// A Dirty token records where writes may have happened, not their intended
+/// bytes. Only the old sealed digests survive this cut. Check every possibly
+/// written group before healing even a clean group, and never infer new source
+/// authority from the bytes currently on disk.
+fn verify_dirty_recovery_sources(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    id: &NativeFsIdentity,
+    baseline: &NativeBaseline,
+    token: &NativeEpochToken,
+    recovery_dirty_groups: &BTreeSet<GroupNumber>,
+) -> Result<(), FfsError> {
+    for (index, tail) in baseline.storage.tails.iter().enumerate() {
+        if !token.is_group_dirty(tail.group) && !recovery_dirty_groups.contains(&tail.group) {
+            continue;
+        }
+        let (root, table) = read_sealed_table(
+            cx,
+            dev,
+            id,
+            &baseline.storage,
+            baseline.owner_generation,
+            tail,
+        )?;
+        if root != baseline.roots[index] {
+            return Err(validation_error(tail, "dirty recovery baseline changed"));
+        }
+        if !native_corrupt_indices(cx, dev, id, tail, &table)?.is_empty() {
+            return Err(validation_error(
+                tail,
+                "dirty epoch source changed without persisted intended-source authority",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn ensure_native_baseline(fs: &OpenFs, cx: &Cx, expected: &NativeBaseline) -> Result<(), FfsError> {
@@ -4041,9 +4092,11 @@ impl OpenFs {
         Ok(())
     }
 
-    /// Reconcile any interrupted format-committed epoch (`FFSEPK02` across
-    /// Cuts A–D), heal recoverable clean-group bit-rot, and activate live
-    /// native read verification and write fencing on `self.dev`.
+    /// Reconcile root-bound pending epochs and dirty fences whose possible
+    /// write targets still match the old sealed sources, then activate native
+    /// read verification and write fencing. Changed Dirty sources require
+    /// durable per-source intent and are refused; a group bitmap alone cannot
+    /// distinguish a legitimate write from corruption.
     #[expect(clippy::too_many_lines)]
     pub fn reconcile_and_activate_native_repair(
         &mut self,
@@ -4157,160 +4210,68 @@ impl OpenFs {
                     && token.prev_sealed_plan_root == prev_root
                     && token.prev_sealed_epoch == plan_epoch =>
             {
-                let target_epoch = token.target_epoch;
-                let mut validations = Vec::with_capacity(storage.tails.len());
-                let mut needs_publish = Vec::with_capacity(storage.tails.len());
-                for tail in &storage.tails {
-                    if token.is_group_dirty(tail.group)
-                        || recovery_dirty_groups.contains(&tail.group)
-                    {
-                        let table = build_validation_table(
-                            cx,
-                            &dev,
-                            &id,
-                            storage.owner_inode,
-                            owner_generation,
-                            tail,
-                            target_epoch,
-                        )?;
-                        let (_, _, used) = validation_sizes(&id, tail)?;
-                        let root = validation_root(&table, used);
-                        validations.push(ValidationAdmission {
-                            epoch: target_epoch,
-                            root,
-                            intent: ValidationIntent::Pending(root),
-                        });
-                        needs_publish.push(true);
+                let baseline = read_native_group_baseline(
+                    cx,
+                    &dev,
+                    &id,
+                    storage.clone(),
+                    owner_generation,
+                    token.prev_sealed_epoch,
+                    prev_root,
+                )?;
+                verify_dirty_recovery_sources(
+                    cx,
+                    &dev,
+                    &id,
+                    &baseline,
+                    &token,
+                    &recovery_dirty_groups,
+                )?;
+                for (index, tail) in storage.tails.iter().enumerate() {
+                    let (root, table) =
+                        read_sealed_table(cx, &dev, &id, &storage, owner_generation, tail)?;
+                    if root != baseline.roots[index] {
+                        return Err(validation_error(tail, "dirty recovery baseline changed"));
+                    }
+                    let corrupt = native_corrupt_indices(cx, &dev, &id, tail, &table)?;
+                    if corrupt.is_empty() {
+                        native_sealed_generation(cx, &dev, &id, &baseline, tail, false)?;
                     } else {
-                        let (root, table) =
-                            read_sealed_table(cx, &dev, &id, &storage, owner_generation, tail)?;
-                        let local_epoch =
-                            u32::from_le_bytes(table[68..72].try_into().expect("checked table"));
-                        if local_epoch == 0 || local_epoch > token.prev_sealed_epoch {
+                        if token.is_group_dirty(tail.group)
+                            || recovery_dirty_groups.contains(&tail.group)
+                        {
                             return Err(validation_error(
                                 tail,
-                                "clean group epoch exceeds pre-crash sealed epoch",
+                                "dirty epoch source changed without persisted intended-source authority",
                             ));
                         }
-                        let temp_baseline = NativeBaseline {
-                            storage: storage.clone(),
-                            owner_generation,
-                            epoch: token.prev_sealed_epoch,
-                            plan_root: prev_root,
-                            roots: storage.tails.iter().map(|_| root).collect(),
-                            group_epochs: vec![local_epoch; storage.tails.len()],
-                        };
-                        let corrupt = native_corrupt_indices(cx, &dev, &id, tail, &table)?;
-                        if corrupt.is_empty() {
-                            verify_validation_table(cx, &dev, &id, tail, &table, &root)?;
-                            native_sealed_generation(cx, &dev, &id, &temp_baseline, tail, false)?;
-                        } else {
-                            native_codec_budget(&id, &storage, tail, codec_budget, true)?;
-                            let generation = native_sealed_generation(
-                                cx,
-                                &dev,
-                                &id,
-                                &temp_baseline,
-                                tail,
-                                true,
-                            )?;
-                            heal_clean_group_sources(
-                                cx,
-                                &dev,
-                                self.dev.as_ref(),
-                                &id,
-                                tail,
-                                &table,
-                                &root,
-                                generation,
-                                &corrupt,
-                            )?;
-                        }
-                        validations.push(ValidationAdmission {
-                            epoch: local_epoch,
-                            root,
-                            intent: ValidationIntent::Sealed(root),
-                        });
-                        needs_publish.push(false);
+                        native_codec_budget(&id, &storage, tail, codec_budget, true)?;
+                        let generation =
+                            native_sealed_generation(cx, &dev, &id, &baseline, tail, true)?;
+                        heal_clean_group_sources(
+                            cx,
+                            &dev,
+                            self.dev.as_ref(),
+                            &id,
+                            tail,
+                            &table,
+                            &root,
+                            generation,
+                            &corrupt,
+                        )?;
                     }
                 }
-                let new_plan_root = validation_plan_root(
-                    &id,
-                    &storage,
-                    owner_generation,
-                    target_epoch,
-                    &validations,
-                )?;
-                let next = NativeBaseline {
-                    storage: storage.clone(),
-                    owner_generation,
-                    epoch: target_epoch,
-                    plan_root: new_plan_root,
-                    roots: validations.iter().map(|v| v.root).collect(),
-                    group_epochs: validations.iter().map(|v| v.epoch).collect(),
-                };
-                let mut admissions = Vec::with_capacity(storage.tails.len());
-                for (index, tail) in storage.tails.iter().enumerate() {
-                    let expected_root = (!needs_publish[index]).then_some(next.roots[index]);
-                    let mut adm = admit_native_group_unconstrained_root(
-                        cx,
-                        &dev,
-                        &id,
-                        &storage,
-                        owner_generation,
-                        tail,
-                        codec_budget,
-                        expected_root,
-                    )?;
-                    if needs_publish[index] {
-                        adm.retained = false;
-                    }
-                    admissions.push(adm);
-                }
+                // No source change survived the interrupted write. Retire the
+                // fence against the original sealed epoch instead of blessing
+                // freshly observed bytes as a new baseline.
                 publish_validation_plan_with_token(
                     cx,
                     &dev,
                     &id,
                     &storage,
                     owner_generation,
-                    target_epoch,
-                    ValidationIntent::Pending(new_plan_root),
-                    Some(&token),
-                )?;
-                for (index, tail) in storage.tails.iter().enumerate() {
-                    if !needs_publish[index] {
-                        continue;
-                    }
-                    publish_validation_group(
-                        cx,
-                        &dev,
-                        &id,
-                        &storage,
-                        owner_generation,
-                        tail,
-                        &validations[index],
-                    )?;
-                    let (_, sealed_table) =
-                        read_sealed_table(cx, &dev, &id, &storage, owner_generation, tail)?;
-                    encode_and_publish_native_group(
-                        cx,
-                        &dev,
-                        &id,
-                        &next,
-                        tail,
-                        &admissions[index],
-                        &sealed_table,
-                        None,
-                    )?;
-                }
-                publish_validation_plan_with_token(
-                    cx,
-                    &dev,
-                    &id,
-                    &storage,
-                    owner_generation,
-                    target_epoch,
-                    ValidationIntent::Sealed(new_plan_root),
+                    token.prev_sealed_epoch,
+                    ValidationIntent::Sealed(prev_root),
                     None,
                 )?;
                 self.dev.sync(cx)?;
@@ -4323,7 +4284,8 @@ impl OpenFs {
                 let mut validations = Vec::with_capacity(storage.tails.len());
                 let mut needs_table_publish = Vec::with_capacity(storage.tails.len());
                 let mut needs_parity_publish = Vec::with_capacity(storage.tails.len());
-                for tail in &storage.tails {
+                let mut needs_source_heal = Vec::new();
+                for (index, tail) in storage.tails.iter().enumerate() {
                     if !token.is_group_dirty(tail.group) {
                         let (root, table) =
                             read_sealed_table(cx, &dev, &id, &storage, owner_generation, tail)?;
@@ -4349,7 +4311,7 @@ impl OpenFs {
                             native_sealed_generation(cx, &dev, &id, &temp_baseline, tail, false)?;
                         } else {
                             native_codec_budget(&id, &storage, tail, codec_budget, true)?;
-                            let generation = native_sealed_generation(
+                            native_sealed_generation(
                                 cx,
                                 &dev,
                                 &id,
@@ -4357,17 +4319,7 @@ impl OpenFs {
                                 tail,
                                 true,
                             )?;
-                            heal_clean_group_sources(
-                                cx,
-                                &dev,
-                                self.dev.as_ref(),
-                                &id,
-                                tail,
-                                &table,
-                                &root,
-                                generation,
-                                &corrupt,
-                            )?;
+                            needs_source_heal.push(index);
                         }
                         validations.push(ValidationAdmission {
                             epoch: local_epoch,
@@ -4398,7 +4350,7 @@ impl OpenFs {
                                 verify_validation_table(cx, &dev, &id, tail, &table, &root)?;
                             } else {
                                 native_codec_budget(&id, &storage, tail, codec_budget, true)?;
-                                let generation = native_sealed_generation(
+                                native_sealed_generation(
                                     cx,
                                     &dev,
                                     &id,
@@ -4406,17 +4358,7 @@ impl OpenFs {
                                     tail,
                                     true,
                                 )?;
-                                heal_clean_group_sources(
-                                    cx,
-                                    &dev,
-                                    self.dev.as_ref(),
-                                    &id,
-                                    tail,
-                                    &table,
-                                    &root,
-                                    generation,
-                                    &corrupt,
-                                )?;
+                                needs_source_heal.push(index);
                             }
                             needs_parity_publish.push(false);
                         } else {
@@ -4471,6 +4413,30 @@ impl OpenFs {
                     roots: validations.iter().map(|v| v.root).collect(),
                     group_epochs: validations.iter().map(|v| v.epoch).collect(),
                 };
+                // Local checksums and parity do not by themselves authorize
+                // restoration. Bind every group's source root to the persisted
+                // plan first, then reread authority before the first heal.
+                for index in needs_source_heal {
+                    let tail = &storage.tails[index];
+                    let (root, table) =
+                        read_sealed_table(cx, &dev, &id, &storage, owner_generation, tail)?;
+                    if root != next.roots[index] {
+                        return Err(validation_error(tail, "pending recovery baseline changed"));
+                    }
+                    let corrupt = native_corrupt_indices(cx, &dev, &id, tail, &table)?;
+                    let generation = native_sealed_generation(cx, &dev, &id, &next, tail, true)?;
+                    heal_clean_group_sources(
+                        cx,
+                        &dev,
+                        self.dev.as_ref(),
+                        &id,
+                        tail,
+                        &table,
+                        &root,
+                        generation,
+                        &corrupt,
+                    )?;
+                }
                 let mut admissions = Vec::with_capacity(storage.tails.len());
                 for (index, tail) in storage.tails.iter().enumerate() {
                     let expected_root = (!needs_parity_publish[index]).then_some(next.roots[index]);

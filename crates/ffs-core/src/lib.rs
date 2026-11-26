@@ -86477,6 +86477,212 @@ mod tests {
             .expect_err("dirty or failed freshness publication cannot authorize cold recovery");
     }
 
+    fn native_freshness_recovery_cut(pending: bool) -> (Vec<u8>, BlockNumber) {
+        let baseline = native_freshness_baseline();
+        let cx = Cx::for_testing();
+        let dev = TestDevice::from_vec(baseline.sealed.clone());
+        let durable = TestDevice::from_vec(baseline.sealed.clone());
+        let fault = ValidationSyncFaultDevice {
+            inner: dev.clone(),
+            durable: durable.clone(),
+            syncs: Arc::new(AtomicUsize::new(0)),
+            // Dirty fence, source barrier, whole-plan Pending, then the first
+            // local table intent. Cut before that fourth barrier completes.
+            fail_on: if pending { 4 } else { usize::MAX },
+            corrupt_on: None,
+            events: Arc::new(Mutex::new(Vec::new())),
+        };
+        let mut fs =
+            OpenFs::from_device(&cx, Box::new(fault), &native_preparation_options()).unwrap();
+        let payload = native_existing_payload_block(&fs, &cx);
+        fs.activate_native_ext4_repair(&cx, NATIVE_PARITY_TEST_BUDGET)
+            .unwrap();
+        let mut guard = fs.begin_durability_commit(&cx, 42, &[payload]).unwrap();
+        fs.dev
+            .write_all_at(&cx, ByteOffset(payload.0 * 1024 + 17), &[0x3D; 31])
+            .unwrap();
+        if pending {
+            guard.arm_final_seal(&cx).unwrap();
+            let error = fs
+                .dev
+                .sync(&cx)
+                .expect_err("cut during local table publication");
+            assert!(
+                error
+                    .to_string()
+                    .contains("injected native validation sync failure"),
+                "{error}"
+            );
+        }
+        drop(guard);
+        drop(fs);
+        let bytes = durable.snapshot_bytes();
+        let owner = baseline.storage.tails[0].start.0 as usize * 1024;
+        assert_eq!(&bytes[owner + 448..owner + 456], b"FFSEPK02");
+        assert_eq!(
+            u32::from_le_bytes(bytes[owner + 288..owner + 292].try_into().unwrap()),
+            if pending { 1 } else { 4 },
+            "the fault must persist the intended whole-plan cut"
+        );
+        let source = payload.0 as usize * 1024 + 17;
+        assert_eq!(
+            &bytes[source..source + 31],
+            &[if pending { 0x3D } else { 0xA7 }; 31]
+        );
+        (bytes, payload)
+    }
+
+    #[test]
+    fn native_freshness_recovery_preserves_unchanged_dirty_and_root_bound_pending() {
+        let baseline = native_freshness_baseline();
+        for (pending, heal_clean) in [(false, false), (true, false), (true, true)] {
+            let (mut bytes, payload) = native_freshness_recovery_cut(pending);
+            let clean_source = (baseline.storage.tails[1].start.0 as usize - 1) * 1024;
+            if heal_clean {
+                bytes[clean_source + 11] ^= 0x40;
+            }
+            let cx = Cx::for_testing();
+            let dev = TestDevice::from_vec(bytes);
+            let mut fs =
+                OpenFs::from_device(&cx, Box::new(dev.clone()), &native_preparation_options())
+                    .unwrap();
+            let report = fs
+                .reconcile_and_activate_native_repair(
+                    &cx,
+                    NATIVE_PARITY_TEST_BUDGET,
+                    &BTreeSet::new(),
+                )
+                .unwrap();
+            assert_eq!(report.groups, 2);
+            let recovered = dev.snapshot_bytes();
+            let source = payload.0 as usize * 1024 + 17;
+            assert_eq!(
+                &recovered[source..source + 31],
+                &[if pending { 0x3D } else { 0xA7 }; 31]
+            );
+            assert_eq!(
+                &recovered[clean_source..clean_source + 1024],
+                &baseline.sealed[clean_source..clean_source + 1024]
+            );
+            if pending {
+                assert!(report.generations.iter().any(|generation| *generation > 1));
+            } else {
+                assert_eq!(report.generations, vec![1, 1]);
+                assert!(
+                    recovered == baseline.sealed,
+                    "unchanged cut must retain old authority"
+                );
+            }
+            assert_eq!(fs.check_native_ext4_repair(&cx).unwrap(), report);
+        }
+    }
+
+    #[test]
+    fn native_freshness_dirty_recovery_refuses_changed_sources_before_any_repair_io() {
+        let baseline = native_freshness_baseline();
+        let (cut, payload) = native_freshness_recovery_cut(false);
+        for (changed_target, changed_clean) in [(true, false), (false, true), (true, true)] {
+            let mut bytes = cut.clone();
+            if changed_target {
+                let source = payload.0 as usize * 1024;
+                bytes[source + 17..source + 48].fill(0x3D);
+                // This unrelated block shares the token's dirty group. It must
+                // not become trusted merely because another block was written.
+                bytes[source + 1024 + 11] ^= 0x40;
+            }
+            let mut recovery_touched = BTreeSet::new();
+            if changed_clean {
+                let block = BlockNumber(baseline.storage.tails[1].start.0 - 1);
+                bytes[block.0 as usize * 1024 + 11] ^= 0x40;
+                // Native journal recovery can touch a group outside the hint
+                // bitmap. It does not authorize arbitrary new digest values.
+                recovery_touched.insert(block);
+            }
+            let cx = Cx::for_testing();
+            let dev = TestDevice::from_vec(bytes.clone());
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let observed = ValidationFaultDevice {
+                inner: dev.clone(),
+                attempts: Arc::new(AtomicUsize::new(0)),
+                fail_on: usize::MAX,
+                events: Arc::clone(&events),
+            };
+            let mut fs =
+                OpenFs::from_device(&cx, Box::new(observed), &native_preparation_options())
+                    .unwrap();
+            let error = fs
+                .reconcile_and_activate_native_repair(
+                    &cx,
+                    NATIVE_PARITY_TEST_BUDGET,
+                    &recovery_touched,
+                )
+                .expect_err("Dirty has no persisted intended-source authority");
+            assert!(
+                error.to_string().contains("intended-source authority"),
+                "{error}"
+            );
+            assert!(
+                events.lock().unwrap().is_empty(),
+                "refusal performed repair I/O"
+            );
+            assert!(
+                dev.snapshot_bytes() == bytes,
+                "refusal changed source or repair bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn native_freshness_recovery_binds_whole_plan_before_healing_sources() {
+        let baseline = native_freshness_baseline();
+        for pending in [false, true] {
+            let (mut bytes, _) = native_freshness_recovery_cut(pending);
+            let owner = baseline.storage.tails[0].start.0 as usize * 1024;
+            let plan = owner + 192;
+            bytes[plan + 64] ^= 0x40;
+            let checksum = ffs_ondisk::ext4::ext4_chksum(!0, &bytes[plan..plan + 100]);
+            bytes[plan + 100..plan + 104].copy_from_slice(&checksum.to_le_bytes());
+            if !pending {
+                // Keep the token internally consistent with the forged Dirty
+                // header. Only binding the local tables to that root rejects it.
+                let token = owner + 448;
+                bytes[token + 56] ^= 0x40;
+                let checksum = ffs_ondisk::ext4::ext4_chksum(!0, &bytes[token..token + 152]);
+                bytes[token + 152..token + 156].copy_from_slice(&checksum.to_le_bytes());
+            }
+            let clean_source = (baseline.storage.tails[1].start.0 as usize - 1) * 1024;
+            bytes[clean_source + 11] ^= 0x40;
+            let cx = Cx::for_testing();
+            let dev = TestDevice::from_vec(bytes.clone());
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let observed = ValidationFaultDevice {
+                inner: dev.clone(),
+                attempts: Arc::new(AtomicUsize::new(0)),
+                fail_on: usize::MAX,
+                events: Arc::clone(&events),
+            };
+            let mut fs =
+                OpenFs::from_device(&cx, Box::new(observed), &native_preparation_options())
+                    .unwrap();
+            let error = fs
+                .reconcile_and_activate_native_repair(
+                    &cx,
+                    NATIVE_PARITY_TEST_BUDGET,
+                    &BTreeSet::new(),
+                )
+                .expect_err("local parity must not outrank the whole-plan root");
+            assert!(error.to_string().contains("root"), "{error}");
+            assert!(
+                events.lock().unwrap().is_empty(),
+                "healed before root admission"
+            );
+            assert!(
+                dev.snapshot_bytes() == bytes,
+                "refusal changed the captured cut"
+            );
+        }
+    }
+
     #[test]
     fn native_freshness_fsops_write_and_journal_fsync_publish_current_baseline() {
         let baseline = native_freshness_baseline();

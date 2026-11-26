@@ -298,6 +298,107 @@ fn project_creation_refuses_incomplete_profiles_and_inheritable_native_acls() {
 }
 
 #[test]
+fn native_acl_inheritance_refuses_creation_without_project_inheritance() {
+    let cx = Cx::for_testing();
+    let dataset = [b"data".to_vec()];
+    for zpl_version in [4, 5] {
+        for parent in [2, 6] {
+            let built = build_clean_zfs_pool(&PoolFixtureSpec {
+                zpl_version,
+                deadlist_mode: DeadlistMode::NativeDeadlist,
+                // ACL inheritance must be enforced even when project quota
+                // and ZFS_PROJINHERIT have never been enabled.
+                zpl_flags: BTreeMap::from([(parent, 0x2)]),
+                ..PoolFixtureSpec::default()
+            });
+            let devices: Vec<_> = built
+                .members
+                .into_iter()
+                .map(FaultableMemberDevice::new)
+                .collect();
+            let mut engine = open_engine_on_devices(
+                &cx,
+                &devices,
+                default_write_opts(built.pool_guid, built.initial_slot),
+            )
+            .unwrap();
+            assert_eq!(metadata(&cx, &engine, parent).flags & (INHERIT | 0x2), 0x2);
+            assert_native_write_refused(&mut engine, &devices, libc::EOPNOTSUPP, |writer| {
+                writer.create_file(
+                    &cx,
+                    &dataset,
+                    parent,
+                    b"blocked-file",
+                    0o666,
+                    1000,
+                    1000,
+                    TIME,
+                    ZfsDataChecksum::Fletcher4,
+                )
+            });
+            assert_native_write_refused(&mut engine, &devices, libc::EOPNOTSUPP, |writer| {
+                writer.mkdir(
+                    &cx,
+                    &dataset,
+                    parent,
+                    b"blocked-directory",
+                    0o777,
+                    1000,
+                    1000,
+                    TIME,
+                )
+            });
+
+            // OpenZFS does not inherit ACEs onto symlinks. Refusal must not
+            // turn an inheritable-ACL directory into a wholly read-only tree.
+            let (link, token) = engine
+                .create_symlink(
+                    &cx,
+                    &dataset,
+                    parent,
+                    b"permitted-link",
+                    b"../hello.txt",
+                    1000,
+                    1000,
+                    TIME,
+                    ZfsDataChecksum::Fletcher4,
+                )
+                .into_result()
+                .unwrap();
+            assert_eq!(metadata(&cx, &engine, link).flags & 0x2, 0);
+            drop(engine);
+            let fresh: Vec<_> = devices
+                .iter()
+                .map(FaultableMemberDevice::fresh_from_durable)
+                .collect();
+            let engine = open_engine_on_devices(
+                &cx,
+                &fresh,
+                default_write_opts(built.pool_guid, token.published_slot()),
+            )
+            .unwrap();
+            let mut mos = engine.open_read_objects(&cx).unwrap();
+            let mut head = mos.zpl(&cx, &dataset).unwrap();
+            assert_eq!(head.stat(&cx, parent).unwrap().0.flags & 0x2, 0x2);
+            assert_eq!(head.readlink(&cx, link).unwrap(), b"../hello.txt");
+            let prefix = if parent == 2 { "" } else { "/sub" };
+            for name in ["blocked-file", "blocked-directory"] {
+                assert!(matches!(
+                    head.resolve(&cx, format!("{prefix}/{name}").as_bytes()),
+                    Err(FfsError::NotFound(_))
+                ));
+            }
+            assert_pool_scrub_and_allocation_clean(
+                &cx,
+                &fresh,
+                built.pool_guid,
+                Some(token.published_slot()),
+            );
+        }
+    }
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn inherited_mkdir_publication_cuts_keep_sa_namespace_and_project_accounting_atomic() {
     let cx = Cx::for_testing();
