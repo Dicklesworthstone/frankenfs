@@ -55,6 +55,7 @@ use super::dmu_cow::{
     StagedBlockWrite, WriteBucket, allocate_object_id, cow_update_dnode,
     encode_zap_blocks_for_dnode, put_dnode_in_table, zap_optional_u64, zap_required_u64,
 };
+use super::dsl_ops::DD_FLAG_USED_BREAKDOWN;
 use super::{
     ZfsPersistenceStage, ZfsTopologyKind, ZfsTransactionEngine, ZfsTxOutcome, checkpoint, corrupt,
     parse_err, unsupported,
@@ -820,6 +821,8 @@ pub fn create_pool_on_leaves(
     dd_bonus[48..56].copy_from_slice(&order.encode(root_space.comp)); // dd_compressed_bytes
     dd_bonus[56..64].copy_from_slice(&order.encode(root_space.uncomp)); // dd_uncompressed_bytes
     dd_bonus[80..88].copy_from_slice(&order.encode(14)); // props_zapobj
+    dd_bonus[96..104].copy_from_slice(&order.encode(DD_FLAG_USED_BREAKDOWN)); // dd_flags
+    dd_bonus[104..112].copy_from_slice(&order.encode(root_space.dsize)); // dd_used_breakdown[DD_USED_HEAD]
     set_mos(
         &mut mos_tables,
         2,

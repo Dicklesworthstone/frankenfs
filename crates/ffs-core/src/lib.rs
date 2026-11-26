@@ -36506,9 +36506,8 @@ impl OpenFs {
                 .push(inode.clone());
         }
         if Self::ext4_inode_uses_inline_data(&inode) {
-            return self.ext4_fallocate_inline_file(
-                cx, scope, alloc, ino, inode, offset, length, mode,
-            );
+            return self
+                .ext4_fallocate_inline_file(cx, scope, alloc, ino, inode, offset, length, mode);
         }
         // e2compr compressed files are indirect-mapped but their blocks hold
         // compressed cluster data, not plain file bytes — fallocate (alloc/zero/
@@ -37351,10 +37350,7 @@ impl OpenFs {
                 )?;
             }
             scope.ext4_staged.xattr_invalidate_inodes.push(ino);
-            scope
-                .ext4_staged
-                .xattr_refresh_inodes
-                .push((ino, inode));
+            scope.ext4_staged.xattr_refresh_inodes.push((ino, inode));
             self.ext4_fallocate_locked(cx, scope, working, ino, offset, length, mode)
         })
     }
@@ -68039,7 +68035,8 @@ mod tests {
                     fs.read_file(&cx, &old_scope, ino, 0, 128).unwrap(),
                     old_data
                 );
-                fs.ext4_refresh_inode_xattr_cache(&cx, ino, &before).unwrap();
+                fs.ext4_refresh_inode_xattr_cache(&cx, ino, &before)
+                    .unwrap();
                 assert_eq!(fs.getxattr(&cx, ino, "system.data").unwrap(), None);
                 if name == "insert" {
                     fs.fallocate(&cx, ino, 0, 4096, libc::FALLOC_FL_COLLAPSE_RANGE)
@@ -68119,7 +68116,10 @@ mod tests {
             }
             assert_eq!(fs.current_snapshot(), high);
             assert_eq!(fs.read_inode(&cx, ino).unwrap(), before);
-            assert_eq!(fs.read(&cx, ino, 0, 128).unwrap(), (0_u8..80).collect::<Vec<_>>());
+            assert_eq!(
+                fs.read(&cx, ino, 0, 128).unwrap(),
+                (0_u8..80).collect::<Vec<_>>()
+            );
             assert_eq!(fs.statfs(&cx, ino).unwrap().blocks_free, 0);
             assert_eq!(dev.snapshot_bytes(), bytes);
             assert_eq!(
@@ -68149,7 +68149,10 @@ mod tests {
                 fs.fallocate(&cx, ino, 4096, free * 4096, 0),
                 Err(FfsError::NoSpace)
             ));
-            assert_eq!(fs.read(&cx, ino, 0, 128).unwrap(), (0_u8..80).collect::<Vec<_>>());
+            assert_eq!(
+                fs.read(&cx, ino, 0, 128).unwrap(),
+                (0_u8..80).collect::<Vec<_>>()
+            );
             assert_eq!(
                 fs.getxattr(&cx, ino, "user.keep").unwrap(),
                 Some(b"kept".to_vec())

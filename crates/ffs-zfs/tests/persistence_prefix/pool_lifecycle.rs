@@ -710,3 +710,329 @@ fn pool_checkpoint_create_deferred_free_rewind_discard_and_crash_cuts() {
             .is_not_committed()
     );
 }
+
+#[test]
+fn created_pool_root_dataset_tracks_used_breakdown_across_writes_and_snapshots() {
+    let cx = Cx::for_testing();
+    let ts = Timestamp {
+        seconds: 1_735_005_000,
+        nanos: 0,
+    };
+    let dev = FaultableMemberDevice::new(vec![0_u8; 64 * 1024 * 1024]);
+    let pool_guid = 0x5A46_535F_524F_4F54;
+    let spec = ZfsPoolCreateSpec::single_leaf("rootbrk", pool_guid);
+    let rep = create_pool_on_devices(&cx, vec![Box::new(dev.clone())], &spec)
+        .expect("create 64 MiB single-leaf pool");
+    let mut engine = open_engine_on_devices(
+        &cx,
+        std::slice::from_ref(&dev),
+        default_write_opts(pool_guid, rep.initial_slot),
+    )
+    .expect("open freshly formatted pool");
+
+    let read_dir_breakdown = |eng: &ZfsTransactionEngine, dir_obj: u64| -> (u64, u64, u64, u64) {
+        let mut mos = eng.open_read_objects(&cx).unwrap();
+        let dn = mos.object(&cx, dir_obj).unwrap();
+        let ord = dn.order();
+        let b = dn.bonus();
+        let used = ord.u64(b, 40).unwrap();
+        let flags = ord.u64(b, 96).unwrap();
+        let head = ord.u64(b, 104).unwrap();
+        let snap = ord.u64(b, 112).unwrap();
+        (used, flags, head, snap)
+    };
+
+    let (init_used, init_flags, init_head, init_snap) = read_dir_breakdown(&engine, 2);
+    assert_ne!(
+        init_flags & 0x1,
+        0,
+        "newly created root dsl_dir must set DD_FLAG_USED_BREAKDOWN"
+    );
+    assert!(init_used > 0, "root dataset must account initial ZPL bytes");
+    assert_eq!(
+        init_head, init_used,
+        "initial DD_USED_HEAD must equal dd_used_bytes"
+    );
+    assert_eq!(init_snap, 0);
+
+    let root_dir = 5_u64;
+    let (fid, _) = engine
+        .create_file(
+            &cx,
+            &[],
+            root_dir,
+            b"payload.bin",
+            0o644,
+            0,
+            0,
+            ts,
+            ZfsDataChecksum::Sha256,
+        )
+        .into_result()
+        .expect("create root dataset file");
+    let payload_v1: Vec<u8> = (0_u32..4096)
+        .flat_map(|i| i.wrapping_mul(2_654_435_761).to_le_bytes())
+        .collect();
+    engine
+        .write_file_data(&cx, &[], fid, 0, &payload_v1, ts, ZfsDataChecksum::Sha256)
+        .into_result()
+        .expect("write 16 KiB to root dataset");
+    engine
+        .create_snapshot(&cx, &[], b"snap1", ts)
+        .into_result()
+        .expect("snapshot root dataset");
+    // Overwrite and shrink to exercise negative `ref_delta` against DD_USED_HEAD
+    // while retaining the pre-snapshot blocks in DD_USED_SNAP.
+    engine
+        .write_file_data(
+            &cx,
+            &[],
+            fid,
+            0,
+            b"tiny-after-snap",
+            ts,
+            ZfsDataChecksum::Sha256,
+        )
+        .into_result()
+        .expect("overwrite root file after snapshot");
+    engine
+        .truncate_file(&cx, &[], fid, 15, ts, ZfsDataChecksum::Sha256)
+        .into_result()
+        .expect("truncate root file after snapshot");
+
+    let (post_used, post_flags, post_head, post_snap) = read_dir_breakdown(&engine, 2);
+    assert_ne!(post_flags & 0x1, 0);
+    assert!(
+        post_snap > 0,
+        "retained pre-snapshot blocks must move into DD_USED_SNAP"
+    );
+    assert_eq!(
+        post_head + post_snap,
+        post_used,
+        "root dsl_dir breakdown must sum to dd_used_bytes"
+    );
+    let mos = engine.open_read_objects(&cx).unwrap();
+    assert!(mos.scrub(&cx, ScrubLimits::default()).unwrap().is_clean());
+    let _ = mos
+        .allocation(&cx, AllocationLimits::default())
+        .expect("clean allocation after root dataset breakdown updates");
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn clone_with_own_snapshot_cow_of_origin_block_preserves_head_and_snap_breakdown() {
+    let cx = Cx::for_testing();
+    let ts = Timestamp {
+        seconds: 1_735_006_000,
+        nanos: 0,
+    };
+    let built = build_clean_zfs_pool(&PoolFixtureSpec {
+        mirror_width: 1,
+        ashift: 12,
+        image_bytes: 32 * 1024 * 1024,
+        ..PoolFixtureSpec::default()
+    });
+    let dev = FaultableMemberDevice::new(built.members[0].clone());
+    let mut engine = open_engine_on_devices(
+        &cx,
+        std::slice::from_ref(&dev),
+        default_write_opts(built.pool_guid, built.initial_slot),
+    )
+    .expect("open clean pool");
+
+    let data_ds = vec![b"data".to_vec()];
+    let clone_ds = vec![b"data".to_vec(), b"fork".to_vec()];
+
+    // Seed a 32 KiB file in origin dataset `data`, then snapshot `data@origin`.
+    let (origin_fid, _) = engine
+        .create_file(
+            &cx,
+            &data_ds,
+            2,
+            b"origin.bin",
+            0o644,
+            0,
+            0,
+            ts,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .expect("create origin.bin");
+    let big_origin: Vec<u8> = (0_u32..8192)
+        .flat_map(|i| {
+            i.wrapping_mul(1_664_525)
+                .wrapping_add(1_013_904_223)
+                .to_le_bytes()
+        })
+        .collect();
+    engine
+        .write_file_data(
+            &cx,
+            &data_ds,
+            origin_fid,
+            0,
+            &big_origin,
+            ts,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .expect("write 32 KiB origin.bin");
+    engine
+        .create_snapshot(&cx, &data_ds, b"origin", ts)
+        .into_result()
+        .expect("snapshot data@origin");
+
+    // Clone `data@origin` -> `data/fork`, add a small 4 KiB clone-owned file,
+    // and take the clone's OWN snapshot `data/fork@c1` (`prev_snap_obj != dd_origin_obj`).
+    engine
+        .create_clone(&cx, &data_ds, b"origin", &data_ds, b"fork", &[], ts)
+        .into_result()
+        .expect("create_clone data/fork");
+    let (clone_fid, _) = engine
+        .create_file(
+            &cx,
+            &clone_ds,
+            2,
+            b"clone_only.bin",
+            0o644,
+            0,
+            0,
+            ts,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .expect("create clone_only.bin");
+    engine
+        .write_file_data(
+            &cx,
+            &clone_ds,
+            clone_fid,
+            0,
+            &vec![0xAB; 4096],
+            ts,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .expect("write clone_only.bin");
+    engine
+        .create_snapshot(&cx, &clone_ds, b"c1", ts)
+        .into_result()
+        .expect("snapshot data/fork@c1");
+
+    // Now COW & delete the 32 KiB origin file (birth <= origin_txg) AFTER `clone@c1`,
+    // and also overwrite the 4 KiB clone-owned file (origin_txg < birth <= c1_txg).
+    // Previously `stage_head_space` debited the 32 KiB origin block from `DD_USED_HEAD`
+    // (causing underflow) and misattributed it to `DD_USED_SNAP`.
+    engine
+        .write_file_data(
+            &cx,
+            &clone_ds,
+            origin_fid,
+            0,
+            b"shrunk-origin",
+            ts,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .expect("COW origin.bin in clone after own snapshot");
+    engine
+        .truncate_file(
+            &cx,
+            &clone_ds,
+            origin_fid,
+            13,
+            ts,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .expect("truncate origin.bin in clone after own snapshot");
+    engine
+        .unlink_entry(&cx, &clone_ds, 2, b"origin.bin", false, ts)
+        .into_result()
+        .expect("unlink origin.bin in clone after own snapshot");
+    engine
+        .write_file_data(
+            &cx,
+            &clone_ds,
+            clone_fid,
+            0,
+            &vec![0xCD; 4096],
+            ts,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .expect("overwrite clone_only.bin after c1");
+
+    let clone_dir_obj = {
+        let mut mos = engine.open_read_objects(&cx).unwrap();
+        let root_dd = mos.object(&cx, 2).unwrap();
+        let root_cz = root_dd.order().u64(root_dd.bonus(), 32).unwrap();
+        let data_dd_obj = mos
+            .zap(&cx, root_cz)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == b"data")
+            .unwrap()
+            .value;
+        let data_dd = mos.object(&cx, data_dd_obj).unwrap();
+        let data_cz = data_dd.order().u64(data_dd.bonus(), 32).unwrap();
+        mos.zap(&cx, data_cz)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == b"fork")
+            .unwrap()
+            .value
+    };
+
+    let read_clone_breakdown = |eng: &ZfsTransactionEngine| -> (u64, u64, u64, u64) {
+        let mut mos = eng.open_read_objects(&cx).unwrap();
+        let dn = mos.object(&cx, clone_dir_obj).unwrap();
+        let ord = dn.order();
+        let b = dn.bonus();
+        (
+            ord.u64(b, 40).unwrap(),
+            ord.u64(b, 96).unwrap(),
+            ord.u64(b, 104).unwrap(),
+            ord.u64(b, 112).unwrap(),
+        )
+    };
+
+    let (used_with_c1, flags_with_c1, head_with_c1, snap_with_c1) = read_clone_breakdown(&engine);
+    assert_ne!(flags_with_c1 & 0x1, 0);
+    assert_eq!(
+        head_with_c1 + snap_with_c1,
+        used_with_c1,
+        "clone DD_USED_HEAD + DD_USED_SNAP must equal dd_used_bytes"
+    );
+    assert!(
+        snap_with_c1 > 0 && snap_with_c1 < 32 * 1024,
+        "clone DD_USED_SNAP ({snap_with_c1}) must hold only clone@c1's own retired blocks, not the 32 KiB origin file"
+    );
+
+    // Destroying `data/fork@c1` must return `DD_USED_SNAP` cleanly to 0 while
+    // keeping origin's `data@origin` blocks intact.
+    engine
+        .destroy_snapshot(&cx, &clone_ds, b"c1", false)
+        .into_result()
+        .expect("destroy data/fork@c1");
+    let (used_after, _, head_after, snap_after) = read_clone_breakdown(&engine);
+    assert_eq!(
+        snap_after, 0,
+        "destroying the clone's sole snapshot must drain DD_USED_SNAP to exactly 0"
+    );
+    assert_eq!(head_after, used_after);
+
+    let mut mos = engine.open_read_objects(&cx).unwrap();
+    let mut origin_snap = mos.zpl_snapshot(&cx, &data_ds, b"origin").unwrap();
+    assert_eq!(
+        origin_snap
+            .read(&cx, origin_fid, 0, big_origin.len())
+            .unwrap(),
+        big_origin,
+        "origin@origin payload must remain byte-identical"
+    );
+    assert!(mos.scrub(&cx, ScrubLimits::default()).unwrap().is_clean());
+    let _ = mos
+        .allocation(&cx, AllocationLimits::default())
+        .expect("clean allocation after clone snapshot destroy");
+}

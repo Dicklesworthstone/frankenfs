@@ -478,6 +478,7 @@ fn finalize_zvol_to_mos(
         born,
         killed_free,
         killed_snap,
+        &snap_bps,
         alloc.total_free_bytes(),
         order,
     )?;

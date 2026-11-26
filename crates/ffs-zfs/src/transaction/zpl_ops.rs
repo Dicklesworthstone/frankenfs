@@ -4881,6 +4881,7 @@ fn finalize_dataset_to_mos(
         zpl_born,
         killed_free,
         killed_snap,
+        &snap_bps,
         alloc.total_free_bytes(),
         order,
     )?;

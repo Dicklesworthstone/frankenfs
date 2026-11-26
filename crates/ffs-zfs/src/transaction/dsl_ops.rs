@@ -1718,6 +1718,7 @@ pub(super) fn stage_head_space(
     born: SpaceDelta,
     freed: SpaceDelta,
     retained: SpaceDelta,
+    retired_snap_bps: &[BlockPointer],
     pool_free_bytes: u64,
     order: Endian,
 ) -> Result<()> {
@@ -1753,14 +1754,39 @@ pub(super) fn stage_head_space(
     let old_unique = order.u64(&bonus, 96).map_err(|e| parse_err(&e))?;
     let unique_delta = i128::from(born.dsize) - i128::from(freed.dsize);
     let ref_delta = unique_delta - i128::from(retained.dsize);
-    // On a clone with no snapshots of its own (`prev_snap_obj == dd_origin_obj`),
-    // blocks retained at `<= origin_txg` belong to the origin dataset, not this
-    // clone's `DD_USED_HEAD` or `DD_USED_SNAP`. Retiring an origin block during
-    // COW only charges newly born unique blocks to the clone's `DD_USED_HEAD`.
-    let (dir_head_delta, dir_snap_delta) = if dd_origin_obj != 0 && prev_snap_obj == dd_origin_obj {
+    // On a clone, blocks born `<= origin_txg` belong to the origin dataset, not
+    // this clone's `DD_USED_HEAD` or `DD_USED_SNAP`. Retiring an origin block
+    // during COW must not debit `DD_USED_HEAD` (which would underflow) or
+    // credit `DD_USED_SNAP` — both before and after the clone takes snapshots
+    // of its own. Only retired blocks born strictly after `origin_txg` belonged
+    // to this clone's HEAD and shift into `DD_USED_SNAP`.
+    let (dir_head_delta, dir_snap_delta) = if dd_origin_obj == 0 {
+        (ref_delta, i128::from(retained.dsize))
+    } else if prev_snap_obj == dd_origin_obj {
         (unique_delta, 0_i128)
     } else {
-        (ref_delta, i128::from(retained.dsize))
+        let (origin_dn, _) = read_staged_or_committed_dnode(
+            cx,
+            mos,
+            &meta,
+            ceiling,
+            mos_dirty_dnodes,
+            dd_origin_obj,
+            order,
+        )?;
+        let origin_txg = order
+            .u64(origin_dn.bonus(), 56)
+            .map_err(|e| parse_err(&e))?;
+        let mut own_snap_retained_dsize = 0_u64;
+        for bp in retired_snap_bps {
+            if bp.birth() > origin_txg {
+                own_snap_retained_dsize = own_snap_retained_dsize
+                    .checked_add(SpaceDelta::from_bp(bp)?.dsize)
+                    .ok_or_else(|| corrupt("clone own snapshot retained dsize overflow"))?;
+            }
+        }
+        let own_snap_retained = i128::from(own_snap_retained_dsize);
+        (unique_delta - own_snap_retained, own_snap_retained)
     };
     let comp_delta = i128::from(born.comp) - i128::from(freed.comp);
     let uncomp_delta = i128::from(born.uncomp) - i128::from(freed.uncomp);

@@ -2001,6 +2001,17 @@ pub fn format_cmd(
                 .checked_mul(1024 * 1024)
                 .context("size_mib overflow")?;
             let pool_name = label.unwrap_or("frankenpool").to_owned();
+            if pool_name.is_empty()
+                || pool_name.len() > 255
+                || matches!(pool_name.as_str(), "." | "..")
+                || pool_name.starts_with('$')
+                || !pool_name.is_ascii()
+                || pool_name
+                    .bytes()
+                    .any(|b| matches!(b, 0 | b'/' | b'@' | b'#') || b.is_ascii_whitespace())
+            {
+                bail!("invalid ZFS pool name {pool_name:?}");
+            }
             // Deterministic non-zero pool GUID derived from the pool name.
             let mut hasher = Sha256::new();
             hasher.update(b"frankenfs-zfs-pool-guid-v1:");
@@ -3572,6 +3583,29 @@ mod tests {
         .expect_err("ZFS format < 64 MiB must fail closed");
         assert!(tiny_err.to_string().contains(">= 64"));
         assert!(!tiny_zfs.exists());
+
+        for bad_label in ["", "bad/pool", "bad@pool", "has space", "$reserved"] {
+            let bad_zfs = dir.path().join("bad_name.zfs");
+            let bad_err = format_cmd(
+                &bad_zfs,
+                "zfs",
+                64,
+                Some(bad_label),
+                Some(4096),
+                None,
+                false,
+                true,
+            )
+            .expect_err("invalid ZFS pool name must fail closed before creating output file");
+            assert!(
+                bad_err.to_string().contains("invalid ZFS pool name"),
+                "unexpected error for {bad_label:?}: {bad_err:#}"
+            );
+            assert!(
+                !bad_zfs.exists(),
+                "invalid ZFS pool name {bad_label:?} must not leave an orphan image"
+            );
+        }
 
         let zfs_img = dir.path().join("native_pool.zfs");
         format_cmd(
