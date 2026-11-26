@@ -1145,7 +1145,7 @@ pub fn maybe_route_walk_cmd(
     Ok(true)
 }
 
-pub(crate) fn open_zfs_pool_and_objects(
+pub fn open_zfs_pool_and_objects(
     cx: &Cx,
     path: &Path,
     part_entry: Option<&PartitionEntry>,

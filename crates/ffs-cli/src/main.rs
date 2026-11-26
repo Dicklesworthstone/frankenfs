@@ -11905,6 +11905,7 @@ fn mkfs_cmd_with_program(
 
 // ── TUI command ───────────────────────────────────────────────────────────
 
+#[cfg(test)]
 fn build_live_tui_snapshot(
     image_path: &Path,
     run_scrub: bool,
