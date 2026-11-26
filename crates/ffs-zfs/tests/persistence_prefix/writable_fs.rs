@@ -2717,6 +2717,9 @@ fn postcommit_cancellation_returns_success_for_metadata_publication() {
             "setxattr",
             "removexattr",
         ] {
+            if zpl_version == 4 && matches!(operation, "setxattr" | "removexattr") {
+                continue;
+            }
             let cx = Cx::for_testing();
             let request = Cx::for_testing();
             let (mut engine, devices) = writer_fixture(

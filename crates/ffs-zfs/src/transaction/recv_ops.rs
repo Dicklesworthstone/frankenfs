@@ -58,8 +58,8 @@ use ffs_ondisk::zfs::{
     BlockPointer, Endian, MAX_BLOCK_BYTES, ProtectedBlockSpec, RegularBlockSpec, decompress,
 };
 use ffs_ondisk::zfs_dmu::{
-    DMU_OT_DNODE, DNODE_BLOCK_BYTES, DNODE_FLAG_USED_BYTES, Dnode, DnodeSpec, ObjectSet, ZilHeader,
-    count_allocated_dnodes, write_dnode_at,
+    DMU_OT_DNODE, DNODE_BLOCK_BYTES, DNODE_BYTES, DNODE_FLAG_USED_BYTES, Dnode, DnodeSpec,
+    ObjectSet, ZilHeader, count_allocated_dnodes, write_dnode_at,
 };
 use ffs_ondisk::zfs_zap::Entry as RawZapEntry;
 use ffs_ondisk::zfs_zap::names::NamePolicy as ZapNamePolicy;
@@ -3281,6 +3281,33 @@ impl ZfsTransactionEngine {
                                 dva,
                                 padded,
                             ));
+                            // When a resumable raw encrypted receive checkpoints between
+                            // `DRR_OBJECT` (with `DRR_OBJECT_SPILL`) and `DRR_SPILL`, the
+                            // on-disk dnode had `has_spill == false`, so `extract_raw_dnode_bonus`
+                            // captured the trailing 128 zero bytes reserved for the incoming spill
+                            // pointer. Trim that zero-filled spill slot while rejecting any
+                            // non-zero ciphertext that would collide with the spill BP.
+                            if let Some(ref mut raw_bonus) = d.raw_bonus {
+                                let dnode_size = d
+                                    .slots
+                                    .checked_mul(DNODE_BYTES)
+                                    .ok_or_else(|| corrupt("dnode size overflow"))?;
+                                let bonus_start = 64 + d.nblkptr * 128;
+                                let spill_bonus_cap = dnode_size
+                                    .checked_sub(128)
+                                    .and_then(|end| end.checked_sub(bonus_start))
+                                    .ok_or_else(|| {
+                                        corrupt("dnode has insufficient space for spill pointer")
+                                    })?;
+                                if raw_bonus.len() > spill_bonus_cap {
+                                    if raw_bonus[spill_bonus_cap..].iter().any(|&b| b != 0) {
+                                        return Err(corrupt(
+                                            "raw bonus payload exceeds dnode spill bonus capacity",
+                                        ));
+                                    }
+                                    raw_bonus.truncate(spill_bonus_cap);
+                                }
+                            }
                             d.spill = Some(bp);
                         }
                     }

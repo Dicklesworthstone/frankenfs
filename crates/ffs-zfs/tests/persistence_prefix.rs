@@ -112,6 +112,7 @@ enum SaSpillFixture {
     Opaque,
     Mtime,
     Project(u64),
+    ProjectCompact(u64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -829,18 +830,23 @@ fn encode_zpl_bonus_for_fixture(
             // Valid SA header `[magic(4), (header_bytes=8 => 1<<10 | layout=3), 32B attr 18]`
             let with_mtime = matches!(
                 spill_profile,
-                SaSpillFixture::Mtime | SaSpillFixture::Project(_)
+                SaSpillFixture::Mtime
+                    | SaSpillFixture::Project(_)
+                    | SaSpillFixture::ProjectCompact(_)
             );
             let mut sraw = vec![
                 0_u8;
-                if matches!(spill_profile, SaSpillFixture::Project(_)) {
+                if matches!(
+                    spill_profile,
+                    SaSpillFixture::Project(_) | SaSpillFixture::ProjectCompact(_)
+                ) {
                     8192
                 } else {
                     512
                 }
             ];
             let layout = match spill_profile {
-                SaSpillFixture::Project(_) => 8,
+                SaSpillFixture::Project(_) | SaSpillFixture::ProjectCompact(_) => 8,
                 SaSpillFixture::Mtime => 7,
                 _ => 3,
             };
@@ -911,6 +917,25 @@ fn encode_zpl_bonus_for_fixture(
                     sraw
                 );
                 Some(arena.alloc_raw_compressed(&sraw, &compressed, 44, 0, 3, 7, birth, order))
+            } else if let SaSpillFixture::ProjectCompact(project_id) = spill_profile {
+                sraw[56..64].copy_from_slice(&order.encode(project_id));
+                let (compressed, comp_algo) = ffs_ondisk::zfs::compress_block(
+                    &sraw,
+                    15,
+                    None,
+                    usize::try_from(arena.sector).unwrap(),
+                )
+                .expect("compress compact project SA spill");
+                Some(arena.alloc_raw_compressed(
+                    &sraw,
+                    &compressed,
+                    44,
+                    0,
+                    comp_algo,
+                    7,
+                    birth,
+                    order,
+                ))
             } else {
                 Some(arena.alloc_block(&sraw, 44, 0, birth, order))
             }
@@ -1339,7 +1364,7 @@ fn build_zpl_objectset(
             spec.directory_projects
                 .get(&6)
                 .copied()
-                .map_or(SaSpillFixture::None, SaSpillFixture::Project),
+                .map_or(SaSpillFixture::None, SaSpillFixture::ProjectCompact),
             arena,
             birth,
             order,
@@ -1741,7 +1766,7 @@ fn build_zpl_objectset(
         spec.directory_projects
             .get(&2)
             .copied()
-            .map_or(SaSpillFixture::None, SaSpillFixture::Project),
+            .map_or(SaSpillFixture::None, SaSpillFixture::ProjectCompact),
         arena,
         birth,
         order,
