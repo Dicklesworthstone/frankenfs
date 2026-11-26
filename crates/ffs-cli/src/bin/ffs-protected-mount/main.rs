@@ -214,7 +214,12 @@ impl mount_worker::PeriodicCommitTarget for ProtectedFs {
             Self::Core(fs) => {
                 mount_worker::PeriodicCommitTarget::default_commit_interval(fs.as_ref())
             }
-            Self::Fat { .. } | Self::Ntfs(_) | Self::Zfs(_) => None,
+            Self::Fat { writable: true, .. } => Some(std::time::Duration::from_secs(5)),
+            Self::Fat {
+                writable: false, ..
+            } => None,
+            Self::Ntfs(fs) => FsOps::default_commit_interval(fs.as_ref()),
+            Self::Zfs(fs) => FsOps::default_commit_interval(fs.as_ref()),
         }
     }
 
@@ -248,6 +253,7 @@ struct Prepared {
     device: Arc<SidecarImageDevice>,
     storage_set: Arc<ProtectedStorageSet>,
     filesystem: &'static str,
+    pool_guid: Option<u64>,
     mountpoint: Option<PathBuf>,
 }
 
@@ -276,8 +282,9 @@ impl Prepared {
             .context("checkpoint protected filesystem before shutdown")?;
         }
         drop(fs);
-        let binding = compute_live_native_binding(cx, &self.storage_set, self.filesystem, None)
-            .context("extract native commit binding before final seal")?;
+        let binding =
+            compute_live_native_binding(cx, &self.storage_set, self.filesystem, self.pool_guid)
+                .context("extract native commit binding before final seal")?;
         self.storage_set
             .seal_committed(cx, binding)
             .context("final protected-device sync")
@@ -543,6 +550,19 @@ fn compute_live_native_binding(
             else {
                 return Err(FfsError::Format("expected FAT boot sector".into()));
             };
+            let mut boot = [0_u8; 512];
+            primary.read_exact_at(cx, ByteOffset(0), &mut boot)?;
+            let ext_offset = if filesystem == "fat32" { 64 } else { 36 };
+            let volume_id = if matches!(boot[ext_offset + 2], 0x28 | 0x29) {
+                u32::from_le_bytes([
+                    boot[ext_offset + 3],
+                    boot[ext_offset + 4],
+                    boot[ext_offset + 5],
+                    boot[ext_offset + 6],
+                ])
+            } else {
+                0
+            };
             let volume = fat::reader::FatVolume::from_device(cx, primary, 0, len)?;
             let check = volume.check(cx)?;
             let total_sectors = if summary.sector_bytes == 0 {
@@ -552,7 +572,7 @@ fn compute_live_native_binding(
             };
             Ok(NativeCommitBinding::Fat {
                 kind: filesystem.to_owned(),
-                volume_id: 0,
+                volume_id,
                 total_sectors,
                 clean: check.clean,
             })
@@ -717,17 +737,21 @@ fn verify_manifest_native_binding(
         (
             NativeCommitBinding::Fat {
                 kind: ek,
+                volume_id: ev,
                 total_sectors: es,
                 ..
             },
             NativeCommitBinding::Fat {
                 kind: ak,
+                volume_id: av,
                 total_sectors: as_,
                 ..
             },
         ) => {
-            if ek != ak || es != as_ {
-                bail!("storage-set manifest FAT geometry disagrees with on-disk boot sector");
+            if ek != ak || es != as_ || (*ev != 0 && ev != av) {
+                bail!(
+                    "storage-set manifest FAT geometry or volume serial disagrees with on-disk boot sector"
+                );
             }
             Ok(())
         }
@@ -1045,6 +1069,7 @@ fn prepare(cx: &Cx, args: &Args) -> Result<Prepared> {
         device,
         storage_set,
         filesystem,
+        pool_guid: args.set.pool_guid,
         mountpoint: checked.mountpoint,
     })
 }

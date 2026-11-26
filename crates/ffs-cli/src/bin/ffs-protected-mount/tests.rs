@@ -4819,4 +4819,70 @@ mod bd_tqrnc {
             }
         }
     }
+
+    #[test]
+    fn bd_tqrnc_fat_binding_extracts_real_bpb_serial_and_rejects_mismatched_volume_id() {
+        let cx = Cx::for_testing();
+        let dir = TempDir::new().unwrap();
+        let fat32_img = dir.path().join("vol_a.fat32");
+        let fat32_rq = dir.path().join("vol_a.fat32.ffsrq");
+        let serial = 0xCAFE_BABE_u32;
+        fat::formatter::create(
+            &cx,
+            &fat::formatter::FormatArgs {
+                image: fat32_img.clone(),
+                kind: fat::formatter::FormatKind::Fat32,
+                size_mib: 40,
+                sectors_per_cluster: None,
+                label: Some("BIND32".to_owned()),
+                serial: Some(serial),
+                source_dir: None,
+                sidecar: None,
+            },
+        )
+        .expect("format fat32 with explicit serial");
+        protect(&cx, &fat32_img, &fat32_rq, &SidecarOptions::default()).expect("protect fat32");
+
+        let storage_set = ProtectedStorageSet::open_standalone(
+            &cx,
+            &fat32_img,
+            &fat32_rq,
+            0,
+            None,
+            &StorageSetOpenOptions::default(),
+        )
+        .expect("open protected fat32 storage set");
+        let live = compute_live_native_binding(&cx, &storage_set, "fat32", None)
+            .expect("compute live FAT32 native binding");
+        match &live {
+            NativeCommitBinding::Fat {
+                kind,
+                volume_id,
+                total_sectors,
+                clean,
+            } => {
+                assert_eq!(kind, "fat32");
+                assert_eq!(*volume_id, serial);
+                assert!(*total_sectors > 0);
+                assert!(*clean);
+            }
+            other => panic!("expected NativeCommitBinding::Fat, got {other:?}"),
+        }
+
+        // Exact match passes; mismatched serial on same-size volume fails closed.
+        verify_manifest_native_binding("fat32", &live, "fat32", &live)
+            .expect("matching FAT32 serial must pass");
+        let wrong_serial = NativeCommitBinding::Fat {
+            kind: "fat32".to_owned(),
+            volume_id: serial ^ 0x0000_00FF,
+            total_sectors: match &live {
+                NativeCommitBinding::Fat { total_sectors, .. } => *total_sectors,
+                _ => unreachable!(),
+            },
+            clean: true,
+        };
+        let err = verify_manifest_native_binding("fat32", &wrong_serial, "fat32", &live)
+            .expect_err("mismatched FAT volume serial must fail closed");
+        assert!(err.to_string().contains("volume serial"));
+    }
 }

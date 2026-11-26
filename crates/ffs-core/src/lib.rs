@@ -37473,8 +37473,7 @@ impl OpenFs {
         // This upper bound only avoids allocating a sparse file in memory.
         // The xattr serializer decides the exact available inline capacity.
         let bound = inode.extent_bytes.len() + inode.xattr_ibody.len();
-        let mut stayed_inline = false;
-        if end <= bound as u64 {
+        let stayed_inline = if end <= bound as u64 {
             let new_size = usize::try_from(inode.size.max(end))
                 .map_err(|_| FfsError::Format("inline size does not fit usize".into()))?;
             let mut updated = payload.clone();
@@ -37482,8 +37481,10 @@ impl OpenFs {
             let start = usize::try_from(offset)
                 .map_err(|_| FfsError::Format("inline offset does not fit usize".into()))?;
             updated[start..start + data.len()].copy_from_slice(data);
-            stayed_inline = Self::ext4_try_store_inline_file(&mut inode, &updated)?;
-        }
+            Self::ext4_try_store_inline_file(&mut inode, &updated)?
+        } else {
+            false
+        };
         Self::with_ext4_block_counts(self, scope, alloc, |scope, working| {
             {
                 let base = self.block_device_adapter();
