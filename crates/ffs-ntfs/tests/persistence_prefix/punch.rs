@@ -335,6 +335,105 @@ fn compressed_hole_punch_large_sparse_tail_preserves_valid_data_length() {
 }
 
 #[test]
+fn hole_punch_noop_keeps_durable_token_without_writes_or_barriers() {
+    let cx = Cx::for_testing();
+    for (length, compressed) in [
+        (17, false),
+        (2 * CLUSTER_BYTES, false),
+        (32 * CLUSTER_BYTES, true),
+    ] {
+        let original = vec![0x6B; length];
+        let (device, mut engine, file) = fixture(256, &original);
+        if compressed {
+            engine
+                .set_compression_at(&cx, file, true, DEFAULT_FILETIME)
+                .into_result()
+                .unwrap();
+        }
+        let before = device.snapshot_durable_only();
+        let writes = device.write_bytes_total();
+        let syncs = device.state.lock().unwrap().sync_calls;
+        let events = engine.persistence_trace().len();
+        for offset in [length as u64, length as u64 + 4096, i64::MAX as u64 - 1] {
+            let ((), token) = engine
+                .punch_hole_at(&cx, file, &[], offset, 1, DEFAULT_FILETIME + 1)
+                .into_result()
+                .unwrap();
+            assert_eq!(token.transaction_id(), 0, "no transaction was needed");
+            assert!(token.matches_engine(&engine));
+            assert_ne!(token.commit_lsn(), 0);
+            assert!(!engine.requires_recovery());
+            assert_eq!(device.write_bytes_total(), writes);
+            assert_eq!(device.state.lock().unwrap().sync_calls, syncs);
+            assert_eq!(engine.persistence_trace().len(), events);
+            assert_eq!(device.snapshot_live(), before);
+            assert_eq!(device.snapshot_durable_only(), before);
+        }
+        let cancelled = Cx::for_testing();
+        cancelled.set_cancel_requested(true);
+        assert!(matches!(
+            engine.punch_hole_at(
+                &cancelled,
+                file,
+                &[],
+                length as u64,
+                1,
+                DEFAULT_FILETIME + 2,
+            ),
+            NtfsTxOutcome::NotCommitted(FfsError::Cancelled)
+        ));
+        assert_eq!(device.write_bytes_total(), writes);
+        assert_eq!(device.state.lock().unwrap().sync_calls, syncs);
+        assert_eq!(engine.persistence_trace().len(), events);
+        assert_eq!(device.snapshot_live(), before);
+    }
+}
+
+#[test]
+fn hole_punch_noop_refuses_pending_native_recovery() {
+    let cx = Cx::for_testing();
+    for stage in [
+        NtfsPersistenceStage::DirtyRestartBarrier,
+        NtfsPersistenceStage::LogCommitBarrier,
+        NtfsPersistenceStage::TargetMetadataBarrier,
+    ] {
+        let (device, mut engine, file) = fixture(128, b"retained payload");
+        engine.set_stage_hook(Some(Box::new(move |event| {
+            if event.stage == stage {
+                return Err(FfsError::Io(std::io::Error::other("publication cut")));
+            }
+            Ok(())
+        })));
+        let outcome = engine.punch_hole_at(&cx, file, &[], 1, 2, DEFAULT_FILETIME);
+        if stage == NtfsPersistenceStage::DirtyRestartBarrier {
+            assert!(matches!(outcome, NtfsTxOutcome::NotCommitted(_)));
+        } else {
+            assert!(matches!(outcome, NtfsTxOutcome::Uncertain { .. }));
+        }
+        engine.set_stage_hook(None);
+        assert!(engine.requires_recovery(), "{stage:?}");
+        let live = device.snapshot_live();
+        let durable = device.snapshot_durable_only();
+        let writes = device.write_bytes_total();
+        let syncs = device.state.lock().unwrap().sync_calls;
+        let events = engine.persistence_trace().len();
+        assert!(matches!(
+            engine.punch_hole_at(&cx, file, &[], 4096, 1, DEFAULT_FILETIME + 1),
+            NtfsTxOutcome::NotCommitted(FfsError::RequestRejected {
+                errno: libc::EIO,
+                ..
+            })
+        ));
+        assert!(engine.requires_recovery());
+        assert_eq!(device.write_bytes_total(), writes);
+        assert_eq!(device.state.lock().unwrap().sync_calls, syncs);
+        assert_eq!(engine.persistence_trace().len(), events);
+        assert_eq!(device.snapshot_live(), live);
+        assert_eq!(device.snapshot_durable_only(), durable);
+    }
+}
+
+#[test]
 fn compressed_hole_punch_on_full_volume_retires_only_whole_units_without_cow() {
     let cx = Cx::for_testing();
     let unit = 16 * CLUSTER_BYTES;
