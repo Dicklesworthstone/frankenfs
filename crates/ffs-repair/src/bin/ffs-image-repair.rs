@@ -23,10 +23,12 @@ use ffs_types::{
     BTRFS_SUPER_INFO_OFFSET, BTRFS_SUPER_INFO_SIZE, EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE,
 };
 use serde::Serialize;
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::{Mutex, OnceLock};
 
 #[derive(Parser)]
 #[command(
@@ -145,6 +147,53 @@ fn load_por_key(path: &Path) -> Result<PorKey> {
     Ok(key)
 }
 
+static ACTIVE_CANCEL_CX: Mutex<Option<asupersync::Cx>> = Mutex::new(None);
+static CTRLC_INSTALLED: OnceLock<()> = OnceLock::new();
+
+struct ActiveCancelGuard;
+
+impl ActiveCancelGuard {
+    fn install(cx: &asupersync::Cx) -> Result<Self> {
+        if let Ok(mut slot) = ACTIVE_CANCEL_CX.lock() {
+            *slot = Some(cx.clone());
+        }
+        if CTRLC_INSTALLED.get().is_none() {
+            match ctrlc::set_handler(|| {
+                if let Ok(slot) = ACTIVE_CANCEL_CX.lock()
+                    && let Some(active) = slot.as_ref()
+                {
+                    active.set_cancel_requested(true);
+                }
+            }) {
+                Ok(()) | Err(ctrlc::Error::MultipleHandlers) => {
+                    let _ = CTRLC_INSTALLED.set(());
+                }
+                Err(error) => {
+                    if let Ok(mut slot) = ACTIVE_CANCEL_CX.lock() {
+                        *slot = None;
+                    }
+                    return Err(FfsError::Io(std::io::Error::other(error)));
+                }
+            }
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for ActiveCancelGuard {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = ACTIVE_CANCEL_CX.lock() {
+            *slot = None;
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ExtractedNativeSet {
+    binding: NativeCommitBinding,
+    topology_hint: Option<StorageSetTopology>,
+}
+
 fn read_exact_range(path: &Path, offset: u64, out: &mut [u8]) -> Result<u64> {
     let mut file = File::open(path)?;
     let len = file.metadata()?.len();
@@ -161,16 +210,18 @@ fn read_exact_range(path: &Path, offset: u64, out: &mut [u8]) -> Result<u64> {
     Ok(len)
 }
 
+#[allow(clippy::too_many_lines)]
 fn extract_zfs_native_binding(
     specs: &mut [StorageSetMemberSpec],
-) -> Result<Option<NativeCommitBinding>> {
-    let mut member_guids = Vec::new();
-    let mut first_cfg: Option<(u64, u64, u64, u64, u8, u64)> = None;
+) -> Result<Option<ExtractedNativeSet>> {
+    let mut pending_member_guids: Vec<(usize, u64)> = Vec::new();
+    let mut seen_guids = BTreeSet::new();
+    let mut first_cfg: Option<(u64, u64, u64, u64, u8, u64, u64, usize, Option<String>)> = None;
     let mut best_ub: Option<(usize, Uberblock)> = None;
     let mut config_buf = vec![0_u8; LABEL_CONFIG_BYTES];
     let mut ring_buf = vec![0_u8; UBERBLOCK_RING_BYTES];
 
-    for spec in specs.iter_mut() {
+    for (idx, spec) in specs.iter().enumerate() {
         if spec.role != MemberRole::Data {
             continue;
         }
@@ -180,6 +231,7 @@ fn extract_zfs_native_binding(
             return Ok(None);
         };
         let mut leaf_guid: Option<u64> = None;
+        let mut leaf_pool_guid: Option<u64> = None;
         for label_offset in offsets {
             let config_offset = label_offset + LABEL_CONFIG_OFFSET;
             file.seek(SeekFrom::Start(config_offset))?;
@@ -206,14 +258,31 @@ fn extract_zfs_native_binding(
             };
             if leaf_guid.is_none() {
                 let m_guid = config.unsigned("guid").unwrap_or(0);
+                let p_guid = config.unsigned("pool_guid").unwrap_or(0);
                 leaf_guid = Some(m_guid);
+                leaf_pool_guid = Some(p_guid);
                 if first_cfg.is_none() {
-                    let pool_guid = config.unsigned("pool_guid").unwrap_or(0);
                     let top_guid = config.unsigned("top_guid").unwrap_or(0);
                     let version = config.unsigned("version").unwrap_or(0);
                     let label_txg = config.unsigned("txg").unwrap_or(0);
+                    let vdev_children = config.unsigned("vdev_children").unwrap_or(1);
+                    let required_children = match tree.fields.get("children") {
+                        Some(ffs_ondisk::zfs::nvlist::Value::Lists(items)) => items.len(),
+                        _ => 1,
+                    };
+                    let vdev_type = tree.text("type").map(str::to_owned);
                     let asize = tree.unsigned("asize").unwrap_or(0);
-                    first_cfg = Some((pool_guid, top_guid, version, label_txg, ashift, asize));
+                    first_cfg = Some((
+                        p_guid,
+                        top_guid,
+                        version,
+                        label_txg,
+                        ashift,
+                        asize,
+                        vdev_children,
+                        required_children,
+                        vdev_type,
+                    ));
                 }
             }
             let ring_offset = label_offset + UBERBLOCK_RING_OFFSET;
@@ -227,6 +296,9 @@ fn extract_zfs_native_binding(
                 let slot_offset = ring_offset + u64::try_from(start).unwrap_or(u64::MAX);
                 if let Ok(ub) = Uberblock::parse(&ring_buf[start..start + slot_bytes], slot_offset)
                 {
+                    if ub.txg == 0 {
+                        continue;
+                    }
                     let better = best_ub
                         .as_ref()
                         .is_none_or(|(_, cur)| (ub.txg, ub.timestamp) > (cur.txg, cur.timestamp));
@@ -239,33 +311,94 @@ fn extract_zfs_native_binding(
         let Some(m_guid) = leaf_guid else {
             return Ok(None);
         };
+        if let (Some((expected_pool_guid, ..)), Some(actual_pool_guid)) =
+            (&first_cfg, leaf_pool_guid)
+            && *expected_pool_guid != actual_pool_guid
+        {
+            return Err(FfsError::Format(format!(
+                "ZFS member {idx} belongs to pool_guid {actual_pool_guid:#x}, expected {expected_pool_guid:#x}"
+            )));
+        }
+        if m_guid != 0 && !seen_guids.insert(m_guid) {
+            return Err(FfsError::Format(format!(
+                "duplicate ZFS member GUID {m_guid:#x} in storage set"
+            )));
+        }
+        pending_member_guids.push((idx, m_guid));
+    }
+
+    let (
+        Some((
+            pool_guid,
+            top_guid,
+            version,
+            label_txg,
+            ashift,
+            asize,
+            vdev_children,
+            required_children,
+            vdev_type,
+        )),
+        Some((slot, ub)),
+    ) = (first_cfg, best_ub)
+    else {
+        return Ok(None);
+    };
+
+    // Commit per-member native GUIDs only after the entire storage set validates.
+    let mut member_guids = Vec::with_capacity(pending_member_guids.len());
+    for (idx, m_guid) in pending_member_guids {
         if m_guid != 0 {
-            spec.native_member_id[..8].copy_from_slice(&m_guid.to_le_bytes());
+            specs[idx].native_member_id[..8].copy_from_slice(&m_guid.to_le_bytes());
         }
         member_guids.push(m_guid);
     }
 
-    let (Some((pool_guid, top_guid, version, label_txg, ashift, asize)), Some((slot, ub))) =
-        (first_cfg, best_ub)
-    else {
-        return Ok(None);
+    let data_count = member_guids.len();
+    let has_non_data = specs.len() != data_count;
+    let is_group_vdev = matches!(vdev_type.as_deref(), Some("mirror" | "raidz" | "draid"));
+    let topology_hint = if !has_non_data
+        && data_count == 1
+        && vdev_children <= 1
+        && required_children <= 1
+        && !is_group_vdev
+    {
+        Some(StorageSetTopology::ZfsSingleLeaf)
+    } else if !has_non_data
+        && vdev_children <= 1
+        && vdev_type.as_deref() == Some("mirror")
+        && data_count >= 2
+        && data_count >= required_children
+    {
+        u8::try_from(data_count)
+            .ok()
+            .map(|width| StorageSetTopology::ZfsMirror { width })
+    } else {
+        Some(StorageSetTopology::ZfsMultiMemberReadOnly {
+            vdev_children: u32::try_from(vdev_children).unwrap_or(u32::MAX),
+            member_count: u32::try_from(specs.len()).unwrap_or(u32::MAX),
+        })
     };
+
     let root_bp_blake3 = *blake3::hash(format!("{:?}", ub.root).as_bytes()).as_bytes();
     let published_slot = u32::try_from(slot).unwrap_or(u32::MAX);
-    Ok(Some(NativeCommitBinding::Zfs {
-        pool_guid,
-        top_guid,
-        member_guids,
-        guid_sum: ub.guid_sum,
-        version,
-        ashift,
-        asize,
-        label_txg,
-        committed_txg: ub.txg,
-        published_slot,
-        root_bp_blake3,
-        generation: ub.txg,
-        operation_digest: [0_u8; 32],
+    Ok(Some(ExtractedNativeSet {
+        binding: NativeCommitBinding::Zfs {
+            pool_guid,
+            top_guid,
+            member_guids,
+            guid_sum: ub.guid_sum,
+            version,
+            ashift,
+            asize,
+            label_txg,
+            committed_txg: ub.txg,
+            published_slot,
+            root_bp_blake3,
+            generation: ub.txg,
+            operation_digest: [0_u8; 32],
+        },
+        topology_hint,
     }))
 }
 
@@ -273,7 +406,7 @@ fn extract_zfs_native_binding(
 fn extract_native_binding_for_set(
     filesystem: &str,
     specs: &mut [StorageSetMemberSpec],
-) -> Result<Option<NativeCommitBinding>> {
+) -> Result<Option<ExtractedNativeSet>> {
     let Some(primary) = specs.first() else {
         return Ok(None);
     };
@@ -293,12 +426,15 @@ fn extract_native_binding_for_set(
             let Ok(sb) = Ext4Superblock::parse_superblock_region(&region) else {
                 return Ok(None);
             };
-            Ok(Some(NativeCommitBinding::Ext4 {
-                uuid: sb.uuid,
-                blocks_count: sb.blocks_count,
-                journal_uuid: sb.journal_uuid,
-                journal_inum: sb.journal_inum,
-                state: sb.state,
+            Ok(Some(ExtractedNativeSet {
+                binding: NativeCommitBinding::Ext4 {
+                    uuid: sb.uuid,
+                    blocks_count: sb.blocks_count,
+                    journal_uuid: sb.journal_uuid,
+                    journal_inum: sb.journal_inum,
+                    state: sb.state,
+                },
+                topology_hint: None,
             }))
         }
         "btrfs" => {
@@ -315,13 +451,16 @@ fn extract_native_binding_for_set(
             let Ok(sb) = BtrfsSuperblock::parse_superblock_region(&region) else {
                 return Ok(None);
             };
-            Ok(Some(NativeCommitBinding::Btrfs {
-                fsid: sb.fsid,
-                generation: sb.generation,
-                root_bytenr: sb.root,
-                chunk_root_bytenr: sb.chunk_root,
-                log_root: sb.log_root,
-                num_devices: sb.num_devices,
+            Ok(Some(ExtractedNativeSet {
+                binding: NativeCommitBinding::Btrfs {
+                    fsid: sb.fsid,
+                    generation: sb.generation,
+                    root_bytenr: sb.root,
+                    chunk_root_bytenr: sb.chunk_root,
+                    log_root: sb.log_root,
+                    num_devices: sb.num_devices,
+                },
+                topology_hint: None,
             }))
         }
         "fat16" | "fat32" => {
@@ -356,11 +495,14 @@ fn extract_native_binding_for_set(
             } else {
                 len / u64::from(geom.sector_bytes())
             };
-            Ok(Some(NativeCommitBinding::Fat {
-                kind: filesystem.to_owned(),
-                volume_id,
-                total_sectors,
-                clean: true,
+            Ok(Some(ExtractedNativeSet {
+                binding: NativeCommitBinding::Fat {
+                    kind: filesystem.to_owned(),
+                    volume_id,
+                    total_sectors,
+                    clean: true,
+                },
+                topology_hint: None,
             }))
         }
         "ntfs" => {
@@ -372,20 +514,23 @@ fn extract_native_binding_for_set(
                 return Ok(None);
             };
             let boot_blake3 = *blake3::hash(&boot).as_bytes();
-            Ok(Some(NativeCommitBinding::Ntfs {
-                volume_serial: geo.serial(),
-                volume_bytes: geo.volume_bytes(),
-                cluster_bytes: geo.cluster_bytes(),
-                record_bytes: geo.record_bytes(),
-                index_bytes: geo.index_bytes(),
-                mft_cluster: geo.mft_cluster(),
-                mirror_cluster: geo.mirror_cluster(),
-                boot_blake3,
-                transaction_id: 0,
-                commit_lsn: 0,
-                checkpoint_lsn: None,
-                generation: 0,
-                operation_digest: [0_u8; 32],
+            Ok(Some(ExtractedNativeSet {
+                binding: NativeCommitBinding::Ntfs {
+                    volume_serial: geo.serial(),
+                    volume_bytes: geo.volume_bytes(),
+                    cluster_bytes: geo.cluster_bytes(),
+                    record_bytes: geo.record_bytes(),
+                    index_bytes: geo.index_bytes(),
+                    mft_cluster: geo.mft_cluster(),
+                    mirror_cluster: geo.mirror_cluster(),
+                    boot_blake3,
+                    transaction_id: 0,
+                    commit_lsn: 0,
+                    checkpoint_lsn: None,
+                    generation: 0,
+                    operation_digest: [0_u8; 32],
+                },
+                topology_hint: None,
             }))
         }
         "zfs" => extract_zfs_native_binding(specs),
@@ -465,9 +610,7 @@ fn run(cli: Cli) -> Result<u8> {
         .build()
         .map_err(|error| FfsError::Io(std::io::Error::other(error.to_string())))?;
     let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
-    let cancellation = cx.clone();
-    ctrlc::set_handler(move || cancellation.set_cancel_requested(true))
-        .map_err(|error| FfsError::Io(std::io::Error::other(error)))?;
+    let _cancel_guard = ActiveCancelGuard::install(&cx)?;
     match cli.command {
         Command::Protect {
             image,
@@ -524,22 +667,29 @@ fn run(cli: Cli) -> Result<u8> {
                 }
                 _ => filesystem,
             };
-            let native_binding = match extract_native_binding_for_set(&filesystem, &mut specs)? {
-                Some(binding) => binding,
+            let (native_binding, topology_hint) = match extract_native_binding_for_set(
+                &filesystem,
+                &mut specs,
+            )? {
+                Some(extracted) => (extracted.binding, extracted.topology_hint),
                 None if require_native_binding => {
                     return Err(FfsError::Format(format!(
                         "--require-native-binding failed: member image(s) did not parse as native '{filesystem}'"
                     )));
                 }
-                None => NativeCommitBinding::UninterpretedRaw,
+                None => (NativeCommitBinding::UninterpretedRaw, None),
             };
             let view = zfs_dataset
                 .as_deref()
                 .map(ProtectedViewIdentity::from_zfs_dataset)
                 .transpose()?
                 .unwrap_or_default();
-            let topology = if specs.len() == 1 {
+            let topology = if let Some(hint) = topology_hint {
+                hint
+            } else if specs.len() == 1 {
                 StorageSetTopology::SingleData
+            } else if filesystem == "ext4" && !log_members.is_empty() {
+                StorageSetTopology::Ext4WithExternalLog
             } else if filesystem == "zfs" {
                 let width = u8::try_from(specs.len()).map_err(|_| FfsError::Corruption {
                     block: 0,
@@ -847,6 +997,7 @@ mod tests {
         match extract_native_binding_for_set("fat32", &mut fat32_specs)
             .unwrap()
             .expect("FAT32 binding extracted")
+            .binding
         {
             NativeCommitBinding::Fat {
                 kind,
@@ -861,7 +1012,41 @@ mod tests {
             other => panic!("expected NativeCommitBinding::Fat (fat32), got {other:?}"),
         }
 
-        // 4. Negative control: `--require-native-binding` fails closed on non-ext4 bytes
+        // 4. Ext4 + `--log-member` classifies topology as Ext4WithExternalLog (not BtrfsDevices).
+        let ext4_data = dir.path().join("ext4_data.img");
+        let ext4_data_rq = dir.path().join("ext4_data.ffsrq");
+        let ext4_log = dir.path().join("ext4_log.img");
+        let ext4_log_rq = dir.path().join("ext4_log.ffsrq");
+        let ext4_manifest = dir.path().join("ext4_extlog.ffsrqsm");
+        std::fs::write(&ext4_data, vec![0x11_u8; 8192]).unwrap();
+        std::fs::write(&ext4_log, vec![0x22_u8; 8192]).unwrap();
+        assert_eq!(
+            run(Cli::try_parse_from([
+                "ffs-image-repair",
+                "protect-set",
+                ext4_manifest.to_str().unwrap(),
+                "--filesystem",
+                "ext4",
+                "--member",
+                ext4_data.to_str().unwrap(),
+                ext4_data_rq.to_str().unwrap(),
+                "--log-member",
+                ext4_log.to_str().unwrap(),
+                ext4_log_rq.to_str().unwrap(),
+                "--offline",
+            ])
+            .unwrap())
+            .unwrap(),
+            0
+        );
+        let saved_ext4 = ffs_repair::sidecar::StorageSetManifest::decode(
+            &std::fs::read(&ext4_manifest).unwrap(),
+            TrustPolicy::AllowUnauthenticated,
+        )
+        .unwrap();
+        assert_eq!(saved_ext4.topology, StorageSetTopology::Ext4WithExternalLog);
+
+        // 5. Negative control: `--require-native-binding` fails closed on non-ext4 bytes
         //    without creating either manifest or sidecar.
         let bad_img = dir.path().join("garbage.img");
         let bad_rq = dir.path().join("garbage.ffsrq");
