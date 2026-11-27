@@ -4,8 +4,8 @@
 use super::{
     EditableDataStream, EditableStreamStorage, FILE_ATTR_ENCRYPTED, FILE_ATTR_REPARSE_POINT,
     FILE_ATTR_SPARSE_FILE, MIN_USER_MFT_SLOT, NtfsTransactionEngine, NtfsTxOutcome, PreparedTxPlan,
-    TxWorkspace, checkpoint, compression, corrupt, read_editable_stream_prefix, splice_vcn_interval,
-    stage_runs_writes, unsupported, validate_ntfs_stream_name_utf16,
+    TxWorkspace, checkpoint, compression, corrupt, read_editable_stream_prefix,
+    splice_vcn_interval, stage_runs_writes, unsupported, validate_ntfs_stream_name_utf16,
 };
 use asupersync::Cx;
 use ffs_error::{FfsError, Result};
@@ -286,7 +286,10 @@ fn punch_compressed(
         ..
     } = &stream.storage
     else {
-        return Err(corrupt(0, "compressed hole-punch source is not nonresident"));
+        return Err(corrupt(
+            0,
+            "compressed hole-punch source is not nonresident",
+        ));
     };
     let unit_bytes = compression::UNIT_CLUSTERS * u64::from(engine.geometry.cluster_bytes());
     let mut working = runs.clone();

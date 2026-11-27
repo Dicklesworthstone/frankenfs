@@ -379,9 +379,11 @@ fn compressed_hole_punch_on_full_volume_retires_only_whole_units_without_cow() {
         )
         .into_result()
         .unwrap();
-    assert!(!engine.persistence_trace()[trace_start..].iter().any(|event| {
-        event.stage == NtfsPersistenceStage::PayloadDataWrite
-    }));
+    assert!(
+        !engine.persistence_trace()[trace_start..]
+            .iter()
+            .any(|event| { event.stage == NtfsPersistenceStage::PayloadDataWrite })
+    );
     expected[unit..3 * unit].fill(0);
     assert_stream(
         &engine,
@@ -514,8 +516,7 @@ fn compressed_hole_punch_rejects_malformed_unit_layout_before_noop_or_writes() {
         .into_result()
         .unwrap();
     let (volume, record) = view(&engine, file);
-    let record_start =
-        CLUSTER_BYTES + usize::try_from(file.record).unwrap() * super::RECORD_BYTES;
+    let record_start = CLUSTER_BYTES + usize::try_from(file.record).unwrap() * super::RECORD_BYTES;
     let before = device.snapshot_durable_only();
     let mut attributes = super::copied_test_record_attributes(
         &before[record_start..record_start + super::RECORD_BYTES],
@@ -561,12 +562,9 @@ fn compressed_hole_punch_rejects_malformed_unit_layout_before_noop_or_writes() {
             lcn: None,
         },
     ];
-    let (pairs, last_vcn) = ffs_ondisk::ntfs::encode_mapping_pairs(
-        &malformed,
-        0,
-        volume.geometry.cluster_count(),
-    )
-    .unwrap();
+    let (pairs, last_vcn) =
+        ffs_ondisk::ntfs::encode_mapping_pairs(&malformed, 0, volume.geometry.cluster_count())
+            .unwrap();
     data.resize((pairs_at + pairs.len()).next_multiple_of(8), 0);
     data[pairs_at..].fill(0);
     data[pairs_at..pairs_at + pairs.len()].copy_from_slice(&pairs);
@@ -594,16 +592,12 @@ fn compressed_hole_punch_rejects_malformed_unit_layout_before_noop_or_writes() {
     let writes = device.write_bytes_total();
     let events = engine.persistence_trace().len();
     for (offset, length) in [(unit as u64, 1), (0, unit as u64)] {
-        let outcome = engine.punch_hole_at(
-            &cx,
-            file,
-            &[],
-            offset,
-            length,
-            DEFAULT_FILETIME + 1,
-        );
+        let outcome = engine.punch_hole_at(&cx, file, &[], offset, length, DEFAULT_FILETIME + 1);
         assert!(
-            matches!(outcome, NtfsTxOutcome::NotCommitted(FfsError::Corruption { .. })),
+            matches!(
+                outcome,
+                NtfsTxOutcome::NotCommitted(FfsError::Corruption { .. })
+            ),
             "malformed compressed mapping must be refused before publication: {outcome:?}"
         );
         assert_eq!(device.write_bytes_total(), writes);
@@ -1484,7 +1478,8 @@ fn compressed_hole_punch_fsops_publishes_native_usn_and_invalidates_read_cache()
         .lookup(&cx, &mut scope, InodeNumber(1), OsStr::new("punch.bin"))
         .unwrap();
     assert_eq!(
-        fs.read(&cx, &mut scope, attr.ino, 0, expected.len() as u32).unwrap(),
+        fs.read(&cx, &mut scope, attr.ino, 0, expected.len() as u32)
+            .unwrap(),
         expected
     );
     fs.fallocate(
@@ -1498,7 +1493,8 @@ fn compressed_hole_punch_fsops_publishes_native_usn_and_invalidates_read_cache()
     .unwrap();
     expected[unit - 7..2 * unit + 7].fill(0);
     assert_eq!(
-        fs.read(&cx, &mut scope, attr.ino, 0, expected.len() as u32).unwrap(),
+        fs.read(&cx, &mut scope, attr.ino, 0, expected.len() as u32)
+            .unwrap(),
         expected
     );
     assert_eq!(
@@ -1514,7 +1510,9 @@ fn compressed_hole_punch_fsops_publishes_native_usn_and_invalidates_read_cache()
         image.len() as u64 - SECTOR_BYTES as u64,
     )
     .unwrap();
-    let record = volume.record(&cx, file.record, Some(file.sequence)).unwrap();
+    let record = volume
+        .record(&cx, file.record, Some(file.sequence))
+        .unwrap();
     let stream = volume.data_stream(&cx, &record, &[]).unwrap();
     assert_eq!(
         volume.read(&cx, &stream, 0, expected.len()).unwrap(),
