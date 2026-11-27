@@ -413,7 +413,7 @@ impl Drop for DurabilityCommitGuard<'_> {
         if self.armed
             && let Some(device) = self.device
         {
-            device.abort_durability_commit();
+            device.release_durability_commit(true);
         }
     }
 }
@@ -421,10 +421,14 @@ impl Drop for DurabilityCommitGuard<'_> {
 impl DurabilityCommitGuard<'_> {
     pub(crate) fn arm_final_seal(&mut self, cx: &Cx) -> Result<(), FfsError> {
         if self.armed {
-            self.armed = false;
             if let Some(device) = self.device {
                 device.arm_final_seal(cx)?;
             }
+            // The cancellable native handoff must succeed before this guard
+            // relinquishes its abort obligation. Otherwise cancellation leaves
+            // an unowned deferred-seal hold and later syncs acknowledge raw I/O
+            // without ever publishing fresh native protection.
+            self.armed = false;
         }
         if let Some(mut deferral) = self.byte_deferral.take() {
             deferral.complete();
@@ -750,6 +754,11 @@ impl NativeFreshnessDevice {
         hinted_blocks: &[BlockNumber],
     ) -> Result<DurabilityCommitGuard<'a>, FfsError> {
         let mut state = self.lock(cx)?;
+        let defer_seal = state
+            .defer_seal
+            .checked_add(1)
+            .ok_or_else(|| freshness_error("durability commit nesting overflow"))?;
+        let byte_deferral = ffs_block::DurabilityCommitDeferral::enter(cx, self.inner.as_ref())?;
         for &block in hinted_blocks {
             if let Some(group) = native_source_tail(&state.baseline.storage, block).map(|t| t.group)
             {
@@ -759,11 +768,7 @@ impl NativeFreshnessDevice {
         if state.format_commit_seq.is_none() {
             state.format_commit_seq = Some(pre_commit_seq);
         }
-        let byte_deferral = ffs_block::DurabilityCommitDeferral::enter(cx, self.inner.as_ref())?;
-        state.defer_seal = state
-            .defer_seal
-            .checked_add(1)
-            .ok_or_else(|| freshness_error("durability commit nesting overflow"))?;
+        state.defer_seal = defer_seal;
         Ok(DurabilityCommitGuard {
             device: Some(self),
             byte_deferral: Some(byte_deferral),
@@ -780,7 +785,7 @@ impl NativeFreshnessDevice {
         Ok(())
     }
 
-    fn abort_durability_commit(&self) {
+    fn release_durability_commit(&self, aborted: bool) {
         let guard = loop {
             match self.state.try_lock() {
                 Ok(state) => break Some(state),
@@ -792,14 +797,17 @@ impl NativeFreshnessDevice {
         };
         if let Some(mut state) = guard {
             state.defer_seal = state.defer_seal.saturating_sub(1);
-            if state.defer_seal == 0 {
-                state.format_commit_seq = None;
-                state.pending_dirty_buckets = [0; 64];
+            if aborted {
                 if state.phase == FreshnessPhase::Dirty {
-                    // Physical writes escaped before the format transaction sealed;
-                    // poison the live handle so only cold recovery + reconciliation
-                    // can admit subsequent I/O.
+                    // Nested commits share physical writes and have no savepoint.
+                    // Poison immediately: an outer successful completion must not
+                    // seal bytes from an aborted inner operation as valid repair
+                    // authority. Only cold recovery can readmit the device.
                     state.phase = FreshnessPhase::Poisoned;
+                }
+                if state.defer_seal == 0 {
+                    state.format_commit_seq = None;
+                    state.pending_dirty_buckets = [0; 64];
                 }
             }
         }
@@ -1701,14 +1709,27 @@ impl ByteDevice for NativeFreshnessDevice {
     }
 
     fn begin_durability_commit(&self, cx: &Cx) -> Result<(), FfsError> {
-        self.inner.begin_durability_commit(cx)
+        let mut state = self.lock(cx)?;
+        let defer_seal = state
+            .defer_seal
+            .checked_add(1)
+            .ok_or_else(|| freshness_error("durability commit nesting overflow"))?;
+        self.inner.begin_durability_commit(cx)?;
+        // Embedders receive this same fenced ByteDevice. Its generic deferral
+        // must hold native protection as well as any underlying sidecar across
+        // intermediate barriers. No format recovery token is invented here;
+        // interrupted generic epochs retain the existing fail-closed policy.
+        state.defer_seal = defer_seal;
+        Ok(())
     }
 
     fn complete_durability_commit(&self) {
+        self.release_durability_commit(false);
         self.inner.complete_durability_commit();
     }
 
     fn abort_durability_commit(&self) {
+        self.release_durability_commit(true);
         self.inner.abort_durability_commit();
     }
 }
