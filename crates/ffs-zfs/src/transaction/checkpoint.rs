@@ -119,35 +119,24 @@ pub(super) fn load_deferred_frees_from_mos(
     decode_deferred_frees(&def_entry.values)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn persist_deferred_frees_into_mos(
-    cx: &Cx,
-    mos: &mut Objects,
-    mos_dirty_dnodes: &mut BTreeMap<u64, Vec<u8>>,
-    alloc: &mut PoolSpaceAllocator,
-    order: Endian,
-    new_txg: u64,
-    staged_writes: &mut Vec<StagedBlockWrite>,
-) -> Result<()> {
-    let mut dir = mos.zap_values(cx, 1)?;
-    let mut unique: BTreeSet<(u32, u64, u64)> = BTreeSet::new();
-    if let Some(def_entry) = dir
+pub(super) fn canonical_deferred_frees(
+    entries: &[(u32, std::ops::Range<u64>)],
+) -> Vec<(u32, std::ops::Range<u64>)> {
+    entries
         .iter()
-        .find(|e| e.name == DMU_POOL_CHECKPOINT_DEFERRED_KEY)
-    {
-        for (vdev, range) in decode_deferred_frees(&def_entry.values)? {
-            unique.insert((vdev, range.start, range.end));
-        }
-    }
-    for (vdev, range) in &alloc.checkpoint_deferred_frees {
-        unique.insert((*vdev, range.start, range.end));
-    }
-    let merged: Vec<(u32, std::ops::Range<u64>)> = unique
+        .map(|(vdev, range)| (*vdev, range.start, range.end))
+        .collect::<BTreeSet<_>>()
         .into_iter()
         .map(|(vdev, start, end)| (vdev, start..end))
-        .collect();
+        .collect()
+}
+
+pub(super) fn set_deferred_free_entry(
+    dir: &mut Vec<RawZapEntry>,
+    entries: &[(u32, std::ops::Range<u64>)],
+) {
     dir.retain(|e| e.name != DMU_POOL_CHECKPOINT_DEFERRED_KEY);
-    let words = encode_deferred_frees(&merged);
+    let words = encode_deferred_frees(entries);
     if !words.is_empty() {
         dir.push(RawZapEntry {
             name: DMU_POOL_CHECKPOINT_DEFERRED_KEY.to_vec(),
@@ -156,20 +145,10 @@ pub(super) fn persist_deferred_frees_into_mos(
             collision: 0,
         });
     }
-    stage_mos_dir_entries(
-        cx,
-        mos,
-        mos_dirty_dnodes,
-        alloc,
-        order,
-        new_txg,
-        &dir,
-        staged_writes,
-    )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn stage_mos_dir_entries(
+pub(super) fn stage_mos_dir_entries(
     cx: &Cx,
     mos: &mut Objects,
     mos_dirty_dnodes: &mut BTreeMap<u64, Vec<u8>>,
@@ -275,7 +254,6 @@ impl ZfsTransactionEngine {
             Ok(w) => w,
             Err(err) => return ZfsTxOutcome::NotCommitted(err),
         };
-        let order = self.order;
         // Set `checkpoint_txg` on the live uberblock & allocator BEFORE commit so the
         // newly published uberblock carries `ub_checkpoint_txg = checkpoint_txg` AND
         // pre-checkpoint MOS blocks retired during this very TXG are deferred!
@@ -284,10 +262,10 @@ impl ZfsTransactionEngine {
         self.current_uberblock.checkpoint_txg = checkpoint_txg;
         self.allocator.checkpoint_txg = checkpoint_txg;
 
-        let outcome = self.execute_staged_txg_typed(
+        let mut outcome = self.execute_staged_txg_typed(
             cx,
             "zfs_checkpoint_create",
-            |mos, mos_dirty, features, alloc, new_txg, staged| {
+            |mos, _mos_dirty, features, alloc, _new_txg, _staged| {
                 let mut dir = mos.zap_values(cx, 1)?;
                 dir.retain(|e| {
                     e.name != DMU_POOL_CHECKPOINT_KEY && e.name != DMU_POOL_CHECKPOINT_DEFERRED_KEY
@@ -311,7 +289,7 @@ impl ZfsTransactionEngine {
                     .write_features
                     .insert(ZPOOL_CHECKPOINT_FEATURE.to_owned(), 1);
                 features.write_dirty = true;
-                stage_mos_dir_entries(cx, mos, mos_dirty, alloc, order, new_txg, &dir, staged)?;
+                alloc.pending_mos_directory = Some(dir);
                 let info = ZfsCheckpointInfo {
                     checkpoint_txg,
                     timestamp: checkpoint_ts,
@@ -325,7 +303,15 @@ impl ZfsTransactionEngine {
                 Ok((info, checkpoint_txg))
             },
         );
-        if !outcome.is_committed() {
+        if let ZfsTxOutcome::Committed { value, .. } = &mut outcome {
+            value.deferred_free_bytes = self
+                .allocator
+                .checkpoint_deferred_frees
+                .iter()
+                .fold(0_u64, |total, (_, range)| {
+                    total.saturating_add(range.end - range.start)
+                });
+        } else {
             self.current_uberblock.checkpoint_txg = prev_ub_ckpt;
             self.allocator.checkpoint_txg = prev_alloc_ckpt;
         }
@@ -341,7 +327,6 @@ impl ZfsTransactionEngine {
                 "pool has no active checkpoint to discard".into(),
             ));
         }
-        let order = self.order;
         let prev_ub_ckpt = self.current_uberblock.checkpoint_txg;
         let prev_alloc_ckpt = self.allocator.checkpoint_txg;
         self.current_uberblock.checkpoint_txg = 0;
@@ -349,7 +334,7 @@ impl ZfsTransactionEngine {
         let outcome = self.execute_staged_txg_typed(
             cx,
             "zfs_checkpoint_discard",
-            |mos, mos_dirty, features, alloc, new_txg, staged| {
+            |mos, _mos_dirty, features, alloc, _new_txg, _staged| {
                 let mut dir = mos.zap_values(cx, 1)?;
                 let mut unique: BTreeSet<(u32, u64, u64)> = BTreeSet::new();
                 if let Some(def_entry) = dir
@@ -377,7 +362,7 @@ impl ZfsTransactionEngine {
                     .write_features
                     .insert(ZPOOL_CHECKPOINT_FEATURE.to_owned(), 0);
                 features.write_dirty = true;
-                stage_mos_dir_entries(cx, mos, mos_dirty, alloc, order, new_txg, &dir, staged)?;
+                alloc.pending_mos_directory = Some(dir);
                 let info = ZfsCheckpointInfo {
                     checkpoint_txg: ckpt_txg,
                     timestamp: 0,

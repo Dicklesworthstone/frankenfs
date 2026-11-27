@@ -2642,27 +2642,6 @@ impl ZfsTransactionEngine {
             Err(err) => return ZfsTxOutcome::NotCommitted(err),
         };
 
-        // Persist newly deferred pre-checkpoint frees into MOS `"vdev_checkpoint_sm"`
-        // so reopening after any foreground write/unlink still protects & reclaims them.
-        if draft_alloc.checkpoint_txg != 0
-            && draft_alloc.checkpoint_deferred_frees.len()
-                > self.allocator.checkpoint_deferred_frees.len()
-            && op_name != "zfs_checkpoint_create"
-            && op_name != "zfs_checkpoint_discard"
-            && !mos_dirty_dnodes.contains_key(&1)
-            && let Err(err) = checkpoint::persist_deferred_frees_into_mos(
-                cx,
-                &mut mos,
-                &mut mos_dirty_dnodes,
-                &mut draft_alloc,
-                self.order,
-                new_txg,
-                &mut base_staged,
-            )
-        {
-            return ZfsTxOutcome::NotCommitted(err);
-        }
-
         let (new_root_bp, mut converged_alloc, converged_features, staged_writes) =
             match finalize_mos_and_space_maps_to_convergence(
                 cx,

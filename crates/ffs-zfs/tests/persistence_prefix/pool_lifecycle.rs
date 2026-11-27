@@ -522,6 +522,191 @@ fn resumable_pool_trim_persists_cursor_and_reports_eopnotsupp_cleanly() {
 }
 
 #[test]
+fn checkpoint_metadata_retirements_survive_reopen_and_discard() {
+    let cx = Cx::for_testing();
+    let built = build_clean_zfs_pool(&PoolFixtureSpec {
+        ashift: 12,
+        ..PoolFixtureSpec::default()
+    });
+    let dev = FaultableMemberDevice::new(built.members[0].clone());
+    let mut engine = open_engine_on_devices(
+        &cx,
+        std::slice::from_ref(&dev),
+        default_write_opts(built.pool_guid, built.initial_slot),
+    )
+    .unwrap();
+    let (created, token) = engine.checkpoint_create(&cx).into_result().unwrap();
+    let before = engine.checkpoint_status(&cx).unwrap().unwrap();
+    assert!(before.deferred_free_bytes > 0);
+    assert_eq!(created, before);
+
+    // The first checkpoint TXG already retires its predecessor's MOS root,
+    // DNODE table, feature records and space maps. Every one must be durable in
+    // the deferred-free record before the checkpoint is acknowledged.
+    let reopened_dev = FaultableMemberDevice::new(dev.durable_snapshot());
+    let mut reopened = open_engine_on_devices(
+        &cx,
+        std::slice::from_ref(&reopened_dev),
+        default_write_opts(built.pool_guid, token.published_slot()),
+    )
+    .unwrap();
+    assert_eq!(
+        reopened.checkpoint_status(&cx).unwrap().unwrap(),
+        before,
+        "reopening must retain all deferred metadata reclamation authority"
+    );
+
+    // Restart must not change how much storage discarding the checkpoint
+    // reclaims. Compare independent engines over identical durable bytes.
+    let (live_discard, live_token) = engine.checkpoint_discard(&cx).into_result().unwrap();
+    let (reopened_discard, reopened_token) =
+        reopened.checkpoint_discard(&cx).into_result().unwrap();
+    assert_eq!(reopened_discard, live_discard);
+    assert_eq!(live_discard.deferred_free_bytes, before.deferred_free_bytes);
+    assert_eq!(reopened_token.committed_txg(), live_token.committed_txg());
+    assert_eq!(reopened_dev.durable_snapshot(), dev.durable_snapshot());
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn checkpoint_foreground_frees_preserve_scan_and_trim_state_after_restart() {
+    let cx = Cx::for_testing();
+    let built = build_clean_zfs_pool(&PoolFixtureSpec {
+        ashift: 12,
+        ..PoolFixtureSpec::default()
+    });
+    let dev = FaultableMemberDevice::new(built.members[0].clone());
+    let mut engine = open_engine_on_devices(
+        &cx,
+        std::slice::from_ref(&dev),
+        default_write_opts(built.pool_guid, built.initial_slot),
+    )
+    .unwrap();
+    let ts = Timestamp {
+        seconds: 1_735_004_000,
+        nanos: 0,
+    };
+    let parent = vec![b"data".to_vec()];
+    let mut dataset = None;
+    for index in 0..4 {
+        let name = format!("child{index}").into_bytes();
+        let (head, _) = engine
+            .create_dataset(&cx, &parent, &name, &[], ts)
+            .into_result()
+            .unwrap();
+        if head / (DNODE_BLOCK_BYTES / DNODE_BYTES) as u64 == 1 {
+            dataset = Some(vec![b"data".to_vec(), name]);
+            break;
+        }
+    }
+    // Regression for the old contains_key(&1) test: dirty-map keys identify
+    // DNODE-table blocks, not MOS object numbers. This head lives in block 1.
+    let dataset = dataset.expect("fixture must exercise MOS DNODE-table block 1");
+    let (file, _) = engine
+        .create_file(
+            &cx,
+            &dataset,
+            2,
+            b"data.bin",
+            0o644,
+            0,
+            0,
+            ts,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    engine
+        .write_file_data(
+            &cx,
+            &dataset,
+            file,
+            0,
+            &vec![0x51; 40_960],
+            ts,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    engine.checkpoint_create(&cx).into_result().unwrap();
+    let original_checkpoint = engine.checkpoint_status(&cx).unwrap().unwrap();
+    let changed = vec![0xA3; 40_960];
+    engine
+        .write_file_data(
+            &cx,
+            &dataset,
+            file,
+            0,
+            &changed,
+            ts,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    let before = engine.checkpoint_status(&cx).unwrap().unwrap();
+    assert!(before.deferred_free_bytes > original_checkpoint.deferred_free_bytes);
+
+    // Both operations edit MOS directory object 1 while checkpoint bookkeeping
+    // edits the same object. All entries must survive the same native TXG.
+    engine
+        .scrub_start(
+            &cx,
+            ZfsScanLimits {
+                max_blocks_per_txg: 1,
+            },
+        )
+        .into_result()
+        .unwrap();
+    let scan = engine.scan_status(&cx).unwrap().unwrap();
+    assert_eq!(scan.state, DslScanState::Scanning);
+    engine.trim_pool(&cx, 4, false).into_result().unwrap();
+    let slot = engine.committed_slot();
+    let expected_checkpoint = engine.checkpoint_status(&cx).unwrap().unwrap();
+    let mut mos = engine.open_read_objects(&cx).unwrap();
+    let expected_directory = mos.zap_values(&cx, 1).unwrap();
+    let trim = expected_directory
+        .iter()
+        .find(|row| row.name == b"vdev_trim_progress")
+        .expect("trim progress must be persisted")
+        .values
+        .clone();
+
+    let restarted_dev = FaultableMemberDevice::new(dev.durable_snapshot());
+    let mut restarted = open_engine_on_devices(
+        &cx,
+        std::slice::from_ref(&restarted_dev),
+        default_write_opts(built.pool_guid, slot),
+    )
+    .unwrap();
+    assert_eq!(
+        restarted.checkpoint_status(&cx).unwrap().unwrap(),
+        expected_checkpoint
+    );
+    assert_eq!(restarted.scan_status(&cx).unwrap().unwrap(), scan);
+    let mut mos = restarted.open_read_objects(&cx).unwrap();
+    let directory = mos.zap_values(&cx, 1).unwrap();
+    assert_eq!(
+        directory
+            .iter()
+            .find(|row| row.name == b"vdev_trim_progress")
+            .unwrap()
+            .values,
+        trim
+    );
+    assert_eq!(
+        read_zpl_bytes(&cx, &mut mos, &dataset, b"/data.bin", changed.len()).unwrap(),
+        changed
+    );
+    let (discarded, _) = restarted.checkpoint_discard(&cx).into_result().unwrap();
+    assert_eq!(
+        discarded.deferred_free_bytes,
+        expected_checkpoint.deferred_free_bytes
+    );
+    assert_eq!(restarted.scan_status(&cx).unwrap().unwrap(), scan);
+    assert_pool_scrub_and_allocation_clean(&cx, &[restarted_dev], built.pool_guid, None);
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn pool_checkpoint_create_deferred_free_rewind_discard_and_crash_cuts() {
     let cx = Cx::for_testing();

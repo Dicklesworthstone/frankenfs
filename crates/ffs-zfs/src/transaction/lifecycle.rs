@@ -52,8 +52,8 @@ use serde::Serialize;
 use super::dmu_cow::{
     AllocatorWriteTopology, DMU_OT_OBJECT_ARRAY, DMU_OT_OBJSET, DMU_OT_PACKED_NVLIST,
     DMU_OT_SPACE_MAP, DMU_OT_SPACE_MAP_HEADER, DnodeCowSpec, PoolSpaceAllocator, SpaceDelta,
-    StagedBlockWrite, WriteBucket, allocate_object_id, cow_update_dnode,
-    encode_zap_blocks_for_dnode, put_dnode_in_table, zap_optional_u64, zap_required_u64,
+    StagedBlockWrite, WriteBucket, allocate_object_id, cow_update_dnode, put_dnode_in_table,
+    zap_optional_u64, zap_required_u64,
 };
 use super::dsl_ops::DD_FLAG_USED_BREAKDOWN;
 use super::{
@@ -2479,13 +2479,12 @@ impl ZfsTransactionEngine {
         }
         cumulative_bytes = cumulative_bytes.saturating_add(trimmed_bytes_chunk);
 
-        let order = self.order;
         let final_cursor = cursor;
         let final_completed = reached_end;
         self.execute_staged_txg_typed(
             cx,
             "zfs_pool_trim",
-            |mos, mos_dirty, _features, alloc, txg, staged| {
+            |mos, _mos_dirty, _features, alloc, txg, _staged| {
                 let mut entries = mos.zap_values(cx, 1)?;
                 entries.retain(|e| e.name != DMU_POOL_TRIM_PROGRESS_KEY);
                 entries.push(RawZapEntry {
@@ -2494,51 +2493,7 @@ impl ZfsTransactionEngine {
                     values: vec![final_cursor, cumulative_bytes, u64::from(final_completed)],
                     collision: 0,
                 });
-                let (dir_dn, dir_ceil) = mos.object_with_ceiling(cx, 1)?;
-                let (bsize, blocks) = encode_zap_blocks_for_dnode(
-                    cx,
-                    mos,
-                    Some((&dir_dn, dir_ceil)),
-                    &entries,
-                    order,
-                    512,
-                )?;
-                let mut dirty = BTreeMap::new();
-                for (bid, blk) in blocks.into_iter().enumerate() {
-                    dirty.insert(bid as u64, Some(blk));
-                }
-                let out = cow_update_dnode(
-                    cx,
-                    mos,
-                    alloc,
-                    DnodeCowSpec {
-                        existing: Some((&dir_dn, dir_ceil)),
-                        object_type: dir_dn.object_type(),
-                        bonus_type: dir_dn.bonus_type(),
-                        checksum_type: dir_dn.checksum_type(),
-                        compress_type: dir_dn.compress_type(),
-                        user_flags: dir_dn.flags(),
-                        indirect_shift: dir_dn.indirect_shift(),
-                        data_bytes: bsize,
-                        max_block: (dirty.len().saturating_sub(1)) as u64,
-                        slots: dir_dn.slots(),
-                        nblkptr: dir_dn.pointers().len(),
-                        bonus: dir_dn.bonus().to_vec(),
-                        spill: dir_dn.spill().cloned(),
-                        order,
-                        new_txg: txg,
-                        leaf_bucket: WriteBucket::MosSpaceMap,
-                        indirect_bucket: WriteBucket::MosSpaceMap,
-                    },
-                    &dirty,
-                    staged,
-                )?;
-                for rbp in &out.retired_bps {
-                    alloc.free_block_dvas(rbp, txg)?;
-                }
-                let mos_meta = mos.meta_dnode().clone();
-                let mos_ceil = mos.root_birth_txg();
-                put_dnode_in_table(cx, mos, &mos_meta, mos_ceil, mos_dirty, 1, &out.dnode)?;
+                alloc.pending_mos_directory = Some(entries);
                 Ok((
                     ZfsTrimReport {
                         ranges_trimmed: trimmed_ranges,
