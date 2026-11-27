@@ -16,7 +16,7 @@ mod scan;
 mod zpl_ops;
 mod zvol_ops;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use asupersync::Cx;
@@ -857,6 +857,7 @@ impl ZfsTransactionEngine {
             &mut mos,
             &mos_features.write_features,
             &vcfg.read_features,
+            &member_guids,
         )?;
         allocator.checkpoint_txg = current_uberblock.checkpoint_txg;
         if allocator.checkpoint_txg != 0 {
@@ -2672,6 +2673,13 @@ impl ZfsTransactionEngine {
             Err(e) => return ZfsTxOutcome::NotCommitted(parse_err(&e)),
         };
 
+        // Bind every native child to its admitted physical device before any write.
+        // Argument order is unrelated to native vdev or parity-column IDs.
+        let write_members = match self.staged_write_members(&converged_alloc, &staged_writes) {
+            Ok(members) => members,
+            Err(err) => return ZfsTxOutcome::NotCommitted(err),
+        };
+
         // 2. Persist any pre-commit topology reflow writes + strictly child-before-parent
         //    blocks across all members BEFORE touching Uberblocks!
         // Retain independent handles to the same admitted devices while updating
@@ -2713,9 +2721,14 @@ impl ZfsTransactionEngine {
                 continue;
             }
             for w in &bucket_writes {
-                if let Err(err) =
-                    self.write_staged_block_to_topology(cx, op_name, new_txg, bucket, w)
-                {
+                if let Err(err) = self.write_staged_block_to_topology(
+                    cx,
+                    op_name,
+                    new_txg,
+                    w,
+                    &converged_alloc,
+                    &write_members,
+                ) {
                     return ZfsTxOutcome::NotCommitted(err);
                 }
             }
@@ -2921,18 +2934,70 @@ impl ZfsTransactionEngine {
         }
     }
 
-    /// Fan out a single staged logical/physical block write onto every target
-    /// physical member according to this pool's active topology (SingleLeaf,
-    /// Mirror, RAIDZ1/2/3, dRAID1/2/3, or MultiVdev).
+    /// Resolve the selected allocator's native child order once for the whole TXG.
+    /// A missing, duplicated, or foreign route must fail before any physical write.
+    fn staged_write_members(
+        &self,
+        allocation: &PoolSpaceAllocator,
+        staged: &[StagedBlockWrite],
+    ) -> Result<Vec<usize>> {
+        let supplied = &self.storage_identity.member_guids;
+        if supplied.len() != self.pool.leaves().len() {
+            return Err(corrupt(
+                "ZFS member GUID count disagrees with supplied devices",
+            ));
+        }
+        let supplied_indices: BTreeMap<_, _> = supplied
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, guid)| (guid, index))
+            .collect();
+        if supplied_indices.len() != supplied.len() || supplied_indices.contains_key(&0) {
+            return Err(corrupt("duplicate or zero supplied ZFS member GUID"));
+        }
+        let expected_count = match &allocation.write_topology {
+            dmu_cow::AllocatorWriteTopology::LeafOrMirror => allocation.write_member_guids.len(),
+            dmu_cow::AllocatorWriteTopology::Raidz { width, .. } => *width,
+            dmu_cow::AllocatorWriteTopology::Draid(config) => config.children,
+        };
+        if expected_count == 0 || allocation.write_member_guids.len() != expected_count {
+            return Err(corrupt(
+                "ZFS write geometry disagrees with native child GUIDs",
+            ));
+        }
+        if staged
+            .iter()
+            .any(|write| write.vdev_id != allocation.vdev_id)
+        {
+            return Err(corrupt("staged ZFS write targets a foreign allocator vdev"));
+        }
+        let mut seen = BTreeSet::new();
+        allocation
+            .write_member_guids
+            .iter()
+            .map(|guid| {
+                if *guid == 0 || !seen.insert(*guid) {
+                    return Err(corrupt("duplicate or zero native ZFS child GUID"));
+                }
+                supplied_indices.get(guid).copied().ok_or_else(|| {
+                    unsupported("native ZFS write child has no supplied physical device")
+                })
+            })
+            .collect()
+    }
+
+    /// Fan out a single staged block using the preflighted native-child mapping.
     fn write_staged_block_to_topology(
         &mut self,
         cx: &Cx,
         op_name: &str,
         new_txg: u64,
-        bucket: WriteBucket,
         w: &StagedBlockWrite,
+        allocation: &PoolSpaceAllocator,
+        members: &[usize],
     ) -> Result<()> {
-        let stage_for = |member_index: usize| match bucket {
+        let stage_for = |member_index: usize| match w.bucket {
             WriteBucket::ChildBlocks => ZfsPersistenceStage::ChildBlocksWrite { member_index },
             WriteBucket::DatasetMetadata => {
                 ZfsPersistenceStage::DatasetMetadataWrite { member_index }
@@ -2940,50 +3005,23 @@ impl ZfsTransactionEngine {
             WriteBucket::MosSpaceMap => ZfsPersistenceStage::MosSpaceMapWrite { member_index },
             WriteBucket::MosRoot => ZfsPersistenceStage::MosRootWrite { member_index },
         };
-        match &self.allocator.write_topology {
+        match &allocation.write_topology {
             dmu_cow::AllocatorWriteTopology::LeafOrMirror => {
                 let phys_off = DATA_OFFSET + w.dva_offset;
-                if matches!(
-                    self.storage_identity.topology,
-                    ZfsTopologyKind::MultiVdev { .. }
-                ) {
-                    // Target the physical member(s) owning `w.vdev_id`.
-                    let targets: Vec<usize> = self
-                        .pool
-                        .pool_topology()
-                        .and_then(|t| t.top_vdev(w.vdev_id))
-                        .map_or_else(
-                            || vec![(w.vdev_id as usize).min(self.pool.leaves().len() - 1)],
-                            |top| top.supplied_indices.iter().flatten().copied().collect(),
-                        );
-                    for m_idx in targets {
-                        self.emit_event(
-                            op_name,
-                            stage_for(m_idx),
-                            new_txg,
-                            m_idx,
-                            phys_off,
-                            w.bytes.len(),
-                        )?;
-                        self.pool.leaves()[m_idx].write_raw(cx, phys_off, &w.bytes)?;
-                    }
-                } else {
-                    let member_count = self.pool.leaves().len();
-                    for m_idx in 0..member_count {
-                        self.emit_event(
-                            op_name,
-                            stage_for(m_idx),
-                            new_txg,
-                            m_idx,
-                            phys_off,
-                            w.bytes.len(),
-                        )?;
-                        self.pool.leaves()[m_idx].write_raw(cx, phys_off, &w.bytes)?;
-                    }
+                for &m_idx in members {
+                    self.emit_event(
+                        op_name,
+                        stage_for(m_idx),
+                        new_txg,
+                        m_idx,
+                        phys_off,
+                        w.bytes.len(),
+                    )?;
+                    self.pool.leaves()[m_idx].write_raw(cx, phys_off, &w.bytes)?;
                 }
             }
             dmu_cow::AllocatorWriteTopology::Raidz { parity, width } => {
-                let ashift = self.allocator.ashift;
+                let ashift = allocation.ashift;
                 let (columns, payloads) = if *parity == 1 {
                     let map = ffs_ondisk::zfs::raidz::Raidz1Map::new_wide(
                         w.dva_offset,
@@ -3011,7 +3049,7 @@ impl ZfsTransactionEngine {
                         continue;
                     }
                     let phys_off = DATA_OFFSET + col.offset;
-                    let m_idx = col.child_id;
+                    let m_idx = members[col.child_id];
                     self.emit_event(
                         op_name,
                         stage_for(m_idx),
@@ -3034,7 +3072,7 @@ impl ZfsTransactionEngine {
                             continue;
                         }
                         let phys_off = DATA_OFFSET + col.offset;
-                        let m_idx = col.child_id;
+                        let m_idx = members[col.child_id];
                         self.emit_event(
                             op_name,
                             stage_for(m_idx),

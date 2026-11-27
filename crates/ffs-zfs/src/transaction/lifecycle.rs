@@ -1735,6 +1735,10 @@ impl ZfsTransactionEngine {
             width: new_member_guids.len(),
         };
         self.storage_identity.member_dev_inos.push(None);
+        let old_write_member_guids = std::mem::replace(
+            &mut self.allocator.write_member_guids,
+            new_member_guids.clone(),
+        );
 
         let order = self.order;
         let tree_for_mos = new_top_tree;
@@ -1790,6 +1794,7 @@ impl ZfsTransactionEngine {
         self.pool = old_pool;
         self.label_offsets_per_member = old_label_offsets;
         self.storage_identity = old_identity;
+        self.allocator.write_member_guids = old_write_member_guids;
         outcome
     }
 
@@ -1803,6 +1808,14 @@ impl ZfsTransactionEngine {
         target_member_index: usize,
         replacement: Leaf,
     ) -> ZfsTxOutcome<ZfsLifecycleReport> {
+        if matches!(
+            self.storage_identity.topology,
+            ZfsTopologyKind::MultiVdev { .. }
+        ) {
+            return ZfsTxOutcome::NotCommitted(unsupported(
+                "multi-vdev member replacement requires target-specific topology publication",
+            ));
+        }
         if target_member_index >= self.pool.leaves().len() {
             return ZfsTxOutcome::NotCommitted(FfsError::NotFound(
                 "target member index out of bounds".into(),
@@ -1815,8 +1828,24 @@ impl ZfsTransactionEngine {
             ));
         }
 
-        // Copy full data area of target (or healthy mirror sibling if mirror) onto replacement!
-        let source_idx = if self.pool.leaves().len() > 1 {
+        let replaced_guid = self.storage_identity.member_guids[target_member_index];
+        let Some(native_child_index) = self
+            .allocator
+            .write_member_guids
+            .iter()
+            .position(|&guid| guid == replaced_guid)
+        else {
+            return ZfsTxOutcome::NotCommitted(corrupt(
+                "replacement target has no native allocator child",
+            ));
+        };
+
+        // Mirrors hold interchangeable replicas. Parity members hold distinct
+        // columns, so a complete healthy parity pool must copy the target itself.
+        let source_idx = if matches!(
+            self.storage_identity.topology,
+            ZfsTopologyKind::Mirror { .. }
+        ) {
             (0..self.pool.leaves().len())
                 .find(|&i| i != target_member_index)
                 .unwrap_or(target_member_index)
@@ -1853,6 +1882,8 @@ impl ZfsTransactionEngine {
             .wrapping_add(0x203);
         let mut new_guids = self.storage_identity.member_guids.clone();
         new_guids[target_member_index] = new_guid;
+        let mut new_write_member_guids = self.allocator.write_member_guids.clone();
+        new_write_member_guids[native_child_index] = new_guid;
         let new_top_guid = if self.pool.leaves().len() == 1 {
             new_guid
         } else {
@@ -1889,10 +1920,16 @@ impl ZfsTransactionEngine {
             None => return ZfsTxOutcome::NotCommitted(corrupt("missing vdev_tree")),
         };
         if let Some(Value::Lists(kids)) = updated_tree.fields.get_mut("children") {
-            if let Some(kid) = kids.get_mut(target_member_index) {
-                kid.fields
-                    .insert("guid".to_owned(), Value::Unsigned(new_guid));
-            }
+            let Some(kid) = kids
+                .iter_mut()
+                .find(|child| child.unsigned("guid") == Some(replaced_guid))
+            else {
+                return ZfsTxOutcome::NotCommitted(corrupt(
+                    "replacement target GUID is absent from native vdev children",
+                ));
+            };
+            kid.fields
+                .insert("guid".to_owned(), Value::Unsigned(new_guid));
         } else {
             updated_tree
                 .fields
@@ -1929,6 +1966,10 @@ impl ZfsTransactionEngine {
         self.storage_identity.top_guid = new_top_guid;
         self.storage_identity.member_guids = new_guids;
         self.storage_identity.guid_sum = new_guid_sum;
+        let old_write_member_guids = std::mem::replace(
+            &mut self.allocator.write_member_guids,
+            new_write_member_guids,
+        );
 
         let order = self.order;
         let pool_guid = self.storage_identity.pool_guid;
@@ -1981,6 +2022,7 @@ impl ZfsTransactionEngine {
         self.pool = old_pool;
         self.label_offsets_per_member = old_offs;
         self.storage_identity = old_id;
+        self.allocator.write_member_guids = old_write_member_guids;
         outcome
     }
 
@@ -2129,6 +2171,10 @@ impl ZfsTransactionEngine {
         self.storage_identity
             .member_dev_inos
             .remove(target_member_index);
+        let old_write_member_guids = std::mem::replace(
+            &mut self.allocator.write_member_guids,
+            remaining_guids.clone(),
+        );
 
         let order = self.order;
         let pool_guid = self.storage_identity.pool_guid;
@@ -2179,6 +2225,7 @@ impl ZfsTransactionEngine {
         self.pool = old_pool;
         self.label_offsets_per_member = old_offs;
         self.storage_identity = old_id;
+        self.allocator.write_member_guids = old_write_member_guids;
         outcome
     }
 
@@ -2885,6 +2932,11 @@ impl ZfsTransactionEngine {
         chunk_bytes: u64,
         max_chunks_per_txg: usize,
     ) -> ZfsTxOutcome<ZfsExpandRaidzReport> {
+        if self.requires_recovery() {
+            return ZfsTxOutcome::NotCommitted(unsupported(
+                "RAIDZ expansion requires recovery of the uncertain writer",
+            ));
+        }
         let ZfsTopologyKind::Raidz { parity, width } = self.storage_identity.topology else {
             return ZfsTxOutcome::NotCommitted(unsupported(
                 "expand_raidz requires a RAIDZ1/2/3 top-level vdev",
@@ -2913,6 +2965,21 @@ impl ZfsTransactionEngine {
         }
         let new_width = width + 1;
         let ashift = self.allocator.ashift;
+        let Some(next_txg) = self.committed_txg.checked_add(1) else {
+            return ZfsTxOutcome::NotCommitted(corrupt("ZFS TXG counter overflow"));
+        };
+        let mut reflow_members = match self.staged_write_members(&self.allocator, &[]) {
+            Ok(members) if members.len() == width && self.pool.leaves().len() == width => members,
+            Ok(_) => {
+                return ZfsTxOutcome::NotCommitted(corrupt(
+                    "RAIDZ expansion width disagrees with native member routing",
+                ));
+            }
+            Err(err) => return ZfsTxOutcome::NotCommitted(err),
+        };
+        // The new native child is appended to the supplied device set. Existing
+        // native child IDs retain their GUID-derived positions in that set.
+        reflow_members.push(self.pool.leaves().len());
         let cur_reflow = if self.current_uberblock.raidz_reflow_info != 0 {
             match RaidzReflowInfo::decode(self.current_uberblock.raidz_reflow_info) {
                 Ok(info) => info.offset,
@@ -2938,7 +3005,6 @@ impl ZfsTransactionEngine {
             .max()
             .unwrap_or(0);
 
-        let next_txg = self.committed_txg.saturating_add(1);
         let mut reflow_cursor = cur_reflow;
         let mut chunks_processed = 0_u64;
         let mut all_leaves = self.pool.leaves().to_vec();
@@ -3002,9 +3068,14 @@ impl ZfsTransactionEngine {
                     };
                     for (row, r_bufs) in map.rows().iter().zip(&encoded_rows) {
                         for (col, buf) in row.cols.iter().zip(r_bufs) {
-                            if buf.is_empty() || col.child_id >= all_leaves.len() {
+                            if buf.is_empty() {
                                 continue;
                             }
+                            let Some(&member_index) = reflow_members.get(col.child_id) else {
+                                return ZfsTxOutcome::NotCommitted(corrupt(
+                                    "RAIDZ expansion column has no physical member",
+                                ));
+                            };
                             let scratch_off = if col.child_id == width {
                                 match col.leaf_byte_offset() {
                                     Ok(o) => o,
@@ -3019,18 +3090,16 @@ impl ZfsTransactionEngine {
                             };
                             if let Err(err) = self.emit_event(
                                 "zfs_pool_expand_raidz",
-                                ZfsPersistenceStage::ReflowChunkWrite {
-                                    member_index: col.child_id,
-                                },
+                                ZfsPersistenceStage::ReflowChunkWrite { member_index },
                                 next_txg,
-                                col.child_id,
+                                member_index,
                                 scratch_off,
                                 buf.len(),
                             ) {
                                 return ZfsTxOutcome::NotCommitted(err);
                             }
                             if let Err(err) =
-                                all_leaves[col.child_id].write_raw(cx, scratch_off, buf)
+                                all_leaves[member_index].write_raw(cx, scratch_off, buf)
                             {
                                 return ZfsTxOutcome::NotCommitted(err);
                             }
@@ -3197,9 +3266,15 @@ impl ZfsTransactionEngine {
                 };
                 for (row, r_bufs) in map.rows().iter().zip(&encoded_rows) {
                     for (col, buf) in row.cols.iter().zip(r_bufs) {
-                        if buf.is_empty() || col.child_id >= all_leaves.len() {
+                        if buf.is_empty() {
                             continue;
                         }
+                        let Some(&member_index) = reflow_members.get(col.child_id) else {
+                            self.current_uberblock.raidz_reflow_info = prev_reflow_raw;
+                            return ZfsTxOutcome::NotCommitted(corrupt(
+                                "RAIDZ expansion column has no physical member",
+                            ));
+                        };
                         let leaf_off = match col.leaf_byte_offset() {
                             Ok(o) => o,
                             Err(e) => {
@@ -3207,7 +3282,7 @@ impl ZfsTransactionEngine {
                                 return ZfsTxOutcome::NotCommitted(parse_err(&e));
                             }
                         };
-                        pre_commit_writes.push((col.child_id, leaf_off, buf.clone()));
+                        pre_commit_writes.push((member_index, leaf_off, buf.clone()));
                     }
                 }
             }
@@ -3313,6 +3388,7 @@ impl ZfsTransactionEngine {
         let old_offs = std::mem::replace(&mut self.label_offsets_per_member, new_offs);
         let old_id = self.storage_identity.clone();
         let old_write_topo = self.allocator.write_topology.clone();
+        let old_write_member_guids = self.allocator.write_member_guids.clone();
 
         self.storage_identity.member_guids = new_member_guids;
         self.storage_identity.guid_sum = new_guid_sum;
@@ -3326,6 +3402,7 @@ impl ZfsTransactionEngine {
             parity,
             width: new_width,
         };
+        self.allocator.write_member_guids.push(new_child_guid);
 
         let tree_for_mos = updated_top_tree;
         let outcome = self.execute_staged_txg_with_mos(
@@ -3380,6 +3457,7 @@ impl ZfsTransactionEngine {
         self.label_offsets_per_member = old_offs;
         self.storage_identity = old_id;
         self.allocator.write_topology = old_write_topo;
+        self.allocator.write_member_guids = old_write_member_guids;
         self.current_uberblock.raidz_reflow_info = prev_reflow_raw;
         outcome
     }

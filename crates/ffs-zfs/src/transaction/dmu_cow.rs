@@ -33,6 +33,7 @@ use ffs_ondisk::zfs_zap::{
 
 use crate::crypto::ZfsNonceGenerator;
 use crate::reader::dmu::Objects;
+use crate::reader::pool::vdev::{PoolTopology, VdevHealth};
 
 use super::{checkpoint, corrupt, parse_err, unsupported};
 
@@ -277,6 +278,8 @@ pub(super) struct PoolSpaceAllocator {
     pub metaslab_shift: u8,
     pub metaslab_array_obj: u64,
     pub write_topology: AllocatorWriteTopology,
+    /// Physical child GUIDs in native vdev child order, independent of caller order.
+    pub write_member_guids: Vec<u64>,
     pub spacemap_v2_present: bool,
     pub spacemap_v2_active: bool,
     pub spacemap_histogram_present: bool,
@@ -289,12 +292,33 @@ pub(super) struct PoolSpaceAllocator {
     pub metaslabs: Vec<MetaslabState>,
 }
 
+fn admit_native_write_children(top: &NvList) -> Result<()> {
+    let Some(children) = top.fields.get("children") else {
+        return Ok(());
+    };
+    let Value::Lists(children) = children else {
+        return Err(corrupt(
+            "allocating ZFS vdev children are not a native array",
+        ));
+    };
+    if children.iter().any(|child| {
+        !matches!(child.text("type"), Some("file" | "disk"))
+            || !VdevHealth::from_vdev_tree(child).is_healthy()
+    }) {
+        return Err(unsupported(
+            "native ZFS writes require healthy direct physical children; replacement and spare wrappers need explicit write routing",
+        ));
+    }
+    Ok(())
+}
+
 impl PoolSpaceAllocator {
     pub fn load(
         cx: &Cx,
         mos: &mut Objects,
         write_features: &BTreeMap<String, u64>,
         read_features: &[String],
+        supplied_guids: &[u64],
     ) -> Result<Self> {
         checkpoint(cx)?;
         let directory = mos.zap_values(cx, 1)?;
@@ -316,6 +340,11 @@ impl PoolSpaceAllocator {
         }
         let cfg_bytes = read_dnode_prefix(cx, mos, &cfg_node, cfg_ceiling, cfg_len as usize)?;
         let cfg_nv = NvList::parse_exact(&cfg_bytes).map_err(|e| parse_err(&e))?;
+        let supplied_set: BTreeSet<_> = supplied_guids.iter().copied().collect();
+        if supplied_set.len() != supplied_guids.len() || supplied_set.contains(&0) {
+            return Err(corrupt("duplicate or zero supplied ZFS member GUID"));
+        }
+        let topology = PoolTopology::from_mos_config(&cfg_nv, supplied_guids)?;
         let root_tree = cfg_nv
             .list("vdev_tree")
             .ok_or_else(|| corrupt("MOS config missing vdev_tree"))?;
@@ -334,6 +363,16 @@ impl PoolSpaceAllocator {
             })
             .ok_or_else(|| unsupported("pool has no allocating top-level data vdev"))?;
         let vdev_id = u32::try_from(vdev_id).map_err(|_| corrupt("vdev ID overflow"))?;
+        let write_vdev = topology
+            .top_vdev(vdev_id)
+            .ok_or_else(|| corrupt("allocating ZFS vdev has no native topology"))?;
+        if !write_vdev.is_complete() || !write_vdev.health.is_healthy() {
+            return Err(unsupported(
+                "native ZFS writes require every allocating vdev child to be present and healthy",
+            ));
+        }
+        admit_native_write_children(top)?;
+        let write_member_guids = write_vdev.children_guids.clone();
         let ashift = u8::try_from(
             top.unsigned("ashift")
                 .ok_or_else(|| corrupt("missing vdev ashift"))?,
@@ -491,6 +530,7 @@ impl PoolSpaceAllocator {
             metaslab_shift,
             metaslab_array_obj,
             write_topology,
+            write_member_guids,
             spacemap_v2_present,
             spacemap_v2_active,
             spacemap_histogram_present,
@@ -4255,6 +4295,75 @@ impl<'a> FixedDvaReplay<'a> {
 
 #[allow(dead_code)]
 fn _assert_btree_set_used(_: &BTreeSet<u64>) {}
+
+#[cfg(test)]
+mod write_topology_tests {
+    use super::*;
+
+    #[test]
+    fn writer_refuses_reader_collapsed_wrappers_and_unhealthy_children() {
+        let leaf = |id, guid| NvList {
+            fields: BTreeMap::from([
+                ("type".into(), Value::String("file".into())),
+                ("id".into(), Value::Unsigned(id)),
+                ("guid".into(), Value::Unsigned(guid)),
+            ]),
+        };
+        let top = |child| NvList {
+            fields: BTreeMap::from([
+                ("type".into(), Value::String("mirror".into())),
+                ("id".into(), Value::Unsigned(0)),
+                ("guid".into(), Value::Unsigned(2)),
+                ("ashift".into(), Value::Unsigned(12)),
+                ("asize".into(), Value::Unsigned(1 << 20)),
+                ("children".into(), Value::Lists(vec![child])),
+            ]),
+        };
+        admit_native_write_children(&top(leaf(0, 11))).unwrap();
+        for wrapper_type in ["replacing", "spare"] {
+            let wrapper = NvList {
+                fields: BTreeMap::from([
+                    ("type".into(), Value::String(wrapper_type.into())),
+                    ("id".into(), Value::Unsigned(0)),
+                    (
+                        "children".into(),
+                        Value::Lists(vec![leaf(0, 11), leaf(1, 12)]),
+                    ),
+                ]),
+            };
+            let owner = top(wrapper);
+            let root = NvList {
+                fields: BTreeMap::from([
+                    ("type".into(), Value::String("root".into())),
+                    ("guid".into(), Value::Unsigned(1)),
+                    ("children".into(), Value::Lists(vec![owner.clone()])),
+                ]),
+            };
+            let config = NvList {
+                fields: BTreeMap::from([
+                    ("pool_guid".into(), Value::Unsigned(1)),
+                    ("version".into(), Value::Unsigned(5000)),
+                    ("vdev_tree".into(), Value::List(root)),
+                ]),
+            };
+            // Read admission can choose one replica; a writer must not silently
+            // leave the other supplied child stale.
+            let readable = PoolTopology::from_mos_config(&config, &[11, 12]).unwrap();
+            assert_eq!(readable.top_vdev(0).unwrap().supplied_indices, [Some(0)]);
+            assert!(admit_native_write_children(&owner).is_err());
+        }
+        for flag in ["offline", "faulted", "removed", "not_present", "degraded"] {
+            let mut child = leaf(0, 11);
+            child.fields.insert(flag.into(), Value::Unsigned(1));
+            assert!(admit_native_write_children(&top(child)).is_err(), "{flag}");
+        }
+        let mut spare = leaf(0, 11);
+        spare
+            .fields
+            .insert("type".into(), Value::String("draid_spare".into()));
+        assert!(admit_native_write_children(&top(spare)).is_err());
+    }
+}
 
 #[cfg(test)]
 mod compression_policy_tests {
