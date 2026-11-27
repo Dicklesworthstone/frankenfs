@@ -4155,3 +4155,53 @@ repeated disk/memory exhaustion. A later limited recovery allowed formatting,
 but no completed compiler, Clippy or runtime result is claimed. Direct publication
 records the documented gate bypass. This change does not close bd-jbo9q or
 establish native OpenZFS interchange qualification.
+
+## ZFS native filesystem/snapshot limits and receive accounting (2026-11-27)
+
+Native count admission now reads `filesystem_limit` and `snapshot_limit`,
+including local/received precedence, while preserving the native
+`com.joyent:filesystem_count` and `com.joyent:snapshot_count` fields. Property
+read errors, malformed scalar values, inconsistent tracking, ancestry cycles,
+and counter overflow/underflow refuse the transaction. Namespaced user
+properties resembling limit names do not become native policy.
+
+Rename computes both counter deltas across both ancestor chains before
+rewriting each affected directory once. Shared ancestors with zero net growth
+remain valid when their limits have been lowered below current usage. Clone
+destruction and deferred origin-snapshot destruction likewise combine their
+filesystem and snapshot decrements in one update. New-directory counter
+initialization reads the active filesystem-limits feature from the native write
+feature map.
+
+Numeric set/inherit is supported for already initialized native tracking.
+Zero prohibits further growth, `u64::MAX` is unlimited, and inheriting restores
+a received value or the unlimited default. Lowering a limit below current
+usage is permitted; subsequent growth is checked. Imported untracked
+hierarchies still require native initialization: the setter and moves requiring
+unknown subtree counts refuse instead of inventing counts.
+
+Receive now counts and admits its final native snapshot. Private incremental
+`%recv` creation follows the native distinction between a persisted count and
+limit admission: it adds one filesystem to the target/ancestor counters while
+remaining exempt from the filesystem ceiling check. Promotion coalesces removal
+of that temporary filesystem with addition of the published snapshot; abort
+performs the normal filesystem decrement. Full receive promotion adds one
+snapshot. Final-publication refusal preserves the earlier receive checkpoints
+reported by `ZfsRecvOutcome`.
+
+Eight authored integration tests cover canonical/local/received properties,
+unknown user keys, malformed values and property-read faults, checked arithmetic
+and tracking refusal, shared-ancestor moves above lowered limits, deferred clone
+and snapshot destruction, active-versus-enabled feature state, and full and
+incremental receive refusal/reopen/abort/retry. Their count oracle traverses raw
+MOS directory catalogs so it can inspect inconsistent receive staging.
+The focused entry point is
+`cargo test -p ffs-zfs --test persistence_prefix dsl_native_count_limits_ -- --test-threads=1`.
+
+Qualification is independent source review, pinned formatting of the final
+changed Rust files and `git diff --check`. A narrow offline metadata check,
+with one job, no debug information, no incremental compilation and one compiler
+thread, also failed when upstream `asupersync` rustc was killed by SIGKILL before
+repository diagnostics. No completed compiler, Clippy or runtime result is
+claimed. Direct publication records the documented gate bypass. Broader writable
+ZFS/native interoperability qualification and the associated beads remain open.

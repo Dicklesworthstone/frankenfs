@@ -2773,17 +2773,120 @@ pub(super) fn bump_filesystem_limits_counter_if_present(
     new_txg: u64,
     staged_writes: &mut Vec<StagedBlockWrite>,
 ) -> Result<()> {
-    let limit_key: &[u8] = if counter_key == b"com.joyent:snapshot_count" {
-        b"com.joyent:snapshot_limit"
-    } else {
-        b"com.joyent:filesystem_limit"
+    let deltas = match counter_key {
+        b"com.joyent:filesystem_count" => [i128::from(delta), 0],
+        b"com.joyent:snapshot_count" => [0, i128::from(delta)],
+        _ => return Err(corrupt("unknown native filesystem limit counter")),
     };
-    let mut cur_dir = start_dir_obj;
-    let mut seen = BTreeSet::new();
-    while cur_dir != 0 {
-        checkpoint(cx)?;
-        if !seen.insert(cur_dir) {
-            break;
+    adjust_filesystem_limits_counters(
+        cx,
+        mos,
+        mos_meta,
+        mos_ceiling,
+        mos_dirty_dnodes,
+        alloc,
+        &[(start_dir_obj, deltas)],
+        true,
+        order,
+        new_txg,
+        staged_writes,
+    )
+}
+
+/// Apply the net change once per ancestor and once per DSL directory ZAP.
+///
+/// Native count fields are namespaced, while their non-inheritable properties
+/// are `filesystem_limit` and `snapshot_limit` (OpenZFS zfs-2.3.0 dsl_dir.c).
+/// Combining both dimensions and both sides of a move before COW also prevents
+/// a second update from rereading committed counts or discarding the first
+/// staged update. Common ancestors of a rename have no growth to admit, even
+/// when an administrator has lowered their limit below existing usage.
+///
+/// OpenZFS's private receive clone increments the persisted filesystem count,
+/// but bypasses filesystem limit admission. Only that internal creation passes
+/// `enforce_limits = false`; arithmetic and native metadata are still checked.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(super) fn adjust_filesystem_limits_counters(
+    cx: &Cx,
+    mos: &mut Objects,
+    mos_meta: &Dnode,
+    mos_ceiling: u64,
+    mos_dirty_dnodes: &mut BTreeMap<u64, Vec<u8>>,
+    alloc: &mut PoolSpaceAllocator,
+    changes: &[(u64, [i128; 2])],
+    enforce_limits: bool,
+    order: Endian,
+    new_txg: u64,
+    staged_writes: &mut Vec<StagedBlockWrite>,
+) -> Result<()> {
+    let mut ancestors: BTreeMap<u64, [i128; 2]> = BTreeMap::new();
+    for &(start_dir, delta) in changes {
+        if delta == [0, 0] {
+            continue;
+        }
+        let mut cur_dir = start_dir;
+        let mut seen = BTreeSet::new();
+        let mut untracked_below = [false; 2];
+        while cur_dir != 0 {
+            checkpoint(cx)?;
+            if !seen.insert(cur_dir) {
+                return Err(corrupt("cycle in filesystem limit ancestry"));
+            }
+            let (dd_dn, _) = read_staged_or_committed_dnode(
+                cx,
+                mos,
+                mos_meta,
+                mos_ceiling,
+                mos_dirty_dnodes,
+                cur_dir,
+                order,
+            )?;
+            if !matches!(dd_dn.object_type(), DMU_OT_DSL_DIR | DMU_OTN_ZAP_METADATA)
+                || dd_dn.bonus_type() != DMU_OT_DSL_DIR
+                || dd_dn.bonus().len() != 256
+            {
+                return Err(corrupt("filesystem limit ancestor is not a DSL directory"));
+            }
+            let entries = if dd_dn.object_type() == DMU_OTN_ZAP_METADATA {
+                mos.zap_values(cx, cur_dir)?
+            } else {
+                Vec::new()
+            };
+            let counts = [
+                zap_optional_u64(&entries, b"com.joyent:filesystem_count")?,
+                zap_optional_u64(&entries, b"com.joyent:snapshot_count")?,
+            ];
+            if counts[0].is_some() != counts[1].is_some() {
+                return Err(corrupt(
+                    "partially initialized native filesystem limit counters",
+                ));
+            }
+            for index in 0..2 {
+                if delta[index] == 0 {
+                    continue;
+                }
+                if counts[index].is_none() {
+                    untracked_below[index] = true;
+                } else if untracked_below[index] {
+                    return Err(corrupt("uninitialized directory below a counted ancestor"));
+                }
+            }
+            let totals = ancestors.entry(cur_dir).or_default();
+            for (total, change) in totals.iter_mut().zip(delta) {
+                *total = total
+                    .checked_add(change)
+                    .ok_or_else(|| corrupt("filesystem limit delta overflow"))?;
+            }
+            cur_dir = order.u64(dd_dn.bonus(), 16).map_err(|e| parse_err(&e))?;
+        }
+    }
+
+    // Resolve and validate every affected native limit before allocating any
+    // replacement counter ZAP. A failed/corrupt property read is not unlimited.
+    let mut updates = Vec::new();
+    for (directory, deltas) in ancestors {
+        if deltas == [0, 0] {
+            continue;
         }
         let (dd_dn, dd_ceil) = read_staged_or_committed_dnode(
             cx,
@@ -2791,52 +2894,79 @@ pub(super) fn bump_filesystem_limits_counter_if_present(
             mos_meta,
             mos_ceiling,
             mos_dirty_dnodes,
-            cur_dir,
+            directory,
             order,
         )?;
-        let parent = order.u64(dd_dn.bonus(), 16).map_err(|e| parse_err(&e))?;
         let props_zap = order.u64(dd_dn.bonus(), 80).map_err(|e| parse_err(&e))?;
-        let limit_val = if props_zap != 0
-            && let Ok(rows) = mos.zap_values(cx, props_zap)
-        {
-            zap_optional_u64(&rows, limit_key)?.filter(|&v| v < u64::MAX)
+        let properties = if props_zap == 0 {
+            Vec::new()
         } else {
-            None
+            mos.zap_values(cx, props_zap)?
         };
-        if dd_dn.object_type() == DMU_OTN_ZAP_METADATA {
-            let mut entries = mos.zap_values(cx, cur_dir)?;
-            if let Some(pos) = entries.iter().position(|e| e.name == counter_key) {
-                let cur_cnt = i128::from(entries[pos].scalar().map_err(|e| parse_err(&e))?);
-                let next_cnt = u64::try_from((cur_cnt + i128::from(delta)).max(0)).unwrap_or(0);
-                if delta > 0
-                    && let Some(lim) = limit_val
-                    && next_cnt > lim
-                {
-                    return Err(reject_edquot("ZFS filesystem/snapshot limit exceeded"));
-                }
-                entries[pos].values = vec![next_cnt];
-                write_zap_dnode_in_mos(
-                    cx,
-                    mos,
-                    mos_meta,
-                    mos_ceiling,
-                    mos_dirty_dnodes,
-                    alloc,
-                    cur_dir,
-                    Some((&dd_dn, dd_ceil)),
-                    dd_dn.object_type(),
-                    dd_dn.bonus_type(),
-                    dd_dn.bonus().to_vec(),
-                    &entries,
-                    0,
-                    false,
-                    order,
-                    new_txg,
-                    staged_writes,
-                )?;
+        let mut entries = if dd_dn.object_type() == DMU_OTN_ZAP_METADATA {
+            mos.zap_values(cx, directory)?
+        } else {
+            Vec::new()
+        };
+        let mut changed = false;
+        for ((counter_key, property), delta) in [
+            (
+                b"com.joyent:filesystem_count".as_slice(),
+                "filesystem_limit",
+            ),
+            (b"com.joyent:snapshot_count".as_slice(), "snapshot_limit"),
+        ]
+        .into_iter()
+        .zip(deltas)
+        {
+            if delta == 0 {
+                continue;
             }
+            let limit = effective_local_numeric_prop(&properties, property)?
+                .filter(|&value| value != u64::MAX);
+            let Some(pos) = entries.iter().position(|entry| entry.name == counter_key) else {
+                if limit.is_some() {
+                    return Err(corrupt(
+                        "native filesystem limit has no initialized counter",
+                    ));
+                }
+                continue;
+            };
+            let current = entries[pos].scalar().map_err(|e| parse_err(&e))?;
+            let next = i128::from(current)
+                .checked_add(delta)
+                .and_then(|value| u64::try_from(value).ok())
+                .ok_or_else(|| corrupt("native filesystem limit counter underflow or overflow"))?;
+            if enforce_limits && delta > 0 && limit.is_some_and(|limit| next > limit) {
+                return Err(reject_edquot("ZFS filesystem/snapshot limit exceeded"));
+            }
+            entries[pos].values = vec![next];
+            changed = true;
         }
-        cur_dir = parent;
+        if changed {
+            updates.push((directory, dd_dn, dd_ceil, entries));
+        }
+    }
+    for (directory, dd_dn, dd_ceil, entries) in updates {
+        write_zap_dnode_in_mos(
+            cx,
+            mos,
+            mos_meta,
+            mos_ceiling,
+            mos_dirty_dnodes,
+            alloc,
+            directory,
+            Some((&dd_dn, dd_ceil)),
+            dd_dn.object_type(),
+            dd_dn.bonus_type(),
+            dd_dn.bonus().to_vec(),
+            &entries,
+            0,
+            false,
+            order,
+            new_txg,
+            staged_writes,
+        )?;
     }
     Ok(())
 }
@@ -2884,6 +3014,7 @@ fn stage_destroy_snapshot(
         head_obj,
         snap_ds_obj,
         defer,
+        &[],
         mos_dirty_dnodes,
         features,
         empty_bpobj_id,
@@ -2902,6 +3033,7 @@ fn stage_destroy_snapshot_by_id(
     head_obj: u64,
     snap_ds_obj: u64,
     defer: bool,
+    additional_limit_changes: &[(u64, [i128; 2])],
     mos_dirty_dnodes: &mut BTreeMap<u64, Vec<u8>>,
     features: &mut MosFeatureState,
     empty_bpobj_id: Option<u64>,
@@ -3337,16 +3469,17 @@ fn stage_destroy_snapshot_by_id(
         -i128::from(freed_space.uncomp),
         order,
     )?;
-    bump_filesystem_limits_counter_if_present(
+    let mut limit_changes = vec![(dir_obj, [0, -1])];
+    limit_changes.extend_from_slice(additional_limit_changes);
+    adjust_filesystem_limits_counters(
         cx,
         mos,
         &mos_meta,
         mos_ceiling,
         mos_dirty_dnodes,
         alloc,
-        dir_obj,
-        b"com.joyent:snapshot_count",
-        -1,
+        &limit_changes,
+        true,
         order,
         new_txg,
         staged_writes,
@@ -3626,6 +3759,7 @@ fn stage_release_snapshot(
                 head_obj,
                 snap_ds_obj,
                 false,
+                &[],
                 mos_dirty_dnodes,
                 features,
                 empty_bpobj_id,
@@ -4626,7 +4760,7 @@ pub(super) fn put_new_dsl_dir_in_mos(
     staged_writes: &mut Vec<StagedBlockWrite>,
 ) -> Result<()> {
     let fs_ss_limit_active = features
-        .read_features
+        .write_features
         .get("com.joyent:filesystem_limits")
         .copied()
         .unwrap_or(0)
@@ -6039,18 +6173,36 @@ fn stage_rename_dataset(
         target_dd_obj,
         order,
     )?;
-    let (moved_filesystems, moved_snapshots) = if t_cur.object_type() == DMU_OTN_ZAP_METADATA {
-        let t_entries = mos.zap_values(cx, target_dd_obj)?;
-        let child_filesystems =
-            zap_optional_u64(&t_entries, b"com.joyent:filesystem_count")?.unwrap_or(0);
-        let child_snapshots =
-            zap_optional_u64(&t_entries, b"com.joyent:snapshot_count")?.unwrap_or(0);
-        (
-            i64::try_from(child_filesystems.saturating_add(1)).unwrap_or(i64::MAX),
-            i64::try_from(child_snapshots).unwrap_or(i64::MAX),
-        )
+    let t_entries = if t_cur.object_type() == DMU_OTN_ZAP_METADATA {
+        mos.zap_values(cx, target_dd_obj)?
     } else {
-        (1_i64, 0_i64)
+        Vec::new()
+    };
+    let moved_counts = (
+        zap_optional_u64(&t_entries, b"com.joyent:filesystem_count")?,
+        zap_optional_u64(&t_entries, b"com.joyent:snapshot_count")?,
+    );
+    let (moved_filesystems, moved_snapshots) = match moved_counts {
+        (Some(filesystems), Some(snapshots)) => {
+            (i128::from(filesystems) + 1, i128::from(snapshots))
+        }
+        (None, None) => {
+            for parent in [old_parent_dd, new_parent_dd] {
+                let parent_dn = mos.object(cx, parent)?;
+                if parent_dn.object_type() == DMU_OTN_ZAP_METADATA {
+                    let rows = mos.zap_values(cx, parent)?;
+                    if zap_optional_u64(&rows, b"com.joyent:filesystem_count")?.is_some()
+                        || zap_optional_u64(&rows, b"com.joyent:snapshot_count")?.is_some()
+                    {
+                        return Err(unsupported(
+                            "moving an untracked subtree requires native counter initialization",
+                        ));
+                    }
+                }
+            }
+            (1, 0)
+        }
+        _ => return Err(corrupt("partially initialized moved dataset counters")),
     };
     let mut t_bonus = t_cur.bonus().to_vec();
     t_bonus[16..24].copy_from_slice(&order.encode(new_parent_dd));
@@ -6069,67 +6221,22 @@ fn stage_rename_dataset(
         &updated_t,
     )?;
 
-    bump_filesystem_limits_counter_if_present(
+    adjust_filesystem_limits_counters(
         cx,
         mos,
         &mos_meta,
         mos_ceiling,
         mos_dirty_dnodes,
         alloc,
-        old_parent_dd,
-        b"com.joyent:filesystem_count",
-        -moved_filesystems,
+        &[
+            (old_parent_dd, [-moved_filesystems, -moved_snapshots]),
+            (new_parent_dd, [moved_filesystems, moved_snapshots]),
+        ],
+        true,
         order,
         new_txg,
         staged_writes,
     )?;
-    if moved_snapshots > 0 {
-        bump_filesystem_limits_counter_if_present(
-            cx,
-            mos,
-            &mos_meta,
-            mos_ceiling,
-            mos_dirty_dnodes,
-            alloc,
-            old_parent_dd,
-            b"com.joyent:snapshot_count",
-            -moved_snapshots,
-            order,
-            new_txg,
-            staged_writes,
-        )?;
-    }
-    bump_filesystem_limits_counter_if_present(
-        cx,
-        mos,
-        &mos_meta,
-        mos_ceiling,
-        mos_dirty_dnodes,
-        alloc,
-        new_parent_dd,
-        b"com.joyent:filesystem_count",
-        moved_filesystems,
-        order,
-        new_txg,
-        staged_writes,
-    )?;
-    if moved_snapshots > 0 {
-        bump_filesystem_limits_counter_if_present(
-            cx,
-            mos,
-            &mos_meta,
-            mos_ceiling,
-            mos_dirty_dnodes,
-            alloc,
-            new_parent_dd,
-            b"com.joyent:snapshot_count",
-            moved_snapshots,
-            order,
-            new_txg,
-            staged_writes,
-        )?;
-    }
-
     Ok(target_head_obj)
 }
 
@@ -6375,21 +6482,6 @@ pub(super) fn stage_destroy_dataset_by_ids(
         -i128::from(dd_uncomp),
         order,
     )?;
-    bump_filesystem_limits_counter_if_present(
-        cx,
-        mos,
-        &mos_meta,
-        mos_ceiling,
-        mos_dirty_dnodes,
-        alloc,
-        parent_dd_obj,
-        b"com.joyent:filesystem_count",
-        -1,
-        order,
-        new_txg,
-        staged_writes,
-    )?;
-
     // 5. Free MOS objects of this dataset (`snapmap_obj`, `child_zap`, `props_zap`, `dd_clones`, `head_obj`, `dd_obj`).
     if dd_dn.object_type() == DMU_OTN_ZAP_METADATA
         && features
@@ -6465,6 +6557,9 @@ pub(super) fn stage_destroy_dataset_by_ids(
 
     // 6. If this was a clone (`origin_obj != 0`), unlink from `origin_snap` + `origin_dd.dd_clones`,
     // and auto-destroy `origin_snap` if `DS_FLAG_DEFER_DESTROY` was waiting on this last clone!
+    // Combine filesystem and snapshot decrements before rewriting a shared
+    // ancestor's counter ZAP; both destructions belong to this same TXG.
+    let mut filesystem_count_adjusted = false;
     if origin_obj != 0 {
         let (o_snap_dn, _) = read_staged_or_committed_dnode(
             cx,
@@ -6635,6 +6730,7 @@ pub(super) fn stage_destroy_dataset_by_ids(
                 o_dd_head,
                 origin_obj,
                 false,
+                &[(parent_dd_obj, [-1, 0])],
                 mos_dirty_dnodes,
                 features,
                 empty_bpobj_id,
@@ -6643,7 +6739,24 @@ pub(super) fn stage_destroy_dataset_by_ids(
                 new_txg,
                 staged_writes,
             )?;
+            filesystem_count_adjusted = true;
         }
+    }
+    if !filesystem_count_adjusted {
+        bump_filesystem_limits_counter_if_present(
+            cx,
+            mos,
+            &mos_meta,
+            mos_ceiling,
+            mos_dirty_dnodes,
+            alloc,
+            parent_dd_obj,
+            b"com.joyent:filesystem_count",
+            -1,
+            order,
+            new_txg,
+            staged_writes,
+        )?;
     }
 
     Ok(head_obj)
@@ -6945,6 +7058,7 @@ pub(super) fn apply_properties_batch_on_ids(
                 name,
                 "quota"
                     | "refquota"
+                    | "filesystem_limit"
                     | "recordsize"
                     | "atime"
                     | "relatime"
@@ -6983,15 +7097,20 @@ pub(super) fn apply_properties_batch_on_ids(
             name,
             "quota" | "refquota" | "reservation" | "refreservation"
         );
-        let restored_space_value = if value.is_none() && is_space_property {
+        let is_count_limit = matches!(name, "filesystem_limit" | "snapshot_limit");
+        let restored_numeric_value = if value.is_none() && (is_space_property || is_count_limit) {
             Some(ZfsPropertySetValue::Number(
-                zap_optional_u64(&rows, &recvd_key)?.unwrap_or(0),
+                zap_optional_u64(&rows, &recvd_key)?.unwrap_or(if is_count_limit {
+                    u64::MAX
+                } else {
+                    0
+                }),
             ))
         } else {
             None
         };
 
-        if let Some(val) = value.or(restored_space_value.as_ref()) {
+        if let Some(val) = value.or(restored_numeric_value.as_ref()) {
             if is_user_prop || name == "keylocation" {
                 if name == "keylocation" && !is_encryption_root {
                     return Err(reject_einval(
@@ -7027,6 +7146,37 @@ pub(super) fn apply_properties_batch_on_ids(
                     )));
                 };
                 match name {
+                    "filesystem_limit" | "snapshot_limit" => {
+                        // Native count limits may be lowered below current
+                        // usage. They govern subsequent growth, not existence.
+                        // Do not activate tracking with invented zero counts:
+                        // imported hierarchies must already be initialized.
+                        zap_optional_u64(&rows, name.as_bytes())?;
+                        zap_optional_u64(&rows, &recvd_key)?;
+                        if features
+                            .write_features
+                            .get("com.joyent:filesystem_limits")
+                            .copied()
+                            .unwrap_or(0)
+                            == 0
+                            || dd_dn.object_type() != DMU_OTN_ZAP_METADATA
+                        {
+                            return Err(unsupported(
+                                "native count limits require initialized filesystem limit tracking",
+                            ));
+                        }
+                        let counter_rows = mos.zap_values(cx, dd_obj)?;
+                        for counter in [
+                            b"com.joyent:filesystem_count".as_slice(),
+                            b"com.joyent:snapshot_count".as_slice(),
+                        ] {
+                            if zap_optional_u64(&counter_rows, counter)?.is_none() {
+                                return Err(corrupt(
+                                    "native count limit has no initialized counter",
+                                ));
+                            }
+                        }
+                    }
                     "quota" => {
                         if num > 0 && num < dd_used.max(old_dd_reserved) {
                             return Err(reject_edquot(
@@ -7175,7 +7325,7 @@ pub(super) fn apply_properties_batch_on_ids(
             rows.retain(|r| {
                 r.name != name.as_bytes() && r.name != iuv_key && r.name != inherit_key
             });
-            if has_recvd && !is_space_property {
+            if has_recvd && !is_space_property && !is_count_limit {
                 rows.push(RawZapEntry {
                     name: inherit_key,
                     integer_bytes: 8,

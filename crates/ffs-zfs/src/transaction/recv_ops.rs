@@ -16,7 +16,8 @@ use super::dmu_cow::{
 use super::dsl_ops::{
     DMU_OT_DSL_DATASET, DMU_OT_DSL_DIR_CHILD_MAP, DMU_OT_DSL_DS_SNAP_MAP, DMU_OT_DSL_PROPS,
     DS_FLAG_UNIQUE_ACCURATE, ObjectSetWalkMode, activate_dataset_block_features,
-    activate_initial_compression_feature, adjust_dsl_crypto_key_refcount, allocate_fresh_deadlist,
+    activate_initial_compression_feature, adjust_dsl_crypto_key_refcount,
+    adjust_filesystem_limits_counters, allocate_fresh_deadlist,
     bump_filesystem_limits_counter_if_present, dataset_block_feature_owners,
     dataset_feature_entries, derive_fsid_guid, derive_unique_guid,
     effective_compression_for_new_dataset, enforce_dataset_quotas_for_growth,
@@ -2906,6 +2907,22 @@ impl ZfsTransactionEngine {
                         staged_writes,
                     )?;
 
+                    // Native %recv children count as filesystems while the
+                    // temporary receive clone bypasses filesystem-limit admission.
+                    adjust_filesystem_limits_counters(
+                        cx,
+                        mos,
+                        &mos_meta,
+                        mos_ceiling,
+                        mos_dirty_dnodes,
+                        alloc,
+                        &[(target_dd_obj, [1, 0])],
+                        false,
+                        order,
+                        new_txg,
+                        staged_writes,
+                    )?;
+
                     let meta = StagedSubstreamMeta {
                         stage_dd_obj: recv_dd_obj,
                         stage_head_obj: recv_head_obj,
@@ -4496,6 +4513,19 @@ impl ZfsTransactionEngine {
                             staged_writes,
                         )?;
                     }
+                    adjust_filesystem_limits_counters(
+                        cx,
+                        mos,
+                        &mos_meta,
+                        mos_ceiling,
+                        mos_dirty_dnodes,
+                        alloc,
+                        &[(stage_cloned.target_dd_obj, [-1, 1])],
+                        true,
+                        order,
+                        new_txg,
+                        staged_writes,
+                    )?;
                     Ok((snap_guid, snap_ds_obj))
                 } else {
                     // Full receive promotion: strip resume ZAP keys, clear `DS_FLAG_INCONSISTENT`,
@@ -4744,6 +4774,19 @@ impl ZfsTransactionEngine {
                             staged_writes,
                         )?;
                     }
+                    adjust_filesystem_limits_counters(
+                        cx,
+                        mos,
+                        &mos_meta,
+                        mos_ceiling,
+                        mos_dirty_dnodes,
+                        alloc,
+                        &[(stage_cloned.stage_dd_obj, [0, 1])],
+                        true,
+                        order,
+                        new_txg,
+                        staged_writes,
+                    )?;
                     Ok((snap_guid, snap_ds_obj))
                 }
             },

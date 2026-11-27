@@ -315,6 +315,731 @@ fn owner_quota_allows_net_reclamation_while_already_above_byte_and_object_limits
     }
 }
 
+// Native key and non-inheritance oracle: OpenZFS zfs-2.3.0
+// module/zcommon/zfs_prop.c and module/zfs/dsl_dir.c. These fixtures encode
+// the imported counts and property names directly, independently of the writer.
+fn native_dsl_limit_spec() -> PoolFixtureSpec {
+    PoolFixtureSpec {
+        additional_write_features: vec![(b"com.joyent:filesystem_limits", 1)],
+        dsl_counts: BTreeMap::from([(2, [1, 0]), (17, [0, 0])]),
+        ..PoolFixtureSpec::default()
+    }
+}
+
+fn native_dsl_counts(cx: &Cx, engine: &ZfsTransactionEngine, dataset: &[Vec<u8>]) -> [u64; 2] {
+    let mut mos = engine.open_read_objects(cx).unwrap();
+    // The public dataset list intentionally hides inconsistent receive heads.
+    // Walk the native directory catalog so durable staging counts are checked too.
+    let mut directory = mos
+        .zap_values(cx, 1)
+        .unwrap()
+        .iter()
+        .find(|row| row.name == b"root_dataset")
+        .unwrap()
+        .scalar()
+        .unwrap();
+    for component in dataset {
+        let node = mos.object(cx, directory).unwrap();
+        let children = node.order().u64(node.bonus(), 32).unwrap();
+        directory = mos
+            .zap_values(cx, children)
+            .unwrap()
+            .iter()
+            .find(|row| row.name == *component)
+            .unwrap()
+            .scalar()
+            .unwrap();
+    }
+    let rows = mos.zap_values(cx, directory).unwrap();
+    [
+        b"com.joyent:filesystem_count".as_slice(),
+        b"com.joyent:snapshot_count".as_slice(),
+    ]
+    .map(|key| {
+        rows.iter()
+            .find(|row| row.name == key)
+            .unwrap()
+            .scalar()
+            .unwrap()
+    })
+}
+
+#[test]
+fn dsl_native_count_limits_enforce_canonical_local_and_received_properties() {
+    let cx = Cx::for_testing();
+    let data = [b"data".to_vec()];
+    let child = [b"data".to_vec(), b"child".to_vec()];
+    for properties in [
+        vec![
+            (b"filesystem_limit".as_slice(), 2),
+            (b"snapshot_limit".as_slice(), 1),
+        ],
+        vec![
+            (b"filesystem_limit$recvd".as_slice(), 2),
+            (b"snapshot_limit$recvd".as_slice(), 1),
+        ],
+        vec![
+            (b"filesystem_limit".as_slice(), 2),
+            (b"snapshot_limit".as_slice(), 1),
+            (b"filesystem_limit$recvd".as_slice(), 0),
+            (b"snapshot_limit$recvd".as_slice(), 0),
+        ],
+    ] {
+        let (mut engine, devices) = file_range_fixture(
+            &cx,
+            &PoolFixtureSpec {
+                root_properties: properties,
+                ..native_dsl_limit_spec()
+            },
+        );
+        engine
+            .create_dataset(&cx, &data, b"child", &[], TIME)
+            .into_result()
+            .unwrap();
+        assert_eq!(native_dsl_counts(&cx, &engine, &[]), [2, 0]);
+        assert_eq!(native_dsl_counts(&cx, &engine, &data), [1, 0]);
+        assert_eq!(native_dsl_counts(&cx, &engine, &child), [0, 0]);
+        engine
+            .create_snapshot(&cx, &child, b"one", TIME)
+            .into_result()
+            .unwrap();
+        assert_eq!(native_dsl_counts(&cx, &engine, &[]), [2, 1]);
+        assert_eq!(native_dsl_counts(&cx, &engine, &data), [1, 1]);
+        assert_eq!(native_dsl_counts(&cx, &engine, &child), [0, 1]);
+        assert_native_write_refused(&mut engine, &devices, libc::EDQUOT, |writer| {
+            writer.create_dataset(&cx, &data, b"blocked", &[], TIME)
+        });
+        assert_native_write_refused(&mut engine, &devices, libc::EDQUOT, |writer| {
+            writer.create_snapshot(&cx, &child, b"blocked", TIME)
+        });
+
+        engine
+            .destroy_snapshot(&cx, &child, b"one", false)
+            .into_result()
+            .unwrap();
+        engine.destroy_dataset(&cx, &child).into_result().unwrap();
+        assert_eq!(native_dsl_counts(&cx, &engine, &[]), [1, 0]);
+        assert_eq!(native_dsl_counts(&cx, &engine, &data), [0, 0]);
+        let (_, token) = engine
+            .create_dataset(&cx, &data, b"replacement", &[], TIME)
+            .into_result()
+            .unwrap();
+        drop(engine);
+        let durable: Vec<_> = devices
+            .iter()
+            .map(FaultableMemberDevice::fresh_from_durable)
+            .collect();
+        let reopened = open_engine_on_devices(
+            &cx,
+            &durable,
+            default_write_opts(POOL_GUID, token.published_slot()),
+        )
+        .unwrap();
+        assert_eq!(native_dsl_counts(&cx, &reopened, &[]), [2, 0]);
+        assert_eq!(native_dsl_counts(&cx, &reopened, &data), [1, 0]);
+        assert_pool_scrub_and_allocation_clean(
+            &cx,
+            &durable,
+            POOL_GUID,
+            Some(token.published_slot()),
+        );
+    }
+}
+
+#[test]
+fn dsl_native_count_limits_distinguish_unknown_keys_from_corrupt_native_values() {
+    let cx = Cx::for_testing();
+    let data = [b"data".to_vec()];
+    // The Joyent namespace belongs to the counters, not the native properties.
+    let (mut engine, _) = file_range_fixture(
+        &cx,
+        &PoolFixtureSpec {
+            dsl_property_entries: BTreeMap::from([(
+                16,
+                [
+                    b"com.joyent:filesystem_limit".as_slice(),
+                    b"com.joyent:snapshot_limit".as_slice(),
+                ]
+                .map(|name| RawZapEntry {
+                    name: name.to_vec(),
+                    integer_bytes: 1,
+                    values: vec![u64::from(b'0'), 0],
+                    collision: 0,
+                })
+                .to_vec(),
+            )]),
+            ..native_dsl_limit_spec()
+        },
+    );
+    engine
+        .create_dataset(&cx, &data, b"allowed", &[], TIME)
+        .into_result()
+        .unwrap();
+    engine
+        .create_snapshot(&cx, &data, b"allowed", TIME)
+        .into_result()
+        .unwrap();
+    assert_eq!(native_dsl_counts(&cx, &engine, &[]), [2, 1]);
+
+    for (property, is_filesystem) in [
+        (b"filesystem_limit".as_slice(), true),
+        (b"snapshot_limit".as_slice(), false),
+        (b"filesystem_limit$recvd".as_slice(), true),
+        (b"snapshot_limit$recvd".as_slice(), false),
+    ] {
+        let (mut engine, devices) = file_range_fixture(
+            &cx,
+            &PoolFixtureSpec {
+                dsl_property_entries: BTreeMap::from([(
+                    16,
+                    vec![RawZapEntry {
+                        name: property.to_vec(),
+                        integer_bytes: 8,
+                        values: vec![0, 1],
+                        collision: 0,
+                    }],
+                )]),
+                ..native_dsl_limit_spec()
+            },
+        );
+        assert_native_write_refused(&mut engine, &devices, libc::EIO, |writer| {
+            if is_filesystem {
+                writer.create_dataset(&cx, &data, b"blocked", &[], TIME)
+            } else {
+                writer.create_snapshot(&cx, &data, b"blocked", TIME)
+            }
+        });
+        assert_native_write_refused(&mut engine, &devices, libc::EIO, |writer| {
+            writer.set_property(
+                &cx,
+                &[],
+                if is_filesystem {
+                    "filesystem_limit"
+                } else {
+                    "snapshot_limit"
+                },
+                ffs_zfs::ZfsPropertySetValue::Number(1),
+            )
+        });
+    }
+}
+
+#[test]
+fn dsl_native_count_limits_propagate_property_catalog_read_errors() {
+    let cx = Cx::for_testing();
+    let data = [b"data".to_vec()];
+    let (mut engine, devices) = file_range_fixture(
+        &cx,
+        &PoolFixtureSpec {
+            root_properties: vec![(b"snapshot_limit", 0)],
+            ..native_dsl_limit_spec()
+        },
+    );
+    let property_offset = {
+        let mut mos = engine.open_read_objects(&cx).unwrap();
+        let property_node = mos.object(&cx, 16).unwrap();
+        usize::try_from(DATA_OFFSET + property_node.pointers()[0].regular_dvas().unwrap()[0].offset)
+            .unwrap()
+    };
+    // Corrupt the ancestor's catalog after admission. Snapshot creation reads
+    // the owning dataset's properties separately; the ancestor read used to be
+    // swallowed and treated as an absent limit.
+    devices[0].state.lock().unwrap().durable[property_offset + 64] ^= 1;
+    assert_native_write_refused(&mut engine, &devices, libc::EIO, |writer| {
+        writer.create_snapshot(&cx, &data, b"blocked", TIME)
+    });
+}
+
+#[test]
+fn dsl_native_count_limits_reject_overflow_underflow_and_missing_tracking() {
+    let cx = Cx::for_testing();
+    let data = [b"data".to_vec()];
+    let (mut engine, devices) = file_range_fixture(
+        &cx,
+        &PoolFixtureSpec {
+            dsl_counts: BTreeMap::from([(2, [1, u64::MAX]), (17, [0, u64::MAX])]),
+            ..native_dsl_limit_spec()
+        },
+    );
+    assert_native_write_refused(&mut engine, &devices, libc::EIO, |writer| {
+        writer.create_snapshot(&cx, &data, b"overflow", TIME)
+    });
+
+    let (mut engine, devices) = file_range_fixture(
+        &cx,
+        &PoolFixtureSpec {
+            deadlist_mode: DeadlistMode::NativeDeadlist,
+            dsl_counts: BTreeMap::from([(2, [1, 1]), (17, [0, 0])]),
+            ..native_dsl_limit_spec()
+        },
+    );
+    assert_native_write_refused(&mut engine, &devices, libc::EIO, |writer| {
+        writer.destroy_snapshot(&cx, &data, b"before", false)
+    });
+
+    for tracked in [BTreeMap::from([(2, [1, 0])]), BTreeMap::new()] {
+        let (mut engine, devices) = file_range_fixture(
+            &cx,
+            &PoolFixtureSpec {
+                dsl_counts: tracked,
+                data_properties: vec![(b"snapshot_limit", 0)],
+                ..native_dsl_limit_spec()
+            },
+        );
+        assert_native_write_refused(&mut engine, &devices, libc::EIO, |writer| {
+            writer.create_snapshot(&cx, &data, b"missing", TIME)
+        });
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn dsl_native_count_limits_preserve_shared_ancestors_above_limits_during_subtree_moves() {
+    use ffs_zfs::ZfsPropertySetValue::Number;
+
+    let cx = Cx::for_testing();
+    let data = [b"data".to_vec()];
+    let left = [b"data".to_vec(), b"left".to_vec()];
+    let right = [b"data".to_vec(), b"right".to_vec()];
+    let tree = [b"data".to_vec(), b"left".to_vec(), b"tree".to_vec()];
+    let nested = [
+        b"data".to_vec(),
+        b"left".to_vec(),
+        b"tree".to_vec(),
+        b"nested".to_vec(),
+    ];
+    let moved = [b"data".to_vec(), b"right".to_vec(), b"moved".to_vec()];
+    let moved_nested = [
+        b"data".to_vec(),
+        b"right".to_vec(),
+        b"moved".to_vec(),
+        b"nested".to_vec(),
+    ];
+    let (mut engine, devices) = file_range_fixture(&cx, &native_dsl_limit_spec());
+    for (parent, name) in [
+        (data.as_slice(), b"left".as_slice()),
+        (data.as_slice(), b"right".as_slice()),
+        (left.as_slice(), b"tree".as_slice()),
+        (tree.as_slice(), b"nested".as_slice()),
+    ] {
+        engine
+            .create_dataset(&cx, parent, name, &[], TIME)
+            .into_result()
+            .unwrap();
+    }
+    engine
+        .create_snapshot(&cx, &tree, b"one", TIME)
+        .into_result()
+        .unwrap();
+    engine
+        .create_snapshot(&cx, &nested, b"two", TIME)
+        .into_result()
+        .unwrap();
+    assert_eq!(native_dsl_counts(&cx, &engine, &[]), [5, 2]);
+    assert_eq!(native_dsl_counts(&cx, &engine, &data), [4, 2]);
+    // OpenZFS allows lowering a count limit below existing usage. Moving a
+    // subtree between these siblings consumes no new capacity at their shared
+    // ancestors, so their now-zero ceilings must not refuse the move.
+    for ancestor in [data.as_slice(), &[]] {
+        for property in ["filesystem_limit", "snapshot_limit"] {
+            engine
+                .set_property(&cx, ancestor, property, Number(0))
+                .into_result()
+                .unwrap();
+        }
+    }
+    engine
+        .set_property(&cx, &right, "filesystem_limit", Number(1))
+        .into_result()
+        .unwrap();
+    assert_native_write_refused(&mut engine, &devices, libc::EDQUOT, |writer| {
+        writer.rename_dataset(&cx, &tree, &moved)
+    });
+    engine
+        .set_property(&cx, &right, "filesystem_limit", Number(2))
+        .into_result()
+        .unwrap();
+    engine
+        .set_property(&cx, &right, "snapshot_limit", Number(1))
+        .into_result()
+        .unwrap();
+    assert_native_write_refused(&mut engine, &devices, libc::EDQUOT, |writer| {
+        writer.rename_dataset(&cx, &tree, &moved)
+    });
+    engine
+        .set_property(&cx, &right, "snapshot_limit", Number(2))
+        .into_result()
+        .unwrap();
+    let (_, token) = engine
+        .rename_dataset(&cx, &tree, &moved)
+        .into_result()
+        .unwrap();
+    let durable: Vec<_> = devices
+        .iter()
+        .map(FaultableMemberDevice::fresh_from_durable)
+        .collect();
+    drop(engine);
+    let reopened = open_engine_on_devices(
+        &cx,
+        &durable,
+        default_write_opts(POOL_GUID, token.published_slot()),
+    )
+    .unwrap();
+    for (dataset, expected) in [
+        (&[][..], [5, 2]),
+        (data.as_slice(), [4, 2]),
+        (left.as_slice(), [0, 0]),
+        (right.as_slice(), [2, 2]),
+        (moved.as_slice(), [1, 2]),
+        (moved_nested.as_slice(), [0, 1]),
+    ] {
+        assert_eq!(
+            native_dsl_counts(&cx, &reopened, dataset),
+            expected,
+            "{dataset:?}"
+        );
+    }
+    let rows = reopened
+        .open_read_objects(&cx)
+        .unwrap()
+        .datasets(&cx)
+        .unwrap();
+    assert!(!rows.iter().any(|row| row.components == tree));
+    assert!(rows.iter().any(|row| row.components == moved_nested));
+    assert_pool_scrub_and_allocation_clean(&cx, &durable, POOL_GUID, Some(token.published_slot()));
+}
+
+#[test]
+fn dsl_native_count_limits_merge_clone_and_deferred_snapshot_destruction() {
+    let cx = Cx::for_testing();
+    let data = [b"data".to_vec()];
+    let source = [b"data".to_vec(), b"source".to_vec()];
+    let clone = [b"data".to_vec(), b"clone".to_vec()];
+    let (mut engine, devices) = file_range_fixture(&cx, &native_dsl_limit_spec());
+    engine
+        .create_dataset(&cx, &data, b"source", &[], TIME)
+        .into_result()
+        .unwrap();
+    engine
+        .create_snapshot(&cx, &source, b"base", TIME)
+        .into_result()
+        .unwrap();
+    engine
+        .create_clone(&cx, &source, b"base", &data, b"clone", &[], TIME)
+        .into_result()
+        .unwrap();
+    engine
+        .destroy_snapshot(&cx, &source, b"base", true)
+        .into_result()
+        .unwrap();
+    assert_eq!(native_dsl_counts(&cx, &engine, &[]), [3, 1]);
+    assert_eq!(native_dsl_counts(&cx, &engine, &data), [2, 1]);
+    let (_, token) = engine.destroy_dataset(&cx, &clone).into_result().unwrap();
+    drop(engine);
+    let durable: Vec<_> = devices
+        .iter()
+        .map(FaultableMemberDevice::fresh_from_durable)
+        .collect();
+    let reopened = open_engine_on_devices(
+        &cx,
+        &durable,
+        default_write_opts(POOL_GUID, token.published_slot()),
+    )
+    .unwrap();
+    assert_eq!(native_dsl_counts(&cx, &reopened, &[]), [2, 0]);
+    assert_eq!(native_dsl_counts(&cx, &reopened, &data), [1, 0]);
+    assert_eq!(native_dsl_counts(&cx, &reopened, &source), [0, 0]);
+    assert!(
+        reopened
+            .open_read_objects(&cx)
+            .unwrap()
+            .zpl_snapshot(&cx, &source, b"base")
+            .is_err()
+    );
+    assert_pool_scrub_and_allocation_clean(&cx, &durable, POOL_GUID, Some(token.published_slot()));
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn dsl_native_count_limits_restore_received_values_and_unlimited_defaults() {
+    use ffs_zfs::ZfsPropertySetValue::Number;
+
+    let cx = Cx::for_testing();
+    let data = [b"data".to_vec()];
+    for received in [false, true] {
+        let mut properties = vec![
+            (b"filesystem_limit".as_slice(), 1),
+            (b"snapshot_limit".as_slice(), 0),
+        ];
+        if received {
+            properties.extend([
+                (b"filesystem_limit$recvd".as_slice(), 0),
+                (b"snapshot_limit$recvd".as_slice(), 0),
+            ]);
+        }
+        let (mut engine, devices) = file_range_fixture(
+            &cx,
+            &PoolFixtureSpec {
+                root_properties: properties,
+                ..native_dsl_limit_spec()
+            },
+        );
+        for property in ["filesystem_limit", "snapshot_limit"] {
+            engine
+                .inherit_property(&cx, &[], property)
+                .into_result()
+                .unwrap();
+        }
+        if received {
+            assert_native_write_refused(&mut engine, &devices, libc::EDQUOT, |writer| {
+                writer.create_dataset(&cx, &data, b"blocked", &[], TIME)
+            });
+            assert_native_write_refused(&mut engine, &devices, libc::EDQUOT, |writer| {
+                writer.create_snapshot(&cx, &data, b"blocked", TIME)
+            });
+        }
+        let rows = engine
+            .open_read_objects(&cx)
+            .unwrap()
+            .zap_values(&cx, 16)
+            .unwrap();
+        for property in [b"filesystem_limit".as_slice(), b"snapshot_limit".as_slice()] {
+            assert!(!rows.iter().any(|row| row.name == property));
+        }
+        assert!(!rows.iter().any(|row| row.name.ends_with(b"$inherit")));
+        if received {
+            for property in ["filesystem_limit", "snapshot_limit"] {
+                engine
+                    .set_property(&cx, &[], property, Number(u64::MAX))
+                    .into_result()
+                    .unwrap();
+            }
+        }
+        engine
+            .create_dataset(&cx, &data, b"allowed", &[], TIME)
+            .into_result()
+            .unwrap();
+        engine
+            .create_snapshot(&cx, &data, b"allowed", TIME)
+            .into_result()
+            .unwrap();
+        assert_eq!(native_dsl_counts(&cx, &engine, &[]), [2, 1]);
+    }
+
+    for spec in [
+        PoolFixtureSpec::default(),
+        PoolFixtureSpec {
+            additional_write_features: vec![(b"com.joyent:filesystem_limits", 0)],
+            ..PoolFixtureSpec::default()
+        },
+    ] {
+        let (mut engine, devices) = file_range_fixture(&cx, &spec);
+        let (head, _) = engine
+            .create_dataset(&cx, &data, b"untracked", &[], TIME)
+            .into_result()
+            .unwrap();
+        let mut mos = engine.open_read_objects(&cx).unwrap();
+        let head_node = mos.object(&cx, head).unwrap();
+        let directory = head_node.order().u64(head_node.bonus(), 0).unwrap();
+        assert_eq!(mos.object(&cx, directory).unwrap().object_type(), 12);
+        for property in ["filesystem_limit", "snapshot_limit"] {
+            assert_native_write_refused(&mut engine, &devices, libc::EOPNOTSUPP, |writer| {
+                writer.set_property(&cx, &data, property, Number(0))
+            });
+        }
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn dsl_native_count_limits_receive_snapshots_and_private_staging_follow_native_accounting() {
+    use ffs_zfs::{ZfsPropertySetValue::Number, ZfsRecvOutcome, ZfsRecvRequest, ZfsSendFrom};
+    use std::io::Cursor;
+
+    let cx = Cx::for_testing();
+    let data = vec![b"data".to_vec()];
+    let target = vec![b"data".to_vec(), b"received".to_vec()];
+    let (mut sender, _) = file_range_fixture(
+        &cx,
+        &PoolFixtureSpec {
+            ashift: 12,
+            image_bytes: 32 * 1024 * 1024,
+            deadlist_mode: DeadlistMode::NativeDeadlist,
+            ..PoolFixtureSpec::default()
+        },
+    );
+    sender
+        .create_snapshot(&cx, &data, b"first", TIME)
+        .into_result()
+        .unwrap();
+    let mut full = Vec::new();
+    ffs_zfs::send_stream(
+        &cx,
+        &mut sender.open_read_objects(&cx).unwrap(),
+        &ffs_zfs::ZfsSendRequest::full(data.clone(), b"first".to_vec()),
+        &mut full,
+    )
+    .unwrap();
+    sender
+        .write_file_data(
+            &cx,
+            &data,
+            4,
+            0,
+            b"updated",
+            TIME,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    sender
+        .create_snapshot(&cx, &data, b"second", TIME)
+        .into_result()
+        .unwrap();
+    let mut send = ffs_zfs::ZfsSendRequest::full(data.clone(), b"second".to_vec());
+    send.from = Some(ZfsSendFrom::Snapshot(b"first".to_vec()));
+    let mut incremental = Vec::new();
+    ffs_zfs::send_stream(
+        &cx,
+        &mut sender.open_read_objects(&cx).unwrap(),
+        &send,
+        &mut incremental,
+    )
+    .unwrap();
+
+    for incremental_case in [false, true] {
+        let (mut receiver, devices) = file_range_fixture(
+            &cx,
+            &PoolFixtureSpec {
+                ashift: 12,
+                image_bytes: 32 * 1024 * 1024,
+                root_properties: vec![
+                    (b"filesystem_limit", 2),
+                    (b"snapshot_limit", u64::from(incremental_case)),
+                ],
+                ..native_dsl_limit_spec()
+            },
+        );
+        let mut receive = ZfsRecvRequest::new(target.clone());
+        receive.resumable = true;
+        if incremental_case {
+            receiver
+                .receive_stream(&cx, &receive, &mut Cursor::new(&full))
+                .into_result()
+                .unwrap();
+            assert_eq!(native_dsl_counts(&cx, &receiver, &[]), [2, 1]);
+            assert_eq!(native_dsl_counts(&cx, &receiver, &target), [0, 1]);
+        }
+        let stream = if incremental_case {
+            &incremental
+        } else {
+            &full
+        };
+        let progress = match receiver.receive_stream(&cx, &receive, &mut Cursor::new(stream)) {
+            ZfsRecvOutcome::Interrupted {
+                reason,
+                progress,
+                cleanup_error,
+            } => {
+                assert_eq!(reason.to_errno(), libc::EDQUOT);
+                assert!(cleanup_error.is_none());
+                assert_eq!(progress.substreams_received, 0);
+                progress
+            }
+            outcome => panic!("expected snapshot limit interruption, got {outcome:?}"),
+        };
+        drop(receiver);
+        let durable: Vec<_> = devices
+            .iter()
+            .map(FaultableMemberDevice::fresh_from_durable)
+            .collect();
+        let mut reopened = open_engine_on_devices(
+            &cx,
+            &durable,
+            default_write_opts(POOL_GUID, progress.durable_token.published_slot()),
+        )
+        .unwrap();
+        let resume = reopened
+            .inspect_receive_resume_state(&cx, &target)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resume.is_pct_recv_child, incremental_case);
+        let snapshots = u64::from(incremental_case);
+        // OpenZFS dmu_recv_begin_sync creates %recv through dsl_dir_create_sync:
+        // its persisted count includes the private child, while
+        // recv_begin_check_existing_impl exempts it from filesystem LIMIT
+        // admission. The temporary count therefore exceeds the limit of two.
+        assert_eq!(
+            native_dsl_counts(&cx, &reopened, &[]),
+            [if incremental_case { 3 } else { 2 }, snapshots]
+        );
+        assert_eq!(
+            native_dsl_counts(&cx, &reopened, &data),
+            [if incremental_case { 2 } else { 1 }, snapshots]
+        );
+        assert_eq!(
+            native_dsl_counts(&cx, &reopened, &target),
+            [u64::from(incremental_case), snapshots]
+        );
+        let unpublished = if incremental_case {
+            b"second".as_slice()
+        } else {
+            b"first".as_slice()
+        };
+        assert!(
+            reopened
+                .open_read_objects(&cx)
+                .unwrap()
+                .zpl_snapshot(&cx, &target, unpublished)
+                .is_err()
+        );
+        let (_, cleanup) = reopened.abort_receive(&cx, &target).into_result().unwrap();
+        assert!(
+            reopened
+                .inspect_receive_resume_state(&cx, &target)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            native_dsl_counts(&cx, &reopened, &[]),
+            [if incremental_case { 2 } else { 1 }, snapshots]
+        );
+        assert_eq!(
+            native_dsl_counts(&cx, &reopened, &data),
+            [u64::from(incremental_case), snapshots]
+        );
+        assert_pool_scrub_and_allocation_clean(
+            &cx,
+            &durable,
+            POOL_GUID,
+            Some(cleanup.published_slot()),
+        );
+        if incremental_case {
+            assert_eq!(native_dsl_counts(&cx, &reopened, &target), [0, 1]);
+            reopened
+                .set_property(&cx, &[], "snapshot_limit", Number(2))
+                .into_result()
+                .unwrap();
+            let (_, token) = reopened
+                .receive_stream(&cx, &receive, &mut Cursor::new(&incremental))
+                .into_result()
+                .unwrap();
+            assert_eq!(native_dsl_counts(&cx, &reopened, &[]), [2, 2]);
+            assert_eq!(native_dsl_counts(&cx, &reopened, &data), [1, 2]);
+            assert_eq!(native_dsl_counts(&cx, &reopened, &target), [0, 2]);
+            let mut mos = reopened.open_read_objects(&cx).unwrap();
+            let mut snapshot = mos.zpl_snapshot(&cx, &target, b"second").unwrap();
+            assert_eq!(snapshot.read(&cx, 4, 0, 7).unwrap(), b"updated");
+            assert_pool_scrub_and_allocation_clean(
+                &cx,
+                &durable,
+                POOL_GUID,
+                Some(token.published_slot()),
+            );
+        }
+    }
+}
+
 #[test]
 fn owner_quota_chown_checks_the_destination_and_preserves_unchanged_dimensions() {
     let cx = Cx::for_testing();
