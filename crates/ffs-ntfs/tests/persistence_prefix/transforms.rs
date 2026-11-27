@@ -3843,7 +3843,10 @@ fn assert_last_stream_usn(
     assert_eq!(event.timestamp, timestamp);
     let record = volume.record(cx, file.record, Some(file.sequence)).unwrap();
     let attributes = record.attributes().unwrap();
-    let standard = attributes.iter().find(|attribute| attribute.kind == 0x10).unwrap();
+    let standard = attributes
+        .iter()
+        .find(|attribute| attribute.kind == 0x10)
+        .unwrap();
     let ffs_ondisk::ntfs::NtfsValue::Resident(bytes) = standard.value else {
         panic!("STANDARD_INFORMATION must be resident");
     };
@@ -3860,12 +3863,18 @@ fn usn_stream_mutations_report_named_data_and_namespace_changes() {
     use ffs_ondisk::ntfs::usn::{
         USN_REASON_BASIC_INFO_CHANGE, USN_REASON_CLOSE, USN_REASON_DATA_EXTEND,
         USN_REASON_DATA_OVERWRITE, USN_REASON_DATA_TRUNCATION, USN_REASON_NAMED_DATA_EXTEND,
-        USN_REASON_NAMED_DATA_OVERWRITE, USN_REASON_NAMED_DATA_TRUNCATION, USN_REASON_STREAM_CHANGE,
+        USN_REASON_NAMED_DATA_OVERWRITE, USN_REASON_NAMED_DATA_TRUNCATION,
+        USN_REASON_STREAM_CHANGE,
     };
 
     let cx = Cx::for_testing();
-    let (device, volume_bytes) =
-        format_to_fault_device(&cx, 16, 4096, NtfsFormatVersion::V3_1, 0xBD84_0053_0000_0001);
+    let (device, volume_bytes) = format_to_fault_device(
+        &cx,
+        16,
+        4096,
+        NtfsFormatVersion::V3_1,
+        0xBD84_0053_0000_0001,
+    );
     let mut engine = open_clean_engine(&cx, &device, volume_bytes);
     let (file, _) = engine
         .create_file(&cx, "/", "tracked.bin", b"base")
@@ -3877,13 +3886,27 @@ fn usn_stream_mutations_report_named_data_and_namespace_changes() {
         .unwrap();
 
     for (step, reason) in [
-        (0_u8, USN_REASON_STREAM_CHANGE | USN_REASON_NAMED_DATA_EXTEND | USN_REASON_NAMED_DATA_OVERWRITE),
+        (
+            0_u8,
+            USN_REASON_STREAM_CHANGE
+                | USN_REASON_NAMED_DATA_EXTEND
+                | USN_REASON_NAMED_DATA_OVERWRITE,
+        ),
         (1, USN_REASON_NAMED_DATA_OVERWRITE),
-        (2, USN_REASON_NAMED_DATA_EXTEND | USN_REASON_NAMED_DATA_OVERWRITE),
+        (
+            2,
+            USN_REASON_NAMED_DATA_EXTEND | USN_REASON_NAMED_DATA_OVERWRITE,
+        ),
         (3, USN_REASON_NAMED_DATA_TRUNCATION),
         (4, USN_REASON_NAMED_DATA_EXTEND),
-        (5, USN_REASON_NAMED_DATA_TRUNCATION | USN_REASON_NAMED_DATA_OVERWRITE),
-        (6, USN_REASON_NAMED_DATA_EXTEND | USN_REASON_NAMED_DATA_OVERWRITE),
+        (
+            5,
+            USN_REASON_NAMED_DATA_TRUNCATION | USN_REASON_NAMED_DATA_OVERWRITE,
+        ),
+        (
+            6,
+            USN_REASON_NAMED_DATA_EXTEND | USN_REASON_NAMED_DATA_OVERWRITE,
+        ),
         (7, USN_REASON_NAMED_DATA_OVERWRITE),
         (8, USN_REASON_STREAM_CHANGE),
         (9, USN_REASON_STREAM_CHANGE),
@@ -3893,78 +3916,151 @@ fn usn_stream_mutations_report_named_data_and_namespace_changes() {
         (13, USN_REASON_DATA_EXTEND | USN_REASON_DATA_OVERWRITE),
         (14, USN_REASON_DATA_OVERWRITE),
         (15, USN_REASON_DATA_TRUNCATION | USN_REASON_DATA_OVERWRITE),
+        (16, USN_REASON_STREAM_CHANGE),
+        (17, USN_REASON_BASIC_INFO_CHANGE),
+        (18, USN_REASON_STREAM_CHANGE),
+        (19, USN_REASON_DATA_TRUNCATION),
+        (20, USN_REASON_BASIC_INFO_CHANGE),
     ] {
         let timestamp = DEFAULT_NTFS_FILETIME + u64::from(step) + 1;
         let before = usn_publication_records(&cx, &engine.volume_view(&cx).unwrap());
         match step {
             0 => {
-                engine.create_stream_at(&cx, file, &utf16("audit"), b"seed", timestamp)
-                    .into_result().unwrap();
+                engine
+                    .create_stream_at(&cx, file, &utf16("audit"), b"seed", timestamp)
+                    .into_result()
+                    .unwrap();
             }
             1 => {
-                engine.write_stream_at(&cx, file, &utf16("audit"), 1, b"!", false, timestamp)
-                    .into_result().unwrap();
+                engine
+                    .write_stream_at(&cx, file, &utf16("audit"), 1, b"!", false, timestamp)
+                    .into_result()
+                    .unwrap();
             }
             2 => {
-                engine.write_stream_at(&cx, file, &utf16("audit"), 7, b"X", false, timestamp)
-                    .into_result().unwrap();
+                engine
+                    .write_stream_at(&cx, file, &utf16("audit"), 7, b"X", false, timestamp)
+                    .into_result()
+                    .unwrap();
             }
             3 => {
-                engine.truncate_stream_at(&cx, file, &utf16("audit"), 3, timestamp)
-                    .into_result().unwrap();
+                engine
+                    .truncate_stream_at(&cx, file, &utf16("audit"), 3, timestamp)
+                    .into_result()
+                    .unwrap();
             }
             4 => {
-                engine.truncate_stream_at(&cx, file, &utf16("audit"), 6, timestamp)
-                    .into_result().unwrap();
+                engine
+                    .truncate_stream_at(&cx, file, &utf16("audit"), 6, timestamp)
+                    .into_result()
+                    .unwrap();
             }
             5 => {
-                engine.replace_stream_at(&cx, file, &utf16("audit"), b"two", timestamp)
-                    .into_result().unwrap();
+                engine
+                    .replace_stream_at(&cx, file, &utf16("audit"), b"two", timestamp)
+                    .into_result()
+                    .unwrap();
             }
             6 => {
-                engine.replace_stream_at(&cx, file, &utf16("audit"), b"THREE", timestamp)
-                    .into_result().unwrap();
+                engine
+                    .replace_stream_at(&cx, file, &utf16("audit"), b"THREE", timestamp)
+                    .into_result()
+                    .unwrap();
             }
             7 => {
-                engine.replace_stream_at(&cx, file, &utf16("audit"), b"FOURS", timestamp)
-                    .into_result().unwrap();
+                engine
+                    .replace_stream_at(&cx, file, &utf16("audit"), b"FOURS", timestamp)
+                    .into_result()
+                    .unwrap();
             }
             8 => {
-                engine.rename_stream_at(&cx, file, &utf16("audit"), &utf16("renamed"), true, timestamp)
-                    .into_result().unwrap();
+                engine
+                    .rename_stream_at(
+                        &cx,
+                        file,
+                        &utf16("audit"),
+                        &utf16("renamed"),
+                        true,
+                        timestamp,
+                    )
+                    .into_result()
+                    .unwrap();
             }
             9 => {
-                engine.unlink_stream_at(&cx, file, &utf16("renamed"), timestamp)
-                    .into_result().unwrap();
+                engine
+                    .unlink_stream_at(&cx, file, &utf16("renamed"), timestamp)
+                    .into_result()
+                    .unwrap();
             }
             10 => {
-                engine.create_stream_at(&cx, file, &utf16("empty"), &[], timestamp)
-                    .into_result().unwrap();
+                engine
+                    .create_stream_at(&cx, file, &utf16("empty"), &[], timestamp)
+                    .into_result()
+                    .unwrap();
             }
             11 => {
-                engine.write_stream_at(&cx, file, &utf16("empty"), u64::MAX, &[], false, timestamp)
-                    .into_result().unwrap();
+                engine
+                    .write_stream_at(&cx, file, &utf16("empty"), u64::MAX, &[], false, timestamp)
+                    .into_result()
+                    .unwrap();
             }
             12 => {
-                engine.unlink_stream_at(&cx, file, &utf16("empty"), timestamp)
-                    .into_result().unwrap();
+                engine
+                    .unlink_stream_at(&cx, file, &utf16("empty"), timestamp)
+                    .into_result()
+                    .unwrap();
             }
             13 => {
-                engine.replace_stream_at(&cx, file, &[], b"BASE!", timestamp)
-                    .into_result().unwrap();
+                engine
+                    .replace_stream_at(&cx, file, &[], b"BASE!", timestamp)
+                    .into_result()
+                    .unwrap();
             }
             14 => {
-                engine.replace_stream_at(&cx, file, &[], b"base!", timestamp)
-                    .into_result().unwrap();
+                engine
+                    .replace_stream_at(&cx, file, &[], b"base!", timestamp)
+                    .into_result()
+                    .unwrap();
             }
             15 => {
-                engine.replace_stream_at(&cx, file, &[], b"ok", timestamp)
-                    .into_result().unwrap();
+                engine
+                    .replace_stream_at(&cx, file, &[], b"ok", timestamp)
+                    .into_result()
+                    .unwrap();
+            }
+            16 => {
+                engine
+                    .create_stream_at(&cx, file, &utf16("empty"), &[], timestamp)
+                    .into_result()
+                    .unwrap();
+            }
+            17 => {
+                engine
+                    .replace_stream_at(&cx, file, &utf16("empty"), &[], timestamp)
+                    .into_result()
+                    .unwrap();
+            }
+            18 => {
+                engine
+                    .unlink_stream_at(&cx, file, &utf16("empty"), timestamp)
+                    .into_result()
+                    .unwrap();
+            }
+            19 | 20 => {
+                engine
+                    .replace_stream_at(&cx, file, &[], &[], timestamp)
+                    .into_result()
+                    .unwrap();
             }
             _ => unreachable!(),
         }
         let after = assert_last_stream_usn(
-            &cx, &engine, file, &before, reason | USN_REASON_CLOSE, timestamp,
+            &cx,
+            &engine,
+            file,
+            &before,
+            reason | USN_REASON_CLOSE,
+            timestamp,
         );
         engine.check_clean_consistency(&cx).unwrap();
 
@@ -3973,7 +4069,9 @@ fn usn_stream_mutations_report_named_data_and_namespace_changes() {
         let reopened = open_clean_engine(&cx, &durable, volume_bytes);
         let volume = reopened.volume_view(&cx).unwrap();
         assert_eq!(usn_publication_records(&cx, &volume), after);
-        let record = volume.record(&cx, file.record, Some(file.sequence)).unwrap();
+        let record = volume
+            .record(&cx, file.record, Some(file.sequence))
+            .unwrap();
         let named: Option<(&str, &[u8])> = match step {
             0 => Some(("audit", b"seed")),
             1 => Some(("audit", b"s!ed")),
@@ -3984,7 +4082,7 @@ fn usn_stream_mutations_report_named_data_and_namespace_changes() {
             6 => Some(("audit", b"THREE")),
             7 => Some(("audit", b"FOURS")),
             8 => Some(("renamed", b"FOURS")),
-            10 | 11 => Some(("empty", b"")),
+            10 | 11 | 16 | 17 => Some(("empty", b"")),
             _ => None,
         };
         let streams = volume.data_streams(&cx, &record).unwrap();
@@ -3996,7 +4094,8 @@ fn usn_stream_mutations_report_named_data_and_namespace_changes() {
         let unnamed: &[u8] = match step {
             13 => b"BASE!",
             14 => b"base!",
-            15 => b"ok",
+            15..=18 => b"ok",
+            19 | 20 => b"",
             _ => b"base",
         };
         let stream = volume.data_stream(&cx, &record, &[]).unwrap();
@@ -4010,15 +4109,32 @@ fn usn_stream_namespace_publication_recovers_with_its_native_mutation() {
     use ffs_ondisk::ntfs::usn::{USN_REASON_CLOSE, USN_REASON_STREAM_CHANGE};
 
     let cx = Cx::for_testing();
-    let (seed, volume_bytes) =
-        format_to_fault_device(&cx, 16, 4096, NtfsFormatVersion::V3_1, 0xBD84_0053_0000_0002);
+    let (seed, volume_bytes) = format_to_fault_device(
+        &cx,
+        16,
+        4096,
+        NtfsFormatVersion::V3_1,
+        0xBD84_0053_0000_0002,
+    );
     let mut engine = open_clean_engine(&cx, &seed, volume_bytes);
-    let (file, _) = engine.create_file(&cx, "/", "tracked.bin", b"base")
-        .into_result().unwrap();
-    engine.create_stream_at(&cx, file, &utf16("audit"), b"keep-me", DEFAULT_NTFS_FILETIME)
-        .into_result().unwrap();
-    engine.enable_usn_journal(&cx, 65_536, 4096, DEFAULT_NTFS_FILETIME)
-        .into_result().unwrap();
+    let (file, _) = engine
+        .create_file(&cx, "/", "tracked.bin", b"base")
+        .into_result()
+        .unwrap();
+    engine
+        .create_stream_at(
+            &cx,
+            file,
+            &utf16("audit"),
+            b"keep-me",
+            DEFAULT_NTFS_FILETIME,
+        )
+        .into_result()
+        .unwrap();
+    engine
+        .enable_usn_journal(&cx, 65_536, 4096, DEFAULT_NTFS_FILETIME)
+        .into_result()
+        .unwrap();
     let baseline = seed.snapshot_durable_only();
     drop(engine);
 
@@ -4029,37 +4145,74 @@ fn usn_stream_namespace_publication_recovers_with_its_native_mutation() {
         let before_writes = device.write_bytes_total();
         let cancelled = Cx::for_testing();
         cancelled.set_cancel_requested(true);
-        assert!(matches!(
-            engine.unlink_stream_at(&cancelled, file, &utf16("audit"), DEFAULT_NTFS_FILETIME),
-            NtfsTxOutcome::NotCommitted(FfsError::Cancelled)
-        ));
+        if rename {
+            assert!(matches!(
+                engine.rename_stream_at(
+                    &cancelled,
+                    file,
+                    &utf16("audit"),
+                    &utf16("renamed"),
+                    true,
+                    DEFAULT_NTFS_FILETIME,
+                ),
+                NtfsTxOutcome::NotCommitted(FfsError::Cancelled)
+            ));
+        } else {
+            assert!(matches!(
+                engine.unlink_stream_at(&cancelled, file, &utf16("audit"), DEFAULT_NTFS_FILETIME),
+                NtfsTxOutcome::NotCommitted(FfsError::Cancelled)
+            ));
+        }
         assert_eq!(device.write_bytes_total(), before_writes);
-        assert_eq!(usn_publication_records(&cx, &engine.volume_view(&cx).unwrap()), before);
+        assert_eq!(
+            usn_publication_records(&cx, &engine.volume_view(&cx).unwrap()),
+            before
+        );
 
         let cuts = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&cuts);
         let observed = Arc::clone(&device);
         engine.set_stage_hook(Some(Box::new(move |event| {
-            if matches!(event.stage,
+            if matches!(
+                event.stage,
                 NtfsPersistenceStage::PayloadBarrier
                     | NtfsPersistenceStage::LogCommitBarrier
                     | NtfsPersistenceStage::TargetMetadataBarrier
             ) {
-                captured.lock().unwrap().push((event.stage, observed.snapshot_durable_only()));
+                captured
+                    .lock()
+                    .unwrap()
+                    .push((event.stage, observed.snapshot_durable_only()));
             }
             Ok(())
         })));
         let timestamp = DEFAULT_NTFS_FILETIME + 1;
         if rename {
-            engine.rename_stream_at(&cx, file, &utf16("audit"), &utf16("renamed"), true, timestamp)
-                .into_result().unwrap();
+            engine
+                .rename_stream_at(
+                    &cx,
+                    file,
+                    &utf16("audit"),
+                    &utf16("renamed"),
+                    true,
+                    timestamp,
+                )
+                .into_result()
+                .unwrap();
         } else {
-            engine.unlink_stream_at(&cx, file, &utf16("audit"), timestamp)
-                .into_result().unwrap();
+            engine
+                .unlink_stream_at(&cx, file, &utf16("audit"), timestamp)
+                .into_result()
+                .unwrap();
         }
         engine.set_stage_hook(None);
         let after = assert_last_stream_usn(
-            &cx, &engine, file, &before, USN_REASON_STREAM_CHANGE | USN_REASON_CLOSE, timestamp,
+            &cx,
+            &engine,
+            file,
+            &before,
+            USN_REASON_STREAM_CHANGE | USN_REASON_CLOSE,
+            timestamp,
         );
         let captured = std::mem::take(&mut *cuts.lock().unwrap());
         for stage in [
@@ -4072,9 +4225,13 @@ fn usn_stream_namespace_publication_recovers_with_its_native_mutation() {
         for (stage, snapshot) in captured {
             let recovered_device = FaultInjectingNtfsDevice::new(snapshot);
             let recovered = NtfsTransactionEngine::from_device(
-                &cx, Arc::clone(&recovered_device) as Arc<dyn ByteDevice>,
-                0, volume_bytes, write_options_recover(),
-            ).unwrap();
+                &cx,
+                Arc::clone(&recovered_device) as Arc<dyn ByteDevice>,
+                0,
+                volume_bytes,
+                write_options_recover(),
+            )
+            .unwrap();
             let volume = recovered.volume_view(&cx).unwrap();
             let committed = stage != NtfsPersistenceStage::PayloadBarrier;
             assert_eq!(
@@ -4082,7 +4239,9 @@ fn usn_stream_namespace_publication_recovers_with_its_native_mutation() {
                 if committed { &after } else { &before }.clone(),
                 "stream state and its journal record must recover together at {stage:?}"
             );
-            let record = volume.record(&cx, file.record, Some(file.sequence)).unwrap();
+            let record = volume
+                .record(&cx, file.record, Some(file.sequence))
+                .unwrap();
             let streams = volume.data_streams(&cx, &record).unwrap();
             let expected_name = if !committed {
                 Some("audit")

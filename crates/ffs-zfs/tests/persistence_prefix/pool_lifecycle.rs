@@ -13,12 +13,12 @@
 use super::*;
 use ffs_ondisk::zfs::scan::{DslScanFunc, DslScanState};
 use ffs_zfs::{
-    ZfsPoolCreateSpec, ZfsScanLimits, create_pool_on_devices, export_pool_leaves,
-    import_pool_leaves,
+    AllocClass, ZfsCreateVdevKind, ZfsCreateVdevSpec, ZfsPoolCreateSpec, ZfsScanLimits,
+    create_pool_on_devices, export_pool_leaves, import_pool_leaves,
 };
 
-/// In-memory test `ByteDevice` that genuinely records `discard()` calls so
-/// `trim_pool` can be verified against both discard-capable and `EOPNOTSUPP` media!
+/// In-memory test `ByteDevice` that erases discarded bytes and records each
+/// range so preservation is checked against destructive device behavior.
 #[derive(Clone)]
 struct DiscardTrackingDevice {
     inner: FaultableMemberDevice,
@@ -55,15 +55,92 @@ impl ByteDevice for DiscardTrackingDevice {
         self.inner.sync(cx)
     }
 
+    fn begin_durability_commit(&self, cx: &Cx) -> Result<()> {
+        self.inner.begin_durability_commit(cx)
+    }
+
+    fn complete_durability_commit(&self) {
+        self.inner.complete_durability_commit();
+    }
+
+    fn abort_durability_commit(&self) {
+        self.inner.abort_durability_commit();
+    }
+
     fn supports_discard(&self) -> bool {
         true
     }
 
     fn discard(&self, cx: &Cx, offset: ByteOffset, len: u64) -> Result<()> {
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        let start = usize::try_from(offset.0).map_err(|_| FfsError::NoSpace)?;
+        let count = usize::try_from(len).map_err(|_| FfsError::NoSpace)?;
+        let end = start.checked_add(count).ok_or(FfsError::NoSpace)?;
+        let mut state = self.inner.state.lock().unwrap();
+        if end > state.durable.len() {
+            return Err(FfsError::NoSpace);
+        }
+        if state.protection_depth == 0 {
+            state.unprotected_io += 1;
+        }
+        // Model the strongest destructive device behavior: freed sectors become
+        // zero immediately, even if the subsequent progress TXG never commits.
+        state.durable[start..end].fill(0);
+        for pending in &mut state.volatile {
+            let pending_start = usize::try_from(pending.offset).unwrap();
+            let pending_end = pending_start + pending.bytes.len();
+            let overlap_start = start.max(pending_start);
+            let overlap_end = end.min(pending_end);
+            if overlap_start < overlap_end {
+                pending.bytes[overlap_start - pending_start..overlap_end - pending_start].fill(0);
+            }
+        }
         self.discarded.lock().unwrap().push((offset.0, len));
         Ok(())
     }
+}
+
+fn boxed_trim_devices(devices: &[DiscardTrackingDevice]) -> Vec<Box<dyn ByteDevice>> {
+    devices
+        .iter()
+        .cloned()
+        .map(|device| Box::new(device) as Box<dyn ByteDevice>)
+        .collect()
+}
+
+fn open_trim_engine(
+    cx: &Cx,
+    devices: &[DiscardTrackingDevice],
+    pool_guid: u64,
+    slot: usize,
+) -> ZfsTransactionEngine {
+    ZfsTransactionEngine::from_devices(
+        cx,
+        boxed_trim_devices(devices),
+        default_write_opts(pool_guid, slot),
+    )
+    .unwrap()
+}
+
+fn assert_trimmed_pool_file(
+    cx: &Cx,
+    devices: &[DiscardTrackingDevice],
+    pool_guid: u64,
+    slot: usize,
+    expected: &[u8],
+) {
+    // Reopen only durable bytes. Cached reads cannot hide a destructive discard.
+    let durable: Vec<_> = devices
+        .iter()
+        .map(|device| device.inner.fresh_from_durable())
+        .collect();
+    let engine = open_engine_on_devices(cx, &durable, default_write_opts(pool_guid, slot)).unwrap();
+    let mut mos = engine.open_read_objects(cx).unwrap();
+    assert_eq!(
+        read_zpl_bytes(cx, &mut mos, &[], b"/keep.bin", expected.len()).unwrap(),
+        expected
+    );
+    assert_pool_scrub_and_allocation_clean(cx, &durable, pool_guid, Some(slot));
 }
 
 fn leaf_from_dev(cx: &Cx, dev: &FaultableMemberDevice) -> Leaf {
@@ -522,6 +599,380 @@ fn resumable_pool_trim_persists_cursor_and_reports_eopnotsupp_cleanly() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn pool_trim_preserves_live_data_on_single_mirror_and_raidz() {
+    let ts = Timestamp {
+        seconds: 1_735_006_000,
+        nanos: 0,
+    };
+    for (kind, members) in [
+        (ZfsCreateVdevKind::Leaf, 1),
+        (ZfsCreateVdevKind::Mirror { width: 2 }, 2),
+        (
+            ZfsCreateVdevKind::Raidz {
+                parity: 1,
+                width: 3,
+            },
+            3,
+        ),
+        (
+            ZfsCreateVdevKind::Raidz {
+                parity: 2,
+                width: 4,
+            },
+            4,
+        ),
+        (
+            ZfsCreateVdevKind::Raidz {
+                parity: 3,
+                width: 5,
+            },
+            5,
+        ),
+    ] {
+        let cx = Cx::for_testing();
+        let pool_guid = 0x7711_7700_0000_0000 + u64::try_from(members).unwrap();
+        let mut devices: Vec<_> = (0..members)
+            .map(|_| DiscardTrackingDevice::new(12 * 1024 * 1024 + 128 * 1024))
+            .collect();
+        let mut spec = ZfsPoolCreateSpec::single_leaf("trim_data_pool", pool_guid);
+        spec.vdevs[0].kind = kind;
+        let created = create_pool_on_devices(&cx, boxed_trim_devices(&devices), &spec).unwrap();
+        // Physical supply order is independent of the native mirror/RAIDZ IDs.
+        devices.rotate_left(1);
+        let mut engine = open_trim_engine(&cx, &devices, pool_guid, created.initial_slot);
+        let root = engine
+            .open_read_objects(&cx)
+            .unwrap()
+            .zpl(&cx, &[])
+            .unwrap()
+            .root;
+        let kept: Vec<_> = (0..512 * 1024)
+            .map(|index| u8::try_from(index % 251).unwrap())
+            .collect();
+        for (name, bytes) in [
+            (b"erase.bin".as_slice(), vec![0x51; 512 * 1024]),
+            (b"keep.bin".as_slice(), kept.clone()),
+        ] {
+            let (object, _) = engine
+                .create_file(
+                    &cx,
+                    &[],
+                    root,
+                    name,
+                    0o600,
+                    0,
+                    0,
+                    ts,
+                    ZfsDataChecksum::Fletcher4,
+                )
+                .into_result()
+                .unwrap();
+            engine
+                .write_file_data(&cx, &[], object, 0, &bytes, ts, ZfsDataChecksum::Fletcher4)
+                .into_result()
+                .unwrap();
+        }
+        // A large early free extent overlaps later live RAIDZ physical rows if
+        // logical top-level offsets are incorrectly broadcast to every child.
+        engine
+            .unlink_entry(&cx, &[], root, b"erase.bin", false, ts)
+            .into_result()
+            .unwrap();
+        let unprotected: Vec<_> = devices
+            .iter()
+            .map(|device| device.inner.state.lock().unwrap().unprotected_io)
+            .collect();
+        let (report, token) = engine.trim_pool(&cx, 256, true).into_result().unwrap();
+        assert!(report.completed);
+        assert_eq!(report.supported_members, members);
+        assert_eq!(report.unsupported_members, 0);
+        assert!(report.bytes_trimmed > 0);
+        let mut actual_bytes = 0;
+        let mut actual_ranges = 0;
+        for (index, device) in devices.iter().enumerate() {
+            for (offset, len) in device.discarded_ranges() {
+                assert!(offset >= DATA_OFFSET);
+                assert!(offset + len <= label_offsets(device.len_bytes()).unwrap()[2]);
+                assert!(len > 0 && len.is_multiple_of(4096));
+                actual_ranges += 1;
+                actual_bytes += len;
+            }
+            let state = device.inner.state.lock().unwrap();
+            assert_eq!(state.protection_depth, 0);
+            assert_eq!(state.unprotected_io, unprotected[index]);
+        }
+        assert_eq!(report.ranges_trimmed, actual_ranges);
+        assert_eq!(report.bytes_trimmed, actual_bytes);
+        assert_trimmed_pool_file(&cx, &devices, pool_guid, token.published_slot(), &kept);
+    }
+}
+
+#[test]
+fn pool_trim_routes_only_to_the_allocators_vdev_when_devices_are_shuffled() {
+    let cx = Cx::for_testing();
+    let pool_guid = 0x7711_7700_0000_0100;
+    let devices = vec![
+        DiscardTrackingDevice::new(12 * 1024 * 1024),
+        DiscardTrackingDevice::new(12 * 1024 * 1024),
+    ];
+    let mut spec = ZfsPoolCreateSpec::single_leaf("trim_domain_pool", pool_guid);
+    spec.vdevs.push(ZfsCreateVdevSpec {
+        kind: ZfsCreateVdevKind::Leaf,
+        alloc_class: AllocClass::Normal,
+    });
+    let created = create_pool_on_devices(&cx, boxed_trim_devices(&devices), &spec).unwrap();
+    let canary_at = DATA_OFFSET + 4 * 1024 * 1024;
+    let canary = vec![0x9D; 4096];
+    devices[1]
+        .write_all_at(&cx, ByteOffset(canary_at), &canary)
+        .unwrap();
+    devices[1].sync(&cx).unwrap();
+    let supplied = [devices[1].clone(), devices[0].clone()];
+    let mut engine = open_trim_engine(&cx, &supplied, pool_guid, created.initial_slot);
+    let (report, _) = engine.trim_pool(&cx, 256, true).into_result().unwrap();
+    assert!(report.completed);
+    assert_eq!(report.supported_members, 1);
+    assert!(!devices[0].discarded_ranges().is_empty());
+    assert!(devices[1].discarded_ranges().is_empty());
+    let mut observed = vec![0; canary.len()];
+    devices[1]
+        .read_exact_at(&cx, ByteOffset(canary_at), &mut observed)
+        .unwrap();
+    assert_eq!(observed, canary);
+}
+
+#[test]
+fn pool_trim_refuses_draid_and_uncertain_writers_before_discard() {
+    let cx = Cx::for_testing();
+    let pool_guid = 0x7711_7700_0000_0200;
+    let devices: Vec<_> = (0..4)
+        .map(|_| DiscardTrackingDevice::new(12 * 1024 * 1024))
+        .collect();
+    let mut spec = ZfsPoolCreateSpec::single_leaf("trim_draid_pool", pool_guid);
+    spec.vdevs[0].kind = ZfsCreateVdevKind::Draid {
+        ndata: 2,
+        nparity: 1,
+        children: 4,
+        nspares: 1,
+        ngroups: 1,
+    };
+    let created = create_pool_on_devices(&cx, boxed_trim_devices(&devices), &spec).unwrap();
+    let mut engine = open_trim_engine(&cx, &devices, pool_guid, created.initial_slot);
+    let before: Vec<_> = devices
+        .iter()
+        .map(|device| device.inner.durable_snapshot())
+        .collect();
+    let writes: Vec<_> = devices
+        .iter()
+        .map(|device| device.inner.write_calls())
+        .collect();
+    assert!(engine.trim_pool(&cx, 256, true).is_not_committed());
+    for (index, device) in devices.iter().enumerate() {
+        assert!(device.discarded_ranges().is_empty());
+        assert_eq!(device.inner.durable_snapshot(), before[index]);
+        assert_eq!(device.inner.write_calls(), writes[index]);
+    }
+
+    let plain_guid = pool_guid + 1;
+    let plain = vec![DiscardTrackingDevice::new(12 * 1024 * 1024)];
+    let created = create_pool_on_devices(
+        &cx,
+        boxed_trim_devices(&plain),
+        &ZfsPoolCreateSpec::single_leaf("trim_uncertain_pool", plain_guid),
+    )
+    .unwrap();
+    let mut engine = open_trim_engine(&cx, &plain, plain_guid, created.initial_slot);
+    let root = engine
+        .open_read_objects(&cx)
+        .unwrap()
+        .zpl(&cx, &[])
+        .unwrap()
+        .root;
+    engine.with_fault_hook(|event| {
+        if matches!(
+            event.stage,
+            ZfsPersistenceStage::UberblockBarrier { wave: 1, .. }
+        ) {
+            return Err(FfsError::Cancelled);
+        }
+        Ok(())
+    });
+    let result = engine.create_file(
+        &cx,
+        &[],
+        root,
+        b"uncertain.bin",
+        0o600,
+        0,
+        0,
+        Timestamp {
+            seconds: 1_735_006_100,
+            nanos: 0,
+        },
+        ZfsDataChecksum::Fletcher4,
+    );
+    assert!(matches!(result, ZfsTxOutcome::Uncertain { .. }));
+    assert!(engine.requires_recovery());
+    engine.clear_fault_hook();
+    // This is an allowed device outcome: the newer root reached media even
+    // though the owner retains its predecessor allocator after an uncertain ack.
+    plain[0].inner.state.lock().unwrap().crash_flush_volatile();
+    let durable = plain[0].inner.durable_snapshot();
+    let writes = plain[0].inner.write_calls();
+    assert!(engine.trim_pool(&cx, 256, true).is_not_committed());
+    assert!(plain[0].discarded_ranges().is_empty());
+    assert_eq!(plain[0].inner.write_calls(), writes);
+    assert_eq!(plain[0].inner.durable_snapshot(), durable);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn pool_trim_cancellation_retry_preserves_checkpoint_owned_data() {
+    let cx = Cx::for_testing();
+    let pool_guid = 0x7711_7700_0000_0300;
+    let devices = vec![DiscardTrackingDevice::new(12 * 1024 * 1024)];
+    let created = create_pool_on_devices(
+        &cx,
+        boxed_trim_devices(&devices),
+        &ZfsPoolCreateSpec::single_leaf("trim_checkpoint_pool", pool_guid),
+    )
+    .unwrap();
+    let mut engine = open_trim_engine(&cx, &devices, pool_guid, created.initial_slot);
+    let root = engine
+        .open_read_objects(&cx)
+        .unwrap()
+        .zpl(&cx, &[])
+        .unwrap()
+        .root;
+    let ts = Timestamp {
+        seconds: 1_735_006_200,
+        nanos: 0,
+    };
+    let (object, _) = engine
+        .create_file(
+            &cx,
+            &[],
+            root,
+            b"keep.bin",
+            0o600,
+            0,
+            0,
+            ts,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    let original = vec![0x31; 256 * 1024];
+    engine
+        .write_file_data(
+            &cx,
+            &[],
+            object,
+            0,
+            &original,
+            ts,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    engine.checkpoint_create(&cx).into_result().unwrap();
+    let changed = vec![0xE3; original.len()];
+    engine
+        .write_file_data(
+            &cx,
+            &[],
+            object,
+            0,
+            &changed,
+            ts,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    assert!(
+        engine
+            .checkpoint_status(&cx)
+            .unwrap()
+            .unwrap()
+            .deferred_free_bytes
+            > 0
+    );
+    let before_slot = engine.committed_slot();
+
+    let cancelled = Cx::for_testing();
+    cancelled.cancel_with(asupersync::types::CancelKind::User, Some("before TRIM"));
+    assert!(engine.trim_pool(&cancelled, 256, true).is_not_committed());
+    assert!(engine.trim_pool(&cx, 0, true).is_not_committed());
+    assert!(devices[0].discarded_ranges().is_empty());
+
+    engine.with_fault_hook(|event| {
+        if matches!(event.stage, ZfsPersistenceStage::MosSpaceMapWrite { .. }) {
+            return Err(FfsError::Cancelled);
+        }
+        Ok(())
+    });
+    assert!(matches!(
+        engine.trim_pool(&cx, 256, true),
+        ZfsTxOutcome::NotCommitted(FfsError::Cancelled)
+    ));
+    assert!(!devices[0].discarded_ranges().is_empty());
+    assert_eq!(engine.committed_slot(), before_slot);
+    assert_eq!(devices[0].inner.state.lock().unwrap().protection_depth, 0);
+    engine.clear_fault_hook();
+
+    let durable = devices[0].inner.fresh_from_durable();
+    let reopened = open_engine_on_devices(
+        &cx,
+        std::slice::from_ref(&durable),
+        default_write_opts(pool_guid, before_slot),
+    )
+    .unwrap();
+    assert_eq!(
+        read_zpl_bytes(
+            &cx,
+            &mut reopened.open_read_objects(&cx).unwrap(),
+            &[],
+            b"/keep.bin",
+            changed.len()
+        )
+        .unwrap(),
+        changed
+    );
+    // Failed progress publication leaves the old cursor reusable. Reissuing
+    // the exact free-range scan must remain harmless and commit its new cursor.
+    let (report, token) = engine.trim_pool(&cx, 256, false).into_result().unwrap();
+    assert!(report.completed);
+    let rewind_device = devices[0].inner.fresh_from_durable();
+    let (_, rewind_token) = ZfsTransactionEngine::import_rewind_to_checkpoint(
+        &cx,
+        vec![leaf_from_dev(&cx, &rewind_device)],
+        default_write_opts(pool_guid, token.published_slot()),
+    )
+    .unwrap()
+    .into_result()
+    .unwrap();
+    let restored = open_engine_on_devices(
+        &cx,
+        std::slice::from_ref(&rewind_device),
+        default_write_opts(pool_guid, rewind_token.published_slot()),
+    )
+    .unwrap();
+    assert_eq!(
+        read_zpl_bytes(
+            &cx,
+            &mut restored.open_read_objects(&cx).unwrap(),
+            &[],
+            b"/keep.bin",
+            original.len()
+        )
+        .unwrap(),
+        original,
+        "TRIM must retain blocks still owned by the native checkpoint"
+    );
+}
+
+#[test]
 fn checkpoint_metadata_retirements_survive_reopen_and_discard() {
     let cx = Cx::for_testing();
     let built = build_clean_zfs_pool(&PoolFixtureSpec {
@@ -602,11 +1053,17 @@ fn checkpoint_foreground_frees_preserve_scan_and_trim_state_after_restart() {
     // Regression for the old contains_key(&1) test: dirty-map keys identify
     // DNODE-table blocks, not MOS object numbers. This head lives in block 1.
     let dataset = dataset.expect("fixture must exercise MOS DNODE-table block 1");
+    let root = engine
+        .open_read_objects(&cx)
+        .unwrap()
+        .zpl(&cx, &dataset)
+        .unwrap()
+        .root;
     let (file, _) = engine
         .create_file(
             &cx,
             &dataset,
-            2,
+            root,
             b"data.bin",
             0o644,
             0,

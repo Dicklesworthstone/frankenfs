@@ -400,3 +400,231 @@ fn ordinary_writes_revoke_delayed_read_fill_and_write_fast_residents() {
         }
     }
 }
+
+#[derive(Debug)]
+struct PausedReadDevice {
+    disk: DiskDevice,
+    pause_once: AtomicBool,
+    read_count: AtomicUsize,
+    captured: std::sync::mpsc::Sender<()>,
+    resume: Mutex<std::sync::mpsc::Receiver<()>>,
+    fail_after_capture: AtomicBool,
+}
+
+struct PausedReadControl {
+    captured: std::sync::mpsc::Receiver<()>,
+    resume: std::sync::mpsc::Sender<()>,
+}
+
+impl BlockDevice for PausedReadDevice {
+    fn read_block(&self, cx: &Cx, block: BlockNumber) -> Result<BlockBuf> {
+        self.read_count.fetch_add(1, Ordering::Relaxed);
+        let bytes = self.disk.read_block(cx, block)?;
+        if self.pause_once.swap(false, Ordering::AcqRel) {
+            self.captured
+                .send(())
+                .map_err(|error| FfsError::Io(std::io::Error::other(error)))?;
+            self.resume
+                .lock()
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(|error| FfsError::Io(std::io::Error::other(error)))?;
+            if self.fail_after_capture.swap(false, Ordering::AcqRel) {
+                return Err(FfsError::Io(std::io::Error::other(
+                    "injected read failure after capture",
+                )));
+            }
+        }
+        Ok(bytes)
+    }
+
+    fn write_block(&self, cx: &Cx, block: BlockNumber, data: &[u8]) -> Result<()> {
+        self.disk.write_block(cx, block, data)
+    }
+
+    fn block_size(&self) -> u32 {
+        self.disk.block_size()
+    }
+
+    fn block_count(&self) -> u64 {
+        self.disk.block_count()
+    }
+
+    fn sync(&self, cx: &Cx) -> Result<()> {
+        self.disk.sync(cx)
+    }
+}
+
+fn paused_read_fixture(policy: ArcWritePolicy) -> (ArcCache<PausedReadDevice>, PausedReadControl) {
+    let (captured_tx, captured_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let device = PausedReadDevice {
+        disk: DiskDevice::new(),
+        pause_once: AtomicBool::new(true),
+        read_count: AtomicUsize::new(0),
+        captured: captured_tx,
+        resume: Mutex::new(resume_rx),
+        fail_after_capture: AtomicBool::new(false),
+    };
+    (
+        ArcCache::new_with_policy(device, 512, policy).unwrap(),
+        PausedReadControl {
+            captured: captured_rx,
+            resume: resume_tx,
+        },
+    )
+}
+
+#[test]
+fn slow_miss_cannot_resurrect_bytes_after_overwrite_flush_and_eviction() {
+    for policy in [ArcWritePolicy::WriteBack, ArcWritePolicy::WriteThrough] {
+        for staged in [false, true] {
+            let cx = Cx::for_testing();
+            let (cache, control) = paused_read_fixture(policy);
+            let block = BlockNumber(2);
+            std::thread::scope(|scope| {
+                let reader = scope.spawn(|| cache.read_block(&Cx::for_testing(), block));
+                control
+                    .captured
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+                if staged {
+                    cache
+                        .stage_txn_write(&cx, TxnId(10), block, &[9; BLOCK_BYTES])
+                        .unwrap();
+                    cache
+                        .commit_staged_txn(&cx, TxnId(10), CommitSeq(1))
+                        .unwrap();
+                } else {
+                    cache.write_block(&cx, block, &[9; BLOCK_BYTES]).unwrap();
+                }
+                cache.sync(&cx).unwrap();
+                assert_eq!(cache.inner().disk.bytes(block), vec![9; BLOCK_BYTES]);
+                cache.evict(block);
+                assert!(!cache.state.lock().resident.contains_key(&block));
+                control.resume.send(()).unwrap();
+                // This read overlapped the writer. The following reads do not,
+                // so none may observe bytes captured before the completed write.
+                reader.join().unwrap().unwrap();
+            });
+            for _ in 0..2 {
+                assert_eq!(
+                    cache.read_block(&cx, block).unwrap().as_slice(),
+                    &[9; BLOCK_BYTES],
+                    "a delayed read must not cache bytes older than an acknowledged write"
+                );
+            }
+            assert_eq!(cache.inner().read_count.load(Ordering::Relaxed), 2);
+            assert_eq!(cache.page_locks.in_flight_len(), 0);
+            assert!(cache.state.lock().in_flight_reads.is_empty());
+        }
+    }
+}
+
+#[test]
+fn slow_miss_ignores_writes_and_eviction_of_other_blocks() {
+    let cx = Cx::for_testing();
+    let (cache, control) = paused_read_fixture(ArcWritePolicy::WriteThrough);
+    let block = BlockNumber(2);
+    std::thread::scope(|scope| {
+        let reader = scope.spawn(|| cache.read_block(&Cx::for_testing(), block));
+        control
+            .captured
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        cache
+            .write_block(&cx, BlockNumber(3), &[9; BLOCK_BYTES])
+            .unwrap();
+        cache.sync(&cx).unwrap();
+        cache.evict(BlockNumber(3));
+        control.resume.send(()).unwrap();
+        assert_eq!(
+            reader.join().unwrap().unwrap().as_slice(),
+            &[0; BLOCK_BYTES]
+        );
+    });
+    assert_eq!(cache.inner().read_count.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        cache.read_block(&cx, block).unwrap().as_slice(),
+        &[0; BLOCK_BYTES]
+    );
+    assert_eq!(cache.page_locks.in_flight_len(), 0);
+    assert!(cache.state.lock().in_flight_reads.is_empty());
+}
+
+#[test]
+fn slow_miss_observes_explicit_invalidation_before_any_resident_exists() {
+    let cx = Cx::for_testing();
+    let (cache, control) = paused_read_fixture(ArcWritePolicy::WriteThrough);
+    let block = BlockNumber(2);
+    std::thread::scope(|scope| {
+        let reader = scope.spawn(|| cache.read_block(&Cx::for_testing(), block));
+        control
+            .captured
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        cache
+            .inner()
+            .disk
+            .write_block(&cx, block, &[7; BLOCK_BYTES])
+            .unwrap();
+        cache.inner().sync(&cx).unwrap();
+        cache.evict(block);
+        control.resume.send(()).unwrap();
+        reader.join().unwrap().unwrap();
+    });
+    assert_eq!(
+        cache.read_block(&cx, block).unwrap().as_slice(),
+        &[7; BLOCK_BYTES]
+    );
+    assert_eq!(cache.inner().read_count.load(Ordering::Relaxed), 2);
+    assert_eq!(cache.page_locks.in_flight_len(), 0);
+    assert!(cache.state.lock().in_flight_reads.is_empty());
+}
+
+#[test]
+fn slow_miss_error_and_cancellation_release_tracking_and_page_permit() {
+    for cancel in [false, true] {
+        let read_cx = Cx::for_testing();
+        let (cache, control) = paused_read_fixture(ArcWritePolicy::WriteBack);
+        let block = BlockNumber(2);
+        std::thread::scope(|scope| {
+            let reader = scope.spawn(|| cache.read_block(&read_cx, block));
+            control
+                .captured
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            assert_eq!(cache.state.lock().in_flight_reads.len(), 1);
+            if cancel {
+                read_cx.set_cancel_requested(true);
+            } else {
+                cache
+                    .inner()
+                    .fail_after_capture
+                    .store(true, Ordering::Release);
+            }
+            control.resume.send(()).unwrap();
+            let error = reader.join().unwrap().expect_err("the read must fail");
+            if cancel {
+                assert!(matches!(error, FfsError::Cancelled));
+            } else {
+                assert!(matches!(error, FfsError::Io(_)));
+            }
+        });
+        assert_eq!(cache.page_locks.in_flight_len(), 0);
+        {
+            let state = cache.state.lock();
+            assert!(state.in_flight_reads.is_empty());
+            assert!(!state.resident.contains_key(&block));
+        }
+        // A subsequent caller must be able to load the same block normally.
+        assert_eq!(
+            cache
+                .read_block(&Cx::for_testing(), block)
+                .unwrap()
+                .as_slice(),
+            &[0; BLOCK_BYTES]
+        );
+        assert_eq!(cache.page_locks.in_flight_len(), 0);
+        assert!(cache.state.lock().in_flight_reads.is_empty());
+    }
+}

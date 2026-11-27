@@ -23,9 +23,8 @@ use ffs_ondisk::ntfs::usn::{
     USN_REASON_BASIC_INFO_CHANGE, USN_REASON_CLOSE, USN_REASON_DATA_EXTEND,
     USN_REASON_DATA_OVERWRITE, USN_REASON_DATA_TRUNCATION, USN_REASON_FILE_CREATE,
     USN_REASON_FILE_DELETE, USN_REASON_HARD_LINK_CHANGE, USN_REASON_NAMED_DATA_EXTEND,
-    USN_REASON_NAMED_DATA_OVERWRITE, USN_REASON_NAMED_DATA_TRUNCATION,
-    USN_REASON_RENAME_NEW_NAME, USN_REASON_RENAME_OLD_NAME, USN_REASON_STREAM_CHANGE,
-    UsnRecordV2,
+    USN_REASON_NAMED_DATA_OVERWRITE, USN_REASON_NAMED_DATA_TRUNCATION, USN_REASON_RENAME_NEW_NAME,
+    USN_REASON_RENAME_OLD_NAME, USN_REASON_STREAM_CHANGE, UsnRecordV2,
 };
 use ffs_ondisk::ntfs::view_index::ViewCollation;
 use ffs_ondisk::ntfs::{
@@ -3283,8 +3282,12 @@ impl NtfsTransactionEngine {
             cat.set_std_times(None, Some(now_ticks), Some(now_ticks), None);
             cat.clone()
         };
-        let mut reason =
-            stream_data_change_reason(!stream_utf16.is_empty(), old_size, new_size, !data.is_empty());
+        let mut reason = stream_data_change_reason(
+            !stream_utf16.is_empty(),
+            old_size,
+            new_size,
+            !data.is_empty(),
+        );
         if existing_idx.is_none() && !stream_utf16.is_empty() {
             reason |= USN_REASON_STREAM_CHANGE;
         }
@@ -3647,8 +3650,7 @@ impl NtfsTransactionEngine {
             cat.set_std_times(None, Some(now_ticks), Some(now_ticks), None);
             cat.clone()
         };
-        let reason =
-            stream_data_change_reason(!stream_utf16.is_empty(), old_size, new_size, false);
+        let reason = stream_data_change_reason(!stream_utf16.is_empty(), old_size, new_size, false);
         ws.push_usn_event_for_catalog(&usn_snapshot, reason, now_ticks);
         if stream_utf16.is_empty() {
             ws.sync_target_into_parent_dirs(self, cx, target_ref)?;
@@ -5017,12 +5019,15 @@ impl NtfsTransactionEngine {
                 cat.set_std_times(None, Some(now_ticks), Some(now_ticks), None);
                 cat.clone()
             };
-            let reason = stream_data_change_reason(
+            let mut reason = stream_data_change_reason(
                 !stream_utf16.is_empty(),
                 old_size,
                 new_data.len() as u64,
                 !new_data.is_empty(),
             );
+            if old_size == 0 && new_data.is_empty() {
+                reason |= USN_REASON_BASIC_INFO_CHANGE;
+            }
             ws.push_usn_event_for_catalog(&usn_snap, reason, now_ticks);
             if stream_utf16.is_empty() {
                 ws.sync_target_into_parent_dirs(self, cx, target_ref)?;
