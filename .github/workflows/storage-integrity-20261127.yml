@@ -18,7 +18,7 @@ env:
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
   CARGO_INCREMENTAL: "0"
-  RUSTFLAGS: "-Z threads=1 -Z no-parallel-backend"
+  RUSTFLAGS: "-Z threads=1 -Z unstable-options --jobs-backend=1"
   CFLAGS: "-g0 -O2"
   CARGO_HTTP_USER_AGENT: "frankenfs-agent (+https://github.com/Dicklesworthstone/frankenfs)"
   FFS_REQUIRE_ORACLES: "1"
@@ -47,6 +47,7 @@ jobs:
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/ffs-storage-logs"
           printf 'CARGO_TARGET_DIR=%s\nCARGO_BUILD_BUILD_DIR=%s\n' "$RUNNER_TEMP/ffs-storage-target" "$RUNNER_TEMP/ffs-storage-target" >> "$GITHUB_ENV"
+          printf 'FFS_STORAGE_CACHE_TARGET=%s\n' "$(realpath -m --relative-to="$GITHUB_WORKSPACE" "$RUNNER_TEMP/ffs-storage-target")" >> "$GITHUB_ENV"
           rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends e2fsprogs btrfs-progs ntfs-3g zfsutils-linux pkg-config
@@ -65,9 +66,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: ffs-storage-registry-v1
-          shared-key: nightly-2026-08-31
-          cache-targets: "false"
+          prefix-key: ffs-storage-target-v1
+          shared-key: nightly-2026-08-31-${{ matrix.lane }}
+          workspaces: ". -> ${{ env.FFS_STORAGE_CACHE_TARGET }}"
           cache-bin: "false"
           cache-on-failure: "true"
 
@@ -137,6 +138,14 @@ jobs:
                 tests::native_freshness_shared_and_format_guards_share_one_abortable_epoch
               )
               ;;
+            core-crash)
+              required=(
+                native_repair_crash_cuts_and_healing::native_ext4_crash_cuts_a_and_b_corruption_1pct_5pct_and_e2fsck_bd_11a8t_bd_j7a4e
+                native_repair_crash_cuts_and_healing::native_ext4_crash_cuts_c_and_d_corruption_1pct_5pct_and_e2fsck_bd_11a8t_bd_j7a4e
+                native_repair_crash_cuts_and_healing::native_btrfs_crash_cuts_a_b_c_d_treelog_corruption_1pct_5pct_and_btrfs_check_bd_11a8t_bd_j7a4e
+                native_repair_crash_cuts_and_healing::native_repair_negative_controls_exhausted_tampered_stale_missing_and_cancelled_bd_j7a4e
+              )
+              ;;
             *) exit 2 ;;
           esac
           for name in "${required[@]}"; do
@@ -167,6 +176,10 @@ jobs:
       - name: Native repair freshness and cancellation suite
         if: ${{ !cancelled() && matrix.lane == 'tests' }}
         run: bash "$RUNNER_TEMP/ffs-run-storage-suite.sh" core cargo test --locked -p ffs-core --lib native_freshness_
+
+      - name: Native repair crash cuts, healing, and native image checks
+        if: ${{ !cancelled() && matrix.lane == 'tests' }}
+        run: bash "$RUNNER_TEMP/ffs-run-storage-suite.sh" core-crash cargo test --locked -p ffs-core --test cross_crate_integration native_repair_crash_cuts_and_healing
 
       - name: Confirm candidate source stayed unchanged
         if: ${{ !cancelled() }}
