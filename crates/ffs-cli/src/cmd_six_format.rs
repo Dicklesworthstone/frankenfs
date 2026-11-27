@@ -1765,9 +1765,7 @@ pub fn maybe_route_mount_cmd(
     let commit_interval = options.commit_interval_secs.map(Duration::from_secs);
     match options.runtime.mode {
         MountRuntimeMode::Standard => {
-            if options.console.live_refresh().is_some() {
-                bail!("--console-live requires --runtime-mode=managed or --runtime-mode=per-core");
-            }
+            options.console.reject_unsupported_runtime(true)?;
             ffs_fuse::mount_with_commit_interval(
                 &cx,
                 fs_ops,
@@ -1785,6 +1783,7 @@ pub fn maybe_route_mount_cmd(
                 commit_interval,
                 ..ffs_fuse::MountConfig::default()
             };
+            let mount_started = std::time::SystemTime::now();
             let handle = if options.runtime.mode == MountRuntimeMode::PerCore {
                 if config.options.resolved_thread_count() < 2 {
                     config.options.worker_threads = 2;
@@ -1797,7 +1796,7 @@ pub fn maybe_route_mount_cmd(
             let _ = ctrlc::set_handler(move || {
                 stop_sig.store(true, Ordering::SeqCst);
             });
-            let per_core = if let Some(interval) = options.console.live_refresh() {
+            let (metrics, per_core) = if let Some(interval) = options.console.live_refresh() {
                 use std::io::IsTerminal;
 
                 let started = std::time::Instant::now();
@@ -1806,7 +1805,7 @@ pub fn maybe_route_mount_cmd(
                 let stdout = io::stdout();
                 let terminal = stdout.is_terminal();
                 let mut output = stdout.lock();
-                let (_metrics, per_core) = handle
+                handle
                     .wait_with_observer(interval, |metrics| {
                         let elapsed = started.elapsed();
                         let snapshot = collector.sample_six_format_live(
@@ -1834,14 +1833,27 @@ pub fn maybe_route_mount_cmd(
                         )?;
                         output.flush()
                     })
-                    .context("six-format live dashboard failed during observation or unmount")?;
-                per_core
+                    .context("six-format live dashboard failed during observation or unmount")?
             } else if options.runtime.mode == MountRuntimeMode::PerCore {
-                handle.wait_with_per_core_metrics()?.1
+                handle.wait_with_per_core_metrics()?
             } else {
-                handle.wait()?;
-                None
+                (handle.wait()?, None)
             };
+            let mount_shutdown = std::time::SystemTime::now();
+            if options.console.is_enabled() {
+                let observation = build_six_format_console_observation(&SixFormatConsoleInput {
+                    kind,
+                    image_path,
+                    mountpoint: &mountpoint_canon,
+                    runtime: options.runtime,
+                    read_write: options.read_write,
+                    metrics: &metrics,
+                    per_core: per_core.as_ref(),
+                    started_at: mount_started,
+                    shutdown_at: mount_shutdown,
+                });
+                crate::mount_console::emit_mount_console(&options.console, &observation)?;
+            }
             if options.runtime.mode == MountRuntimeMode::PerCore {
                 let lanes = per_core.as_ref().map_or(0, |m| m.cpus.len());
                 let total_requests: u64 = per_core
@@ -1866,6 +1878,82 @@ pub fn maybe_route_mount_cmd(
         image_path,
     );
     Ok(true)
+}
+
+struct SixFormatConsoleInput<'a> {
+    kind: FsFormatKind,
+    image_path: &'a Path,
+    mountpoint: &'a Path,
+    runtime: crate::MountRuntimeConfig,
+    read_write: bool,
+    metrics: &'a ffs_fuse::MetricsSnapshot,
+    per_core: Option<&'a ffs_fuse::PerCoreTransportMetrics>,
+    started_at: std::time::SystemTime,
+    shutdown_at: std::time::SystemTime,
+}
+
+fn build_six_format_console_observation(
+    input: &SixFormatConsoleInput<'_>,
+) -> crate::mount_console::MountConsoleObservation {
+    let uptime = input
+        .shutdown_at
+        .duration_since(input.started_at)
+        .unwrap_or_default();
+    let mountpoint_label = input.mountpoint.display().to_string();
+    let runtime_mode = if input.runtime.mode == MountRuntimeMode::PerCore {
+        ffs_harness::runtime_console_report::RuntimeConsoleMode::PerCore
+    } else {
+        ffs_harness::runtime_console_report::RuntimeConsoleMode::Managed
+    };
+    let per_core_rows: Vec<crate::mount_console::MountConsoleCore> = if input.runtime.mode
+        == MountRuntimeMode::PerCore
+        && let Some(transport) = input.per_core
+        && transport.requests.iter().any(|&reqs| reqs > 0)
+    {
+        transport
+            .cpus
+            .iter()
+            .zip(transport.requests.iter())
+            .map(|(&cpu, &requests)| crate::mount_console::MountConsoleCore {
+                core_id: u32::try_from(cpu).unwrap_or(u32::MAX),
+                requests,
+                cache_hits: 0,
+                cache_misses: 0,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let dashboard_snapshot = Some(ffs_tui::DashboardSnapshot::from_six_format_live(
+        input.kind.as_str(),
+        &mountpoint_label,
+        uptime.as_secs(),
+        input.metrics.bytes_read,
+        0,
+    ));
+    crate::mount_console::MountConsoleObservation {
+        operation_id: format!("six-format-mount-{}", input.kind.as_str()),
+        scenario_id: format!("six_format_mount_{}", input.kind.as_str()),
+        runtime_mode,
+        read_write: input.read_write,
+        started_at: input.started_at,
+        shutdown_at: input.shutdown_at,
+        requests_total: input.metrics.requests_total,
+        requests_err: input.metrics.requests_err,
+        bytes_read: input.metrics.bytes_read,
+        requests_throttled: input.metrics.requests_throttled,
+        requests_shed: input.metrics.requests_shed,
+        degradation_level: ffs_core::degradation::DegradationLevel::Normal,
+        per_core: per_core_rows,
+        clean_shutdown: true,
+        reproduction_command: crate::mount_runtime_reproduction_command(
+            input.image_path,
+            input.mountpoint,
+            input.runtime,
+            input.read_write,
+        ),
+        dashboard_snapshot,
+    }
 }
 
 #[expect(
@@ -3960,5 +4048,86 @@ mod tests {
                 .render_ascii()
                 .contains("ntfs")
         );
+
+        // 6. Verify six-format managed & per-core console observation + emission
+        //    writes real runtime console JSON and Markdown artifacts (and omits idle lanes).
+        let json_out = tmp.path().join("six_format_console.json");
+        let md_out = tmp.path().join("six_format_console.md");
+        let console_cfg = crate::mount_console::MountConsoleConfig::from_cli(
+            true,
+            Some(json_out.clone()),
+            Some(md_out.clone()),
+        )
+        .expect("console config");
+        console_cfg
+            .reject_unsupported_runtime(true)
+            .expect_err("standard runtime must reject --console");
+        let started_at = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let shutdown_at = started_at + Duration::from_secs(3);
+        let sample_metrics = ffs_fuse::MetricsSnapshot {
+            requests_total: 12,
+            requests_err: 0,
+            bytes_read: 65_536,
+            requests_throttled: 0,
+            requests_shed: 0,
+            ..ffs_fuse::MetricsSnapshot::default()
+        };
+        let active_per_core = ffs_fuse::PerCoreTransportMetrics {
+            cpus: vec![0, 2],
+            requests: vec![7, 5],
+            stolen_from: vec![0, 0],
+            stolen_to: vec![0, 0],
+        };
+        let mut pc_runtime = crate::MountRuntimeConfig::default();
+        pc_runtime.mode = MountRuntimeMode::PerCore;
+        let obs = build_six_format_console_observation(&SixFormatConsoleInput {
+            kind: FsFormatKind::Zfs,
+            image_path: &zfs_img,
+            mountpoint: tmp.path(),
+            runtime: pc_runtime,
+            read_write: false,
+            metrics: &sample_metrics,
+            per_core: Some(&active_per_core),
+            started_at,
+            shutdown_at,
+        });
+        assert_eq!(obs.per_core.len(), 2);
+        assert_eq!(obs.per_core[0].core_id, 0);
+        assert_eq!(obs.per_core[0].requests, 7);
+        assert_eq!(obs.per_core[1].core_id, 2);
+        assert_eq!(obs.per_core[1].requests, 5);
+        assert_eq!(
+            obs.dashboard_snapshot.as_ref().map(|s| s.fs_type.as_str()),
+            Some("zfs")
+        );
+        crate::mount_console::emit_mount_console(&console_cfg, &obs)
+            .expect("emit six-format runtime console report");
+        let report_json = fs::read_to_string(&json_out).expect("read emitted console json");
+        assert!(report_json.contains("six-format-mount-zfs"));
+        assert!(
+            fs::read_to_string(&md_out)
+                .expect("read emitted console md")
+                .contains("per_core")
+        );
+
+        // Idle per-core transport must omit zeroed lane rows.
+        let idle_per_core = ffs_fuse::PerCoreTransportMetrics {
+            cpus: vec![0, 1],
+            requests: vec![0, 0],
+            stolen_from: vec![0, 0],
+            stolen_to: vec![0, 0],
+        };
+        let idle_obs = build_six_format_console_observation(&SixFormatConsoleInput {
+            kind: FsFormatKind::Ntfs,
+            image_path: &ntfs_src,
+            mountpoint: tmp.path(),
+            runtime: pc_runtime,
+            read_write: false,
+            metrics: &ffs_fuse::MetricsSnapshot::default(),
+            per_core: Some(&idle_per_core),
+            started_at,
+            shutdown_at,
+        });
+        assert!(idle_obs.per_core.is_empty());
     }
 }
