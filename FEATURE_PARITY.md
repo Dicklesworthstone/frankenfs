@@ -4114,3 +4114,44 @@ focused test build had not reached test execution when the shared executor
 disconnected under disk/memory pressure. No compiler, strict-Clippy or runtime
 pass is claimed. The direct publication records the documented gate bypass;
 bd-h8n46 remains open for its full acceptance contract.
+
+## ZFS receive durable progress and cleanup outcomes (2026-11-27)
+
+`receive_stream` now returns `ZfsRecvOutcome`, a receive-specific result for
+operations that can publish multiple native TXGs. `NotCommitted` is reserved
+for invocations with no new publication. `Interrupted` retains the last known
+durable token, completed substream count and snapshot identity, successful TXG
+count, and whether the latest durable action checkpointed staging, promoted a
+substream, or reclaimed incomplete staging. A later compound framing or
+substream error no longer hides an already published snapshot.
+
+Native publication uncertainty remains distinct and retains the actual target
+TXG/slot together with any earlier known durable progress. A resumed invocation
+that publishes nothing and cannot reclaim its prior staging reports both errors
+as `CleanupFailed`; `is_not_committed` recognizes this no-new-publication case.
+Automatic abort cleanup results are checked, including uncertain cleanup;
+an uncertain owner retains its existing fresh-engine recovery requirement.
+The CLI emits structured interruption/recovery details and returns failure for
+incomplete receives. The generic single-transaction `ZfsTxOutcome` is unchanged;
+callers of `receive_stream` must use the new receive outcome.
+
+Two authored faultable-device regressions cover six later-compound failures
+and eight publication, cleanup and cancellation cuts. They check snapshot/data
+survival using fresh engines over durable-only media, staging visibility, and
+the refusal to reuse an uncertain writer. Existing receive regressions retain
+their media, allocation, namespace and resume checks while asserting the new
+outcome categories. The existing resume regression also checks failed cleanup
+before any new publication, preserving both errors and the prior durable state.
+Focused entry points are
+`cargo test -p ffs-zfs --test persistence_prefix receive_outcome_ -- --nocapture --test-threads=1`
+and
+`cargo test -p ffs-zfs --test persistence_prefix send_recv:: -- --nocapture --test-threads=1`.
+
+Qualification is independent source review, pinned formatting of all six final
+changed Rust files, and whitespace validation, including the resumed-cleanup
+and explicit torn-root recovery corrections. Compiler and runtime qualification
+remain pending after dependency compilation was killed and the executor suffered
+repeated disk/memory exhaustion. A later limited recovery allowed formatting,
+but no completed compiler, Clippy or runtime result is claimed. Direct publication
+records the documented gate bypass. This change does not close bd-jbo9q or
+establish native OpenZFS interchange qualification.
