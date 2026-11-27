@@ -162,8 +162,8 @@ impl ScanRepairRoute {
                 }
             }
             AllocatorWriteTopology::Draid(config) => {
-                let map = DraidMap::new(config, dva.offset, physical.len())
-                    .map_err(|e| parse_err(&e))?;
+                let map =
+                    DraidMap::new(config, dva.offset, physical.len()).map_err(|e| parse_err(&e))?;
                 if map.allocated_bytes() > dva.allocated_bytes {
                     return Err(corrupt("scrub dRAID columns exceed their DVA allocation"));
                 }
@@ -448,10 +448,11 @@ impl ZfsTransactionEngine {
     fn scan_repair_routes(&self, cx: &Cx, mos: &mut Objects) -> Result<ScanRepairRoutes> {
         let config = mos.load_mos_config_nvlist(cx)?;
         if self.storage_identity.member_guids.len() != self.pool.leaves().len() {
-            return Err(corrupt("scrub member identity count disagrees with devices"));
+            return Err(corrupt(
+                "scrub member identity count disagrees with devices",
+            ));
         }
-        let topology =
-            PoolTopology::from_mos_config(&config, &self.storage_identity.member_guids)?;
+        let topology = PoolTopology::from_mos_config(&config, &self.storage_identity.member_guids)?;
         let trees = config
             .list("vdev_tree")
             .and_then(|root| root.fields.get("children"));
@@ -499,7 +500,9 @@ impl ZfsTransactionEngine {
             let members: Vec<_> = top.supplied_indices.iter().flatten().copied().collect();
             if members.is_empty()
                 || members.len() != top.children_guids.len()
-                || members.iter().any(|&index| index >= self.pool.leaves().len())
+                || members
+                    .iter()
+                    .any(|&index| index >= self.pool.leaves().len())
                 || !(9..=16).contains(&top.ashift)
             {
                 return Err(corrupt("scrub native child routing is incomplete"));
@@ -859,9 +862,11 @@ impl ZfsTransactionEngine {
         let mut synced_members = vec![false; self.pool.leaves().len()];
         for write in writes {
             checkpoint(cx)?;
-            let current = match self.pool.leaves()[write.member]
-                .read_raw(cx, write.offset, write.bytes.len())
-            {
+            let current = match self.pool.leaves()[write.member].read_raw(
+                cx,
+                write.offset,
+                write.bytes.len(),
+            ) {
                 Ok(bytes) => Some(bytes),
                 Err(FfsError::Cancelled) => return Err(FfsError::Cancelled),
                 Err(_) => None,

@@ -20,6 +20,8 @@ mod pool_lifecycle;
 mod projects;
 #[path = "persistence_prefix/quota_profile.rs"]
 mod quota_profile;
+#[path = "persistence_prefix/removal.rs"]
+mod removal;
 #[path = "persistence_prefix/send_recv.rs"]
 mod send_recv;
 #[path = "persistence_prefix/topology_advanced.rs"]

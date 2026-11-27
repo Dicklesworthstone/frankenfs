@@ -1052,8 +1052,8 @@ impl ZfsTransactionEngine {
         self.committed_slot
     }
 
-    /// Whether an incomplete uberblock publication requires a fresh, explicitly
-    /// reconciled writer before this handle can serve further mutations.
+    /// Whether uncertain publication or an interrupted physical repair requires
+    /// a fresh native writer before this handle can serve further mutations.
     #[must_use]
     pub const fn requires_recovery(&self) -> bool {
         self.poisoned_uncertain
@@ -2590,7 +2590,6 @@ impl ZfsTransactionEngine {
         self.execute_staged_txg_with_mos(cx, op_name, None, &[], stage_fn)
     }
 
-    #[allow(clippy::too_many_lines)]
     fn execute_staged_txg_with_mos<T>(
         &mut self,
         cx: &Cx,
@@ -2606,9 +2605,38 @@ impl ZfsTransactionEngine {
             &mut Vec<StagedBlockWrite>,
         ) -> Result<(T, u64)>,
     ) -> ZfsTxOutcome<T> {
+        self.execute_staged_txg_publication(
+            cx,
+            op_name,
+            pre_opened_mos,
+            pre_commit_writes,
+            true,
+            stage_fn,
+        )
+    }
+
+    /// Topology changes defer acknowledgement until their label configurations
+    /// have also crossed every required durability barrier.
+    #[allow(clippy::too_many_lines)]
+    fn execute_staged_txg_publication<T>(
+        &mut self,
+        cx: &Cx,
+        op_name: &str,
+        pre_opened_mos: Option<Objects>,
+        pre_commit_writes: &[(usize, u64, Vec<u8>)],
+        acknowledge: bool,
+        stage_fn: impl FnOnce(
+            &mut Objects,
+            &mut BTreeMap<u64, Vec<u8>>,
+            &mut MosFeatureState,
+            &mut PoolSpaceAllocator,
+            u64,
+            &mut Vec<StagedBlockWrite>,
+        ) -> Result<(T, u64)>,
+    ) -> ZfsTxOutcome<T> {
         if self.poisoned_uncertain {
             return ZfsTxOutcome::NotCommitted(unsupported(
-                "ZFS writer handle experienced an Uncertain Uberblock outcome; reopen fresh engine to reconcile",
+                "ZFS writer requires fresh native recovery after uncertain publication or interrupted repair",
             ));
         }
         if let Err(err) = checkpoint(cx) {
@@ -2919,19 +2947,34 @@ impl ZfsTransactionEngine {
         // These events concern delivery of a known result, not native durability.
         // Preserve the token even if the request is cancelled or its reply fails:
         // the caller can reconcile the committed operation without replaying it.
-        let _ = self.emit_event(
-            op_name,
-            ZfsPersistenceStage::BeforeAcknowledge,
-            new_txg,
-            0,
-            0,
-            0,
-        );
-        let _ = self.emit_event(op_name, ZfsPersistenceStage::AckPublished, new_txg, 0, 0, 0);
+        if acknowledge {
+            self.acknowledge_committed_txg(op_name);
+        }
         ZfsTxOutcome::Committed {
             value: result_typed,
             token,
         }
+    }
+
+    /// Deliver a known durable result after its enclosing lifecycle transition.
+    /// A reply fault cannot undo either the native root or its completed labels.
+    fn acknowledge_committed_txg(&mut self, op_name: &str) {
+        let _ = self.emit_event(
+            op_name,
+            ZfsPersistenceStage::BeforeAcknowledge,
+            self.committed_txg,
+            0,
+            0,
+            0,
+        );
+        let _ = self.emit_event(
+            op_name,
+            ZfsPersistenceStage::AckPublished,
+            self.committed_txg,
+            0,
+            0,
+            0,
+        );
     }
 
     /// Resolve the selected allocator's native child order once for the whole TXG.

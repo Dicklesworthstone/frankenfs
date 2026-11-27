@@ -10,10 +10,9 @@
 //!   (`L0..L1 -> sync -> L2..L3 -> sync`).
 //! - `trim` checks `supports_discard_raw()`, reports `EOPNOTSUPP` cleanly per
 //!   device without weakening pool durability, and persists resumable progress.
-//! - `remove_vdev` evacuates blocks onto remaining top-level vdevs and writes
-//!   genuine OpenZFS `IndirectMappingPhys` + `IndirectMappingEntry` +
-//!   `IndirectBirthEntry` structures (`com.delphix:device_removal` +
-//!   `com.delphix:obsolete_counts`).
+//! - `remove_vdev` proves an empty trailing vdev is unreferenced and retires its
+//!   metadata atomically before publishing the surviving topology. Allocated
+//!   source evacuation refuses until its complete native lifecycle is supported.
 //! - `expand_raidz` reflows RAIDZ1/2/3 stripes onto `physical_width + 1` with
 //!   resumable `ub_raidz_reflow_info` progress and `org.openzfs:raidz_expansion`.
 
@@ -24,9 +23,6 @@ use asupersync::Cx;
 use ffs_block::ByteDevice;
 use ffs_error::{FfsError, Result};
 use ffs_ondisk::zfs::draid::{DraidConfig, DraidMap};
-use ffs_ondisk::zfs::indirect::{
-    IndirectBirthEntry, IndirectBirthsPhys, IndirectMappingEntry, IndirectMappingPhys,
-};
 use ffs_ondisk::zfs::nvlist::{NvList, Value};
 use ffs_ondisk::zfs::raidz::Raidz1Map;
 use ffs_ondisk::zfs::raidz::expand::{
@@ -52,16 +48,18 @@ use serde::Serialize;
 use super::dmu_cow::{
     AllocatorWriteTopology, DMU_OT_OBJECT_ARRAY, DMU_OT_OBJSET, DMU_OT_PACKED_NVLIST,
     DMU_OT_SPACE_MAP, DMU_OT_SPACE_MAP_HEADER, DnodeCowSpec, PoolSpaceAllocator, SpaceDelta,
-    StagedBlockWrite, WriteBucket, allocate_object_id, cow_update_dnode, put_dnode_in_table,
-    zap_optional_u64, zap_required_u64,
+    StagedBlockWrite, WriteBucket, cow_update_dnode, put_dnode_in_table, zap_optional_u64,
+    zap_required_u64,
 };
-use super::dsl_ops::DD_FLAG_USED_BREAKDOWN;
+use super::dsl_ops::{DD_FLAG_USED_BREAKDOWN, free_mos_object_completely};
 use super::{
     ZfsPersistenceStage, ZfsTopologyKind, ZfsTransactionEngine, ZfsTxOutcome, checkpoint, corrupt,
     parse_err, unsupported,
 };
 use crate::Leaf;
 use crate::reader::AllocClass;
+
+mod removal;
 
 const INITIAL_TXG: u64 = 4;
 const SLAB_SHIFT: u64 = 20; // 1 MiB metaslabs for compact offline test & scratch images
@@ -79,7 +77,6 @@ const DMU_OT_BPOBJ_HDR: u8 = 6;
 const DMU_OT_SA_MASTER_NODE: u8 = 45;
 const DMU_OT_SA_ATTR_REGISTRATION: u8 = 46;
 const DMU_OT_SA_ATTR_LAYOUTS: u8 = 47;
-const DMU_OTN_UINT64_METADATA: u8 = 195;
 const DMU_OTN_ZAP_METADATA: u8 = 196;
 const DMU_POOL_TRIM_PROGRESS_KEY: &[u8] = b"vdev_trim_progress";
 
@@ -224,14 +221,16 @@ pub struct ZfsTrimReport {
     pub txg: u64,
 }
 
-/// Summary returned by resumable [`ZfsTransactionEngine::remove_vdev`].
+/// Summary returned by [`ZfsTransactionEngine::remove_vdev`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ZfsRemoveVdevReport {
     pub removed_vdev_id: u32,
     pub target_vdev_id: u32,
     pub extents_evacuated: u64,
     pub bytes_evacuated: u64,
+    /// Zero when removing an empty vdev without indirect mappings.
     pub indirect_mapping_object: u64,
+    /// Zero when removing an empty vdev without indirect mappings.
     pub indirect_births_object: u64,
     pub completed: bool,
     pub txg: u64,
@@ -2811,11 +2810,14 @@ impl ZfsTransactionEngine {
         outcome
     }
 
-    /// Resumable top-level vdev removal (`com.delphix:device_removal` +
-    /// `com.delphix:obsolete_counts`): copies allocated extents from `remove_vdev_id`
-    /// onto `target_vdev_id`, persists genuine OpenZFS `IndirectMappingPhys` +
-    /// `IndirectMappingEntry` + `IndirectBirthEntry` MOS objects, and converts
-    /// `remove_vdev_id` to `type = "indirect"` in MOS config!
+    /// Remove an empty trailing top-level leaf or mirror while retaining every
+    /// surviving native vdev ID. The committed source space maps and all current
+    /// head/snapshot references must prove that no source allocation remains.
+    ///
+    /// Allocated-source evacuation is refused before writes until native
+    /// survivor bootstrap and indirect-DVA free accounting are implemented.
+    /// An empty removal needs no indirect mapping objects and reports zero
+    /// evacuated bytes. Successful completion permits disconnecting the source.
     #[allow(clippy::too_many_lines)]
     pub fn remove_vdev(
         &mut self,
@@ -2824,352 +2826,89 @@ impl ZfsTransactionEngine {
         target_vdev_id: u32,
         extents_to_evacuate: &[(u64, u64)],
     ) -> ZfsTxOutcome<ZfsRemoveVdevReport> {
-        if remove_vdev_id == target_vdev_id {
-            return ZfsTxOutcome::NotCommitted(FfsError::Format(
-                "remove_vdev target must differ from removed vdev".into(),
-            ));
-        }
-        // Validate MOS topology before touching any disk: OpenZFS only permits
-        // removing leaf/mirror top-level vdevs and requires another normal vdev.
-        let mut pre_mos = match self.open_read_objects(cx) {
-            Ok(m) => m,
-            Err(err) => return ZfsTxOutcome::NotCommitted(err),
+        let plan = match removal::EmptyRemovalPlan::build(
+            cx,
+            self,
+            remove_vdev_id,
+            target_vdev_id,
+            extents_to_evacuate,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => return ZfsTxOutcome::NotCommitted(error),
         };
-        let pre_cfg = match pre_mos.load_mos_config_nvlist(cx) {
-            Ok(c) => c,
-            Err(err) => return ZfsTxOutcome::NotCommitted(err),
+        let removal::EmptyRemovalPlan {
+            mos,
+            config,
+            pool,
+            identity,
+            label_offsets,
+            labels,
+            retired_objects,
+            next_txg,
+        } = plan;
+        // The old committed MOS retains its own source handles. Staging reads
+        // may use them, but every new block and root is written only to survivors.
+        let protected_pool = pool.clone();
+        let mut protection = match protected_pool.defer_protection(cx) {
+            Ok(holds) => holds,
+            Err(error) => return ZfsTxOutcome::NotCommitted(error),
         };
-        let Some(Value::List(pre_root)) = pre_cfg.fields.get("vdev_tree") else {
-            return ZfsTxOutcome::NotCommitted(corrupt("MOS config missing vdev_tree"));
-        };
-        let Some(Value::Lists(pre_tops)) = pre_root.fields.get("children") else {
-            return ZfsTxOutcome::NotCommitted(corrupt("MOS config missing top-level children"));
-        };
-        let Some(remove_tree) = pre_tops.get(remove_vdev_id as usize) else {
-            return ZfsTxOutcome::NotCommitted(FfsError::NotFound(
-                "remove_vdev_id out of bounds".into(),
-            ));
-        };
-        if pre_tops.get(target_vdev_id as usize).is_none() {
-            return ZfsTxOutcome::NotCommitted(FfsError::NotFound(
-                "target_vdev_id out of bounds".into(),
-            ));
-        }
-        let remove_kind = remove_tree.text("type").unwrap_or("");
-        if matches!(remove_kind, "raidz" | "draid" | "indirect" | "hole") {
-            return ZfsTxOutcome::NotCommitted(unsupported(format!(
-                "OpenZFS device removal refuses vdev type `{remove_kind}`"
-            )));
-        }
-        let remaining_normal = pre_tops
-            .iter()
-            .enumerate()
-            .filter(|(idx, t)| {
-                *idx != remove_vdev_id as usize
-                    && !matches!(t.text("type"), Some("indirect" | "hole"))
-                    && t.unsigned("is_log").unwrap_or(0) == 0
-                    && !matches!(t.text("allocation_bias"), Some("special" | "dedup"))
-            })
-            .count();
-        if remaining_normal == 0 {
-            return ZfsTxOutcome::NotCommitted(unsupported(
-                "cannot remove the last remaining normal data vdev",
-            ));
-        }
-        let next_txg = self.committed_txg.saturating_add(1);
+        let old_pool = std::mem::replace(&mut self.pool, pool);
+        let old_offsets = std::mem::replace(&mut self.label_offsets_per_member, label_offsets);
+        let old_identity = std::mem::replace(&mut self.storage_identity, identity);
         let order = self.order;
-        let remove_leaf_idx = (remove_vdev_id as usize).min(self.pool.leaves().len() - 1);
-        let target_leaf_idx = (target_vdev_id as usize).min(self.pool.leaves().len() - 1);
-
-        // 1. Read every extent from the source vdev and validate alignment before staging!
-        let mut evacuated_payloads: Vec<(u64, Vec<u8>)> =
-            Vec::with_capacity(extents_to_evacuate.len());
-        let mut bytes_evacuated = 0_u64;
-        for &(src_off, len) in extents_to_evacuate {
-            if let Err(err) = checkpoint(cx) {
-                return ZfsTxOutcome::NotCommitted(err);
-            }
-            if len == 0 || !src_off.is_multiple_of(512) || !len.is_multiple_of(512) {
-                return ZfsTxOutcome::NotCommitted(corrupt("unaligned indirect removal extent"));
-            }
-            let Ok(len_usize) = usize::try_from(len) else {
-                return ZfsTxOutcome::NotCommitted(corrupt("extent length overflow"));
-            };
-            let raw = match self.pool.leaves()[remove_leaf_idx].read_raw(
-                cx,
-                DATA_OFFSET + src_off,
-                len_usize,
-            ) {
-                Ok(b) => b,
-                Err(err) => return ZfsTxOutcome::NotCommitted(err),
-            };
-            bytes_evacuated = bytes_evacuated.saturating_add(len);
-            evacuated_payloads.push((src_off, raw));
-        }
-
-        // For non-allocating secondary target vdevs, copy directly with explicit
-        // `RemovalCopyWrite`/`RemovalCopyBarrier`; when targeting the primary
-        // allocating vdev (`self.allocator.vdev_id`), allocate real space-map-tracked
-        // DVAs inside the TXG so no MOS or future block can ever overlap them!
-        let target_is_primary_alloc = target_vdev_id == self.allocator.vdev_id;
-        let mut external_entries = Vec::new();
-        if !target_is_primary_alloc {
-            let mut dst_cursor = 64 * 1024_u64;
-            for (src_off, raw) in &evacuated_payloads {
-                let len = raw.len() as u64;
-                let dst_off = dst_cursor;
-                dst_cursor = dst_cursor.saturating_add(len);
-                if let Err(err) = self.emit_event(
-                    "zfs_pool_remove_vdev",
-                    ZfsPersistenceStage::RemovalCopyWrite {
-                        member_index: target_leaf_idx,
-                    },
-                    next_txg,
-                    target_leaf_idx,
-                    DATA_OFFSET + dst_off,
-                    raw.len(),
-                ) {
-                    return ZfsTxOutcome::NotCommitted(err);
-                }
-                if let Err(err) =
-                    self.pool.leaves()[target_leaf_idx].write_raw(cx, DATA_OFFSET + dst_off, raw)
-                {
-                    return ZfsTxOutcome::NotCommitted(err);
-                }
-                external_entries.push(IndirectMappingEntry {
-                    src_offset: *src_off,
-                    marked: false,
-                    dst: Dva {
-                        vdev: target_vdev_id,
-                        offset: dst_off,
-                        allocated_bytes: len,
-                        gang: false,
-                    },
-                });
-            }
-            if let Err(err) = self.emit_event(
-                "zfs_pool_remove_vdev",
-                ZfsPersistenceStage::RemovalCopyBarrier {
-                    member_index: target_leaf_idx,
-                },
-                next_txg,
-                target_leaf_idx,
-                0,
-                0,
-            ) {
-                return ZfsTxOutcome::NotCommitted(err);
-            }
-            if let Err(err) = self.pool.leaves()[target_leaf_idx].sync_raw(cx) {
-                return ZfsTxOutcome::NotCommitted(err);
-            }
-        }
-
-        let mut encoded_labels = Vec::with_capacity(self.pool.leaves().len());
-        for leaf in self.pool.leaves() {
-            let mut lbl_cfg = match leaf.label(cx, 0) {
-                Ok(l) => l.config,
-                Err(err) => return ZfsTxOutcome::NotCommitted(err),
-            };
-            lbl_cfg
-                .fields
-                .insert("txg".to_owned(), Value::Unsigned(next_txg));
-            let mut rf_list = lbl_cfg
-                .list("features_for_read")
-                .cloned()
-                .unwrap_or_else(|| nv_list(Vec::new()));
-            rf_list.fields.insert(
-                "com.delphix:device_removal".to_owned(),
-                Value::Boolean(true),
-            );
-            lbl_cfg
-                .fields
-                .insert("features_for_read".to_owned(), Value::List(rf_list));
-            match lbl_cfg.encode_xdr() {
-                Ok(b) => encoded_labels.push(b),
-                Err(e) => return ZfsTxOutcome::NotCommitted(parse_err(&e)),
-            }
-        }
-
-        let outcome = self.execute_staged_txg_typed(
+        let outcome = self.execute_staged_txg_publication(
             cx,
             "zfs_pool_remove_vdev",
-            |mos, mos_dirty, features, alloc, txg, staged| {
-                let mut mapping_entries = if target_is_primary_alloc {
-                    let mut entries = Vec::with_capacity(evacuated_payloads.len());
-                    for (src_off, raw) in evacuated_payloads {
-                        let dst_dva = alloc.allocate(raw.len())?;
-                        staged.push(StagedBlockWrite::from_dva(
-                            WriteBucket::ChildBlocks,
-                            dst_dva,
-                            raw,
-                        ));
-                        entries.push(IndirectMappingEntry {
-                            src_offset: src_off,
-                            marked: false,
-                            dst: dst_dva,
-                        });
-                    }
-                    entries
-                } else {
-                    external_entries
-                };
-                mapping_entries.sort_by_key(|e| e.src_offset);
-
-                // 2. Encode OpenZFS `IndirectMappingPhys` + `IndirectMappingEntry` stream + `IndirectBirthsPhys`!
-                let mut mapping_stream = Vec::with_capacity(mapping_entries.len() * 24);
-                for entry in &mapping_entries {
-                    let raw = entry.encode(order).map_err(|e| parse_err(&e))?;
-                    mapping_stream.extend_from_slice(&raw);
+            Some(mos),
+            &[],
+            false,
+            |mos, mos_dirty, _features, alloc, txg, staged| {
+                let meta = mos.meta_dnode().clone();
+                let ceiling = mos.root_birth_txg();
+                for object in retired_objects {
+                    free_mos_object_completely(
+                        cx, mos, &meta, ceiling, mos_dirty, alloc, object, order, txg,
+                    )?;
                 }
-                let max_offset = mapping_entries
-                    .last()
-                    .map_or(0, |e| e.src_offset + e.dst.allocated_bytes);
-                let mapping_hdr = IndirectMappingPhys {
-                    max_offset,
-                    bytes_mapped: bytes_evacuated,
-                    num_entries: mapping_entries.len() as u64,
-                    counts_object: 0,
-                };
-                let births_hdr = IndirectBirthsPhys { count: 1 };
-                let birth_entry = IndirectBirthEntry {
-                    offset: max_offset,
-                    phys_birth_txg: txg,
-                };
-                let birth_stream = birth_entry.encode(order).to_vec();
-
-                let mos_meta = mos.meta_dnode().clone();
-                let mos_ceil = mos.root_birth_txg();
-                let map_obj = allocate_object_id(cx, mos, &mos_meta, mos_ceil, mos_dirty, 1)?;
-                let births_obj = allocate_object_id(cx, mos, &mos_meta, mos_ceil, mos_dirty, 1)?;
-
-                let mut map_padded = mapping_stream;
-                let map_bsize = map_padded.len().max(512).next_multiple_of(512);
-                map_padded.resize(map_bsize, 0);
-                let map_out = cow_update_dnode(
-                    cx,
-                    mos,
-                    alloc,
-                    DnodeCowSpec {
-                        existing: None,
-                        object_type: DMU_OTN_UINT64_METADATA,
-                        bonus_type: DMU_OTN_UINT64_METADATA,
-                        checksum_type: 7,
-                        compress_type: 2,
-                        user_flags: 0,
-                        indirect_shift: 14,
-                        data_bytes: map_bsize,
-                        max_block: 0,
-                        slots: 1,
-                        nblkptr: 3,
-                        bonus: mapping_hdr.encode(order).to_vec(),
-                        spill: None,
-                        order,
-                        new_txg: txg,
-                        leaf_bucket: WriteBucket::MosSpaceMap,
-                        indirect_bucket: WriteBucket::MosSpaceMap,
-                    },
-                    &BTreeMap::from([(0_u64, Some(map_padded))]),
-                    staged,
-                )?;
-                put_dnode_in_table(
-                    cx,
-                    mos,
-                    &mos_meta,
-                    mos_ceil,
-                    mos_dirty,
-                    map_obj,
-                    &map_out.dnode,
-                )?;
-
-                let mut birth_padded = birth_stream;
-                birth_padded.resize(512, 0);
-                let birth_out = cow_update_dnode(
-                    cx,
-                    mos,
-                    alloc,
-                    DnodeCowSpec {
-                        existing: None,
-                        object_type: DMU_OTN_UINT64_METADATA,
-                        bonus_type: DMU_OTN_UINT64_METADATA,
-                        checksum_type: 7,
-                        compress_type: 2,
-                        user_flags: 0,
-                        indirect_shift: 14,
-                        data_bytes: 512,
-                        max_block: 0,
-                        slots: 1,
-                        nblkptr: 3,
-                        bonus: births_hdr.encode(order).to_vec(),
-                        spill: None,
-                        order,
-                        new_txg: txg,
-                        leaf_bucket: WriteBucket::MosSpaceMap,
-                        indirect_bucket: WriteBucket::MosSpaceMap,
-                    },
-                    &BTreeMap::from([(0_u64, Some(birth_padded))]),
-                    staged,
-                )?;
-                put_dnode_in_table(
-                    cx,
-                    mos,
-                    &mos_meta,
-                    mos_ceil,
-                    mos_dirty,
-                    births_obj,
-                    &birth_out.dnode,
-                )?;
-
-                // Update MOS config slot `remove_vdev_id` -> `type = "indirect"`!
-                let mut mos_cfg = mos.load_mos_config_nvlist(cx)?;
-                if let Some(Value::List(root)) = mos_cfg.fields.get_mut("vdev_tree")
-                    && let Some(Value::Lists(tops)) = root.fields.get_mut("children")
-                    && let Some(slot) = tops.get_mut(remove_vdev_id as usize)
-                {
-                    *slot = nv_list(vec![
-                        ("type", Value::String("indirect".into())),
-                        ("id", Value::Unsigned(u64::from(remove_vdev_id))),
-                        ("guid", Value::Unsigned(0)),
-                        ("indirect_object", Value::Unsigned(map_obj)),
-                        ("indirect_births", Value::Unsigned(births_obj)),
-                        ("prev_indirect_vdev", Value::Unsigned(u64::MAX)),
-                    ]);
-                }
-                write_mos_config_nvlist(cx, mos, mos_dirty, alloc, order, txg, &mos_cfg, staged)?;
-
-                features
-                    .read_features
-                    .insert("com.delphix:device_removal".to_owned(), 1);
-                features.read_dirty = true;
-                features
-                    .write_features
-                    .insert("com.delphix:obsolete_counts".to_owned(), 1);
-                features.write_dirty = true;
-
+                write_mos_config_nvlist(cx, mos, mos_dirty, alloc, order, txg, &config, staged)?;
                 Ok((
                     ZfsRemoveVdevReport {
                         removed_vdev_id: remove_vdev_id,
                         target_vdev_id,
-                        extents_evacuated: mapping_entries.len() as u64,
-                        bytes_evacuated,
-                        indirect_mapping_object: map_obj,
-                        indirect_births_object: births_obj,
+                        extents_evacuated: 0,
+                        bytes_evacuated: 0,
+                        indirect_mapping_object: 0,
+                        indirect_births_object: 0,
                         completed: true,
                         txg,
                     },
-                    map_obj,
+                    u64::from(remove_vdev_id),
                 ))
             },
         );
-        if outcome.is_committed()
-            && let Err(err) =
-                self.publish_labels_2wave(cx, "zfs_pool_remove_vdev", next_txg, &encoded_labels)
-        {
-            return ZfsTxOutcome::Uncertain {
-                reason: err,
-                target_txg: next_txg,
-                target_slot: (next_txg as usize) % self.slots_per_label,
-            };
+        if outcome.is_committed() {
+            if let Err(reason) =
+                self.publish_labels_2wave(cx, "zfs_pool_remove_vdev", next_txg, &labels)
+            {
+                // New roots may be durable beside a partial topology-label
+                // cohort. Never permit another mutation through this owner.
+                self.poisoned_uncertain = true;
+                return ZfsTxOutcome::Uncertain {
+                    reason,
+                    target_txg: next_txg,
+                    target_slot: self.committed_slot,
+                };
+            }
+            for hold in &mut protection {
+                hold.complete();
+            }
+            self.acknowledge_committed_txg("zfs_pool_remove_vdev");
+            return outcome;
         }
+        self.pool = old_pool;
+        self.label_offsets_per_member = old_offsets;
+        self.storage_identity = old_identity;
         outcome
     }
 

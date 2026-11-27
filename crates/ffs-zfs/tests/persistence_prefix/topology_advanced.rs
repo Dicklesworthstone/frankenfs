@@ -3,9 +3,8 @@
 //!   resolution, and read-only degraded survivor erasure recovery (`1..=nparity`).
 //! - Resumable RAIDZ1/2/3 width expansion (`org.openzfs:raidz_expansion`) with
 //!   chunked reflow, `ub_raidz_reflow_info` persistence, and crash cuts.
-//! - Top-level vdev removal (`com.delphix:device_removal` + `obsolete_counts`)
-//!   with genuine OpenZFS `IndirectMappingPhys`/`IndirectMappingEntry` +
-//!   `IndirectBirthEntry` evacuation and chained/split resolution.
+//! - Unallocated removal-extent refusal and native indirect mapping split/cycle
+//!   resolution. Empty-vdev lifecycle coverage lives in `removal.rs`.
 //! - Allocation classes (`special`, `log`, `spares`), `l2cache` isolation, and
 //!   fail-closed missing required `special`/`dedup` class refusal.
 //! - OpenZFS `zfs-2.4.0` feature manifest enforcement (`dynamic_gang_header`,
@@ -645,7 +644,7 @@ fn raidz_expansion_resumable_chunked_reflow_and_fault_cut_safety() {
 }
 
 #[test]
-fn device_removal_indirect_vdev_evacuation_and_chained_split_resolution() {
+fn device_removal_refuses_unallocated_claims_and_keeps_indirect_split_resolution() {
     let cx = Cx::for_testing();
     let pool_guid = 0x5245_4D4F_5645_0001_u64;
     let devs = blank_devs(2, 12 * 1024 * 1024);
@@ -690,26 +689,67 @@ fn device_removal_indirect_vdev_evacuation_and_chained_split_resolution() {
             .is_not_committed()
     );
 
-    // Evacuate vdev 1 -> vdev 0!
-    let (rem_rep, tok) = engine
-        .remove_vdev(&cx, 1, 0, &[(0, 4096), (4096, 4096)])
-        .into_result()
-        .expect("remove_vdev evacuation must commit");
-    assert_eq!(rem_rep.removed_vdev_id, 1);
-    assert_eq!(rem_rep.target_vdev_id, 0);
-    assert_eq!(rem_rep.extents_evacuated, 2);
-    assert_eq!(rem_rep.bytes_evacuated, 8192);
-    assert!(rem_rep.completed);
+    // Raw writes did not allocate either range in vdev 1's native space maps.
+    // They cannot authorize copying or changing topology.
+    let snapshots: Vec<_> = devs
+        .iter()
+        .map(FaultableMemberDevice::durable_snapshot)
+        .collect();
+    let writes: Vec<_> = devs
+        .iter()
+        .map(FaultableMemberDevice::write_calls)
+        .collect();
+    assert!(
+        engine
+            .remove_vdev(&cx, 1, 0, &[(0, 4096), (4096, 4096)])
+            .is_not_committed()
+    );
+    for ((device, before), count) in devs.iter().zip(snapshots).zip(writes) {
+        assert_eq!(device.durable_snapshot(), before);
+        assert_eq!(device.write_calls(), count);
+    }
 
-    // Verify IndirectVdevMap loads directly from MOS and resolves split spans to exact bytes on vdev 0!
-    let pool = Pool::from_wide_leaves(leaves_from_devs(&cx, &devs)).unwrap();
-    let mut mos = pool
-        .objects(&cx, 0, tok.published_slot(), pool_guid)
-        .unwrap();
-    let mos_cfg = mos.load_mos_config_nvlist(&cx).unwrap();
-    let ind_map = IndirectVdevMap::load_from_mos(&cx, &mut mos, &mos_cfg)
-        .expect("load persisted indirect vdev map from MOS");
-    let resolved = ind_map
+    // Keep split-span native mapping resolution covered independently of the
+    // removal API's stricter ownership admission.
+    let split = IndirectMappingTable::new(
+        1,
+        IndirectMappingPhys {
+            max_offset: 8192,
+            bytes_mapped: 8192,
+            num_entries: 2,
+            counts_object: 0,
+        },
+        vec![
+            IndirectMappingEntry {
+                src_offset: 0,
+                marked: false,
+                dst: Dva {
+                    vdev: 0,
+                    offset: 16_384,
+                    allocated_bytes: 4096,
+                    gang: false,
+                },
+            },
+            IndirectMappingEntry {
+                src_offset: 4096,
+                marked: false,
+                dst: Dva {
+                    vdev: 0,
+                    offset: 32_768,
+                    allocated_bytes: 4096,
+                    gang: false,
+                },
+            },
+        ],
+        vec![IndirectBirthEntry {
+            offset: 8192,
+            phys_birth_txg: 5,
+        }],
+    )
+    .unwrap();
+    let mut indirect = IndirectVdevMap::default();
+    indirect.insert(1, split);
+    let resolved = indirect
         .resolve_dva(
             &Dva {
                 vdev: 1,
@@ -719,27 +759,14 @@ fn device_removal_indirect_vdev_evacuation_and_chained_split_resolution() {
             },
             8192,
         )
-        .expect("split-span indirect resolution must succeed");
+        .unwrap();
     assert_eq!(resolved.len(), 2);
-    let mut reassembled = Vec::new();
-    for seg in &resolved {
-        assert_eq!(seg.vdev, 0);
-        let mut buf = vec![0_u8; usize::try_from(seg.allocated_bytes).unwrap()];
-        devs[0]
-            .read_exact_at(&cx, ByteOffset(DATA_OFFSET + seg.offset), &mut buf)
-            .unwrap();
-        reassembled.extend_from_slice(&buf);
-    }
-    let mut expected = blk_a;
-    expected.extend_from_slice(&blk_b);
-    assert_eq!(reassembled, expected);
-
-    // Negative control: removing the last remaining normal vdev (`vdev 0`) is strictly refused!
+    assert_eq!(resolved[0].offset, 16_384);
+    assert_eq!(resolved[1].offset, 32_768);
     assert!(
-        engine
-            .remove_vdev(&cx, 0, 1, &[(0, 4096)])
-            .is_not_committed(),
-        "removing last remaining normal vdev must be refused"
+        resolved
+            .iter()
+            .all(|span| span.vdev == 0 && span.allocated_bytes == 4096)
     );
 
     // Negative control: self-referential / cyclic indirect chains MUST fail closed!
