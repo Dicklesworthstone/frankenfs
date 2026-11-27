@@ -4678,8 +4678,9 @@ fn resumable_receive_interrupt_isolation_resume_abort_and_fault_cut_matrix() {
             }
             Ok(())
         });
-        let (begin, _) =
-            DrrRecord::parse_header(&resume_s2[..DMU_REPLAY_RECORD_BYTES], Endian::Little).unwrap();
+        let begin_hdr: &[u8; DMU_REPLAY_RECORD_BYTES] =
+            resume_s2[..DMU_REPLAY_RECORD_BYTES].try_into().unwrap();
+        let (begin, _) = DrrRecord::parse_header(begin_hdr, Endian::Little).unwrap();
         let begin_bytes = DMU_REPLAY_RECORD_BYTES + begin.expected_payload_len(false).unwrap();
         assert!(begin_bytes < resume_s2.len());
         let mut cleanup_request = res_req.clone();
