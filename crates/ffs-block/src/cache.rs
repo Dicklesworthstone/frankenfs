@@ -688,6 +688,9 @@ struct ArcState {
     next_ghost_generation: u64,
     loc: HashMap<BlockNumber, ArcList>,
     resident: HashMap<BlockNumber, BlockBuf>,
+    /// One entry per active cold read, retained even if a newer resident is
+    /// evicted. A true value rejects the bytes captured before a mutation.
+    in_flight_reads: HashMap<BlockNumber, bool>,
     #[cfg(not(feature = "s3fifo"))]
     resident_recency: HashMap<BlockNumber, ResidentRecency>,
     #[cfg(not(feature = "s3fifo"))]
@@ -733,6 +736,21 @@ struct ArcState {
     access_count: HashMap<BlockNumber, Arc<S3AccessHandle>>,
     #[cfg(feature = "s3fifo")]
     fast_invalidations: Vec<BlockNumber>,
+}
+
+/// Removes a cold read's witness on every exit, including I/O errors and
+/// cancellation. Declare this outside state-lock scopes, after the page permit,
+/// so those locks are released before cleanup and the permit is released last.
+#[derive(Debug)]
+struct CacheReadMissGuard<'a> {
+    state: &'a Mutex<ArcState>,
+    block: BlockNumber,
+}
+
+impl Drop for CacheReadMissGuard<'_> {
+    fn drop(&mut self) {
+        self.state.lock().in_flight_reads.remove(&self.block);
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -782,6 +800,7 @@ impl ArcState {
             next_ghost_generation: 1,
             loc: HashMap::new(),
             resident: HashMap::new(),
+            in_flight_reads: HashMap::new(),
             #[cfg(not(feature = "s3fifo"))]
             resident_recency: HashMap::new(),
             #[cfg(not(feature = "s3fifo"))]
@@ -815,6 +834,12 @@ impl ArcState {
             access_count: HashMap::new(),
             #[cfg(feature = "s3fifo")]
             fast_invalidations: Vec::new(),
+        }
+    }
+
+    fn invalidate_in_flight_read(&mut self, block: BlockNumber) {
+        if let Some(invalidated) = self.in_flight_reads.get_mut(&block) {
+            *invalidated = true;
         }
     }
 
@@ -3102,6 +3127,7 @@ impl<D: BlockDevice> ArcCache<D> {
         let mut enforce_backpressure = false;
         let mut committed_blocks = 0_usize;
         for (block, data) in staged {
+            guard.invalidate_in_flight_read(block);
             guard.staged_previous_dirty.remove(&block);
             let payload = BlockBuf::new(data);
             let payload_len = payload.len();
@@ -3713,64 +3739,90 @@ impl<D: BlockDevice> BlockDevice for ArcCache<D> {
             }
         }
 
-        let _page_lock = self.page_locks.acquire(block);
-        {
-            let mut guard = self.state.lock();
-            if let Some(buf) = guard.resident.get(&block).cloned() {
-                guard.on_hit(block);
-                #[cfg(feature = "s3fifo")]
-                let fast_invalidations = guard.take_fast_invalidations();
-                drop(guard);
-                #[cfg(feature = "s3fifo")]
-                self.apply_s3_fast_resident_updates(fast_invalidations, None);
-                return Ok(buf);
-            }
-        }
-
-        let buf = self.inner.read_block(cx, block)?;
-
-        #[cfg(feature = "s3fifo")]
-        let mutation_guard = self.begin_s3_fast_mutation();
-        let mut guard = self.state.lock();
-        // Re-check: another thread may have populated this block while we
-        // were reading from the device (TOCTOU race).  If so, treat as a hit
-        // and return the data already in the cache (it might be newer).
-        #[cfg(feature = "s3fifo")]
-        let mut fast_insert = None;
-        let final_buf = if let Some(existing) = guard.resident.get(&block).cloned() {
-            guard.on_hit(block);
-            #[cfg(feature = "s3fifo")]
+        let page_lock = self.page_locks.acquire(block);
+        let miss_guard = CacheReadMissGuard {
+            state: &self.state,
+            block,
+        };
+        loop {
+            cx_checkpoint(cx)?;
             {
-                fast_insert = self
-                    .s3_fast_entry_for(&guard, block, &existing)
-                    .map(|entry| (block, entry));
+                let mut guard = self.state.lock();
+                if let Some(buf) = guard.resident.get(&block).cloned() {
+                    guard.on_hit(block);
+                    #[cfg(feature = "s3fifo")]
+                    let fast_invalidations = guard.take_fast_invalidations();
+                    drop(guard);
+                    #[cfg(feature = "s3fifo")]
+                    self.apply_s3_fast_resident_updates(fast_invalidations, None);
+                    return Ok(buf);
+                }
+                // The page permit makes this reader the sole owner of the
+                // block's witness. Writers only invalidate it; they never wait
+                // for the reader or take its page permit.
+                guard.in_flight_reads.insert(block, false);
             }
-            existing
-        } else {
-            let bypass_cache = guard.on_read_miss_or_scan_bypass(block);
-            if !bypass_cache {
-                guard.resident.insert(block, buf.clone_ref());
+
+            let buf = self.inner.read_block(cx, block)?;
+            cx_checkpoint(cx)?;
+
+            #[cfg(feature = "s3fifo")]
+            let mutation_guard = self.begin_s3_fast_mutation();
+            let mut guard = self.state.lock();
+            #[cfg(feature = "s3fifo")]
+            let mut fast_insert = None;
+            let final_buf = if let Some(existing) = guard.resident.get(&block).cloned() {
+                // A concurrent writer's resident is authoritative.
+                guard.on_hit(block);
                 #[cfg(feature = "s3fifo")]
                 {
                     fast_insert = self
-                        .s3_fast_entry_for(&guard, block, &buf)
+                        .s3_fast_entry_for(&guard, block, &existing)
                         .map(|entry| (block, entry));
                 }
+                existing
+            } else {
+                // The writer's resident may already have been flushed and
+                // evicted. Absence alone cannot validate an older device read.
+                if guard
+                    .in_flight_reads
+                    .get(&block)
+                    .is_none_or(|invalidated| *invalidated)
+                {
+                    drop(guard);
+                    #[cfg(feature = "s3fifo")]
+                    drop(mutation_guard);
+                    continue;
+                }
+                let bypass_cache = guard.on_read_miss_or_scan_bypass(block);
+                if !bypass_cache {
+                    guard.resident.insert(block, buf.clone_ref());
+                    #[cfg(feature = "s3fifo")]
+                    {
+                        fast_insert = self
+                            .s3_fast_entry_for(&guard, block, &buf)
+                            .map(|entry| (block, entry));
+                    }
+                }
+                buf
+            };
+            let pending_flush = !guard.pending_flush.is_empty();
+            #[cfg(feature = "s3fifo")]
+            let fast_invalidations = guard.take_fast_invalidations();
+            drop(guard);
+            #[cfg(feature = "s3fifo")]
+            self.apply_s3_fast_resident_updates(fast_invalidations, fast_insert);
+            #[cfg(feature = "s3fifo")]
+            drop(mutation_guard);
+            // Cleanup must run without a state guard. Release both miss guards
+            // before I/O or repair callbacks that may reenter this cache.
+            drop(miss_guard);
+            drop(page_lock);
+            if pending_flush {
+                self.flush_pending_evictions(cx)?;
             }
-            buf
-        };
-        let pending_flush = !guard.pending_flush.is_empty();
-        #[cfg(feature = "s3fifo")]
-        let fast_invalidations = guard.take_fast_invalidations();
-        drop(guard);
-        #[cfg(feature = "s3fifo")]
-        self.apply_s3_fast_resident_updates(fast_invalidations, fast_insert);
-        #[cfg(feature = "s3fifo")]
-        drop(mutation_guard);
-        if pending_flush {
-            self.flush_pending_evictions(cx)?;
+            return Ok(final_buf);
         }
-        Ok(final_buf)
     }
 
     fn write_block(&self, cx: &Cx, block: BlockNumber, data: &[u8]) -> Result<()> {
@@ -3787,6 +3839,7 @@ impl<D: BlockDevice> BlockDevice for ArcCache<D> {
         #[cfg(feature = "s3fifo")]
         let mutation_guard = self.begin_s3_fast_mutation();
         let mut guard = self.state.lock();
+        guard.invalidate_in_flight_read(block);
         let payload = BlockBuf::new(data.to_vec());
         if guard.resident.contains_key(&block) {
             // A reader or writer may still hold an unpublished fast entry for
@@ -3981,6 +4034,9 @@ impl<D: BlockDevice> BlockCache for ArcCache<D> {
 
     fn evict(&self, block: BlockNumber) {
         let mut guard = self.state.lock();
+        // Also invalidate a read when there is no resident yet. Callers may
+        // evict after a direct device update while its older read is in flight.
+        guard.invalidate_in_flight_read(block);
         if guard.is_dirty(block) {
             let metrics = guard.snapshot_metrics();
             warn!(
