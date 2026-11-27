@@ -228,6 +228,16 @@ fn graph(order: Endian, sa: u8, case: u8, reads: Reads, failure: Option<u64>) ->
     } else {
         Endian::Little
     };
+    let special = match case {
+        34 => Some((Kind::Fifo, 0)),
+        35 => Some((Kind::CharDevice, 0x0010_0003)), // Linux dev_t for 1:3.
+        36 => Some((Kind::BlockDevice, 0x0081_2345)), // Linux dev_t for 8:74565.
+        37 => Some((Kind::Socket, 0)),
+        38 => Some((Kind::CharDevice, 1_u64 << 32)), // Must not truncate.
+        39 => Some((Kind::CharDevice, 0)),           // SA device missing RDEV.
+        _ => None,
+    };
+    let file_tag = special.map_or(8, |(kind, _)| kind.to_tag());
     let mut image = vec![0; BASE + LENGTH + 512];
     image[..BASE].fill(0xA5);
     image[BASE + LENGTH..].fill(0x5A);
@@ -251,8 +261,11 @@ fn graph(order: Endian, sa: u8, case: u8, reads: Reads, failure: Option<u64>) ->
     table[512..1024].copy_from_slice(&master_node);
     let root = micro(
         &[
-            (b"file.bin", ((if case == 1 { 4 } else { 8 }) << 60) | 3),
-            (b"alias.bin", (8 << 60) | 3),
+            (
+                b"file.bin",
+                ((if case == 1 { 4 } else { file_tag }) << 60) | 3,
+            ),
+            (b"alias.bin", (file_tag << 60) | 3),
             (b"sub", (4 << 60) | if case == 3 { 2 } else { 4 }),
             (b"link", (10 << 60) | 5),
             (b"empty", (8 << 60) | 6),
@@ -260,7 +273,7 @@ fn graph(order: Endian, sa: u8, case: u8, reads: Reads, failure: Option<u64>) ->
         ],
         other,
     );
-    let sub = micro(&[(b"nested", (8 << 60) | 3)], order);
+    let sub = micro(&[(b"nested", (file_tag << 60) | 3)], order);
     store(ROOT_MAP, &root);
     store(SUB_MAP, &sub);
     for (number, data, at, payload, parent) in [
@@ -280,7 +293,13 @@ fn graph(order: Endian, sa: u8, case: u8, reads: Reads, failure: Option<u64>) ->
         table[number * 512..(number + 1) * 512].copy_from_slice(&dn);
     }
     let block_bytes = if case == 32 { 1024 } else { 512 };
-    let file_size = if case == 32 { 2051 } else { 1027 };
+    let file_size = if special.is_some() {
+        0
+    } else if case == 32 {
+        2051
+    } else {
+        1027
+    };
     let a = vec![b'A'; block_bytes];
     let b = vec![b'B'; block_bytes];
     store(FIRST, &a);
@@ -296,30 +315,50 @@ fn graph(order: Endian, sa: u8, case: u8, reads: Reads, failure: Option<u64>) ->
         }
     }
     store(INDIRECT, &indirect);
-    let mut fields = sa_fields(other);
+    let native_fields = |field_order: Endian| {
+        let mut fields = sa_fields(field_order);
+        if let Some((kind, rdev)) = special {
+            fields.iter_mut().find(|(id, _)| *id == 5).unwrap().1 =
+                field_order.encode((kind.to_tag() << 12) | 0o640).to_vec();
+            fields.iter_mut().find(|(id, _)| *id == 6).unwrap().1 = field_order.encode(0).to_vec();
+            if case != 39 && matches!(kind, Kind::CharDevice | Kind::BlockDevice) {
+                fields.push((10, field_order.encode(rdev).to_vec()));
+            }
+        }
+        fields
+    };
+    let mut fields = native_fields(other);
     if case == 32 {
         fields.iter_mut().find(|(id, _)| *id == 6).unwrap().1 = other.encode(file_size).to_vec();
     }
     let bonus = match sa {
-        0 => legacy(0o100_640, file_size, 2, order),
+        0 => {
+            let mut raw = legacy((file_tag << 12) | 0o640, file_size, 2, order);
+            if let Some((_, rdev)) = special {
+                raw[112..120].copy_from_slice(&order.encode(rdev));
+            }
+            raw
+        }
         1 => sa_bytes(2, &fields, other),
         _ => sa_bytes(2, &fields[..5], other),
     };
     let mut file = node(
         19,
         block_bytes,
-        2,
-        2,
+        if special.is_some() { 1 } else { 2 },
+        if special.is_some() { 0 } else { 2 },
         &bonus,
         if sa == 0 { 17 } else { 44 },
         order,
     );
-    file[64..192].copy_from_slice(&bp(&indirect, INDIRECT, 19, 1, 30, order, other));
+    if special.is_none() {
+        file[64..192].copy_from_slice(&bp(&indirect, INDIRECT, 19, 1, 30, order, other));
+    }
     if case == 11 {
         indirect[0] ^= 1;
         store(INDIRECT, &indirect);
     }
-    file[24..32].copy_from_slice(&order.encode(5120));
+    file[24..32].copy_from_slice(&order.encode(if special.is_some() { 0 } else { 5120 }));
     if case == 4 && sa == 0 {
         file[192 + 64..192 + 72].copy_from_slice(&order.encode(0));
     }
@@ -328,7 +367,7 @@ fn graph(order: Endian, sa: u8, case: u8, reads: Reads, failure: Option<u64>) ->
         file[192 + 64..192 + 72].copy_from_slice(&order.encode(99));
     }
     if sa == 2 {
-        let other_fields = sa_fields(order);
+        let other_fields = native_fields(order);
         let mut spill = sa_bytes(3, &other_fields[5..], order);
         spill.resize(512, 0);
         file[7] |= 4;

@@ -245,6 +245,84 @@ fn legacy_metadata_retains_native_times_ids_and_inline_links_in_both_orders() {
     }
 }
 #[test]
+fn legacy_special_metadata_preserves_native_rdev_across_updates() {
+    for order in [Endian::Little, Endian::Big] {
+        for (mode, kind) in [
+            (0o010_640, Kind::Fifo),
+            (0o020_640, Kind::CharDevice),
+            (0o060_640, Kind::BlockDevice),
+            (0o140_640, Kind::Socket),
+        ] {
+            for rdev in [0, 0x0010_0003, 0x0081_2345, u64::MAX] {
+                let mut raw = legacy(order, mode, 0);
+                raw[112..120].copy_from_slice(&order.encode(rdev));
+                raw[104..112].copy_from_slice(&order.encode(42));
+                let mut metadata = Metadata::legacy(&raw, order).unwrap();
+                assert_eq!((metadata.kind, metadata.rdev), (kind, rdev));
+                metadata.mode = (mode & !0o777) | 0o600;
+                let encoded = metadata.encode_legacy(Some(&raw), order).unwrap();
+                assert_eq!(Metadata::legacy(&encoded, order).unwrap(), metadata);
+                assert_eq!(&encoded[104..120], &raw[104..120]);
+            }
+        }
+    }
+}
+
+#[test]
+fn sa_device_metadata_requires_native_rdev_and_preserves_its_buffer_order() {
+    for (bonus_order, spill_order) in [(Endian::Little, Endian::Big), (Endian::Big, Endian::Little)]
+    {
+        for mode in [0o020_640, 0o060_640] {
+            let bonus_attrs = attributes(bonus_order, mode, 0);
+            let spill_attrs = [(10, spill_order.encode(0x0081_2345).to_vec())];
+            let registry =
+                SaRegistry::from_zaps(&[], &[layout(2, &bonus_attrs), layout(3, &spill_attrs)])
+                    .unwrap();
+            let bonus = packed(2, &bonus_attrs, &[], bonus_order);
+            let spill = packed(3, &spill_attrs, &[], spill_order);
+            assert!(registry.decode(&bonus, None).unwrap().metadata().is_err());
+            let mut metadata = registry
+                .decode(&bonus, Some(&spill))
+                .unwrap()
+                .metadata()
+                .unwrap();
+            assert_eq!(metadata.rdev, 0x0081_2345);
+            metadata.times[0].seconds += 1;
+            let (updated_bonus, updated_spill) = registry
+                .encode_updated_bonus_and_spill(&bonus, Some(&spill), &metadata)
+                .unwrap();
+            let updated = registry
+                .decode(&updated_bonus, updated_spill.as_deref())
+                .unwrap();
+            assert_eq!(updated.metadata().unwrap(), metadata);
+            assert_eq!(updated_spill.unwrap(), spill);
+
+            for (length, swap) in [(4, 0), (16, 0), (8, 3)] {
+                let mut mistyped = registry.decode(&bonus, Some(&spill)).unwrap();
+                let value = mistyped.values.get_mut(b"ZPL_RDEV".as_slice()).unwrap();
+                value.bytes.resize(length, 0);
+                value.swap = swap;
+                assert!(mistyped.metadata().is_err());
+            }
+        }
+        // RDEV is not required for ordinary files, FIFOs or sockets.
+        for mode in [0o100_640, 0o010_640, 0o140_640] {
+            let attrs = attributes(bonus_order, mode, 0);
+            let registry = SaRegistry::from_zaps(&[], &[layout(2, &attrs)]).unwrap();
+            assert_eq!(
+                registry
+                    .decode(&packed(2, &attrs, &[], bonus_order), None)
+                    .unwrap()
+                    .metadata()
+                    .unwrap()
+                    .rdev,
+                0
+            );
+        }
+    }
+}
+
+#[test]
 fn legacy_malformed_fields_and_truncation_never_publish_metadata() {
     for end in 0..264 {
         assert!(Metadata::legacy(&vec![0; end], Endian::Little).is_err());

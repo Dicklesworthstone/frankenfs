@@ -2503,6 +2503,121 @@ mod bd_tqrnc {
         img
     }
 
+    fn ntfs_checkpoint_image(clean: bool) -> (Vec<u8>, u64, usize) {
+        use ffs_ondisk::ntfs::logfile_writer::{
+            LFS_RECORD_CLIENT_RESTART, NtfsCheckpointPayload, NtfsLogRingWriter,
+        };
+
+        let mut image = build_clean_writable_ntfs_image(128, 50, 0x1234_5678);
+        let mut ring = NtfsLogRingWriter::new_fresh(4096, (1, 1), 50 * 4096, 1, 1).unwrap();
+        let checkpoint = ring
+            .append_raw_record(
+                LFS_RECORD_CLIENT_RESTART,
+                0,
+                0,
+                0,
+                &NtfsCheckpointPayload::default().encode().unwrap(),
+            )
+            .unwrap();
+        let log_start = 10 * NTFS_CLUSTER_BYTES;
+        let checkpoint_start = log_start + usize::try_from(checkpoint.page_vbo).unwrap();
+        image[checkpoint_start..checkpoint_start + checkpoint.protected_page.len()]
+            .copy_from_slice(&checkpoint.protected_page);
+        for _ in 0..2 {
+            let page = ring.build_next_rstr_page(clean).unwrap();
+            let start = log_start + usize::try_from(page.page_vbo).unwrap();
+            image[start..start + page.bytes.len()].copy_from_slice(&page.bytes);
+        }
+        (image, checkpoint.lsn, checkpoint_start)
+    }
+
+    fn ntfs_binding_for_image(image: &[u8]) -> ffs_error::Result<NativeCommitBinding> {
+        let cx = Cx::for_testing();
+        let dir = tempfile::tempdir().unwrap();
+        let image_path = dir.path().join("volume.ntfs");
+        let sidecar_path = dir.path().join("volume.ffsrq");
+        std::fs::write(&image_path, image).unwrap();
+        protect(
+            &cx,
+            &image_path,
+            &sidecar_path,
+            SidecarOptions {
+                block_size: 4096,
+                group_blocks: 16,
+                repair_symbols: 4,
+            },
+        )
+        .unwrap();
+        let archive_before = std::fs::read(&sidecar_path).unwrap();
+        let storage = ProtectedStorageSet::open_standalone(
+            &cx,
+            &image_path,
+            &sidecar_path,
+            0,
+            None,
+            &StorageSetOpenOptions {
+                read_only: true,
+                allow_automatic_repair: false,
+                ..StorageSetOpenOptions::default()
+            },
+        )
+        .unwrap();
+        let binding = compute_live_native_binding(&cx, &storage, "ntfs", None);
+        assert_eq!(std::fs::read(&image_path).unwrap(), image);
+        assert_eq!(std::fs::read(&sidecar_path).unwrap(), archive_before);
+        binding
+    }
+
+    #[test]
+    fn ntfs_protection_binding_uses_audited_checkpoint_or_fully_erased_log() {
+        let erased = build_clean_writable_ntfs_image(128, 50, 0x1234_5678);
+        assert!(matches!(
+            ntfs_binding_for_image(&erased).unwrap(),
+            NativeCommitBinding::Ntfs {
+                commit_lsn: 0,
+                checkpoint_lsn: None,
+                generation: 0,
+                ..
+            }
+        ));
+
+        let (image, checkpoint, _) = ntfs_checkpoint_image(true);
+        assert!(checkpoint > 0);
+        match ntfs_binding_for_image(&image).unwrap() {
+            NativeCommitBinding::Ntfs {
+                commit_lsn,
+                checkpoint_lsn,
+                generation,
+                ..
+            } => {
+                assert_eq!(commit_lsn, checkpoint);
+                assert_eq!(checkpoint_lsn, Some(checkpoint));
+                assert_eq!(generation, checkpoint);
+            }
+            other => panic!("expected NTFS binding, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ntfs_protection_binding_refuses_unvalidated_journal_generations() {
+        // The old two-page probe reported these as a zero generation or a
+        // clean-looking LSN. Protection must not seal either interpretation.
+        let mut partially_erased = build_clean_writable_ntfs_image(128, 50, 0x1234_5678);
+        partially_erased[60 * NTFS_CLUSTER_BYTES - 1] = 0;
+        assert!(ntfs_binding_for_image(&partially_erased).is_err());
+
+        let (mut broken_checkpoint, _, checkpoint_start) = ntfs_checkpoint_image(true);
+        broken_checkpoint[checkpoint_start + 510] ^= 1;
+        assert!(ntfs_binding_for_image(&broken_checkpoint).is_err());
+
+        let (mut torn_restart, _, _) = ntfs_checkpoint_image(true);
+        torn_restart[11 * NTFS_CLUSTER_BYTES + 510] ^= 1;
+        assert!(ntfs_binding_for_image(&torn_restart).is_err());
+
+        let (dirty, _, _) = ntfs_checkpoint_image(false);
+        assert!(ntfs_binding_for_image(&dirty).is_err());
+    }
+
     // ── Clean ZFS v5000 single-leaf / 2-way mirror pool builder ──────────────
 
     fn xdr_string(value: &str) -> Vec<u8> {
@@ -2921,6 +3036,7 @@ mod bd_tqrnc {
             parent: 2,
             uid: 0,
             gid: 0,
+            rdev: 0,
             flags: 0x408,
             generation: birth,
             times: [ts; 4],

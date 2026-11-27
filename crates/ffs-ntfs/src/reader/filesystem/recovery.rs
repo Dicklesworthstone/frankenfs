@@ -61,6 +61,26 @@ pub(super) fn admit(cx: &Cx, volume: &NtfsVolume) -> Result<()> {
     )
 }
 
+impl NtfsVolume {
+    /// Inspect the native `$LogFile` through this volume's validated stream map.
+    ///
+    /// This read-only audit validates initialized, nonsparse journal storage,
+    /// comparable restart pages and the selected checkpoint. An erased log is
+    /// reported only after verifying its entire initialized stream. Dirty or
+    /// torn journals are reported in the summary; callers requiring a durable
+    /// clean boundary must check `clean` before accepting its LSN. No replay or
+    /// backing writes are performed, and read errors/cancellation propagate.
+    pub fn inspect_log_state(&self, cx: &Cx) -> Result<crate::transaction::NtfsLogStateSummary> {
+        checkpoint(cx)?;
+        let record = self.record(cx, 2, None)?;
+        let stream = self.data_stream(cx, &record, &[])?;
+        validate_storage(&stream)?;
+        inspect_logfile(cx, stream.size, |offset, size| {
+            self.read(cx, &stream, offset, size)
+        })
+    }
+}
+
 /// Inspect a journal without replay or write authority. Clean active journals
 /// must carry a fully validated native checkpoint; the flat physical-action
 /// parser deliberately cannot supply this checkpoint-aware audit.

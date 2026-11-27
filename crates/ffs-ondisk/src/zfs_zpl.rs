@@ -136,6 +136,8 @@ pub struct Metadata {
     /// Native IDs are retained, not silently converted to host UID/GID values.
     pub uid: u64,
     pub gid: u64,
+    /// Native device number (`zp_rdev` / `ZPL_RDEV`), without host ABI conversion.
+    pub rdev: u64,
     pub times: [Timestamp; 4], // access, modification, change, creation
     pub inline_symlink: Option<Vec<u8>>,
 }
@@ -181,6 +183,7 @@ impl Metadata {
             flags: order.u64(raw, 120)?,
             uid: order.u64(raw, 128)?,
             gid: order.u64(raw, 136)?,
+            rdev: order.u64(raw, 112)?,
             times: [
                 timestamp(&raw[0..16], order)?,
                 timestamp(&raw[16..32], order)?,
@@ -193,7 +196,7 @@ impl Metadata {
     }
 
     /// Encode a legacy ZPL v4 `znode_phys_t` (`264` bytes + optional inline symlink),
-    /// preserving unedited fields (`zp_xattr`, `zp_rdev`, `zp_pad`, `zp_acl`) when
+    /// preserving unedited fields (`zp_xattr`, `zp_pad`, `zp_acl`) when
     /// `existing_bonus` is provided.
     pub fn encode_legacy(
         &self,
@@ -249,6 +252,7 @@ impl Metadata {
         if let Some(xdir) = xattr_dir_override {
             raw[104..112].copy_from_slice(&order.encode(xdir));
         }
+        raw[112..120].copy_from_slice(&order.encode(checked.rdev));
         raw[120..128].copy_from_slice(&order.encode(checked.flags));
         raw[128..136].copy_from_slice(&order.encode(checked.uid));
         raw[136..144].copy_from_slice(&order.encode(checked.gid));
@@ -683,6 +687,13 @@ impl SaRegistry {
         for (name, val) in core {
             map.insert(name.to_vec(), val);
         }
+        // Ordinary SA files need no RDEV field. Device nodes must retain the
+        // native scalar, including when it lives in a separately ordered spill.
+        if matches!(checked.kind, Kind::CharDevice | Kind::BlockDevice)
+            || map.contains_key(b"ZPL_RDEV".as_slice())
+        {
+            map.insert(b"ZPL_RDEV".to_vec(), order.encode(checked.rdev).to_vec());
+        }
         if let Some(target) = &checked.inline_symlink {
             map.insert(b"ZPL_SYMLINK".to_vec(), target.clone());
         }
@@ -700,7 +711,7 @@ impl SaRegistry {
 
     /// Update core ZPL `Metadata` inside an existing SA bonus (and optional spill),
     /// preserving its registered layout ID, byte order, and all non-core attributes
-    /// (ACLs, project IDs, xattrs, rdev, etc.).
+    /// (ACLs, project IDs, xattrs, etc.).
     pub fn encode_updated_bonus_and_spill(
         &self,
         existing_bonus: &[u8],
@@ -1383,6 +1394,15 @@ impl Attributes {
     }
 
     pub fn metadata(&self) -> Result<Metadata, ParseError> {
+        let mode = self.integer("ZPL_MODE")?;
+        let kind = Kind::from_tag((mode >> 12) & 15)?;
+        let rdev = if matches!(kind, Kind::CharDevice | Kind::BlockDevice)
+            || self.values.contains_key(b"ZPL_RDEV".as_slice())
+        {
+            self.integer("ZPL_RDEV")?
+        } else {
+            0
+        };
         let inline_symlink = self
             .values
             .get(b"ZPL_SYMLINK".as_slice())
@@ -1394,8 +1414,8 @@ impl Attributes {
             })
             .transpose()?;
         Metadata {
-            kind: Kind::Regular,
-            mode: self.integer("ZPL_MODE")?,
+            kind,
+            mode,
             size: self.integer("ZPL_SIZE")?,
             parent: self.integer("ZPL_PARENT")?,
             links: self.integer("ZPL_LINKS")?,
@@ -1403,6 +1423,7 @@ impl Attributes {
             flags: self.integer("ZPL_FLAGS")?,
             uid: self.integer("ZPL_UID")?,
             gid: self.integer("ZPL_GID")?,
+            rdev,
             times: [
                 self.time("ZPL_ATIME")?,
                 self.time("ZPL_MTIME")?,

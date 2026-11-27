@@ -83,6 +83,32 @@ impl NtfsTransactionEngine {
             )
         })();
         match plan {
+            Ok(plan)
+                if plan.pre_payload_writes.is_empty()
+                    && plan.mft_zero_writes.is_empty()
+                    && plan.open_attr_registrations.is_empty()
+                    && plan.mutation_specs.is_empty()
+                    && plan.target_writes.is_empty() =>
+            {
+                // The planner has checked the target sequence, complete
+                // stream and transform/provider semantics. An admitted range
+                // past EOF changes nothing, including $LogFile. Preserve the
+                // current clean authority without initializing a journal or
+                // issuing a barrier for an empty transaction.
+                if let Err(error) = checkpoint(cx).and_then(|()| self.require_clean_writer()) {
+                    return NtfsTxOutcome::NotCommitted(error);
+                }
+                let current_lsn = self
+                    .ring
+                    .as_ref()
+                    .map_or(1, |ring| ring.current_lsn().max(1));
+                let checkpoint_lsn = self
+                    .ring
+                    .as_ref()
+                    .map(ffs_ondisk::ntfs::logfile_writer::NtfsLogRingWriter::client_restart_lsn);
+                let token = self.make_token(0, current_lsn, checkpoint_lsn, plan.operation_digest);
+                NtfsTxOutcome::Committed { value: (), token }
+            }
             Ok(plan) => self.execute_logged_tx(cx, plan),
             Err(error) => NtfsTxOutcome::NotCommitted(error),
         }

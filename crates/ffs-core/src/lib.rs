@@ -2504,7 +2504,9 @@ struct BtrfsAllocState {
     /// read, so this is not a formatting detail that can default.
     csum_type: u16,
     /// bd-0ajub: the tree-log blocks currently reachable from the superblock, as
-    /// `(bytenr, num_bytes, is_metadata)`.
+    /// `(allocation_start, allocation_bytes, is_metadata)`. DATA fallback nodes
+    /// may be aligned inside these extents; reclamation must keep the original
+    /// allocation boundaries rather than the aligned node address.
     ///
     /// Every ephemeral fsync allocated a FRESH nodesize extent and nothing ever freed
     /// the one it superseded, so a long-lived mount leaked one block plus one extent
@@ -2721,6 +2723,26 @@ type BtrfsPurgeAction = (BtrfsKey, BtrfsExtentDisposition);
 enum BtrfsExtentRewriteSegment {
     Data { logical_offset: u64, data: Vec<u8> },
     Prealloc { logical_offset: u64, length: u64 },
+}
+
+/// A tree-log node can be aligned inside a larger DATA allocation. Its on-disk
+/// address is then distinct from the exact extent identity used to reclaim it.
+#[derive(Debug, Clone, Copy)]
+struct BtrfsTreeLogBlock {
+    bytenr: u64,
+    allocation_start: u64,
+    allocation_bytes: u64,
+    is_metadata: bool,
+}
+
+impl BtrfsTreeLogBlock {
+    fn allocation(self) -> (u64, u64, bool) {
+        (
+            self.allocation_start,
+            self.allocation_bytes,
+            self.is_metadata,
+        )
+    }
 }
 
 // No longer `Copy`: `retired_log_blocks` is a Vec, because the kernel's log shape
@@ -10214,8 +10236,7 @@ impl OpenFs {
         if value_inum != 0 {
             // Borrow the operation adapter's pin for this value read. This is
             // not a managed request scope, so it must not release that pin.
-            let mut scope = RequestScope::with_snapshot(dev.tx.lock().snapshot());
-            scope.read_snapshot_pinned = true;
+            let scope = RequestScope::with_snapshot(dev.tx.lock().snapshot());
             let ea_ino = InodeNumber(u64::from(value_inum));
             let ea_inode = self.read_inode_with_scope(cx, &scope, ea_ino)?;
             if ea_inode.size > 65_536 {
@@ -44269,13 +44290,18 @@ impl OpenFs {
 
     fn btrfs_allocate_tree_log_block(
         alloc: &mut BtrfsAllocState,
-    ) -> Result<(u64, u64, bool), FfsError> {
+    ) -> Result<BtrfsTreeLogBlock, FfsError> {
         let nodesize = u64::from(alloc.nodesize);
         match alloc
             .extent_alloc
             .alloc_metadata_for_tree(nodesize, BTRFS_TREE_LOG_OBJECTID, 0)
         {
-            Ok(allocation) => Ok((allocation.bytenr, allocation.num_bytes, true)),
+            Ok(allocation) => Ok(BtrfsTreeLogBlock {
+                bytenr: allocation.bytenr,
+                allocation_start: allocation.bytenr,
+                allocation_bytes: allocation.num_bytes,
+                is_metadata: true,
+            }),
             Err(BtrfsMutationError::NoSpace) => {
                 let fallback_len = nodesize.checked_mul(2).ok_or_else(|| {
                     FfsError::InvalidGeometry("btrfs tree-log allocation size overflow".into())
@@ -44284,23 +44310,38 @@ impl OpenFs {
                     .extent_alloc
                     .alloc_data(fallback_len)
                     .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-                let log_root = Self::btrfs_align_up(allocation.bytenr, nodesize)?;
-                let log_end = log_root.checked_add(nodesize).ok_or_else(|| {
-                    FfsError::InvalidGeometry("btrfs tree-log bytenr overflow".into())
-                })?;
-                let alloc_end = allocation
-                    .bytenr
-                    .checked_add(allocation.num_bytes)
-                    .ok_or_else(|| {
-                        FfsError::InvalidGeometry("btrfs tree-log allocation overflow".into())
+                let aligned = (|| {
+                    let bytenr = Self::btrfs_align_up(allocation.bytenr, nodesize)?;
+                    let log_end = bytenr.checked_add(nodesize).ok_or_else(|| {
+                        FfsError::InvalidGeometry("btrfs tree-log bytenr overflow".into())
                     })?;
-                if log_end > alloc_end {
-                    return Err(FfsError::Corruption {
-                        block: allocation.bytenr,
-                        detail: "aligned btrfs tree-log block escaped allocation".into(),
-                    });
+                    let alloc_end = allocation
+                        .bytenr
+                        .checked_add(allocation.num_bytes)
+                        .ok_or_else(|| {
+                            FfsError::InvalidGeometry("btrfs tree-log allocation overflow".into())
+                        })?;
+                    if log_end > alloc_end {
+                        return Err(FfsError::Corruption {
+                            block: allocation.bytenr,
+                            detail: "aligned btrfs tree-log block escaped allocation".into(),
+                        });
+                    }
+                    Ok(BtrfsTreeLogBlock {
+                        bytenr,
+                        allocation_start: allocation.bytenr,
+                        allocation_bytes: allocation.num_bytes,
+                        is_metadata: false,
+                    })
+                })();
+                if aligned.is_err() {
+                    Self::btrfs_free_retired_log_blocks(
+                        alloc,
+                        &[(allocation.bytenr, allocation.num_bytes, false)],
+                        "tree_log_alignment_failed",
+                    );
                 }
-                Ok((log_root, allocation.num_bytes, false))
+                aligned
             }
             Err(err) => Err(btrfs_mutation_to_ffs(&err)),
         }
@@ -44442,6 +44483,13 @@ impl OpenFs {
         nodesize: u32,
         on_disk_sb: &[u8],
     ) -> Result<BtrfsTreeLogPreparedBytes, FfsError> {
+        if on_disk_sb.len() < ffs_types::BTRFS_SUPER_INFO_SIZE {
+            return Err(parse_to_ffs_error(&ParseError::InsufficientData {
+                needed: ffs_types::BTRFS_SUPER_INFO_SIZE,
+                offset: 0,
+                actual: on_disk_sb.len(),
+            }));
+        }
         let (log_tree, log_root) = log_blocks;
         let serialize_params = |bytenr: u64| BtrfsNodeSerializeParams {
             fsid: sb.fsid,
@@ -44533,6 +44581,11 @@ impl OpenFs {
         subvol_objectid: u64,
         on_disk_sb: &[u8],
     ) -> Result<BtrfsTreeLogWriteBundle, FfsError> {
+        // Refuse an exhausted transaction identity before reserving either
+        // node. No caller can reclaim allocations from a failed preparation.
+        let generation = alloc.generation.checked_add(1).ok_or_else(|| {
+            FfsError::InvalidGeometry("btrfs tree-log generation overflow".into())
+        })?;
         let items = Self::btrfs_collect_accumulated_tree_log_items(alloc, canonical)?;
 
         // TWO blocks, in the kernel's shape (bd-jhuob): the subvolume's LOG TREE
@@ -44542,8 +44595,7 @@ impl OpenFs {
         // log the kernel cannot parse, and the exposure is exactly the window the
         // log exists for: a crash before the next full commit leaves `log_root`
         // set on disk for a kernel mount to read.
-        let (log_tree, log_tree_bytes_alloc, log_tree_is_metadata) =
-            Self::btrfs_allocate_tree_log_block(alloc)?;
+        let log_tree = Self::btrfs_allocate_tree_log_block(alloc)?;
         // ⚠️ TWO FALLIBLE ALLOCATIONS MEANS THE FIRST CAN BE ORPHANED BY THE
         // SECOND. Propagating with `?` here would leave the log tree allocated —
         // extent item inserted, used_bytes charged — and unreachable, because
@@ -44555,28 +44607,29 @@ impl OpenFs {
         // A failure to free is swallowed rather than masking the real error: the
         // allocation failure is what the caller needs to see, and turning a
         // space-accounting problem into a different error would lose it.
-        let (log_root, log_root_bytes_alloc, log_root_is_metadata) =
-            match Self::btrfs_allocate_tree_log_block(alloc) {
-                Ok(block) => block,
-                Err(err) => {
-                    if let Err(free_err) = alloc.extent_alloc.free_extent(
-                        log_tree,
-                        log_tree_bytes_alloc,
-                        log_tree_is_metadata,
-                    ) {
-                        warn!(
-                            target: "ffs::btrfs::rw",
-                            log_tree,
-                            error = ?free_err,
-                            "btrfs tree-log: log tree not freed after the log root \
-                             allocation failed; space leaked"
-                        );
-                    }
-                    return Err(err);
+        let log_root = match Self::btrfs_allocate_tree_log_block(alloc) {
+            Ok(block) => block,
+            Err(err) => {
+                if let Err(free_err) = alloc.extent_alloc.free_extent(
+                    log_tree.allocation_start,
+                    log_tree.allocation_bytes,
+                    log_tree.is_metadata,
+                ) {
+                    warn!(
+                        target: "ffs::btrfs::rw",
+                        log_tree = log_tree.bytenr,
+                        error = ?free_err,
+                        "btrfs tree-log: log tree not freed after the log root \
+                         allocation failed; space leaked"
+                    );
                 }
-            };
-        let allocated_bytes = log_tree_bytes_alloc.saturating_add(log_root_bytes_alloc);
-        let metadata_allocation = log_tree_is_metadata && log_root_is_metadata;
+                return Err(err);
+            }
+        };
+        let allocated_bytes = log_tree
+            .allocation_bytes
+            .saturating_add(log_root.allocation_bytes);
+        let metadata_allocation = log_tree.is_metadata && log_root.is_metadata;
         // ⚠️ COMPUTED, NOT STORED BACK. `alloc.generation` is the LAST COMMITTED
         // generation — the full commit derives `new_gen = current_gen + 1` and only
         // assigns it once the commit has succeeded. An fsync does not complete a
@@ -44586,16 +44639,13 @@ impl OpenFs {
         // by one per fsync; the kernel reads the log tree root at exactly
         // `super.generation + 1` (btrfs_tree.h:682), so the second fsync onward
         // wrote a log no kernel could find (bd-jhuob).
-        let generation = alloc.generation.checked_add(1).ok_or_else(|| {
-            FfsError::InvalidGeometry("btrfs tree-log generation overflow".into())
-        })?;
         let nodesize = alloc.nodesize;
         let items_count = items.len();
         let node = BtrfsCowNode::Leaf { items };
         let prepared = Self::btrfs_serialize_tree_log_blocks(
             sb,
             &node,
-            (log_tree, log_root),
+            (log_tree.bytenr, log_root.bytenr),
             subvol_objectid,
             generation,
             nodesize,
@@ -44604,10 +44654,7 @@ impl OpenFs {
         let (log_tree_bytes, log_root_bytes, sb_bytes) = match prepared {
             Ok(prepared) => prepared,
             Err(err) => {
-                for (bytenr, bytes, is_metadata) in [
-                    (log_tree, log_tree_bytes_alloc, log_tree_is_metadata),
-                    (log_root, log_root_bytes_alloc, log_root_is_metadata),
-                ] {
+                for (bytenr, bytes, is_metadata) in [log_tree.allocation(), log_root.allocation()] {
                     if let Err(free_err) =
                         alloc.extent_alloc.free_extent(bytenr, bytes, is_metadata)
                     {
@@ -44629,13 +44676,10 @@ impl OpenFs {
         // is guaranteed to receive them (bd-0ajub).
         let retired_log_blocks = std::mem::replace(
             &mut alloc.btrfs_live_log_blocks,
-            vec![
-                (log_tree, log_tree_bytes_alloc, log_tree_is_metadata),
-                (log_root, log_root_bytes_alloc, log_root_is_metadata),
-            ],
+            vec![log_tree.allocation(), log_root.allocation()],
         );
         let stats = BtrfsTreeLogWriteStats {
-            log_root,
+            log_root: log_root.bytenr,
             generation,
             items_count,
             allocated_bytes,
@@ -44645,7 +44689,10 @@ impl OpenFs {
         // Log tree FIRST: the publish barriers after all nodes, and a reader that
         // ever sees a partial set must not find the root tree without its target.
         Ok((
-            vec![(log_tree, log_tree_bytes), (log_root, log_root_bytes)],
+            vec![
+                (log_tree.bytenr, log_tree_bytes),
+                (log_root.bytenr, log_root_bytes),
+            ],
             sb_bytes,
             stats,
         ))
@@ -45082,8 +45129,10 @@ impl OpenFs {
             );
         }
 
-        durability_guard.arm_final_seal(cx)?;
-        match self.dev.sync(cx) {
+        match durability_guard
+            .arm_final_seal(cx)
+            .and_then(|()| self.dev.sync(cx))
+        {
             Ok(()) => {
                 // bd-0ajub: the new log_root is durable as of this sync, so the
                 // block it superseded is now unreachable and its space can go
@@ -45501,6 +45550,21 @@ impl OpenFs {
             .extent_alloc
             .remove_metadata_items_owned_by_roots(&purged_roots)
             .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+
+        // The metadata-owner scan cannot find a tree-log node placed inside a
+        // DATA fallback extent. Retire those exact allocations too, keeping
+        // every byte pinned until the superblock no longer names the old log.
+        // The surrounding commit snapshot restores both items and pins on a
+        // failure before publication; a later failure retains the pins for retry.
+        for &(bytenr, num_bytes, is_metadata) in &alloc.btrfs_live_log_blocks {
+            if !is_metadata {
+                alloc.extent_alloc.pin_freed_extent(bytenr, num_bytes);
+                alloc
+                    .extent_alloc
+                    .free_extent(bytenr, num_bytes, false)
+                    .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+            }
+        }
 
         // Build the write-dependency DAG from the in-memory FS tree
         let dag = WriteDependencyDag::from_cow_tree(&alloc.fs_tree, new_gen)
@@ -52426,7 +52490,12 @@ impl OpenFs {
     ) -> ffs_error::Result<T> {
         let _view = self.btrfs_semantic_view_guard()?;
         let snapshot = self.latest_snapshot();
-        let mut scope = RequestScope::with_snapshot(snapshot);
+        // Unscoped helpers need the current view after any nested publication,
+        // unlike callers that explicitly select a fixed snapshot version.
+        let mut scope = RequestScope {
+            snapshot: Some(snapshot),
+            ..RequestScope::empty()
+        };
         f(&mut scope)
     }
 
@@ -83196,7 +83265,10 @@ mod tests {
         fs.write(&cx, ino, 0, &first).unwrap();
         // Interleave publication between a current reader's inode load and
         // mapping lookup, without claiming a live concurrent execution.
-        let earlier = RequestScope::with_snapshot(fs.current_snapshot());
+        let earlier = RequestScope {
+            snapshot: Some(fs.current_snapshot()),
+            ..RequestScope::empty()
+        };
         let old_inode = fs.read_inode_with_scope(&cx, &earlier, ino).unwrap();
         fs.write(&cx, ino, 2 * u64::from(bs), &replacement).unwrap();
         let current = fs.current_snapshot();
@@ -117598,6 +117670,120 @@ pub(crate) mod scrub;\n";
     // ── OpenFs MVCC wrapper method tests (bd-1k7g) ──────────────────
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn open_fs_explicit_snapshot_scope_preserves_versions_without_owning_pins() {
+        for single_store in [false, true] {
+            let cx = Cx::for_testing();
+            let mut fs = OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(build_ext4_image(2))),
+                &OpenOptions::default(),
+            )
+            .unwrap();
+            fs.mvcc_store = Arc::new(if single_store {
+                FsMvccStore::single()
+            } else {
+                FsMvccStore::sharded()
+            });
+            let block = BlockNumber(64);
+            let bs = fs.block_size() as usize;
+            let old = vec![0x31; bs];
+            let newer = vec![0x62; bs];
+            let mut first = fs.begin_transaction();
+            for number in [block, BlockNumber(block.0 + 1)] {
+                fs.stage_block_write(&mut first, number, old.clone());
+            }
+            fs.commit_transaction(&cx, first).unwrap();
+            let owner = fs.begin_request_scope(&cx, RequestOp::Read).unwrap();
+            let explicit = RequestScope::with_snapshot(owner.snapshot.unwrap());
+            assert!(explicit.uses_fixed_snapshot());
+            assert!(!explicit.read_snapshot_pinned);
+            assert_eq!(fs.mvcc_active_snapshot_count(), 1);
+            let encoded = serde_json::to_vec(&explicit).unwrap();
+            let explicit: RequestScope = serde_json::from_slice(&encoded).unwrap();
+            assert!(explicit.uses_fixed_snapshot());
+            assert!(!explicit.read_snapshot_pinned);
+
+            let mut write_scope = RequestScope::with_transaction(fs.begin_transaction());
+            for number in [block, BlockNumber(block.0 + 1)] {
+                fs.stage_block_write(write_scope.tx.as_mut().unwrap(), number, newer.clone());
+            }
+            fs.commit_transaction(&cx, write_scope.tx.take().unwrap())
+                .unwrap();
+            assert!(
+                !write_scope.uses_fixed_snapshot(),
+                "a committed writer resumes current reads"
+            );
+            fs.prune_mvcc_versions();
+            fs.flush_mvcc_to_device(&cx).unwrap();
+            assert_eq!(
+                fs.read_block_with_scope(&cx, &explicit, block).unwrap(),
+                old
+            );
+            assert_eq!(
+                fs.read_block_arc_with_scope(&cx, &explicit, block)
+                    .unwrap()
+                    .as_ref(),
+                old
+            );
+            assert_eq!(
+                fs.with_block_bytes(&cx, &explicit, block, <[u8]>::to_vec)
+                    .unwrap(),
+                old
+            );
+            assert_eq!(
+                fs.read_contiguous_blocks_with_scope(&cx, &explicit, block, 2)
+                    .unwrap(),
+                vec![old.clone(); 2]
+            );
+            let mut into = vec![0; 2 * bs];
+            fs.read_contiguous_into_with_scope(&cx, &explicit, block, &mut into)
+                .unwrap();
+            assert_eq!(into, old.repeat(2));
+            assert_eq!(
+                fs.read_block_with_scope(&cx, &write_scope, block).unwrap(),
+                newer
+            );
+
+            // Ending or dropping a borrowed explicit view must not release
+            // the registration owned by the managed read request.
+            fs.end_request_scope(&cx, RequestOp::Read, explicit.clone())
+                .unwrap();
+            assert_eq!(fs.mvcc_active_snapshot_count(), 1);
+            fs.end_request_scope(&cx, RequestOp::Read, owner).unwrap();
+            assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+            fs.prune_mvcc_versions();
+            for result in [
+                fs.read_block_with_scope(&cx, &explicit, block).map(|_| ()),
+                fs.read_block_arc_with_scope(&cx, &explicit, block)
+                    .map(|_| ()),
+                fs.with_block_bytes(&cx, &explicit, block, |_| ()),
+                fs.read_contiguous_blocks_with_scope(&cx, &explicit, block, 2)
+                    .map(|_| ()),
+                fs.read_contiguous_into_with_scope(&cx, &explicit, block, &mut into),
+            ] {
+                assert!(
+                    matches!(result, Err(FfsError::MvccConflict { .. })),
+                    "a pruned explicit view must not return newer checkpointed bytes: {result:?}"
+                );
+            }
+
+            fs.with_latest_scope(|current| {
+                assert!(!current.uses_fixed_snapshot());
+                let latest = vec![0x93; bs];
+                let mut write = fs.begin_transaction();
+                fs.stage_block_write(&mut write, block, latest.clone());
+                fs.commit_transaction(&cx, write)?;
+                assert_eq!(fs.read_block_with_scope(&cx, current, block)?, latest);
+                assert_eq!(fs.read_block_with_scope(&cx, &write_scope, block)?, latest);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+        }
+    }
+
+    #[test]
     fn open_fs_mvcc_stage_block_write_and_commit() {
         for single_store in [false, true] {
             let image = build_ext4_image(2); // 4K blocks
@@ -129652,6 +129838,370 @@ pub(crate) mod scrub;\n";
             .btrfs_canonical_inode(attr.ino)
             .expect("canonical btrfs inode");
         (dev.snapshot_bytes(), canonical)
+    }
+
+    fn set_up_misaligned_tree_log_allocator(alloc: &mut BtrfsAllocState, bytes: u64) {
+        alloc.nodesize = 16 * 1024;
+        alloc.extent_alloc = BtrfsExtentAllocator::new(alloc.generation).unwrap();
+        alloc.extent_alloc.set_nodesize(u64::from(alloc.nodesize));
+        alloc.extent_alloc.add_block_group(
+            0x21_000,
+            BtrfsBlockGroupItem {
+                used_bytes: 0,
+                chunk_objectid: 256,
+                flags: BTRFS_BLOCK_GROUP_DATA,
+                total_bytes: bytes,
+            },
+        );
+    }
+
+    #[test]
+    fn btrfs_tree_log_data_fallback_reclaims_exact_allocations_on_rotation_and_rollback() {
+        let (fs, _cx, dev) = open_writable_btrfs_with_device();
+        let sb = fs.btrfs_superblock().unwrap();
+        let image = dev.snapshot_bytes();
+        let disk_sb = &image[BTRFS_SUPER_INFO_OFFSET..BTRFS_SUPER_INFO_OFFSET + 4096];
+        let mut alloc = fs.require_btrfs_alloc_state().unwrap().write();
+        // Four padded allocations fit: two for the old log and two for its
+        // replacement. Leaking even one generation makes the next prepare fail.
+        set_up_misaligned_tree_log_allocator(&mut alloc, 8 * 16 * 1024);
+        let nodesize = u64::from(alloc.nodesize);
+        for _ in 0..32 {
+            let before_live = alloc.btrfs_live_log_blocks.clone();
+            let before_used = alloc.extent_alloc.total_used();
+            let (_, _, trial) = OpenFs::btrfs_prepare_tree_log_write(
+                sb,
+                &mut alloc,
+                256,
+                BTRFS_FS_TREE_OBJECTID,
+                disk_sb,
+            )
+            .unwrap();
+            OpenFs::btrfs_rollback_unwritten_tree_log(
+                &mut alloc,
+                &trial.retired_log_blocks,
+                "data-log-rollback",
+            );
+            assert_eq!(alloc.btrfs_live_log_blocks, before_live);
+            assert_eq!(alloc.extent_alloc.total_used(), before_used);
+
+            let (nodes, _, published) = OpenFs::btrfs_prepare_tree_log_write(
+                sb,
+                &mut alloc,
+                256,
+                BTRFS_FS_TREE_OBJECTID,
+                disk_sb,
+            )
+            .unwrap();
+            assert!(!published.metadata_allocation);
+            for ((node, bytes), &(start, length, metadata)) in
+                nodes.iter().zip(&alloc.btrfs_live_log_blocks)
+            {
+                assert!(!metadata);
+                assert_eq!(start % nodesize, 4096, "force alignment padding");
+                assert_eq!(node % nodesize, 0);
+                assert!(*node > start && *node + bytes.len() as u64 <= start + length);
+                assert_eq!(length, 2 * nodesize);
+                assert!(
+                    alloc
+                        .extent_alloc
+                        .extent_tree()
+                        .get(&BtrfsKey {
+                            objectid: start,
+                            item_type: ffs_btrfs::BTRFS_ITEM_EXTENT_ITEM,
+                            offset: length,
+                        })
+                        .is_some(),
+                    "retirement must retain the actual EXTENT_ITEM identity"
+                );
+            }
+            OpenFs::btrfs_free_retired_log_blocks(
+                &mut alloc,
+                &published.retired_log_blocks,
+                "data-log-rotation",
+            );
+            assert_eq!(alloc.extent_alloc.total_used(), 4 * nodesize);
+        }
+        let live = std::mem::take(&mut alloc.btrfs_live_log_blocks);
+        OpenFs::btrfs_free_retired_log_blocks(&mut alloc, &live, "data-log-final-retire");
+        assert_eq!(alloc.extent_alloc.total_used(), 0);
+        assert_eq!(
+            alloc.extent_alloc.total_free(BTRFS_BLOCK_GROUP_DATA),
+            8 * nodesize
+        );
+        assert_eq!(alloc.extent_alloc.allocated_extent_item_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn btrfs_tree_log_data_fallback_prepare_failures_do_not_leak() {
+        for failure in [
+            "second_allocation",
+            "serialization",
+            "empty_superblock",
+            "truncated_superblock",
+            "generation",
+        ] {
+            let (fs, _cx, dev) = open_writable_btrfs_with_device();
+            let mut sb = fs.btrfs_superblock().unwrap().clone();
+            if failure == "serialization" {
+                sb.csum_type = u16::MAX;
+            }
+            let image = dev.snapshot_bytes();
+            let disk_sb = &image[BTRFS_SUPER_INFO_OFFSET..BTRFS_SUPER_INFO_OFFSET + 4096];
+            let disk_sb = match failure {
+                "empty_superblock" => &disk_sb[..0],
+                "truncated_superblock" => &disk_sb[..0x8f],
+                _ => disk_sb,
+            };
+            let mut alloc = fs.require_btrfs_alloc_state().unwrap().write();
+            set_up_misaligned_tree_log_allocator(
+                &mut alloc,
+                if failure == "second_allocation" {
+                    2 * 16 * 1024
+                } else {
+                    8 * 16 * 1024
+                },
+            );
+            if failure == "generation" {
+                alloc.generation = u64::MAX;
+            }
+            let free = alloc.extent_alloc.total_free(BTRFS_BLOCK_GROUP_DATA);
+            for _ in 0..3 {
+                let error = OpenFs::btrfs_prepare_tree_log_write(
+                    &sb,
+                    &mut alloc,
+                    256,
+                    BTRFS_FS_TREE_OBJECTID,
+                    disk_sb,
+                )
+                .expect_err(failure);
+                match failure {
+                    "second_allocation" => assert!(matches!(error, FfsError::NoSpace)),
+                    "generation" => assert!(matches!(error, FfsError::InvalidGeometry(_))),
+                    "empty_superblock" | "truncated_superblock" => {
+                        assert!(matches!(error, FfsError::Corruption { .. }));
+                    }
+                    _ => assert!(error.to_string().contains("csum_type"), "{error}"),
+                }
+                assert_eq!(alloc.extent_alloc.total_used(), 0, "{failure}");
+                assert_eq!(alloc.extent_alloc.total_free(BTRFS_BLOCK_GROUP_DATA), free);
+                assert_eq!(alloc.extent_alloc.allocated_extent_item_count().unwrap(), 0);
+                assert!(alloc.btrfs_live_log_blocks.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn btrfs_tree_log_data_fallback_fsync_and_full_commit_reclaim_native() {
+        let Some((seed_fs, seed_device, _tmp, image)) =
+            open_writable_btrfs_mkfs_args(128, &["-n", "16384", "-m", "single", "-d", "single"])
+        else {
+            return;
+        };
+        let seed = seed_device.snapshot_bytes();
+        drop(seed_fs);
+        drop(seed_device);
+        let cx = Cx::for_testing();
+        let device = CrashDevice::from_vec(seed);
+        let mut fs = OpenFs::from_device(
+            &cx,
+            Box::new(device.clone()),
+            &OpenOptions {
+                btrfs_rw_ephemeral_ok: true,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        fs.enable_writes(&cx).unwrap();
+        fs.set_btrfs_grow_chunks(true);
+        fs.set_btrfs_dirty_bytes_threshold(0);
+        let file = fs
+            .create(&cx, InodeNumber(1), OsStr::new("fallback-log"), 0o600, 0, 0)
+            .unwrap();
+        let payload = vec![0xA9; 4096];
+        fs.write(&cx, file.ino, 0, &payload).unwrap();
+        let before = device.sync_count();
+        fs.btrfs_full_transaction_commit(&cx, "data-log-seed")
+            .unwrap();
+        // The same native superblock and free-space-tree policy is used by
+        // the reclaiming commit, including when it must grow metadata space.
+        let sync_span = device.sync_count() - before;
+        assert!(sync_span >= 2, "separate tree and superblock barriers");
+        let data_used = {
+            let mut alloc = fs.require_btrfs_alloc_state().unwrap().write();
+            // Model temporary metadata pressure. Real data allocation follows
+            // the 4 KiB file extent, forcing 16 KiB log-node alignment padding.
+            for group in alloc.extent_alloc.free_space_extents().unwrap() {
+                if group.flags & BTRFS_BLOCK_GROUP_METADATA != 0 {
+                    for (start, length) in group.free_ranges {
+                        alloc.extent_alloc.pin_live_tree_block(start, length);
+                    }
+                }
+            }
+            assert_eq!(
+                alloc
+                    .extent_alloc
+                    .allocatable_bytes(BTRFS_BLOCK_GROUP_METADATA),
+                0
+            );
+            alloc
+                .extent_alloc
+                .space_info()
+                .iter()
+                .filter(|(flags, _, _)| flags & BTRFS_BLOCK_GROUP_DATA != 0)
+                .map(|(_, _, used)| *used)
+                .sum::<u64>()
+        };
+        for _ in 0..8 {
+            fs.fsync(&cx, file.ino, 0, false).unwrap();
+            let alloc = fs.require_btrfs_alloc_state().unwrap().read();
+            assert_eq!(alloc.btrfs_live_log_blocks.len(), 2);
+            for &(start, length, metadata) in &alloc.btrfs_live_log_blocks {
+                assert!(!metadata, "the regression must exercise DATA fallback");
+                assert_eq!(start % 16384, 4096, "the node must need alignment");
+                assert_eq!(length, 32768);
+            }
+            let used: u64 = alloc
+                .extent_alloc
+                .space_info()
+                .iter()
+                .filter(|(flags, _, _)| flags & BTRFS_BLOCK_GROUP_DATA != 0)
+                .map(|(_, _, used)| *used)
+                .sum();
+            assert_eq!(
+                used,
+                data_used + 65536,
+                "only the current log stays allocated"
+            );
+        }
+        let logged = device.durable_bytes();
+        assert_ne!(
+            BtrfsSuperblock::parse_from_image(&logged).unwrap().log_root,
+            0
+        );
+        let cold = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(logged)),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        let reopened = cold
+            .lookup(&cx, InodeNumber(1), OsStr::new("fallback-log"))
+            .unwrap();
+        assert_eq!(cold.read(&cx, reopened.ino, 0, 4097).unwrap(), payload);
+        drop(cold);
+
+        // The real full commit can grow metadata space to resolve pressure.
+        // It must retire DATA-backed log extents as well as metadata-owned logs.
+        let live_log_blocks = fs
+            .require_btrfs_alloc_state()
+            .unwrap()
+            .read()
+            .btrfs_live_log_blocks
+            .clone();
+        let failed_at = device.sync_count() + sync_span;
+        device.arm_sync_failure(failed_at);
+        let error = fs
+            .btrfs_full_transaction_commit(&cx, "data-log-final-sync-failure")
+            .expect_err("fail the final superblock durability barrier");
+        assert!(
+            error.to_string().contains("injected sync failure"),
+            "{error}"
+        );
+        assert_eq!(device.sync_count(), failed_at);
+        assert_eq!(
+            BtrfsSuperblock::parse_from_image(&device.volatile.lock())
+                .unwrap()
+                .log_root,
+            0,
+            "failure must follow the superblock write"
+        );
+        {
+            let alloc = fs.require_btrfs_alloc_state().unwrap().read();
+            assert!(alloc.btrfs_live_log_blocks.is_empty());
+            for (start, length, _) in live_log_blocks {
+                assert!(
+                    alloc
+                        .extent_alloc
+                        .extent_tree()
+                        .get(&BtrfsKey {
+                            objectid: start,
+                            item_type: ffs_btrfs::BTRFS_ITEM_EXTENT_ITEM,
+                            offset: length,
+                        })
+                        .is_none()
+                );
+                assert!(
+                    alloc
+                        .extent_alloc
+                        .pinned_extents()
+                        .any(|pin| pin == (start, length, false)),
+                    "unacknowledged log retirement must remain pinned"
+                );
+            }
+        }
+        // A crash at the failed barrier still sees the old log. Its DATA
+        // allocation must not have been reused by the reclaiming commit.
+        let durable = device.durable_bytes();
+        assert_ne!(
+            BtrfsSuperblock::parse_from_image(&durable)
+                .unwrap()
+                .log_root,
+            0
+        );
+        let cold = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(durable)),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        let reopened = cold
+            .lookup(&cx, InodeNumber(1), OsStr::new("fallback-log"))
+            .unwrap();
+        assert_eq!(cold.read(&cx, reopened.ino, 0, 4097).unwrap(), payload);
+        drop(cold);
+
+        device.disarm();
+        fs.btrfs_full_transaction_commit(&cx, "data-log-full-commit-retry")
+            .unwrap();
+        {
+            let alloc = fs.require_btrfs_alloc_state().unwrap().read();
+            assert!(alloc.btrfs_live_log_blocks.is_empty());
+            let used: u64 = alloc
+                .extent_alloc
+                .space_info()
+                .iter()
+                .filter(|(flags, _, _)| flags & BTRFS_BLOCK_GROUP_DATA != 0)
+                .map(|(_, _, used)| *used)
+                .sum();
+            assert_eq!(
+                used, data_used,
+                "full commit must reclaim both padded extents"
+            );
+        }
+        let committed = device.durable_bytes();
+        assert_eq!(
+            BtrfsSuperblock::parse_from_image(&committed)
+                .unwrap()
+                .log_root,
+            0
+        );
+        std::fs::write(&image, &committed).unwrap();
+        let (clean, output) = run_btrfs_check(&image).expect("btrfs check is required");
+        assert!(
+            clean,
+            "native checker after fallback-log retirement: {output}"
+        );
+        let cold = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(committed)),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        let reopened = cold
+            .lookup(&cx, InodeNumber(1), OsStr::new("fallback-log"))
+            .unwrap();
+        assert_eq!(cold.read(&cx, reopened.ino, 0, 4097).unwrap(), payload);
     }
 
     /// bd-dm01m: EVERY fsync'd inode must survive a crash, not merely the last.

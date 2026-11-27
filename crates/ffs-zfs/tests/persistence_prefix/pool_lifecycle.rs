@@ -1053,12 +1053,12 @@ fn checkpoint_foreground_frees_preserve_scan_and_trim_state_after_restart() {
     // Regression for the old contains_key(&1) test: dirty-map keys identify
     // DNODE-table blocks, not MOS object numbers. This head lives in block 1.
     let dataset = dataset.expect("fixture must exercise MOS DNODE-table block 1");
-    let root = engine
-        .open_read_objects(&cx)
-        .unwrap()
-        .zpl(&cx, &dataset)
-        .unwrap()
-        .root;
+    // A newly created dataset has its own root identity. Object 2 belongs to
+    // its native delete queue, even though the seed dataset uses 2 for ROOT.
+    let root = {
+        let mut mos = engine.open_read_objects(&cx).unwrap();
+        mos.zpl(&cx, &dataset).unwrap().resolve(&cx, b"/").unwrap()
+    };
     let (file, _) = engine
         .create_file(
             &cx,

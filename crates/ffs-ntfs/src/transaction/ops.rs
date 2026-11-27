@@ -1594,11 +1594,12 @@ impl NtfsTransactionEngine {
         })
     }
 
-    /// Add a native hard link to an ordinary file without copying its DATA.
+    /// Add a native hard link without copying the file's DATA.
     ///
     /// Both the indexed FILE_NAME and destination $I30 entry share one logged
-    /// transaction. The supported catalog fits in the base FILE record and has
-    /// no coupled DOS aliases or ATTRIBUTE_LIST extension records.
+    /// transaction. Compressed, sparse and extended catalogs use the same
+    /// complete-catalog writer as reference-addressed links. Plain base-record
+    /// files retain their bounded fast path and malformed-catalog refusals.
     pub fn link_file(
         &mut self,
         cx: &Cx,
@@ -1615,6 +1616,51 @@ impl NtfsTransactionEngine {
         let digest = *hasher.finalize().as_bytes();
         match self.plan_link_file(cx, digest, source_path, parent_path, name) {
             Ok(plan) => self.execute_logged_tx(cx, plan),
+            Err(error @ FfsError::UnsupportedFeature(_)) => {
+                // The plain planner must not admit transformed DATA merely
+                // because a link leaves its bytes unchanged. The catalog
+                // writer already validates and preserves those streams and
+                // their extension records; use it only for a recognized
+                // extended shape, retaining plain malformed/capacity refusals.
+                let endpoints: Result<_> = (|| {
+                    checkpoint(cx)?;
+                    self.require_clean_writer()?;
+                    let source = self.resolve_path_reference(cx, source_path)?;
+                    if source.record < 24 {
+                        return Err(FfsError::PermissionDenied);
+                    }
+                    let parent = self.resolve_path_reference(cx, parent_path)?;
+                    if !self.record_uses_extended_catalog_or_sparse(cx, source)?
+                        && !self.record_uses_extended_catalog_or_sparse(cx, parent)?
+                    {
+                        return Ok(None);
+                    }
+                    let leaf = utf8_component_to_utf16(name)?;
+                    super::validate_ntfs_component_utf16(&leaf)?;
+                    Ok(Some((source, parent, leaf)))
+                })();
+                let (source, parent, leaf) = match endpoints {
+                    Ok(Some(endpoints)) => endpoints,
+                    Ok(None) => return NtfsTxOutcome::NotCommitted(error),
+                    Err(error) => return NtfsTxOutcome::NotCommitted(error),
+                };
+                match self.link_entry_at(cx, source, parent, &leaf, DEFAULT_NTFS_FILETIME) {
+                    NtfsTxOutcome::Committed { token, .. } => NtfsTxOutcome::Committed {
+                        value: source,
+                        token,
+                    },
+                    NtfsTxOutcome::NotCommitted(error) => NtfsTxOutcome::NotCommitted(error),
+                    NtfsTxOutcome::Uncertain {
+                        reason,
+                        transaction_id,
+                        commit_lsn,
+                    } => NtfsTxOutcome::Uncertain {
+                        reason,
+                        transaction_id,
+                        commit_lsn,
+                    },
+                }
+            }
             Err(error) => NtfsTxOutcome::NotCommitted(error),
         }
     }

@@ -756,6 +756,7 @@ impl Zpl {
                     kind,
                     uid: *uid,
                     gid: *gid,
+                    rdev: 0,
                     size,
                     links: if *is_dir { 2 } else { 1 },
                     parent: *dir_obj,
