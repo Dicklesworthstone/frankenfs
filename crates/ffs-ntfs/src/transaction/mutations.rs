@@ -22,8 +22,9 @@ use ffs_ondisk::ntfs::reparse::NtfsReparsePoint;
 use ffs_ondisk::ntfs::usn::{
     USN_REASON_BASIC_INFO_CHANGE, USN_REASON_CLOSE, USN_REASON_DATA_EXTEND,
     USN_REASON_DATA_OVERWRITE, USN_REASON_DATA_TRUNCATION, USN_REASON_FILE_CREATE,
-    USN_REASON_FILE_DELETE, USN_REASON_HARD_LINK_CHANGE, USN_REASON_RENAME_NEW_NAME,
-    USN_REASON_RENAME_OLD_NAME, UsnRecordV2,
+    USN_REASON_FILE_DELETE, USN_REASON_HARD_LINK_CHANGE, USN_REASON_NAMED_DATA_EXTEND,
+    USN_REASON_NAMED_DATA_OVERWRITE, USN_REASON_NAMED_DATA_TRUNCATION, USN_REASON_RENAME_NEW_NAME,
+    USN_REASON_RENAME_OLD_NAME, USN_REASON_STREAM_CHANGE, UsnRecordV2,
 };
 use ffs_ondisk::ntfs::view_index::ViewCollation;
 use ffs_ondisk::ntfs::{
@@ -146,6 +147,35 @@ pub fn validate_ntfs_stream_name_utf16(name: &[u16]) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// Keep the native journal's unnamed and named DATA reason domains distinct.
+/// Consumers can filter by these bits, so an ADS edit must never masquerade
+/// as an edit of the file's unnamed contents.
+fn stream_data_change_reason(named: bool, old_size: u64, new_size: u64, overwritten: bool) -> u32 {
+    let (overwrite, extend, truncate) = if named {
+        (
+            USN_REASON_NAMED_DATA_OVERWRITE,
+            USN_REASON_NAMED_DATA_EXTEND,
+            USN_REASON_NAMED_DATA_TRUNCATION,
+        )
+    } else {
+        (
+            USN_REASON_DATA_OVERWRITE,
+            USN_REASON_DATA_EXTEND,
+            USN_REASON_DATA_TRUNCATION,
+        )
+    };
+    let mut reason = USN_REASON_CLOSE;
+    if overwritten {
+        reason |= overwrite;
+    }
+    if new_size > old_size {
+        reason |= extend;
+    } else if new_size < old_size {
+        reason |= truncate;
+    }
+    reason
 }
 
 fn stale_target() -> FfsError {
@@ -3006,6 +3036,12 @@ impl NtfsTransactionEngine {
         if data.is_empty() && existing_idx.is_some() && !wof_materialized {
             let cat = ws.catalog_mut(self, cx, target_ref)?;
             cat.set_std_times(None, Some(now_ticks), Some(now_ticks), None);
+            let snapshot = cat.clone();
+            ws.push_usn_event_for_catalog(
+                &snapshot,
+                USN_REASON_BASIC_INFO_CHANGE | USN_REASON_CLOSE,
+                now_ticks,
+            );
             if stream_utf16.is_empty() {
                 ws.sync_target_into_parent_dirs(self, cx, target_ref)?;
             }
@@ -3246,11 +3282,15 @@ impl NtfsTransactionEngine {
             cat.set_std_times(None, Some(now_ticks), Some(now_ticks), None);
             cat.clone()
         };
-        let reason = if new_size > old_size {
-            USN_REASON_DATA_EXTEND | USN_REASON_DATA_OVERWRITE | USN_REASON_CLOSE
-        } else {
-            USN_REASON_DATA_OVERWRITE | USN_REASON_CLOSE
-        };
+        let mut reason = stream_data_change_reason(
+            !stream_utf16.is_empty(),
+            old_size,
+            new_size,
+            !data.is_empty(),
+        );
+        if existing_idx.is_none() && !stream_utf16.is_empty() {
+            reason |= USN_REASON_STREAM_CHANGE;
+        }
         ws.push_usn_event_for_catalog(&usn_snapshot, reason, now_ticks);
         if stream_utf16.is_empty() {
             ws.sync_target_into_parent_dirs(self, cx, target_ref)?;
@@ -3610,11 +3650,7 @@ impl NtfsTransactionEngine {
             cat.set_std_times(None, Some(now_ticks), Some(now_ticks), None);
             cat.clone()
         };
-        let reason = if new_size < old_size {
-            USN_REASON_DATA_TRUNCATION | USN_REASON_CLOSE
-        } else {
-            USN_REASON_DATA_EXTEND | USN_REASON_CLOSE
-        };
+        let reason = stream_data_change_reason(!stream_utf16.is_empty(), old_size, new_size, false);
         ws.push_usn_event_for_catalog(&usn_snapshot, reason, now_ticks);
         if stream_utf16.is_empty() {
             ws.sync_target_into_parent_dirs(self, cx, target_ref)?;
@@ -3679,6 +3715,12 @@ impl NtfsTransactionEngine {
                 }
             };
             ws.free_clusters_deferred(&freed);
+            let snapshot = ws.load_catalog(self, cx, target_ref)?.clone();
+            ws.push_usn_event_for_catalog(
+                &snapshot,
+                USN_REASON_STREAM_CHANGE | USN_REASON_CLOSE,
+                now_ticks,
+            );
             ws.sync_target_into_parent_dirs(self, cx, target_ref)?;
             ws.finalize(self, cx, "unlink_stream_at", digest, ())
         })();
@@ -3768,6 +3810,12 @@ impl NtfsTransactionEngine {
                 cat.set_std_times(None, None, Some(now_ticks), None);
             }
             ws.free_clusters_deferred(&freed);
+            let snapshot = ws.load_catalog(self, cx, target_ref)?.clone();
+            ws.push_usn_event_for_catalog(
+                &snapshot,
+                USN_REASON_STREAM_CHANGE | USN_REASON_CLOSE,
+                now_ticks,
+            );
             ws.sync_target_into_parent_dirs(self, cx, target_ref)?;
             ws.finalize(self, cx, "rename_stream_at", digest, replaced_existing)
         })();
@@ -3842,6 +3890,12 @@ impl NtfsTransactionEngine {
                 cat.set_std_times(None, None, Some(now_ticks), None);
             }
             ws.free_clusters_deferred(&freed);
+            let snapshot = ws.load_catalog(self, cx, target_ref)?.clone();
+            ws.push_usn_event_for_catalog(
+                &snapshot,
+                USN_REASON_STREAM_CHANGE | USN_REASON_CLOSE,
+                now_ticks,
+            );
             ws.sync_target_into_parent_dirs(self, cx, target_ref)?;
             ws.finalize(self, cx, "rename_stream_at", digest, replaced_existing)
         })();
@@ -4958,17 +5012,23 @@ impl NtfsTransactionEngine {
                 }
             };
 
+            let old_size = cat_ro.data_streams[stream_idx].logical_size();
             let usn_snap = {
                 let cat = ws.catalog_mut(self, cx, target_ref)?;
                 cat.data_streams[stream_idx].storage = updated_storage;
                 cat.set_std_times(None, Some(now_ticks), Some(now_ticks), None);
                 cat.clone()
             };
-            ws.push_usn_event_for_catalog(
-                &usn_snap,
-                USN_REASON_DATA_OVERWRITE | USN_REASON_DATA_TRUNCATION | USN_REASON_CLOSE,
-                now_ticks,
+            let mut reason = stream_data_change_reason(
+                !stream_utf16.is_empty(),
+                old_size,
+                new_data.len() as u64,
+                !new_data.is_empty(),
             );
+            if old_size == 0 && new_data.is_empty() {
+                reason |= USN_REASON_BASIC_INFO_CHANGE;
+            }
+            ws.push_usn_event_for_catalog(&usn_snap, reason, now_ticks);
             if stream_utf16.is_empty() {
                 ws.sync_target_into_parent_dirs(self, cx, target_ref)?;
             }
