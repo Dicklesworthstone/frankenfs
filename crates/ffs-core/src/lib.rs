@@ -10236,8 +10236,7 @@ impl OpenFs {
         if value_inum != 0 {
             // Borrow the operation adapter's pin for this value read. This is
             // not a managed request scope, so it must not release that pin.
-            let mut scope = RequestScope::with_snapshot(dev.tx.lock().snapshot());
-            scope.read_snapshot_pinned = true;
+            let scope = RequestScope::with_snapshot(dev.tx.lock().snapshot());
             let ea_ino = InodeNumber(u64::from(value_inum));
             let ea_inode = self.read_inode_with_scope(cx, &scope, ea_ino)?;
             if ea_inode.size > 65_536 {
@@ -52491,7 +52490,12 @@ impl OpenFs {
     ) -> ffs_error::Result<T> {
         let _view = self.btrfs_semantic_view_guard()?;
         let snapshot = self.latest_snapshot();
-        let mut scope = RequestScope::with_snapshot(snapshot);
+        // Unscoped helpers need the current view after any nested publication,
+        // unlike callers that explicitly select a fixed snapshot version.
+        let mut scope = RequestScope {
+            snapshot: Some(snapshot),
+            ..RequestScope::empty()
+        };
         f(&mut scope)
     }
 
@@ -83261,7 +83265,10 @@ mod tests {
         fs.write(&cx, ino, 0, &first).unwrap();
         // Interleave publication between a current reader's inode load and
         // mapping lookup, without claiming a live concurrent execution.
-        let earlier = RequestScope::with_snapshot(fs.current_snapshot());
+        let earlier = RequestScope {
+            snapshot: Some(fs.current_snapshot()),
+            ..RequestScope::empty()
+        };
         let old_inode = fs.read_inode_with_scope(&cx, &earlier, ino).unwrap();
         fs.write(&cx, ino, 2 * u64::from(bs), &replacement).unwrap();
         let current = fs.current_snapshot();
@@ -117661,6 +117668,120 @@ pub(crate) mod scrub;\n";
     }
 
     // ── OpenFs MVCC wrapper method tests (bd-1k7g) ──────────────────
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn open_fs_explicit_snapshot_scope_preserves_versions_without_owning_pins() {
+        for single_store in [false, true] {
+            let cx = Cx::for_testing();
+            let mut fs = OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(build_ext4_image(2))),
+                &OpenOptions::default(),
+            )
+            .unwrap();
+            fs.mvcc_store = Arc::new(if single_store {
+                FsMvccStore::single()
+            } else {
+                FsMvccStore::sharded()
+            });
+            let block = BlockNumber(64);
+            let bs = fs.block_size() as usize;
+            let old = vec![0x31; bs];
+            let newer = vec![0x62; bs];
+            let mut first = fs.begin_transaction();
+            for number in [block, BlockNumber(block.0 + 1)] {
+                fs.stage_block_write(&mut first, number, old.clone());
+            }
+            fs.commit_transaction(&cx, first).unwrap();
+            let owner = fs.begin_request_scope(&cx, RequestOp::Read).unwrap();
+            let explicit = RequestScope::with_snapshot(owner.snapshot.unwrap());
+            assert!(explicit.uses_fixed_snapshot());
+            assert!(!explicit.read_snapshot_pinned);
+            assert_eq!(fs.mvcc_active_snapshot_count(), 1);
+            let encoded = serde_json::to_vec(&explicit).unwrap();
+            let explicit: RequestScope = serde_json::from_slice(&encoded).unwrap();
+            assert!(explicit.uses_fixed_snapshot());
+            assert!(!explicit.read_snapshot_pinned);
+
+            let mut write_scope = RequestScope::with_transaction(fs.begin_transaction());
+            for number in [block, BlockNumber(block.0 + 1)] {
+                fs.stage_block_write(write_scope.tx.as_mut().unwrap(), number, newer.clone());
+            }
+            fs.commit_transaction(&cx, write_scope.tx.take().unwrap())
+                .unwrap();
+            assert!(
+                !write_scope.uses_fixed_snapshot(),
+                "a committed writer resumes current reads"
+            );
+            fs.prune_mvcc_versions();
+            fs.flush_mvcc_to_device(&cx).unwrap();
+            assert_eq!(
+                fs.read_block_with_scope(&cx, &explicit, block).unwrap(),
+                old
+            );
+            assert_eq!(
+                fs.read_block_arc_with_scope(&cx, &explicit, block)
+                    .unwrap()
+                    .as_ref(),
+                old
+            );
+            assert_eq!(
+                fs.with_block_bytes(&cx, &explicit, block, <[u8]>::to_vec)
+                    .unwrap(),
+                old
+            );
+            assert_eq!(
+                fs.read_contiguous_blocks_with_scope(&cx, &explicit, block, 2)
+                    .unwrap(),
+                vec![old.clone(); 2]
+            );
+            let mut into = vec![0; 2 * bs];
+            fs.read_contiguous_into_with_scope(&cx, &explicit, block, &mut into)
+                .unwrap();
+            assert_eq!(into, old.repeat(2));
+            assert_eq!(
+                fs.read_block_with_scope(&cx, &write_scope, block).unwrap(),
+                newer
+            );
+
+            // Ending or dropping a borrowed explicit view must not release
+            // the registration owned by the managed read request.
+            fs.end_request_scope(&cx, RequestOp::Read, explicit.clone())
+                .unwrap();
+            assert_eq!(fs.mvcc_active_snapshot_count(), 1);
+            fs.end_request_scope(&cx, RequestOp::Read, owner).unwrap();
+            assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+            fs.prune_mvcc_versions();
+            for result in [
+                fs.read_block_with_scope(&cx, &explicit, block).map(|_| ()),
+                fs.read_block_arc_with_scope(&cx, &explicit, block)
+                    .map(|_| ()),
+                fs.with_block_bytes(&cx, &explicit, block, |_| ()),
+                fs.read_contiguous_blocks_with_scope(&cx, &explicit, block, 2)
+                    .map(|_| ()),
+                fs.read_contiguous_into_with_scope(&cx, &explicit, block, &mut into),
+            ] {
+                assert!(
+                    matches!(result, Err(FfsError::MvccConflict { .. })),
+                    "a pruned explicit view must not return newer checkpointed bytes: {result:?}"
+                );
+            }
+
+            fs.with_latest_scope(|current| {
+                assert!(!current.uses_fixed_snapshot());
+                let latest = vec![0x93; bs];
+                let mut write = fs.begin_transaction();
+                fs.stage_block_write(&mut write, block, latest.clone());
+                fs.commit_transaction(&cx, write)?;
+                assert_eq!(fs.read_block_with_scope(&cx, current, block)?, latest);
+                assert_eq!(fs.read_block_with_scope(&cx, &write_scope, block)?, latest);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+        }
+    }
 
     #[test]
     fn open_fs_mvcc_stage_block_write_and_commit() {
