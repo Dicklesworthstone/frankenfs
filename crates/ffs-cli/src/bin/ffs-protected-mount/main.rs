@@ -588,13 +588,19 @@ fn compute_live_native_binding(
             let boot_blake3 = blake3_digest(&boot);
             let volume = ntfs::reader::NtfsVolume::from_device(cx, primary, 0, len)?;
             let geo = &volume.geometry;
-            let restart_lsn = volume
-                .record(cx, 2, None)
-                .and_then(|rec2| volume.data_stream(cx, &rec2, &[]))
-                .and_then(|stream| volume.read(cx, &stream, 0, 8192))
-                .ok()
-                .and_then(|raw_lf| ffs_ondisk::ntfs::parse_ntfs_logfile(&raw_lf).ok())
-                .map_or(0, |plan| plan.restart.current_lsn);
+            // Protection must bind to the validated native durable boundary.
+            // Reading only two small restart pages loses checkpoint validation,
+            // larger page geometries and partially erased logs. In particular,
+            // a parse/I/O failure is never evidence of an untouched generation.
+            let log_state = volume.inspect_log_state(cx)?;
+            if !log_state.clean {
+                return Err(FfsError::Corruption {
+                    block: 0,
+                    detail: "NTFS journal requires recovery before sealing native protection"
+                        .into(),
+                });
+            }
+            let restart_lsn = log_state.current_lsn;
             Ok(NativeCommitBinding::Ntfs {
                 volume_serial: geo.serial(),
                 volume_bytes: geo.volume_bytes(),
@@ -606,7 +612,8 @@ fn compute_live_native_binding(
                 boot_blake3,
                 transaction_id: 0,
                 commit_lsn: restart_lsn,
-                checkpoint_lsn: (restart_lsn != 0).then_some(restart_lsn),
+                checkpoint_lsn: (log_state.client_restart_lsn != 0)
+                    .then_some(log_state.client_restart_lsn),
                 generation: restart_lsn,
                 operation_digest: [0_u8; 32],
             })
