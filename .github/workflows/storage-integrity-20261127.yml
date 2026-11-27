@@ -146,6 +146,37 @@ jobs:
                 native_repair_crash_cuts_and_healing::native_repair_negative_controls_exhausted_tampered_stale_missing_and_cancelled_bd_j7a4e
               )
               ;;
+            zpl-parser)
+              required=(
+                zfs_zpl::tests::legacy_special_metadata_preserves_native_rdev_across_updates
+                zfs_zpl::tests::sa_device_metadata_requires_native_rdev_and_preserves_its_buffer_order
+              )
+              ;;
+            zfs-library)
+              required=(
+                filesystem::tests::native_linux_device_numbers_are_encoded_for_fuse_without_truncation
+                reader::dmu::zpl::tests::mount::extraction_mount_exposes_special_files_without_reading_or_following_them
+                reader::dmu::zpl::tests::mount::extraction_mount_refuses_missing_or_unrepresentable_native_device_numbers
+              )
+              ;;
+            btrfs-tree-log)
+              required=(
+                tests::btrfs_tree_log_data_fallback_reclaims_exact_allocations_on_rotation_and_rollback
+                tests::btrfs_tree_log_data_fallback_prepare_failures_do_not_leak
+                tests::btrfs_tree_log_data_fallback_fsync_and_full_commit_reclaim_native
+              )
+              ;;
+            ntfs-binding)
+              required=(
+                tests::bd_tqrnc::ntfs_protection_binding_uses_audited_checkpoint_or_fully_erased_log
+                tests::bd_tqrnc::ntfs_protection_binding_refuses_unvalidated_journal_generations
+              )
+              ;;
+            ntfs-callback)
+              required=(
+                tests::bd_tqrnc::bd_tqrnc_protected_writable_ntfs_binds_lsn_survives_cancelled_rename_heals_and_mounts_fuse
+              )
+              ;;
             *) exit 2 ;;
           esac
           for name in "${required[@]}"; do
@@ -180,6 +211,32 @@ jobs:
       - name: Native repair crash cuts, healing, and native image checks
         if: ${{ !cancelled() && matrix.lane == 'tests' }}
         run: bash "$RUNNER_TEMP/ffs-run-storage-suite.sh" core-crash cargo test --locked -p ffs-core --test cross_crate_integration native_repair_crash_cuts_and_healing
+
+      - name: ZPL special-entry parsing and metadata preservation
+        if: ${{ !cancelled() && matrix.lane == 'tests' }}
+        run: bash "$RUNNER_TEMP/ffs-run-storage-suite.sh" zpl-parser cargo test --locked -p ffs-ondisk --lib zfs_zpl::tests
+
+      - name: Complete ZFS library and special-entry namespace regressions
+        if: ${{ !cancelled() && matrix.lane == 'tests' }}
+        run: bash "$RUNNER_TEMP/ffs-run-storage-suite.sh" zfs-library cargo test --locked -p ffs-zfs --lib
+
+      - name: Btrfs tree-log allocation and durability regressions
+        if: ${{ !cancelled() && matrix.lane == 'tests' }}
+        run: bash "$RUNNER_TEMP/ffs-run-storage-suite.sh" btrfs-tree-log cargo test --locked -p ffs-core --lib btrfs_tree_log_
+
+      - name: Protected NTFS audited binding regressions
+        if: ${{ !cancelled() && matrix.lane == 'tests' }}
+        run: bash "$RUNNER_TEMP/ffs-run-storage-suite.sh" ntfs-binding cargo test --locked -p ffs-cli --bin ffs-protected-mount ntfs_protection_binding
+
+      - name: Protected NTFS callback sealing and recovery
+        if: ${{ !cancelled() && matrix.lane == 'tests' }}
+        run: |
+          set -euo pipefail
+          # This test always exercises backend writes, fsync sealing, cancellation,
+          # healing and reopen. Its kernel FUSE phase is conditional on /dev/fuse;
+          # passing this selection alone does not qualify executed kernel mounts.
+          printf '%s\n' 'VALIDATION_SCOPE|suite=ntfs-callback|kernel_fuse=conditional_not_credited' | tee "$RUNNER_TEMP/ffs-storage-logs/ntfs-callback.scope.log"
+          bash "$RUNNER_TEMP/ffs-run-storage-suite.sh" ntfs-callback cargo test --locked -p ffs-cli --bin ffs-protected-mount bd_tqrnc_protected_writable_ntfs_binds_lsn_survives_cancelled_rename_heals_and_mounts_fuse
 
       - name: Confirm candidate source stayed unchanged
         if: ${{ !cancelled() }}
