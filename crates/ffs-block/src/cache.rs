@@ -3789,7 +3789,16 @@ impl<D: BlockDevice> BlockDevice for ArcCache<D> {
         let mut guard = self.state.lock();
         let payload = BlockBuf::new(data.to_vec());
         if guard.resident.contains_key(&block) {
-            // Block already cached — just update data and touch for recency.
+            // A reader or writer may still hold an unpublished fast entry for
+            // this payload. Revoke its identity before replacing the bytes.
+            #[cfg(feature = "s3fifo")]
+            if let Some(old) = guard.access_count.remove(&block) {
+                old.invalidate();
+                guard
+                    .access_count
+                    .insert(block, S3AccessHandle::new(old.load_count()));
+                guard.fast_invalidations.push(block);
+            }
             guard.resident.insert(block, payload.clone_ref());
             guard.on_hit(block);
         } else {
@@ -3859,10 +3868,13 @@ impl<D: BlockDevice> BlockDevice for ArcCache<D> {
 
         let pending_flush = !guard.pending_flush.is_empty();
         #[cfg(feature = "s3fifo")]
-        let fast_invalidations = guard.take_fast_invalidations();
+        {
+            // Publish under the same state lock that pins the new identity.
+            // A delayed invalidation must not revoke a later writer's entry.
+            let fast_invalidations = guard.take_fast_invalidations();
+            self.apply_s3_fast_resident_updates(fast_invalidations, fast_insert);
+        }
         drop(guard);
-        #[cfg(feature = "s3fifo")]
-        self.apply_s3_fast_resident_updates(fast_invalidations, fast_insert);
         #[cfg(feature = "s3fifo")]
         drop(mutation_guard);
         drop(write_through_guard);
