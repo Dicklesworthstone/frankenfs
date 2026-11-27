@@ -4051,8 +4051,8 @@ mod tests {
 
         // 6. Verify six-format managed & per-core console observation + emission
         //    writes real runtime console JSON and Markdown artifacts (and omits idle lanes).
-        let json_out = tmp.path().join("six_format_console.json");
-        let md_out = tmp.path().join("six_format_console.md");
+        let json_out = dir.path().join("six_format_console.json");
+        let md_out = dir.path().join("six_format_console.md");
         let console_cfg = crate::mount_console::MountConsoleConfig::from_cli(
             true,
             Some(json_out.clone()),
@@ -4080,12 +4080,12 @@ mod tests {
         };
         let pc_runtime = crate::MountRuntimeConfig {
             mode: MountRuntimeMode::PerCore,
-            ..crate::MountRuntimeConfig::default()
+            managed_unmount_timeout_secs: None,
         };
         let obs = build_six_format_console_observation(&SixFormatConsoleInput {
             kind: FsFormatKind::Zfs,
             image_path: &zfs_img,
-            mountpoint: tmp.path(),
+            mountpoint: dir.path(),
             runtime: pc_runtime,
             read_write: false,
             metrics: &sample_metrics,
@@ -4122,7 +4122,7 @@ mod tests {
         let idle_obs = build_six_format_console_observation(&SixFormatConsoleInput {
             kind: FsFormatKind::Ntfs,
             image_path: &ntfs_src,
-            mountpoint: tmp.path(),
+            mountpoint: dir.path(),
             runtime: pc_runtime,
             read_write: false,
             metrics: &ffs_fuse::MetricsSnapshot::default(),
