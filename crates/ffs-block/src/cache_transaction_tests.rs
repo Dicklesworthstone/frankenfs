@@ -342,3 +342,61 @@ fn staged_commit_replaces_warmed_fast_residents_and_revokes_late_old_inserts() {
     cache.sync(&cx).unwrap();
     assert_eq!(cache.inner().bytes(block), vec![9; BLOCK_BYTES]);
 }
+
+#[cfg(feature = "s3fifo")]
+#[test]
+fn ordinary_writes_revoke_delayed_read_fill_and_write_fast_residents() {
+    for policy in [ArcWritePolicy::WriteBack, ArcWritePolicy::WriteThrough] {
+        for seed_via_write in [false, true] {
+            let cx = Cx::for_testing();
+            let cache = ArcCache::new_with_policy(DiskDevice::new(), 512, policy).unwrap();
+            assert!(cache.s3_fast_hits_enabled);
+            let block = BlockNumber(2);
+            let initial = u8::from(seed_via_write);
+            if seed_via_write {
+                cache
+                    .write_block(&cx, block, &[initial; BLOCK_BYTES])
+                    .unwrap();
+            } else {
+                cache.read_block(&cx, block).unwrap();
+            }
+
+            // Both a cold reader and a writer prepare this entry while holding
+            // state, then can be descheduled before publishing the fast entry.
+            let delayed_old = cache.s3_fast_residents.get_valid(block).unwrap();
+            assert_eq!(
+                cache.s3_fast_hit(block).unwrap().as_slice(),
+                &[initial; BLOCK_BYTES]
+            );
+            cache.write_block(&cx, block, &[9; BLOCK_BYTES]).unwrap();
+            assert_eq!(
+                cache.s3_fast_hit(block).unwrap().as_slice(),
+                &[9; BLOCK_BYTES]
+            );
+            // Resume the earlier publisher after the new write has returned.
+            // A fresh thread has no latest-value thread-local entry to mask a
+            // stale shared fast slot, and a second read warms that local path.
+            cache.s3_fast_residents.insert(block, delayed_old);
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        for _ in 0..2 {
+                            assert_eq!(
+                                cache
+                                    .read_block(&Cx::for_testing(), block)
+                                    .unwrap()
+                                    .as_slice(),
+                                &[9; BLOCK_BYTES],
+                                "late old publication must not resurrect stale bytes"
+                            );
+                        }
+                    })
+                    .join()
+                    .unwrap();
+            });
+            cache.sync(&cx).unwrap();
+            assert_eq!(cache.inner().bytes(block), vec![9; BLOCK_BYTES]);
+            assert_eq!(cache.dirty_count(), 0);
+        }
+    }
+}
