@@ -1060,6 +1060,24 @@ impl NtfsTransactionEngine {
         name: &str,
         initial_data: &[u8],
     ) -> NtfsTxOutcome<NtfsReference> {
+        let name = match utf8_component_to_utf16(name) {
+            Ok(name) => name,
+            Err(error) => return NtfsTxOutcome::NotCommitted(error),
+        };
+        let parent = match self.resolve_path_reference(cx, parent_path) {
+            Ok(parent) => parent,
+            Err(error) => return NtfsTxOutcome::NotCommitted(error),
+        };
+        self.create_file_at(cx, parent, &name, initial_data)
+    }
+
+    pub(super) fn create_file_ordinary(
+        &mut self,
+        cx: &Cx,
+        parent_path: &str,
+        name: &str,
+        initial_data: &[u8],
+    ) -> NtfsTxOutcome<NtfsReference> {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"ntfs.create_file:");
         hasher.update(parent_path.as_bytes());
@@ -1084,6 +1102,23 @@ impl NtfsTransactionEngine {
 
     /// Create an empty directory with `$I30` `INDEX_ROOT` inside `parent_path`.
     pub fn mkdir(
+        &mut self,
+        cx: &Cx,
+        parent_path: &str,
+        name: &str,
+    ) -> NtfsTxOutcome<NtfsReference> {
+        let name = match utf8_component_to_utf16(name) {
+            Ok(name) => name,
+            Err(error) => return NtfsTxOutcome::NotCommitted(error),
+        };
+        let parent = match self.resolve_path_reference(cx, parent_path) {
+            Ok(parent) => parent,
+            Err(error) => return NtfsTxOutcome::NotCommitted(error),
+        };
+        self.mkdir_at(cx, parent, &name)
+    }
+
+    pub(super) fn mkdir_ordinary(
         &mut self,
         cx: &Cx,
         parent_path: &str,

@@ -4081,3 +4081,36 @@ hosted runners were backlogged. These changes have source review and new
 regressions, but no completed compiler, strict-Clippy, UBS, or runtime result is
 claimed. The FUSE change and existing formatting corrections passed local
 formatting before the outage; subsequent changes await hosted formatting checks.
+
+## NTFS creation security admission and audit inheritance (2026-11-27)
+
+Path-based and sequence-bound file/directory creation now share the same parent
+security admission. I/O, corruption and cancellation while resolving a parent
+descriptor refuse creation before native writes; they no longer select the
+ordinary creator as though the parent had no inheritance rules. Only a genuinely
+absent legacy descriptor retains the existing default-security policy. A nonzero
+shared security ID remains authoritative over a legacy descriptor, and a missing
+shared store is an error rather than permission to synthesize security.
+
+Creation checks both discretionary and system ACLs for inheritable entries.
+An inheritable audit SACL therefore takes the existing native inheritance path
+even when the DACL has no inheritable entries. The public path APIs now use the
+same selection as the reference APIs, retaining ordinary creation where that
+selection is valid. This does not add Windows audit-event delivery or qualify
+the broader native security/interchange profile.
+
+Two authored regressions cover four creation entry points against I/O,
+corruption and cancellation faults, unchanged live/durable media, and successful
+subsequent reuse. The positive regression covers NTFS 3.0 and 3.1, file versus
+directory audit inheritance, retained success/failure audit flags, exclusion of
+non-inheritable audit entries, parent preservation and durable-only cold reopen.
+The focused entry point is
+`cargo test -p ffs-ntfs --test persistence_prefix ntfs_creation_ -- --nocapture`.
+
+Qualification is source review, targeted formatting and whitespace validation.
+The initial workspace formatting check passed before edits. Workspace checking
+then failed when the dependency compiler was killed with SIGKILL; a reduced-memory
+focused test build had not reached test execution when the shared executor
+disconnected under disk/memory pressure. No compiler, strict-Clippy or runtime
+pass is claimed. The direct publication records the documented gate bypass;
+bd-h8n46 remains open for its full acceptance contract.

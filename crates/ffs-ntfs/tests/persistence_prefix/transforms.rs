@@ -13,7 +13,7 @@ use asupersync::Cx;
 use ffs_block::ByteDevice;
 use ffs_core::vfs::XattrSetMode;
 use ffs_core::{FileType, FsOps, RequestScope, SeekWhence, SetAttrRequest};
-use ffs_error::FfsError;
+use ffs_error::{FfsError, Result};
 use ffs_ntfs::NtfsVolume;
 use ffs_ntfs::efs::{NtfsEfsKey, StaticEfsKeyScope};
 use ffs_ntfs::formatter::{NtfsFormatOptions, NtfsFormatVersion, format_image_file};
@@ -37,7 +37,7 @@ use ffs_ondisk::ntfs_security::{
     FILE_WRITE_DATA, FILE_WRITE_EA, NtfsAccessToken, NtfsAcl, NtfsSecurityDescriptor, NtfsSid,
     SE_DACL_PRESENT, SE_SACL_PRESENT, SE_SELF_RELATIVE, STANDARD_DELETE,
 };
-use ffs_types::InodeNumber;
+use ffs_types::{ByteOffset, InodeNumber};
 
 use super::{FaultInjectingNtfsDevice, SECTOR_BYTES, write_options_clean, write_options_recover};
 
@@ -80,6 +80,38 @@ fn open_clean_engine(
 
 fn utf16(s: &str) -> Vec<u16> {
     s.encode_utf16().collect()
+}
+
+struct SecurityReadFault {
+    inner: Arc<FaultInjectingNtfsDevice>,
+    descriptor: Vec<u8>,
+    fault: Mutex<Option<FfsError>>,
+}
+
+impl ByteDevice for SecurityReadFault {
+    fn len_bytes(&self) -> u64 {
+        self.inner.len_bytes()
+    }
+
+    fn read_exact_at(&self, cx: &Cx, offset: ByteOffset, buf: &mut [u8]) -> Result<()> {
+        self.inner.read_exact_at(cx, offset, buf)?;
+        if buf
+            .windows(self.descriptor.len())
+            .any(|bytes| bytes == self.descriptor.as_slice())
+            && let Some(error) = self.fault.lock().unwrap().take()
+        {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn write_all_at(&self, cx: &Cx, offset: ByteOffset, buf: &[u8]) -> Result<()> {
+        self.inner.write_all_at(cx, offset, buf)
+    }
+
+    fn sync(&self, cx: &Cx) -> Result<()> {
+        self.inner.sync(cx)
+    }
 }
 
 fn stream_acl_policy(caller_uid: u32) -> NtfsSidPolicy {
@@ -802,37 +834,6 @@ fn ntfs_mapped_namespace_acl_accepts_object_or_parent_delete_authority() {
 
 #[test]
 fn ntfs_mapped_namespace_acl_does_not_replace_security_read_errors_with_parent_permission() {
-    use ffs_error::Result;
-    use ffs_types::ByteOffset;
-
-    struct SecurityReadFault {
-        inner: Arc<FaultInjectingNtfsDevice>,
-        descriptor: Vec<u8>,
-        fault: Mutex<Option<FfsError>>,
-    }
-    impl ByteDevice for SecurityReadFault {
-        fn len_bytes(&self) -> u64 {
-            self.inner.len_bytes()
-        }
-        fn read_exact_at(&self, cx: &Cx, offset: ByteOffset, buf: &mut [u8]) -> Result<()> {
-            self.inner.read_exact_at(cx, offset, buf)?;
-            if buf
-                .windows(self.descriptor.len())
-                .any(|bytes| bytes == self.descriptor.as_slice())
-                && let Some(error) = self.fault.lock().unwrap().take()
-            {
-                return Err(error);
-            }
-            Ok(())
-        }
-        fn write_all_at(&self, cx: &Cx, offset: ByteOffset, buf: &[u8]) -> Result<()> {
-            self.inner.write_all_at(cx, offset, buf)
-        }
-        fn sync(&self, cx: &Cx) -> Result<()> {
-            self.inner.sync(cx)
-        }
-    }
-
     let cx = Cx::for_testing();
     let (initial, vol_bytes) = format_to_fault_device(
         &cx,
@@ -904,6 +905,201 @@ fn ntfs_mapped_namespace_acl_does_not_replace_security_read_errors_with_parent_p
         drop(fs);
         let engine = open_clean_engine(&cx, &dev, vol_bytes);
         assert_eq!(read_file_by_path(&cx, &engine, "/protected.bin"), b"keep");
+    }
+}
+
+#[test]
+fn ntfs_creation_security_errors_refuse_without_writes() {
+    let cx = Cx::for_testing();
+    let (initial, vol_bytes) = format_to_fault_device(
+        &cx,
+        16,
+        4096,
+        NtfsFormatVersion::V3_1,
+        0xAC15_0009_0000_0001,
+    );
+    let descriptor = stream_acl_descriptor(FILE_WRITE_EA);
+    let mut engine = open_clean_engine(&cx, &initial, vol_bytes);
+    let root = engine.resolve_path_reference(&cx, "/").unwrap();
+    engine
+        .set_security_at(&cx, root, &descriptor, DEFAULT_NTFS_FILETIME)
+        .into_result()
+        .unwrap();
+    drop(engine);
+    let pristine = initial.snapshot_durable_only();
+
+    for operation in ["file-at", "directory-at", "file-path", "directory-path"] {
+        for fault_kind in ["I/O", "corruption", "cancellation"] {
+            let dev = FaultInjectingNtfsDevice::new(pristine.clone());
+            let backing = Arc::new(SecurityReadFault {
+                inner: Arc::clone(&dev),
+                descriptor: descriptor.clone(),
+                fault: Mutex::new(None),
+            });
+            let mut engine = NtfsTransactionEngine::from_device(
+                &cx,
+                Arc::clone(&backing) as Arc<dyn ByteDevice>,
+                0,
+                vol_bytes,
+                write_options_clean(),
+            )
+            .unwrap();
+            let root = engine.resolve_path_reference(&cx, "/").unwrap();
+            *backing.fault.lock().unwrap() = Some(match fault_kind {
+                "I/O" => FfsError::Io(std::io::Error::other("parent security read failed")),
+                "corruption" => FfsError::Corruption {
+                    block: 0,
+                    detail: "parent security is corrupt".into(),
+                },
+                "cancellation" => FfsError::Cancelled,
+                _ => unreachable!(),
+            });
+            let writes = dev.write_bytes_total();
+            let outcome = match operation {
+                "file-at" => engine.create_file_at(&cx, root, &utf16("child"), b"payload"),
+                "directory-at" => engine.mkdir_at(&cx, root, &utf16("child")),
+                "file-path" => engine.create_file(&cx, "/", "child", b"payload"),
+                "directory-path" => engine.mkdir(&cx, "/", "child"),
+                _ => unreachable!(),
+            };
+            assert!(backing.fault.lock().unwrap().is_none(), "fault must fire");
+            assert!(
+                matches!(
+                    (fault_kind, &outcome),
+                    ("I/O", NtfsTxOutcome::NotCommitted(FfsError::Io(_)))
+                        | (
+                            "corruption",
+                            NtfsTxOutcome::NotCommitted(FfsError::Corruption { .. })
+                        )
+                        | (
+                            "cancellation",
+                            NtfsTxOutcome::NotCommitted(FfsError::Cancelled)
+                        )
+                ),
+                "{operation} must preserve {fault_kind} before creating a child: {outcome:?}"
+            );
+            assert!(!engine.requires_recovery());
+            assert_eq!(dev.write_bytes_total(), writes);
+            assert_eq!(dev.snapshot_live(), pristine);
+            assert_eq!(dev.snapshot_durable_only(), pristine);
+            drop(engine);
+            let mut reopened = open_clean_engine(&cx, &dev, vol_bytes);
+            assert!(matches!(
+                reopened.resolve_path_reference(&cx, "/child"),
+                Err(FfsError::NotFound(_))
+            ));
+            // Refusal does not poison the predecessor or consume its resources.
+            reopened
+                .create_file(&cx, "/", "retry", b"retry payload")
+                .into_result()
+                .unwrap();
+            assert_eq!(
+                read_file_by_path(&cx, &reopened, "/retry"),
+                b"retry payload"
+            );
+            reopened.check_clean_consistency(&cx).unwrap();
+        }
+    }
+}
+
+#[test]
+fn ntfs_creation_inherits_sacl_without_inheritable_dacl() {
+    for version in [NtfsFormatVersion::V3_0, NtfsFormatVersion::V3_1] {
+        let cx = Cx::for_testing();
+        let (dev, vol_bytes) =
+            format_to_fault_device(&cx, 16, 4096, version, 0xAC15_0010_0000_0001);
+        let mut engine = open_clean_engine(&cx, &dev, vol_bytes);
+        let root = engine.resolve_path_reference(&cx, "/").unwrap();
+        let mut descriptor =
+            NtfsSecurityDescriptor::parse(&stream_acl_descriptor(FILE_WRITE_EA)).unwrap();
+        descriptor.control |= SE_SACL_PRESENT;
+        descriptor.sacl = NtfsAcl {
+            present: true,
+            offset: 0,
+            revision: Some(2),
+            ace_count: Some(3),
+            size: None,
+            aces: vec![
+                build_simple_ace(
+                    ACE_TYPE_SYSTEM_AUDIT,
+                    0xC0 | ACE_FLAG_OBJECT_INHERIT,
+                    FILE_READ_DATA,
+                    NtfsSid::world_everyone(),
+                ),
+                build_simple_ace(
+                    ACE_TYPE_SYSTEM_AUDIT,
+                    0xC0 | ACE_FLAG_CONTAINER_INHERIT,
+                    FILE_WRITE_DATA,
+                    NtfsSid::world_everyone(),
+                ),
+                build_simple_ace(
+                    ACE_TYPE_SYSTEM_AUDIT,
+                    0xC0,
+                    FILE_READ_EA,
+                    NtfsSid::world_everyone(),
+                ),
+            ],
+            padding: Vec::new(),
+        };
+        let parent_bytes = descriptor.encode().unwrap();
+        engine
+            .set_security_at(&cx, root, &parent_bytes, DEFAULT_NTFS_FILETIME)
+            .into_result()
+            .unwrap();
+        engine
+            .create_file_at(&cx, root, &utf16("file-at"), b"payload")
+            .into_result()
+            .unwrap();
+        engine
+            .mkdir_at(&cx, root, &utf16("directory-at"))
+            .into_result()
+            .unwrap();
+        engine
+            .create_file(&cx, "/", "file-path", b"payload")
+            .into_result()
+            .unwrap();
+        engine
+            .mkdir(&cx, "/", "directory-path")
+            .into_result()
+            .unwrap();
+        engine.check_clean_consistency(&cx).unwrap();
+        drop(engine);
+
+        let cold = FaultInjectingNtfsDevice::new(dev.snapshot_durable_only());
+        let reopened = open_clean_engine(&cx, &cold, vol_bytes);
+        let volume = reopened.volume_view(&cx).unwrap();
+        let parent = volume.resolve(&cx, "/").unwrap();
+        assert_eq!(
+            volume.security_descriptor(&cx, &parent).unwrap().bytes,
+            parent_bytes
+        );
+        for path in ["/file-at", "/file-path", "/directory-at", "/directory-path"] {
+            let record = volume.resolve(&cx, path).unwrap();
+            let info = volume.security_descriptor(&cx, &record).unwrap();
+            let aces = &info.descriptor.sacl.aces;
+            assert!(info.descriptor.sacl.present);
+            assert_eq!(aces.len(), if record.is_directory() { 2 } else { 1 });
+            assert_eq!(aces[0].mask, Some(FILE_READ_DATA));
+            assert_eq!(
+                aces[0].flags,
+                0xC0 | ACE_FLAG_INHERITED
+                    | if record.is_directory() {
+                        ACE_FLAG_OBJECT_INHERIT | ACE_FLAG_INHERIT_ONLY
+                    } else {
+                        0
+                    }
+            );
+            if record.is_directory() {
+                assert_eq!(aces[1].mask, Some(FILE_WRITE_DATA));
+                assert_eq!(
+                    aces[1].flags,
+                    0xC0 | ACE_FLAG_CONTAINER_INHERIT | ACE_FLAG_INHERITED
+                );
+            } else {
+                assert_eq!(read_file_by_path(&cx, &reopened, path), b"payload");
+            }
+            assert!(aces.iter().all(|ace| ace.mask != Some(FILE_READ_EA)));
+        }
     }
 }
 
