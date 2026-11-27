@@ -9,7 +9,7 @@ permissions:
 
 concurrency:
   group: storage-integrity-20261127
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: never
@@ -119,6 +119,8 @@ jobs:
                 punch::compressed_hole_punch_large_sparse_tail_preserves_valid_data_length
                 punch::compressed_hole_punch_recovers_data_allocation_and_usn_at_every_cut
                 punch::compressed_hole_punch_rejects_malformed_unit_layout_before_noop_or_writes
+                punch::hole_punch_noop_keeps_durable_token_without_writes_or_barriers
+                punch::hole_punch_noop_refuses_pending_native_recovery
               )
               test "$(grep -c '^punch::compressed_hole_punch_.*: test$' "$inventory")" -ge 6
               ;;
