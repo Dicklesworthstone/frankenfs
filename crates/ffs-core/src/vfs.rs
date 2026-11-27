@@ -623,6 +623,10 @@ pub enum RequestCommitMode {
 pub struct RequestScope {
     pub snapshot: Option<Snapshot>,
     pub tx: Option<ffs_mvcc::Transaction>,
+    /// An explicitly selected read version, independent of GC pin ownership.
+    /// Such a scope can borrow a snapshot retained by another request.
+    #[serde(default)]
+    pub(crate) fixed_snapshot: bool,
     /// A managed read request on a writable filesystem pins and reads its
     /// snapshot until `end_request_scope`. Unscoped mutation helpers still
     /// need the current view for read-your-writes.
@@ -675,7 +679,9 @@ impl RequestScope {
     /// Whether reads must use the retained snapshot rather than the current view.
     /// A committed writer has consumed its transaction and resumes current reads.
     pub(crate) fn uses_fixed_snapshot(&self) -> bool {
-        self.read_snapshot_pinned || (self.tx.is_some() && self.snapshot.is_some())
+        self.fixed_snapshot
+            || self.read_snapshot_pinned
+            || (self.tx.is_some() && self.snapshot.is_some())
     }
 
     pub(crate) fn has_ext4_staged_effects(&self) -> bool {
@@ -718,11 +724,17 @@ impl RequestScope {
         Self::default()
     }
 
-    /// Create a scope tied to a specific MVCC snapshot.
+    /// Create a scope that reads exactly the specified MVCC snapshot.
+    ///
+    /// This does not register or release a garbage-collection pin. The caller
+    /// must retain the snapshot separately if its history must survive pruning;
+    /// use [`FsOps::begin_request_scope`] for an automatically retained read view.
+    /// Missing history returns a conflict instead of reading a newer version.
     #[must_use]
     pub fn with_snapshot(snapshot: Snapshot) -> Self {
         Self {
             snapshot: Some(snapshot),
+            fixed_snapshot: true,
             ..Self::default()
         }
     }

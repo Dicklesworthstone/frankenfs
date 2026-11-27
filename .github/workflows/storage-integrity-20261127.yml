@@ -179,6 +179,9 @@ jobs:
                 tests::bd_tqrnc::bd_tqrnc_protected_writable_ntfs_binds_lsn_survives_cancelled_rename_heals_and_mounts_fuse
               )
               ;;
+            snapshot-*)
+              required=("tests::${suite#snapshot-}")
+              ;;
             *) exit 2 ;;
           esac
           for name in "${required[@]}"; do
@@ -239,6 +242,18 @@ jobs:
           # passing this selection alone does not qualify executed kernel mounts.
           printf '%s\n' 'VALIDATION_SCOPE|suite=ntfs-callback|kernel_fuse=conditional_not_credited' | tee "$RUNNER_TEMP/ffs-storage-logs/ntfs-callback.scope.log"
           bash "$RUNNER_TEMP/ffs-run-storage-suite.sh" ntfs-callback cargo test --locked -p ffs-cli --bin ffs-protected-mount bd_tqrnc_protected_writable_ntfs_binds_lsn_survives_cancelled_rename_heals_and_mounts_fuse
+
+      - name: Explicit snapshots, inline promotion and current-view reads
+        if: ${{ !cancelled() && matrix.lane == 'tests' }}
+        run: |
+          set -euo pipefail
+          for test_name in \
+            open_fs_explicit_snapshot_scope_preserves_versions_without_owning_pins \
+            ext4_inline_fallocate_modes_promote_once_and_preserve_xattrs \
+            ext4_inline_file_write_truncate_and_promotion_preserve_data_and_xattrs \
+            ext4_writeback_current_mapping_cache_rejects_precommit_inode_root; do
+            bash "$RUNNER_TEMP/ffs-run-storage-suite.sh" "snapshot-$test_name" cargo test --locked -p ffs-core --lib "$test_name"
+          done
 
       - name: Confirm candidate source stayed unchanged
         if: ${{ !cancelled() }}
