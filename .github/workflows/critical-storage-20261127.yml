@@ -1,0 +1,115 @@
+name: Critical storage regression validation
+
+on:
+  push:
+    branches: [validation/critical-storage-20261127-953929]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: critical-storage-20261127-953929
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: never
+  RUSTUP_TOOLCHAIN: nightly-2026-08-31
+  CARGO_BUILD_JOBS: "1"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: "-Z threads=1 -Z unstable-options --jobs-backend=1"
+  CFLAGS: "-g0 -O2"
+  CARGO_HTTP_USER_AGENT: "frankenfs-agent (+https://github.com/Dicklesworthstone/frankenfs)"
+  BASE_COMMIT: 6f9f613a6bd0e4e28e7662592e7a33d05fbe431c
+
+jobs:
+  validate:
+    name: Critical storage / ${{ matrix.lane }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [gates, cache]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prepare compiler and disk-backed scratch
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ffs-critical-logs"
+          printf 'CARGO_TARGET_DIR=%s\nCARGO_BUILD_BUILD_DIR=%s\nTMPDIR=%s\n' "$RUNNER_TEMP/ffs-storage-target" "$RUNNER_TEMP/ffs-storage-target" "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          printf 'FFS_STORAGE_CACHE_TARGET=%s\n' "$(realpath -m --relative-to="$GITHUB_WORKSPACE" "$RUNNER_TEMP/ffs-storage-target")" >> "$GITHUB_ENV"
+          rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
+          validation_swap=$(sudo mktemp /mnt/ffs-critical-XXXXXX.swap)
+          sudo fallocate -l 12G "$validation_swap"
+          sudo chmod 0600 "$validation_swap"
+          sudo mkswap "$validation_swap"
+          sudo swapon "$validation_swap"
+          free -h
+          df -h .
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ffs-storage-target-v1
+          shared-key: nightly-2026-08-31-${{ matrix.lane == 'gates' && 'gates' || 'tests' }}
+          workspaces: ". -> ${{ env.FFS_STORAGE_CACHE_TARGET }}"
+          cache-bin: "false"
+          cache-on-failure: "true"
+      - name: Record source and compiler
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD HEAD^{tree} | tee "$RUNNER_TEMP/ffs-critical-logs/source.txt"
+          rustc -Vv
+          git diff --check
+          test -z "$(git status --porcelain)"
+      - name: Workspace formatting
+        if: matrix.lane == 'gates'
+        run: cargo fmt --check
+      - name: Workspace check
+        if: ${{ !cancelled() && matrix.lane == 'gates' }}
+        run: cargo check --locked --workspace --all-targets
+      - name: Workspace strict Clippy
+        if: ${{ !cancelled() && matrix.lane == 'gates' }}
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Default cache regression and complete block unit suite
+        if: matrix.lane == 'cache'
+        run: |
+          set -euo pipefail
+          cargo test --locked -p ffs-block --lib ordinary_writes_revoke_delayed_read_fill_and_write_fast_residents -- --nocapture 2>&1 | tee "$RUNNER_TEMP/ffs-critical-logs/cache-regression.log"
+          grep -F 'test result: ok. 1 passed; 0 failed' "$RUNNER_TEMP/ffs-critical-logs/cache-regression.log"
+          cargo test --locked -p ffs-block --lib -- --test-threads=1
+          cargo test --locked -p ffs-block --lib --no-default-features -- --test-threads=1
+      - name: Prove regression fails on the original implementation
+        if: ${{ !cancelled() && matrix.lane == 'cache' }}
+        run: |
+          set -euo pipefail
+          baseline="$RUNNER_TEMP/ffs-critical-original"
+          git worktree add --detach "$baseline" "$BASE_COMMIT"
+          cp crates/ffs-block/src/cache_transaction_tests.rs "$baseline/crates/ffs-block/src/cache_transaction_tests.rs"
+          set +e
+          (cd "$baseline" && cargo test --locked -p ffs-block --lib ordinary_writes_revoke_delayed_read_fill_and_write_fast_residents -- --nocapture) > "$RUNNER_TEMP/ffs-critical-logs/cache-original.log" 2>&1
+          result=$?
+          set -e
+          cat "$RUNNER_TEMP/ffs-critical-logs/cache-original.log"
+          test "$result" -eq 101
+          grep -F 'late old publication must not resurrect stale bytes' "$RUNNER_TEMP/ffs-critical-logs/cache-original.log"
+          grep -F 'test result: FAILED. 0 passed; 1 failed' "$RUNNER_TEMP/ffs-critical-logs/cache-original.log"
+      - name: Confirm candidate source stayed unchanged
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git diff --exit-code
+          test -z "$(git status --porcelain)"
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: critical-storage-${{ matrix.lane }}-${{ github.sha }}
+          path: ${{ runner.temp }}/ffs-critical-logs
