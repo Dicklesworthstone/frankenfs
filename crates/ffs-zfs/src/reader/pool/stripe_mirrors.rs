@@ -350,6 +350,7 @@ impl Pool {
             member_guid: topology.supplied_guids[block.member_index],
             raidz: None,
             config: topology.config.clone(),
+            imported_pool: Some(owner),
         })
     }
 
@@ -361,6 +362,14 @@ impl Pool {
         cx: &Cx,
         config: &VdevConfig,
     ) -> Result<Self> {
+        if self
+            .top_levels
+            .as_ref()
+            .is_some_and(|topology| topology.config == *config)
+        {
+            checkpoint(cx)?;
+            return Ok(self);
+        }
         if config.raidz_members.as_ref().is_some_and(|group| {
             group.parity == 0
                 && (group.members.len() != self.members.len()

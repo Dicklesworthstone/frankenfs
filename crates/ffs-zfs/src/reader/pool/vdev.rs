@@ -5,7 +5,9 @@
 use crate::reader::{NvList, Result, Value, corrupt, integer, parse, unsupported};
 use ffs_ondisk::zfs::draid::DraidConfig;
 use ffs_ondisk::zfs::indirect::VdevIndirectConfig;
-use ffs_ondisk::zfs::raidz::expand::ExpandedRaidzConfig;
+use ffs_ondisk::zfs::raidz::expand::{
+    ExpandedRaidzConfig, RaidzReflowInfo, RaidzReflowScratchState,
+};
 use serde::Serialize;
 use std::collections::BTreeSet;
 
@@ -107,12 +109,37 @@ pub struct ExpandedRaidzMeta {
     pub original_width: usize,
     pub physical_width: usize,
     pub expand_txgs: Vec<u64>,
+    pub expanding: bool,
     pub reflow_offset_synced: u64,
     pub reflow_offset_next: u64,
     pub use_scratch: bool,
 }
 
 impl ExpandedRaidzMeta {
+    /// Bind physical read authority to the selected uberblock. State 4 also
+    /// represents ordinary intermediate progress while expansion is active.
+    pub fn apply_reflow_info(&mut self, raw: u64) -> Result<()> {
+        let info = RaidzReflowInfo::decode(raw).map_err(|error| parse(&error))?;
+        if self.expanding {
+            if info.state == RaidzReflowScratchState::NotInUse && info.offset != 0 {
+                return Err(corrupt("inactive RAIDZ scratch state has a reflow offset"));
+            }
+            self.reflow_offset_synced = info.offset;
+            self.reflow_offset_next = info.offset;
+            self.use_scratch = info.use_scratch();
+        } else {
+            if info.use_scratch() {
+                return Err(corrupt(
+                    "completed RAIDZ layout still names active scratch space",
+                ));
+            }
+            self.reflow_offset_synced = u64::MAX;
+            self.reflow_offset_next = u64::MAX;
+            self.use_scratch = false;
+        }
+        Ok(())
+    }
+
     /// Build an `ffs-ondisk` [`ExpandedRaidzConfig`] from this metadata and the
     /// vdev's `ashift` + `parity`.
     pub fn to_ondisk(&self, ashift: u8, parity: usize) -> Result<ExpandedRaidzConfig> {
@@ -140,7 +167,7 @@ impl ExpandedRaidzMeta {
         };
         let expanding = match tree.fields.get("raidz_expanding") {
             None => false,
-            Some(Value::Unsigned(1)) => true,
+            Some(Value::Unsigned(1) | Value::Boolean(true)) => true,
             Some(_) => {
                 return Err(unsupported(
                     "invalid or unsupported raidz_expanding metadata",
@@ -150,12 +177,7 @@ impl ExpandedRaidzMeta {
         if expand_txgs.is_empty() && !expanding {
             return Ok(None);
         }
-        if expanding && expand_txgs.is_empty() {
-            return Err(unsupported(
-                "raidz_expanding requires non-empty raidz_expand_txgs metadata",
-            ));
-        }
-        let added = expand_txgs.len();
+        let added = expand_txgs.len() + usize::from(expanding);
         if added >= physical_width {
             return Err(corrupt(
                 "raidz_expand_txgs count meets or exceeds physical width",
@@ -166,8 +188,9 @@ impl ExpandedRaidzMeta {
             original_width,
             physical_width,
             expand_txgs,
-            reflow_offset_synced: u64::MAX,
-            reflow_offset_next: u64::MAX,
+            expanding,
+            reflow_offset_synced: if expanding { 0 } else { u64::MAX },
+            reflow_offset_next: if expanding { 0 } else { u64::MAX },
             use_scratch: false,
         }))
     }
@@ -600,6 +623,92 @@ fn collect_physical_children(
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn first_active_raidz_expansion_has_no_completed_history() {
+        let tree = NvList {
+            fields: BTreeMap::from([("raidz_expanding".into(), Value::Boolean(true))]),
+        };
+        let mut meta = ExpandedRaidzMeta::from_vdev_tree(&tree, 4)
+            .unwrap()
+            .unwrap();
+        assert!(meta.expanding);
+        assert_eq!(meta.original_width, 3);
+        assert_eq!(
+            meta.to_ondisk(12, 1).unwrap().logical_width_for_birth(900),
+            3
+        );
+        meta.apply_reflow_info(0).unwrap();
+        assert_eq!(meta.reflow_offset_synced, 0);
+        for state in [
+            RaidzReflowScratchState::Valid,
+            RaidzReflowScratchState::InvalidSynced,
+            RaidzReflowScratchState::InvalidSyncedOnImport,
+            RaidzReflowScratchState::InvalidSyncedReflow,
+        ] {
+            meta.apply_reflow_info(
+                RaidzReflowInfo {
+                    offset: 65_536,
+                    state,
+                }
+                .encode()
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(meta.reflow_offset_synced, 65_536);
+            assert_eq!(meta.reflow_offset_next, 65_536);
+            assert_eq!(meta.use_scratch, state == RaidzReflowScratchState::Valid);
+        }
+        assert!(meta.apply_reflow_info(5_u64 << 55).is_err());
+    }
+
+    #[test]
+    fn active_and_completed_expansion_history_have_distinct_widths() {
+        let mut tree = NvList {
+            fields: BTreeMap::from([
+                ("raidz_expanding".into(), Value::Unsigned(1)),
+                ("raidz_expand_txgs".into(), Value::UnsignedArray(vec![20])),
+            ]),
+        };
+        let active = ExpandedRaidzMeta::from_vdev_tree(&tree, 5)
+            .unwrap()
+            .unwrap();
+        let config = active.to_ondisk(12, 1).unwrap();
+        assert_eq!(config.logical_width_for_birth(19), 3);
+        assert_eq!(config.logical_width_for_birth(20), 4);
+        assert_eq!(config.logical_width_for_birth(100), 4);
+
+        tree.fields.remove("raidz_expanding");
+        tree.fields.insert(
+            "raidz_expand_txgs".into(),
+            Value::UnsignedArray(vec![20, 40]),
+        );
+        let mut finished = ExpandedRaidzMeta::from_vdev_tree(&tree, 5)
+            .unwrap()
+            .unwrap();
+        assert!(!finished.expanding);
+        assert_eq!(
+            finished
+                .to_ondisk(12, 1)
+                .unwrap()
+                .logical_width_for_birth(40),
+            5
+        );
+        finished.apply_reflow_info(0).unwrap();
+        assert_eq!(finished.reflow_offset_synced, u64::MAX);
+        assert!(
+            finished
+                .apply_reflow_info(
+                    RaidzReflowInfo {
+                        offset: 65_536,
+                        state: RaidzReflowScratchState::Valid,
+                    }
+                    .encode()
+                    .unwrap()
+                )
+                .is_err()
+        );
+    }
 
     fn leaf_nv(id: u64, guid: u64, alloc_bias: Option<&str>, is_log: bool) -> NvList {
         let mut fields = BTreeMap::new();

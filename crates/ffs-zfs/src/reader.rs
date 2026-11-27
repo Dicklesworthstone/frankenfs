@@ -123,7 +123,7 @@ pub struct Leaf {
     length: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Label {
     pub offset: u64,
     pub order: Endian,
@@ -468,6 +468,8 @@ pub struct RootBlock {
     pub member_guid: u64,
     pub raidz: Option<RaidzReadInfo>,
     config: VdevConfig,
+    /// Exact read owner retained by automatic native configuration selection.
+    pub(crate) imported_pool: Option<Pool>,
 }
 
 impl RootBlock {
@@ -706,6 +708,7 @@ impl Leaf {
             member_guid: selected.top_guid,
             raidz: None,
             config: selected,
+            imported_pool: None,
         })
     }
 

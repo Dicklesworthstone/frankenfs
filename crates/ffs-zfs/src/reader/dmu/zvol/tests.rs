@@ -414,6 +414,7 @@ impl Fixture {
                 copy_index: 0,
                 member_guid: 999,
                 raidz: None,
+                imported_pool: None,
                 config: VdevConfig {
                     pool_guid: 123,
                     top_guid: 999,

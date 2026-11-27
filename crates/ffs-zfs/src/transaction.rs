@@ -97,6 +97,8 @@ fn same_uberblock(left: &Uberblock, right: &Uberblock) -> bool {
         && left.guid_sum == right.guid_sum
         && left.timestamp == right.timestamp
         && left.root == right.root
+        && left.checkpoint_txg == right.checkpoint_txg
+        && left.raidz_reflow_info == right.raidz_reflow_info
 }
 
 /// Explicit authorization and root-binding required to open a ZFS pool for native TXG writes.
@@ -505,19 +507,81 @@ impl ZfsTransactionEngine {
                 "ZFS writer requires a non-zero pool_guid and label in 0..4".into(),
             ));
         }
-        let pool = Pool::from_wide_leaves(leaves)?;
+        let mut pool = Pool::from_wide_leaves(leaves)?;
         if pool.has_missing_members() {
             return Err(unsupported(
                 "degraded ZFS pools with missing members are refused for writes",
             ));
         }
+        // Select immutable native authority before considering any recovery
+        // writes. A retained owner can exclude a merely prepared future child,
+        // but never a child required by a committed successor configuration.
+        let recovered_root = if options.reconcile_torn_uberblocks {
+            Some(pool.import_active(cx, Some(options.pool_guid))?.2)
+        } else {
+            None
+        };
+        let mut member_dev_inos = member_dev_inos;
+        if let Some(selected) = recovered_root
+            .as_ref()
+            .and_then(|root| root.imported_pool.as_ref())
+        {
+            if let Some(configuration) = selected.imported_configuration() {
+                member_dev_inos = configuration
+                    .source_indices
+                    .iter()
+                    .map(|&index| {
+                        member_dev_inos
+                            .get(index)
+                            .copied()
+                            .ok_or_else(|| corrupt("imported member identity index is absent"))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+            }
+            pool = selected.clone();
+        }
+        let selected_labels = pool
+            .imported_configuration()
+            .map(|configuration| configuration.labels.clone());
         let members = pool.leaves();
+        if selected_labels
+            .as_ref()
+            .is_some_and(|labels| labels.len() != members.len())
+        {
+            return Err(corrupt(
+                "imported configuration does not cover every retained member",
+            ));
+        }
+        let physical_labels = if options.reconcile_torn_uberblocks {
+            pool.verified_member_labels(cx)?
+        } else {
+            members
+                .iter()
+                .map(|member| {
+                    (0..4)
+                        .map(|index| member.label(cx, index).map(|label| (index, label)))
+                        .collect::<Result<Vec<_>>>()
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
 
-        // 1. Validate all 4 labels across all members: require `state == 1` (EXPORTED),
-        // `multihost == 0`, and admitted leaf/mirror/RAIDZ/dRAID/multi-vdev topology.
+        // 1. Every verified physical label must establish the same exported
+        // identity and refuse MMP. Reconciliation may repair bad redundant
+        // copies only after full native topology, ZIL, and allocation admission.
         let mut member_guids = Vec::with_capacity(members.len());
         let mut label_offsets_per_member = Vec::with_capacity(members.len());
-        let first_l0 = members[0].label(cx, options.label)?;
+        let first_l0 = if let Some(labels) = &selected_labels {
+            labels[0].clone()
+        } else {
+            let copies = &physical_labels[0];
+            copies
+                .iter()
+                .find(|(index, _)| *index == options.label)
+                .or_else(|| copies.first())
+                .ok_or_else(|| corrupt("no verified first member configuration"))?
+                .1
+                .clone()
+        };
         let slot_bytes = first_l0.slot_bytes;
         let slots_per_label = UBERBLOCK_RING_BYTES / slot_bytes;
         if options.slot >= slots_per_label {
@@ -599,20 +663,24 @@ impl ZfsTransactionEngine {
             .unsigned("txg")
             .ok_or_else(|| corrupt("missing label txg"))?;
 
-        for member in members {
+        for (member, labels) in members.iter().zip(&physical_labels) {
             checkpoint(cx)?;
-            let mut l_offsets = [0_u64; 4];
+            let l_offsets =
+                label_offsets(member.length_bytes()).map_err(|error| parse_err(&error))?;
             let mut m_guid = None;
-            for (l_idx, slot_off) in l_offsets.iter_mut().enumerate() {
-                let lbl = member.label(cx, l_idx)?;
-                *slot_off = lbl.offset;
+            for (_, lbl) in labels {
+                if lbl.config.unsigned("pool_guid") != Some(options.pool_guid) {
+                    return Err(corrupt("physical writer label belongs to another pool"));
+                }
                 if lbl.config.unsigned("state") != Some(1) {
                     return Err(unsupported(
-                        "ZFS native writer requires an cleanly exported pool (state == 1); active pools are never force-imported",
+                        "ZFS native writer requires a cleanly exported pool (state == 1); active pools are never force-imported",
                     ));
                 }
-                if lbl.config.unsigned("vdev_children") != Some(vdev_children_count) {
-                    return Err(corrupt("member labels disagree on vdev_children count"));
+                if lbl.config.unsigned("vdev_children") != Some(vdev_children_count)
+                    || lbl.slot_bytes != slot_bytes
+                {
+                    return Err(corrupt("member labels disagree on vdev or sector geometry"));
                 }
                 if lbl.config.unsigned("multihost").unwrap_or(0) != 0 {
                     return Err(unsupported(
@@ -638,9 +706,13 @@ impl ZfsTransactionEngine {
         let guid_sum = if vdev_children_count > 1 {
             // For multi-top-vdev pools, read authoritative guid_sum from the selected uberblock
             // and verify against PoolTopology once MOS config is loaded below.
-            let sel_lbl = members[0].label(cx, options.label)?;
-            let sel_ub = members[0].uberblock(cx, &sel_lbl, options.slot)?;
-            sel_ub.guid_sum
+            if let Some(root) = &recovered_root {
+                root.uberblock.guid_sum
+            } else {
+                let sel_lbl = members[0].label(cx, options.label)?;
+                let sel_ub = members[0].uberblock(cx, &sel_lbl, options.slot)?;
+                sel_ub.guid_sum
+            }
         } else if members.len() == 1 {
             options.pool_guid.wrapping_add(top_guid)
         } else {
@@ -655,13 +727,15 @@ impl ZfsTransactionEngine {
         // and discover `max_ring_txg` (so stale ring slots cannot roll back a newer TXG!).
         let mut max_ring_txg = 0_u64;
         let mut mmp_active = false;
-        let mut selected_ub_from_scan: Option<(usize, Uberblock, Endian, Option<u64>)> = None;
+        let mut selected_ub_from_scan: Option<(usize, usize, Uberblock, Endian, Option<u64>)> =
+            None;
         for (m_idx, member) in members.iter().enumerate() {
             for l_idx in 0..4 {
                 checkpoint(cx)?;
-                let lbl = member.label(cx, l_idx)?;
                 for s_idx in 0..slots_per_label {
-                    let off = lbl.offset + UBERBLOCK_RING_OFFSET + (s_idx * slot_bytes) as u64;
+                    let off = label_offsets_per_member[m_idx][l_idx]
+                        + UBERBLOCK_RING_OFFSET
+                        + (s_idx * slot_bytes) as u64;
                     let raw = member.read_raw(cx, off, slot_bytes)?;
                     let Ok(ub) = Uberblock::parse(&raw, off) else {
                         continue;
@@ -684,14 +758,17 @@ impl ZfsTransactionEngine {
                     if matches_slot {
                         let replace = match &selected_ub_from_scan {
                             None => true,
-                            Some((_, prev_ub, _, _)) => {
+                            Some((_, _, prev_ub, _, _)) => {
                                 ub.txg > prev_ub.txg
-                                    || (ub.txg == prev_ub.txg && l_idx == options.label)
+                                    || (ub.txg == prev_ub.txg
+                                        && (ub.timestamp > prev_ub.timestamp
+                                            || (ub.timestamp == prev_ub.timestamp
+                                                && l_idx == options.label)))
                             }
                         };
                         if replace {
                             selected_ub_from_scan =
-                                Some((m_idx, ub, ub_order, Some(mmp.software_version)));
+                                Some((m_idx, l_idx, ub, ub_order, Some(mmp.software_version)));
                         }
                     }
                 }
@@ -705,7 +782,7 @@ impl ZfsTransactionEngine {
 
         // 3. Select and verify the requested root without modifying any member.
         // Reconciliation must not heal labels for a pool that fails later write admission.
-        let (_, expected_ub, expected_order, current_sw_version) =
+        let (selected_member, selected_label, expected_ub, expected_order, current_sw_version) =
             selected_ub_from_scan.as_ref().ok_or_else(|| {
                 corrupt("explicitly selected (label, slot) does not contain a valid Uberblock")
             })?;
@@ -715,7 +792,8 @@ impl ZfsTransactionEngine {
             ));
         }
         let root_block = if options.reconcile_torn_uberblocks {
-            let (_, _, imported_root) = pool.import_active(cx, Some(options.pool_guid))?;
+            let imported_root = recovered_root
+                .ok_or_else(|| corrupt("reconciliation lost its selected native root"))?;
             if !same_uberblock(&imported_root.uberblock, expected_ub) {
                 return Err(corrupt(
                     "reconcile_torn_uberblocks candidate disagrees with verified active pool root",
@@ -745,7 +823,7 @@ impl ZfsTransactionEngine {
             }
             pool.root(cx, options.label, options.slot, options.pool_guid)?
         };
-        let mut current_uberblock = root_block.uberblock.clone();
+        let current_uberblock = root_block.uberblock.clone();
         let vcfg = root_block.vdev_config().clone();
         let order = current_uberblock.root.payload_order();
         let mos_os = ObjectSet::parse(&root_block.data, order).map_err(|e| parse_err(&e))?;
@@ -865,6 +943,10 @@ impl ZfsTransactionEngine {
                 checkpoint::load_deferred_frees_from_mos(cx, &mut mos)?;
         }
 
+        // The admission view retains imported authority, but a live writer must
+        // rediscover later publications from the exact retained physical leaves.
+        let writer_pool = Pool::from_wide_leaves(members.to_vec())?;
+
         // 6. Only a fully admitted writer may reconcile the selected ring copies.
         if options.reconcile_torn_uberblocks {
             let scrub = mos.scrub(
@@ -881,27 +963,126 @@ impl ZfsTransactionEngine {
             }
             let _ = mos.allocation(cx, AllocationLimits::default())?;
 
-            // Preserve both publication waves and all-member durability barriers.
+            // Encode every selected configuration before any recovery write.
+            // Ordinary leaf, mirror, dRAID, and stripe imports do not carry a
+            // canonical cohort and retain their existing UB-only reconciliation.
+            let encoded_configurations = if let Some(labels) = &selected_labels {
+                let mut configurations = Vec::with_capacity(members.len());
+                for (member_index, label) in labels.iter().enumerate() {
+                    checkpoint(cx)?;
+                    if label.config.unsigned("pool_guid") != Some(options.pool_guid)
+                        || label.config.unsigned("guid") != Some(member_guids[member_index])
+                        || label.config.unsigned("top_guid") != Some(top_guid)
+                        || label.config.unsigned("txg") != Some(label_txg)
+                        || label.config.unsigned("version") != Some(version)
+                        || label.config.unsigned("state") != Some(1)
+                        || label.config.unsigned("multihost").unwrap_or(0) != 0
+                        || label.slot_bytes != slot_bytes
+                    {
+                        return Err(corrupt(
+                            "canonical recovery label disagrees with admitted identity",
+                        ));
+                    }
+                    let packed = label
+                        .config
+                        .encode_xdr()
+                        .map_err(|error| parse_err(&error))?;
+                    if packed.len() > LABEL_CONFIG_BYTES - 40 {
+                        return Err(corrupt(
+                            "canonical recovery label exceeds its configuration span",
+                        ));
+                    }
+                    let mut copies = Vec::with_capacity(4);
+                    for label_offset in label_offsets_per_member[member_index] {
+                        let offset = label_offset + LABEL_CONFIG_OFFSET;
+                        let mut bytes = vec![0_u8; LABEL_CONFIG_BYTES];
+                        bytes[..packed.len()].copy_from_slice(&packed);
+                        stamp_label_checksum(&mut bytes, offset, label.order)
+                            .map_err(|error| parse_err(&error))?;
+                        copies.push((offset, bytes));
+                    }
+                    configurations.push(copies);
+                }
+                Some(configurations)
+            } else {
+                None
+            };
+
+            // Preserve a verified physical identity on every member, the
+            // canonical generation's source, and the selected UB until the
+            // first replacement wave is durable. These sources need not be in
+            // the same fixed front/back label pair after an interrupted write.
+            let mut recovery_waves = Vec::with_capacity(members.len());
+            let mut canonical_source_found = selected_labels.is_none();
+            for (member_index, labels) in physical_labels.iter().enumerate() {
+                let canonical_source = selected_labels.as_ref().and_then(|canonical| {
+                    labels
+                        .iter()
+                        .find(|(_, label)| label.config == canonical[member_index].config)
+                });
+                canonical_source_found |= canonical_source.is_some();
+                let (identity_label, _) = canonical_source
+                    .or_else(|| labels.first())
+                    .ok_or_else(|| corrupt("recovery member has no verified identity source"))?;
+                let mut reserved = [false; 4];
+                *reserved
+                    .get_mut(*identity_label)
+                    .ok_or_else(|| corrupt("recovery identity label index is invalid"))? = true;
+                if member_index == *selected_member {
+                    reserved[*selected_label] = true;
+                }
+                let first: Vec<_> = (0..4).filter(|&index| !reserved[index]).take(2).collect();
+                if first.len() != 2 {
+                    return Err(corrupt(
+                        "recovery cannot preserve its native authority sources",
+                    ));
+                }
+                let second: Vec<_> = (0..4).filter(|index| !first.contains(index)).collect();
+                recovery_waves.push([[first[0], first[1]], [second[0], second[1]]]);
+            }
+            if !canonical_source_found {
+                return Err(corrupt(
+                    "canonical recovery generation has no retained physical source",
+                ));
+            }
+
+            // Pre-encode the selected UB at every destination as well, so all
+            // deterministic encoding errors precede the first physical write.
             let default_sw = if version == 5000 { 5000 } else { version };
-            let selected_order = current_uberblock.order;
-            current_uberblock.order = *expected_order;
+            let mut recovery_uberblock = current_uberblock.clone();
+            recovery_uberblock.order = *expected_order;
+            let mut encoded_uberblocks = Vec::with_capacity(members.len());
+            for offsets in &label_offsets_per_member {
+                checkpoint(cx)?;
+                let mut copies = Vec::with_capacity(4);
+                for label_offset in offsets {
+                    let offset =
+                        label_offset + UBERBLOCK_RING_OFFSET + (options.slot * slot_bytes) as u64;
+                    let bytes = recovery_uberblock
+                        .encode_with_meta(
+                            slot_bytes,
+                            offset,
+                            current_sw_version.unwrap_or(default_sw),
+                            0,
+                            0,
+                        )
+                        .map_err(|error| parse_err(&error))?;
+                    copies.push((offset, bytes));
+                }
+                encoded_uberblocks.push(copies);
+            }
+
             let mut protection = pool.defer_protection(cx)?;
-            for wave_labels in [[0_usize, 1], [2, 3]] {
+            for wave in 0..2 {
                 for (m_idx, member) in members.iter().enumerate() {
-                    for l_idx in wave_labels {
-                        let off = label_offsets_per_member[m_idx][l_idx]
-                            + UBERBLOCK_RING_OFFSET
-                            + (options.slot * slot_bytes) as u64;
-                        let encoded = current_uberblock
-                            .encode_with_meta(
-                                slot_bytes,
-                                off,
-                                current_sw_version.unwrap_or(default_sw),
-                                0,
-                                0,
-                            )
-                            .map_err(|e| parse_err(&e))?;
-                        member.write_raw(cx, off, &encoded)?;
+                    for l_idx in recovery_waves[m_idx][wave] {
+                        checkpoint(cx)?;
+                        if let Some(configurations) = &encoded_configurations {
+                            let (offset, bytes) = &configurations[m_idx][l_idx];
+                            member.write_raw(cx, *offset, bytes)?;
+                        }
+                        let (offset, bytes) = &encoded_uberblocks[m_idx][l_idx];
+                        member.write_raw(cx, *offset, bytes)?;
                     }
                 }
                 for member in members {
@@ -911,9 +1092,6 @@ impl ZfsTransactionEngine {
             for hold in &mut protection {
                 hold.complete();
             }
-            // The native copies use label order; retain the selected in-memory
-            // representation after reconciliation without cloning its root.
-            current_uberblock.order = selected_order;
         }
 
         let storage_identity = ZfsStorageIdentity {
@@ -950,7 +1128,7 @@ impl ZfsTransactionEngine {
         };
 
         Ok(Self {
-            pool,
+            pool: writer_pool,
             storage_identity,
             admission_report,
             order,
@@ -2637,6 +2815,11 @@ impl ZfsTransactionEngine {
         if self.poisoned_uncertain {
             return ZfsTxOutcome::NotCommitted(unsupported(
                 "ZFS writer requires fresh native recovery after uncertain publication or interrupted repair",
+            ));
+        }
+        if self.allocator.raidz_expanding && op_name != "zfs_pool_expand_raidz_complete" {
+            return ZfsTxOutcome::NotCommitted(unsupported(
+                "ZFS RAIDZ expansion must complete before foreground transactions resume",
             ));
         }
         if let Err(err) = checkpoint(cx) {

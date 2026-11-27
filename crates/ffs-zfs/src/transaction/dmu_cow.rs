@@ -280,6 +280,14 @@ pub(super) struct PoolSpaceAllocator {
     pub write_topology: AllocatorWriteTopology,
     /// Physical child GUIDs in native vdev child order, independent of caller order.
     pub write_member_guids: Vec<u64>,
+    /// Foreground COW transactions pause until native reflow publishes completion.
+    pub raidz_expanding: bool,
+    /// Harmless scratch/copy progress within the current authority phase. Reopen
+    /// restarts that phase from zero; only the uberblock selects physical reads.
+    pub raidz_reflow_cursor: u64,
+    /// A bootstrap TXG must fit entirely within the scratch-covered prefix.
+    pub allocation_ceiling: Option<u64>,
+    pub metaslab_array_dirty: bool,
     pub spacemap_v2_present: bool,
     pub spacemap_v2_active: bool,
     pub spacemap_histogram_present: bool,
@@ -373,6 +381,13 @@ impl PoolSpaceAllocator {
         }
         admit_native_write_children(top)?;
         let write_member_guids = write_vdev.children_guids.clone();
+        let raidz_expanding = matches!(
+            &write_vdev.kind,
+            crate::reader::pool::vdev::TopVdevKind::Raidz {
+                expanded: Some(expanded),
+                ..
+            } if expanded.expanding
+        );
         let ashift = u8::try_from(
             top.unsigned("ashift")
                 .ok_or_else(|| corrupt("missing vdev ashift"))?,
@@ -531,6 +546,10 @@ impl PoolSpaceAllocator {
             metaslab_array_obj,
             write_topology,
             write_member_guids,
+            raidz_expanding,
+            raidz_reflow_cursor: 0,
+            allocation_ceiling: None,
+            metaslab_array_dirty: false,
             spacemap_v2_present,
             spacemap_v2_active,
             spacemap_histogram_present,
@@ -556,6 +575,45 @@ impl PoolSpaceAllocator {
             .sum()
     }
 
+    /// Add empty native metaslab slots when a completed expansion grows asize.
+    /// The zero object IDs are persisted in the same COW fixed point as the
+    /// completed topology, before the newly available space can be allocated.
+    pub fn grow_to_asize(&mut self, asize: u64) -> Result<()> {
+        let count = usize::try_from(asize >> self.metaslab_shift)
+            .map_err(|_| unsupported("expanded metaslab count exceeds usize"))?;
+        if count < self.metaslabs.len() || count > 65_536 {
+            return Err(unsupported("expanded metaslab count outside writer bounds"));
+        }
+        let size = 1_u64 << self.metaslab_shift;
+        while self.metaslabs.len() < count {
+            let id = self.metaslabs.len();
+            let start = (id as u64)
+                .checked_mul(size)
+                .ok_or_else(|| corrupt("expanded metaslab start overflow"))?;
+            let map = AllocationMap::new(start, size, self.ashift, MAX_RANGES_PER_METASLAB)
+                .map_err(|error| parse_err(&error))?;
+            self.metaslabs.push(MetaslabState {
+                id,
+                object: 0,
+                start,
+                size,
+                allocatable_map: map.clone(),
+                final_map: map,
+                txg_allocs: Vec::new(),
+                txg_frees: Vec::new(),
+                bonus_len: if self.spacemap_histogram_present {
+                    320
+                } else {
+                    24
+                },
+                preserved_smp_object: 0,
+                base_stream: Vec::new(),
+            });
+            self.metaslab_array_dirty = true;
+        }
+        Ok(())
+    }
+
     /// Allocate one physical block extent of `physical_bytes` honoring the top-level
     /// vdev's exact native allocation size and alignment (Leaf/Mirror/RAIDZ/dRAID).
     pub fn allocate(&mut self, physical_bytes: usize) -> Result<Dva> {
@@ -571,6 +629,9 @@ impl PoolSpaceAllocator {
                     continue;
                 }
                 if let Some(range) = ms.allocatable_map.find_free_extent(asize, align) {
+                    if self.allocation_ceiling.is_some_and(|end| range.end > end) {
+                        continue;
+                    }
                     ms.allocatable_map
                         .apply(MapType::Allocate, range.clone())
                         .map_err(|e| parse_err(&e))?;
@@ -3395,7 +3456,7 @@ pub(super) fn finalize_mos_and_space_maps_to_convergence(
 
         // 1. Ensure every dirty metaslab in `planned_sm` has an allocated `sm_obj` ID
         // (and update `metaslab_array` + `spacemap_histogram` refcount if newly initialized).
-        let mut ms_array_modified = false;
+        let mut ms_array_modified = alloc.metaslab_array_dirty;
         let dirty_ms_ids: Vec<usize> = planned_sm.keys().copied().collect();
         for &ms_id in &dirty_ms_ids {
             if alloc.metaslabs[ms_id].object == 0 {
@@ -3722,6 +3783,7 @@ pub(super) fn finalize_mos_and_space_maps_to_convergence(
         }
         alloc.checkpoint_deferred_frees = checkpoint_frees;
         alloc.pending_mos_directory = None;
+        alloc.metaslab_array_dirty = false;
 
         // 5. CONVERGED! Replay exact byte encoding into the pre-allocated DVAs (`FixedDvaQueue`)!
         for (&ms_id, &(bsize, first_dirty, num_blocks)) in &planned_sm {

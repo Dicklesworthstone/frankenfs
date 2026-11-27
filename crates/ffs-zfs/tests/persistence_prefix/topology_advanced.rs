@@ -512,135 +512,897 @@ fn draid1_draid2_draid3_create_write_read_and_degraded_erasure_recovery() {
     assert!(Pool::check_draid_survivors(3, &[11, 12, 13, 14]).is_err());
 }
 
+fn expansion_leaf(cx: &Cx, device: &FaultableMemberDevice) -> Leaf {
+    Leaf::from_device(cx, Box::new(device.clone()), 0, device.len_bytes()).unwrap()
+}
+
+fn durable_expansion_devices(devices: &[FaultableMemberDevice]) -> Vec<FaultableMemberDevice> {
+    devices
+        .iter()
+        .map(|device| FaultableMemberDevice::new(device.durable_snapshot()))
+        .collect()
+}
+
+fn reopen_expansion(
+    cx: &Cx,
+    devices: &[FaultableMemberDevice],
+    pool_guid: u64,
+    target_slot: usize,
+    previous_slot: usize,
+) -> ZfsTransactionEngine {
+    let calls: Vec<_> = devices
+        .iter()
+        .map(FaultableMemberDevice::write_calls)
+        .collect();
+    let mut options = default_write_opts(pool_guid, target_slot);
+    options.reconcile_torn_uberblocks = true;
+    match ZfsTransactionEngine::from_devices(cx, boxed_devs(devices), options) {
+        Ok(engine) => engine,
+        Err(error) if target_slot != previous_slot => {
+            assert_eq!(
+                devices
+                    .iter()
+                    .map(FaultableMemberDevice::write_calls)
+                    .collect::<Vec<_>>(),
+                calls,
+                "failed successor admission must remain read-only: {error}",
+            );
+            options.slot = previous_slot;
+            ZfsTransactionEngine::from_devices(cx, boxed_devs(devices), options)
+                .expect("reopen the proven predecessor when no successor survived")
+        }
+        Err(error) => panic!("reopen expansion authority: {error}"),
+    }
+}
+
+fn expansion_is_active(cx: &Cx, engine: &ZfsTransactionEngine) -> bool {
+    let mut mos = engine.open_read_objects(cx).unwrap();
+    let config = mos.load_mos_config_nvlist(cx).unwrap();
+    let Some(NvValue::Lists(tops)) = config.list("vdev_tree").unwrap().fields.get("children")
+    else {
+        panic!("native expansion top-level array");
+    };
+    tops[0].fields.contains_key("raidz_expanding")
+}
+
+fn finish_expansion(
+    cx: &Cx,
+    engine: &mut ZfsTransactionEngine,
+    new_disk: &FaultableMemberDevice,
+) -> usize {
+    for _ in 0..512 {
+        if !expansion_is_active(cx, engine) {
+            return engine.committed_slot();
+        }
+        let (report, token) = engine
+            .expand_raidz(cx, expansion_leaf(cx, new_disk), 65_536, 1)
+            .into_result()
+            .expect("resume bounded native reflow");
+        assert!(report.chunks_processed <= 1);
+        if report.completed {
+            assert!(!expansion_is_active(cx, engine));
+            return token.published_slot();
+        }
+    }
+    panic!("bounded native reflow did not finish");
+}
+
 #[test]
+#[allow(clippy::too_many_lines)]
 fn raidz_expansion_resumable_chunked_reflow_and_fault_cut_safety() {
     let cx = Cx::for_testing();
     let ts = Timestamp {
         seconds: 1_735_001_000,
         nanos: 0,
     };
-    let pool_guid = 0x5241_4944_5A45_5850_u64;
-    let devs = blank_devs(3, 12 * 1024 * 1024);
-    let spec = ZfsPoolCreateSpec {
-        pool_name: "raidz_exp_pool".to_owned(),
-        pool_guid,
-        ashift: 12,
-        hostid: 0x4646_5331,
-        hostname: "frankenfs-test".to_owned(),
-        vdevs: vec![ZfsCreateVdevSpec {
-            kind: ZfsCreateVdevKind::Raidz {
-                parity: 1,
-                width: 3,
-            },
-            alloc_class: AllocClass::Normal,
-        }],
-        spare_count: 0,
-        exported: true,
-    };
-    let report = create_pool_on_devices(&cx, boxed_devs(&devs), &spec).unwrap();
-    let mut supplied = devs.clone();
-    supplied.rotate_right(1);
-    let mut engine = open_wide_engine(&cx, &supplied, pool_guid, report.initial_slot).unwrap();
-
-    let (fid, _) = engine
-        .create_file(
+    for parity in 1..=3_usize {
+        let old_width = parity + 2;
+        let pool_guid = 0x5241_4944_5A45_5800_u64 + parity as u64;
+        let (devs, created) = routing_fixture(
             &cx,
-            &[],
-            5,
-            b"pre_expand.bin",
-            0o644,
-            0,
-            0,
-            ts,
-            ZfsDataChecksum::Fletcher4,
-        )
-        .into_result()
-        .unwrap();
-    let payload = vec![0xA5_u8; 12_288];
-    let (_, tok) = engine
-        .write_file_data(&cx, &[], fid, 0, &payload, ts, ZfsDataChecksum::Fletcher4)
-        .into_result()
-        .unwrap();
-
-    // Negative control: undersized expansion disk must fail closed without mutating pool!
-    let snap_before: Vec<Vec<u8>> = devs
-        .iter()
-        .map(FaultableMemberDevice::durable_snapshot)
-        .collect();
-    let tiny_disk = FaultableMemberDevice::new(vec![0_u8; 6 * 1024 * 1024]);
-    let tiny_leaf = Leaf::from_device(&cx, Box::new(tiny_disk), 0, 6 * 1024 * 1024).unwrap();
-    assert!(
+            pool_guid,
+            vec![ZfsCreateVdevKind::Raidz {
+                parity,
+                width: old_width,
+            }],
+        );
+        let mut supplied = devs.clone();
+        supplied.rotate_right(1);
+        let mut engine = open_wide_engine(&cx, &supplied, pool_guid, created.initial_slot).unwrap();
+        let original = routing_payload();
+        let (file, _) = create_routing_file(&cx, &mut engine, &original);
         engine
-            .expand_raidz(&cx, tiny_leaf, 65_536, 1)
-            .is_not_committed(),
-        "undersized RAIDZ expansion disk must be refused"
-    );
-    for (idx, (d, prev)) in devs.iter().zip(&snap_before).enumerate() {
+            .create_snapshot(&cx, &[], b"before_expand", ts)
+            .into_result()
+            .unwrap();
+        let current: Vec<_> = original.iter().map(|byte| byte ^ 0xA7).collect();
+        engine
+            .write_file_data(&cx, &[], file, 0, &current, ts, ZfsDataChecksum::Fletcher4)
+            .into_result()
+            .unwrap();
+
+        let calls: Vec<_> = devs
+            .iter()
+            .map(FaultableMemberDevice::write_calls)
+            .collect();
+        let tiny = FaultableMemberDevice::new(vec![0; 6 * 1024 * 1024]);
+        assert!(
+            engine
+                .expand_raidz(&cx, expansion_leaf(&cx, &tiny), 65_536, 1)
+                .is_not_committed()
+        );
+        assert_eq!(tiny.write_calls(), 0);
         assert_eq!(
-            &d.durable_snapshot(),
-            prev,
-            "refused expand_raidz mutated member {idx}"
+            devs.iter()
+                .map(FaultableMemberDevice::write_calls)
+                .collect::<Vec<_>>(),
+            calls
+        );
+
+        let free_before = engine.free_bytes();
+        let new_disk = FaultableMemberDevice::new(vec![0; 12 * 1024 * 1024]);
+        let (bootstrap, token) = engine
+            .expand_raidz(&cx, expansion_leaf(&cx, &new_disk), 65_536, 1)
+            .into_result()
+            .expect("publish active first-expansion topology");
+        assert_eq!(
+            (bootstrap.old_width, bootstrap.new_width, bootstrap.parity),
+            (old_width, old_width + 1, parity)
+        );
+        assert_eq!(bootstrap.chunks_processed, 0);
+        assert!(!bootstrap.completed);
+        let bootstrap_slot = token.published_slot();
+        let mut all = devs;
+        all.push(new_disk);
+        let calls: Vec<_> = all.iter().map(FaultableMemberDevice::write_calls).collect();
+        assert!(
+            engine
+                .write_file_data(
+                    &cx,
+                    &[],
+                    file,
+                    0,
+                    b"must wait",
+                    ts,
+                    ZfsDataChecksum::Fletcher4,
+                )
+                .is_not_committed(),
+            "foreground TXG must not change the scratch source"
+        );
+        assert_eq!(
+            all.iter()
+                .map(FaultableMemberDevice::write_calls)
+                .collect::<Vec<_>>(),
+            calls
+        );
+        let replacement = FaultableMemberDevice::new(vec![0; 12 * 1024 * 1024]);
+        assert!(
+            engine
+                .replace_member(&cx, 0, expansion_leaf(&cx, &replacement),)
+                .is_not_committed(),
+            "replacement cannot omit active native scratch authority"
+        );
+        assert_eq!(
+            replacement.write_calls(),
+            0,
+            "active expansion refusal must precede the physical member copy"
+        );
+        assert!(
+            engine
+                .scrub_start(&cx, ffs_zfs::ZfsScanLimits::default(),)
+                .is_not_committed(),
+            "scan repair must pause before physical healing"
+        );
+        assert_eq!(
+            all.iter()
+                .map(FaultableMemberDevice::write_calls)
+                .collect::<Vec<_>>(),
+            calls
+        );
+
+        let (progress, _) = engine
+            .expand_raidz(&cx, expansion_leaf(&cx, &all[old_width]), 65_536, 1)
+            .into_result()
+            .unwrap();
+        assert_eq!(progress.chunks_processed, 1);
+        assert!(!progress.completed);
+        drop(engine);
+        // Reopen loses only harmless phase-local progress. All current and
+        // snapshot-owned bytes remain reachable from the selected native root.
+        let durable = durable_expansion_devices(&all);
+        let mut shuffled = durable.clone();
+        shuffled.rotate_left(2);
+        let mut engine =
+            reopen_expansion(&cx, &shuffled, pool_guid, bootstrap_slot, bootstrap_slot);
+        let mut mos = engine.open_read_objects(&cx).unwrap();
+        assert_eq!(
+            read_zpl_file(&cx, &mut mos, &[], b"/route.bin", current.len()).unwrap(),
+            current
+        );
+        let final_slot = finish_expansion(&cx, &mut engine, &durable[old_width]);
+        assert!(
+            engine.free_bytes() > free_before,
+            "completed expansion must add allocatable capacity"
+        );
+        let acknowledgement = engine
+            .persistence_events()
+            .iter()
+            .find(|event| {
+                event.operation == "zfs_pool_expand_raidz_complete"
+                    && event.stage == ZfsPersistenceStage::AckPublished
+            })
+            .expect("completion acknowledgement");
+        let last_label_barrier = engine
+            .persistence_events()
+            .iter()
+            .filter(|event| {
+                event.txg == acknowledgement.txg
+                    && matches!(event.stage, ZfsPersistenceStage::LabelConfigBarrier { .. })
+            })
+            .map(|event| event.seq)
+            .max()
+            .unwrap();
+        assert!(
+            last_label_barrier < acknowledgement.seq,
+            "topology acknowledgement follows every configuration barrier"
+        );
+
+        let durable = durable_expansion_devices(&durable);
+        let mut shuffled = durable.clone();
+        shuffled.reverse();
+        let mut engine = reopen_expansion(&cx, &shuffled, pool_guid, final_slot, final_slot);
+        assert!(!expansion_is_active(&cx, &engine));
+        let mut mos = engine.open_read_objects(&cx).unwrap();
+        assert_eq!(
+            read_zpl_file(&cx, &mut mos, &[], b"/route.bin", current.len()).unwrap(),
+            current
+        );
+
+        // The overwritten version is owned only by a snapshot. A head-only
+        // block walk cannot find it, but raw allocated-prefix reflow preserves it.
+        engine
+            .create_clone(&cx, &[], b"before_expand", &[], b"recovered", &[], ts)
+            .into_result()
+            .expect("post-expansion clone reads snapshot metadata");
+        let mut mos = engine.open_read_objects(&cx).unwrap();
+        assert_eq!(
+            read_zpl_file(
+                &cx,
+                &mut mos,
+                &[b"recovered".to_vec()],
+                b"/route.bin",
+                original.len(),
+            )
+            .unwrap(),
+            original
+        );
+
+        let updated: Vec<_> = current.iter().map(|byte| byte.wrapping_add(11)).collect();
+        engine
+            .write_file_data(&cx, &[], file, 0, &updated, ts, ZfsDataChecksum::Fletcher4)
+            .into_result()
+            .expect("new-width foreground COW after expansion");
+        let mut mos = engine.open_read_objects(&cx).unwrap();
+        assert_eq!(
+            read_zpl_file(&cx, &mut mos, &[], b"/route.bin", updated.len()).unwrap(),
+            updated
         );
     }
+}
 
-    // Fault-cut safety: fault at ReflowChunkBarrier must leave prior committed TXG intact!
-    let new_disk = FaultableMemberDevice::new(vec![0_u8; 12 * 1024 * 1024]);
-    let cut_leaf = Leaf::from_device(&cx, Box::new(new_disk.clone()), 0, 12 * 1024 * 1024).unwrap();
-    engine.with_fault_hook(|ev| {
-        if matches!(ev.stage, ZfsPersistenceStage::ReflowChunkBarrier { .. }) {
-            return Err(FfsError::Io(std::io::Error::other(
-                "injected reflow barrier fault",
-            )));
-        }
-        Ok(())
-    });
+#[test]
+fn raidz_expansion_refuses_checkpoint_before_touching_scratch_or_new_member() {
+    let cx = Cx::for_testing();
+    let pool_guid = 0x5241_4944_4348_4B50_u64;
+    let (devs, created) = routing_fixture(
+        &cx,
+        pool_guid,
+        vec![ZfsCreateVdevKind::Raidz {
+            parity: 1,
+            width: 3,
+        }],
+    );
+    let mut engine = open_wide_engine(&cx, &devs, pool_guid, created.initial_slot).unwrap();
+    create_routing_file(&cx, &mut engine, &routing_payload());
+    engine.checkpoint_create(&cx).into_result().unwrap();
+    let calls: Vec<_> = devs
+        .iter()
+        .map(FaultableMemberDevice::write_calls)
+        .collect();
+    let new_disk = FaultableMemberDevice::new(vec![0; 12 * 1024 * 1024]);
     assert!(
         engine
-            .expand_raidz(&cx, cut_leaf, 65_536, 1)
-            .is_not_committed(),
-        "pre-uberblock reflow barrier fault must report NotCommitted"
+            .expand_raidz(&cx, expansion_leaf(&cx, &new_disk), 65_536, 1,)
+            .is_not_committed()
     );
-    engine.with_fault_hook(|_| Ok(()));
+    assert_eq!(new_disk.write_calls(), 0);
+    assert_eq!(
+        devs.iter()
+            .map(FaultableMemberDevice::write_calls)
+            .collect::<Vec<_>>(),
+        calls
+    );
+}
 
-    // Resumable chunked expansion (`max_chunks_per_txg = 1`) until completed!
-    let _ = tok;
-    let mut chunks = 0_usize;
-    let mut last_slot;
-    loop {
-        let leaf4 =
-            Leaf::from_device(&cx, Box::new(new_disk.clone()), 0, 12 * 1024 * 1024).unwrap();
-        let (rep, t) = engine
-            .expand_raidz(&cx, leaf4, 65_536, 1)
-            .into_result()
-            .expect("chunked RAIDZ expansion must commit");
-        assert_eq!((rep.old_width, rep.new_width, rep.parity), (3, 4, 1));
-        last_slot = t.published_slot();
-        chunks += 1;
-        if rep.completed {
-            break;
-        }
-        assert!(chunks < 128, "reflow failed to converge");
+struct ExpansionLabelReadFailure {
+    inner: FaultableMemberDevice,
+    remaining: std::sync::atomic::AtomicUsize,
+    failure_bytes: usize,
+    cancelled: bool,
+}
+
+impl ByteDevice for ExpansionLabelReadFailure {
+    fn len_bytes(&self) -> u64 {
+        self.inner.len_bytes()
     }
-    assert!(chunks >= 1);
 
-    // Verify `org.openzfs:raidz_expansion` feature, `raidz_expand_txgs`, AND
-    // end-to-end 4-disk expanded RAIDZ readback of pre-expansion `/pre_expand.bin`!
-    let mut expanded_devs = devs;
-    expanded_devs.push(new_disk);
-    let pool = Pool::from_wide_leaves(leaves_from_devs(&cx, &expanded_devs)).unwrap();
-    let mut mos = pool.objects(&cx, 0, last_slot, pool_guid).unwrap();
-    let cfg = mos.load_mos_config_nvlist(&cx).unwrap();
-    let Some(NvValue::Lists(tops)) = cfg.list("vdev_tree").unwrap().fields.get("children") else {
-        panic!("expected top-level children in MOS config");
-    };
-    let primary_top = &tops[0];
-    assert!(
-        primary_top.fields.contains_key("raidz_expand_txgs"),
-        "completed expand_raidz must record raidz_expand_txgs in MOS config"
+    fn read_exact_at(&self, cx: &Cx, offset: ByteOffset, bytes: &mut [u8]) -> Result<()> {
+        if bytes.len() == self.failure_bytes
+            && self
+                .remaining
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |remaining| remaining.checked_sub(1),
+                )
+                .is_ok()
+        {
+            return Err(if self.cancelled {
+                FfsError::Cancelled
+            } else {
+                FfsError::Io(std::io::Error::other(
+                    "injected new-child label read failure",
+                ))
+            });
+        }
+        self.inner.read_exact_at(cx, offset, bytes)
+    }
+
+    fn write_all_at(&self, cx: &Cx, offset: ByteOffset, bytes: &[u8]) -> Result<()> {
+        self.inner.write_all_at(cx, offset, bytes)
+    }
+
+    fn sync(&self, cx: &Cx) -> Result<()> {
+        self.inner.sync(cx)
+    }
+
+    fn begin_durability_commit(&self, cx: &Cx) -> Result<()> {
+        self.inner.begin_durability_commit(cx)
+    }
+
+    fn complete_durability_commit(&self) {
+        self.inner.complete_durability_commit();
+    }
+
+    fn abort_durability_commit(&self) {
+        self.inner.abort_durability_commit();
+    }
+}
+
+#[test]
+fn raidz_expansion_new_child_requires_readable_native_ownership_evidence() {
+    let cx = Cx::for_testing();
+    let pool_guid = 0x5241_4944_4C41_424C_u64;
+    let (devices, created) = routing_fixture(
+        &cx,
+        pool_guid,
+        vec![ZfsCreateVdevKind::Raidz {
+            parity: 1,
+            width: 3,
+        }],
     );
-    let read_back = read_zpl_file(&cx, &mut mos, &[], b"/pre_expand.bin", payload.len())
-        .expect("pre-expansion file must read back cleanly across all 4 expanded RAIDZ disks");
-    assert_eq!(read_back, payload);
+    let mut engine = open_wide_engine(&cx, &devices, pool_guid, created.initial_slot).unwrap();
+    let calls: Vec<_> = devices
+        .iter()
+        .map(FaultableMemberDevice::write_calls)
+        .collect();
+
+    for (cancelled, failure_bytes) in [
+        (false, LABEL_CONFIG_BYTES),
+        (true, LABEL_CONFIG_BYTES),
+        (false, UBERBLOCK_RING_BYTES),
+        (true, UBERBLOCK_RING_BYTES),
+    ] {
+        // Configuration or ring reads fail transiently on an existing member.
+        // Treating those failures as empty labels would overwrite its identity
+        // as soon as writes and subsequent reads recover.
+        let foreign = FaultableMemberDevice::new(devices[0].durable_snapshot());
+        let len = foreign.len_bytes();
+        let leaf = Leaf::from_device(
+            &cx,
+            Box::new(ExpansionLabelReadFailure {
+                inner: foreign.clone(),
+                remaining: std::sync::atomic::AtomicUsize::new(4),
+                failure_bytes,
+                cancelled,
+            }),
+            0,
+            len,
+        )
+        .unwrap();
+        let outcome = engine.expand_raidz(&cx, leaf, 65_536, 1);
+        if cancelled {
+            assert!(matches!(
+                outcome,
+                ZfsTxOutcome::NotCommitted(FfsError::Cancelled)
+            ));
+        } else {
+            assert!(matches!(
+                outcome,
+                ZfsTxOutcome::NotCommitted(FfsError::Io(_))
+            ));
+        }
+        assert_eq!(foreign.write_calls(), 0);
+    }
+
+    for checksum_valid in [false, true] {
+        let mut bytes = vec![0_u8; 12 * 1024 * 1024];
+        let offset = label_offsets(bytes.len() as u64).unwrap()[2] + LABEL_CONFIG_OFFSET;
+        let start = offset as usize;
+        let raw = &mut bytes[start..start + LABEL_CONFIG_BYTES];
+        if checksum_valid {
+            // A checksum-valid empty nvlist is malformed native metadata, not
+            // evidence that the device is blank and can be overwritten.
+            let packed = ffs_ondisk::zfs::nvlist::NvList {
+                fields: BTreeMap::new(),
+            }
+            .encode_xdr()
+            .unwrap();
+            raw[..packed.len()].copy_from_slice(&packed);
+            stamp_label_checksum(raw, offset, Endian::Little).unwrap();
+        } else {
+            raw[0] = 0xA5;
+        }
+        let unknown = FaultableMemberDevice::new(bytes);
+        assert!(
+            engine
+                .expand_raidz(&cx, expansion_leaf(&cx, &unknown), 65_536, 1,)
+                .is_not_committed()
+        );
+        assert_eq!(unknown.write_calls(), 0);
+    }
+    assert_eq!(
+        devices
+            .iter()
+            .map(FaultableMemberDevice::write_calls)
+            .collect::<Vec<_>>(),
+        calls
+    );
+}
+
+#[test]
+fn raidz_expansion_rejects_uberblock_evidence_on_an_unlabeled_new_child() {
+    let cx = Cx::for_testing();
+    let pool_guid = 0x5241_4944_5249_4E47_u64;
+    let (devices, created) = routing_fixture(
+        &cx,
+        pool_guid,
+        vec![ZfsCreateVdevKind::Raidz {
+            parity: 1,
+            width: 3,
+        }],
+    );
+    let mut engine = open_wide_engine(&cx, &devices, pool_guid, created.initial_slot).unwrap();
+    let calls: Vec<_> = devices
+        .iter()
+        .map(FaultableMemberDevice::write_calls)
+        .collect();
+    let foreign = devices[0].durable_snapshot();
+    let source = expansion_leaf(&cx, &devices[0]);
+    let offsets = label_offsets(foreign.len() as u64).unwrap();
+    for (index, offset) in offsets.into_iter().enumerate() {
+        let label = source.label(&cx, index).unwrap();
+        source
+            .uberblock(&cx, &label, created.initial_slot)
+            .expect("fixture has a verified foreign uberblock in each ring");
+        let start = (offset + UBERBLOCK_RING_OFFSET) as usize;
+        let end = start + UBERBLOCK_RING_BYTES;
+        let mut bytes = vec![0_u8; foreign.len()];
+        bytes[start..end].copy_from_slice(&foreign[start..end]);
+        let candidate = FaultableMemberDevice::new(bytes);
+        assert!(
+            engine
+                .expand_raidz(&cx, expansion_leaf(&cx, &candidate), 65_536, 1,)
+                .is_not_committed(),
+            "zero configs cannot hide existing uberblocks in ring {index}"
+        );
+        assert_eq!(candidate.write_calls(), 0);
+    }
+    assert_eq!(
+        devices
+            .iter()
+            .map(FaultableMemberDevice::write_calls)
+            .collect::<Vec<_>>(),
+        calls
+    );
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ExpansionCrashCut {
+    ScratchWrite,
+    ScratchBarrier,
+    ScratchAuthorityWrite,
+    ScratchAuthorityBarrier,
+    CopyWrite,
+    CopyBarrier,
+    CopyCancelled,
+    DataAuthorityWrite,
+    DataAuthorityBarrier,
+    CompletionRootBarrier,
+    CompletionUberblockBarrier,
+    CompletionLabelWrite,
+    CompletionSeedBarrier,
+    AuthorityAcknowledgement,
+}
+
+impl ExpansionCrashCut {
+    fn matches(self, event: &ffs_zfs::ZfsPersistenceEvent) -> bool {
+        let operation = event.operation.as_str();
+        match self {
+            Self::ScratchWrite => {
+                operation == "zfs_pool_expand_raidz_scratch"
+                    && matches!(
+                        event.stage,
+                        ZfsPersistenceStage::ReflowChunkWrite { member_index: 2 }
+                    )
+            }
+            Self::ScratchBarrier => {
+                operation == "zfs_pool_expand_raidz_scratch"
+                    && matches!(
+                        event.stage,
+                        ZfsPersistenceStage::ReflowChunkBarrier { member_index: 2 }
+                    )
+            }
+            Self::ScratchAuthorityWrite => {
+                operation == "zfs_pool_expand_raidz_scratch_authority"
+                    && matches!(
+                        event.stage,
+                        ZfsPersistenceStage::UberblockWrite {
+                            member_index: 1,
+                            label: 0,
+                            ..
+                        }
+                    )
+            }
+            Self::ScratchAuthorityBarrier => {
+                operation == "zfs_pool_expand_raidz_scratch_authority"
+                    && matches!(
+                        event.stage,
+                        ZfsPersistenceStage::UberblockBarrier {
+                            member_index: 1,
+                            wave: 1
+                        }
+                    )
+            }
+            Self::CopyWrite => {
+                operation == "zfs_pool_expand_raidz_copy"
+                    && matches!(
+                        event.stage,
+                        ZfsPersistenceStage::ReflowChunkWrite { member_index: 2 }
+                    )
+            }
+            Self::CopyBarrier | Self::CopyCancelled => {
+                operation == "zfs_pool_expand_raidz_copy"
+                    && matches!(
+                        event.stage,
+                        ZfsPersistenceStage::ReflowChunkBarrier { member_index: 2 }
+                    )
+            }
+            Self::DataAuthorityWrite => {
+                operation == "zfs_pool_expand_raidz_data_authority"
+                    && matches!(
+                        event.stage,
+                        ZfsPersistenceStage::UberblockWrite {
+                            member_index: 1,
+                            label: 0,
+                            ..
+                        }
+                    )
+            }
+            Self::DataAuthorityBarrier => {
+                operation == "zfs_pool_expand_raidz_data_authority"
+                    && matches!(
+                        event.stage,
+                        ZfsPersistenceStage::UberblockBarrier {
+                            member_index: 1,
+                            wave: 1
+                        }
+                    )
+            }
+            Self::CompletionRootBarrier => {
+                operation == "zfs_pool_expand_raidz_complete"
+                    && matches!(
+                        event.stage,
+                        ZfsPersistenceStage::MosRootBarrier { member_index: 1 }
+                    )
+            }
+            Self::CompletionUberblockBarrier => {
+                operation == "zfs_pool_expand_raidz_complete"
+                    && matches!(
+                        event.stage,
+                        ZfsPersistenceStage::UberblockBarrier {
+                            member_index: 1,
+                            wave: 1
+                        }
+                    )
+            }
+            Self::CompletionLabelWrite => {
+                operation == "zfs_pool_expand_raidz_labels"
+                    && matches!(
+                        event.stage,
+                        ZfsPersistenceStage::LabelConfigWrite {
+                            member_index: 1,
+                            label: 2
+                        }
+                    )
+            }
+            Self::CompletionSeedBarrier => {
+                operation == "zfs_pool_expand_raidz_seed"
+                    && matches!(
+                        event.stage,
+                        ZfsPersistenceStage::LabelConfigBarrier {
+                            member_index: 0,
+                            wave: 1
+                        }
+                    )
+            }
+            Self::AuthorityAcknowledgement => {
+                operation == "zfs_pool_expand_raidz_data_authority"
+                    && matches!(event.stage, ZfsPersistenceStage::BeforeAcknowledge)
+            }
+        }
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn raidz_expansion_reopens_every_scratch_and_completion_authority_cut() {
+    let cx = Cx::for_testing();
+    let pool_guid = 0x5241_4944_4355_5453_u64;
+    let (mut initial, created) = routing_fixture(
+        &cx,
+        pool_guid,
+        vec![ZfsCreateVdevKind::Raidz {
+            parity: 1,
+            width: 3,
+        }],
+    );
+    let mut engine = open_wide_engine(&cx, &initial, pool_guid, created.initial_slot).unwrap();
+    let payload = routing_payload();
+    create_routing_file(&cx, &mut engine, &payload);
+    let new_disk = FaultableMemberDevice::new(vec![0; 12 * 1024 * 1024]);
+    let (_, token) = engine
+        .expand_raidz(&cx, expansion_leaf(&cx, &new_disk), 1024 * 1024, 8)
+        .into_result()
+        .unwrap();
+    initial.push(new_disk);
+    let bootstrap_slot = token.published_slot();
+    drop(engine);
+    let baseline = durable_expansion_devices(&initial);
+
+    for cut in [
+        ExpansionCrashCut::ScratchWrite,
+        ExpansionCrashCut::ScratchBarrier,
+        ExpansionCrashCut::ScratchAuthorityWrite,
+        ExpansionCrashCut::ScratchAuthorityBarrier,
+        ExpansionCrashCut::CopyWrite,
+        ExpansionCrashCut::CopyBarrier,
+        ExpansionCrashCut::CopyCancelled,
+        ExpansionCrashCut::DataAuthorityWrite,
+        ExpansionCrashCut::DataAuthorityBarrier,
+        ExpansionCrashCut::CompletionRootBarrier,
+        ExpansionCrashCut::CompletionUberblockBarrier,
+        ExpansionCrashCut::CompletionLabelWrite,
+        ExpansionCrashCut::CompletionSeedBarrier,
+        ExpansionCrashCut::AuthorityAcknowledgement,
+    ] {
+        let devices = durable_expansion_devices(&baseline);
+        let mut supplied = devices.clone();
+        supplied.rotate_right(1);
+        let mut engine =
+            reopen_expansion(&cx, &supplied, pool_guid, bootstrap_slot, bootstrap_slot);
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = fired.clone();
+        engine.with_fault_hook(move |event| {
+            if cut.matches(event) && !observed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return Err(if matches!(cut, ExpansionCrashCut::CopyCancelled) {
+                    FfsError::Cancelled
+                } else {
+                    FfsError::Io(std::io::Error::other(format!("expansion cut {cut:?}")))
+                });
+            }
+            Ok(())
+        });
+        let (target_slot, previous_slot) = loop {
+            let previous = engine.committed_slot();
+            let outcome =
+                engine.expand_raidz(&cx, expansion_leaf(&cx, &devices[3]), 1024 * 1024, 8);
+            if fired.load(std::sync::atomic::Ordering::SeqCst) {
+                if matches!(cut, ExpansionCrashCut::AuthorityAcknowledgement) {
+                    assert!(
+                        outcome.is_committed(),
+                        "a lost acknowledgement cannot undo authority"
+                    );
+                } else {
+                    assert!(!outcome.is_committed(), "fault must be observed at {cut:?}");
+                }
+                if matches!(cut, ExpansionCrashCut::CompletionSeedBarrier) {
+                    assert!(
+                        engine.requires_recovery(),
+                        "a failed completion seed must reconcile the admitted member's labels"
+                    );
+                    assert!(outcome.is_not_committed());
+                }
+                if matches!(cut, ExpansionCrashCut::CompletionLabelWrite) {
+                    assert!(
+                        !engine.persistence_events().iter().any(|event| {
+                            event.operation == "zfs_pool_expand_raidz_complete"
+                                && event.stage == ZfsPersistenceStage::AckPublished
+                        }),
+                        "torn completion labels must never acknowledge the topology"
+                    );
+                }
+                let target = match &outcome {
+                    ZfsTxOutcome::Uncertain { target_slot, .. } => {
+                        assert!(engine.requires_recovery());
+                        *target_slot
+                    }
+                    ZfsTxOutcome::Committed { token, .. } => token.published_slot(),
+                    ZfsTxOutcome::NotCommitted(_) => previous,
+                };
+                break (target, previous);
+            }
+            let (report, _) = outcome.into_result().expect("reach requested reflow phase");
+            assert!(
+                !report.completed,
+                "cut {cut:?} did not occur before completion"
+            );
+        };
+        drop(engine);
+        // Constructing fresh devices from only durable bytes discards every
+        // unsynced write, including a partially published same-TXG timestamp.
+        let recovered = durable_expansion_devices(&devices);
+        let mut shuffled = recovered.clone();
+        shuffled.reverse();
+        let mut engine = reopen_expansion(&cx, &shuffled, pool_guid, target_slot, previous_slot);
+        let mut mos = engine.open_read_objects(&cx).unwrap();
+        assert_eq!(
+            read_zpl_file(&cx, &mut mos, &[], b"/route.bin", payload.len()).unwrap(),
+            payload,
+            "selected root must read exact data after {cut:?}",
+        );
+        let slot = finish_expansion(&cx, &mut engine, &recovered[3]);
+        let final_images = durable_expansion_devices(&recovered);
+        assert_routing_file(&cx, &final_images, pool_guid, slot, &payload);
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn raidz_expansion_bootstrap_cut_preserves_coherent_config_ownership() {
+    let cx = Cx::for_testing();
+    let pool_guid = 0x5241_4944_424F_4F54_u64;
+    let (initial, created) = routing_fixture(
+        &cx,
+        pool_guid,
+        vec![ZfsCreateVdevKind::Raidz {
+            parity: 1,
+            width: 3,
+        }],
+    );
+    let mut engine = open_wide_engine(&cx, &initial, pool_guid, created.initial_slot).unwrap();
+    let payload = routing_payload();
+    let (_, previous_slot) = create_routing_file(&cx, &mut engine, &payload);
+    drop(engine);
+    let baseline = durable_expansion_devices(&initial);
+    for cut_labels in [false, true] {
+        let mut devices = durable_expansion_devices(&baseline);
+        let mut engine = open_wide_engine(&cx, &devices, pool_guid, previous_slot).unwrap();
+        let new_disk = FaultableMemberDevice::new(vec![0; 12 * 1024 * 1024]);
+        engine.with_fault_hook(move |event| {
+            let cut = if cut_labels {
+                event.operation == "zfs_pool_expand_raidz_labels"
+                    && matches!(
+                        event.stage,
+                        ZfsPersistenceStage::LabelConfigBarrier {
+                            member_index: 1,
+                            wave: 1,
+                        }
+                    )
+            } else {
+                event.operation == "zfs_pool_expand_raidz_bootstrap"
+                    && matches!(
+                        event.stage,
+                        ZfsPersistenceStage::UberblockBarrier {
+                            member_index: 1,
+                            wave: 1,
+                        }
+                    )
+            };
+            if cut {
+                return Err(FfsError::Io(std::io::Error::other("bootstrap config cut")));
+            }
+            Ok(())
+        });
+        let target_slot = match engine.expand_raidz(&cx, expansion_leaf(&cx, &new_disk), 65_536, 1)
+        {
+            ZfsTxOutcome::Uncertain { target_slot, .. } => target_slot,
+            other => panic!("bootstrap publication must be uncertain: {other:?}"),
+        };
+        assert!(
+            !engine.persistence_events().iter().any(|event| {
+                event.operation == "zfs_pool_expand_raidz_bootstrap"
+                    && event.stage == ZfsPersistenceStage::AckPublished
+            }),
+            "torn bootstrap labels must never acknowledge the topology"
+        );
+        devices.push(new_disk);
+        drop(engine);
+        let recovered = durable_expansion_devices(&devices);
+        // A successor uberblock is evidence against falling back to an older
+        // geometry even when the newly added member is now absent.
+        let old_only = Pool::from_wide_leaves(leaves_from_devs(&cx, &recovered[..3])).unwrap();
+        assert!(old_only.root(&cx, 0, previous_slot, pool_guid).is_err());
+        let recovered = if cut_labels {
+            recovered
+        } else {
+            // Retain only label0's old-generation physical identity on member2.
+            // The successor configuration and newest UB are on other members.
+            let mut images: Vec<_> = recovered
+                .iter()
+                .map(FaultableMemberDevice::durable_snapshot)
+                .collect();
+            let offsets = label_offsets(images[2].len() as u64).unwrap();
+            for offset in &offsets[1..] {
+                let start = (*offset + LABEL_CONFIG_OFFSET) as usize;
+                images[2][start] ^= 0x5A;
+            }
+            let damaged: Vec<_> = images.into_iter().map(FaultableMemberDevice::new).collect();
+            let identity_start = (offsets[0] + LABEL_CONFIG_OFFSET) as usize;
+            let identity_range = identity_start..identity_start + LABEL_CONFIG_BYTES;
+            let identity_bytes = damaged[2].durable_snapshot()[identity_range.clone()].to_vec();
+            let identity_leaf = expansion_leaf(&cx, &damaged[2]);
+            assert!(identity_leaf.label(&cx, 0).is_ok());
+            for label in 1..4 {
+                assert!(identity_leaf.label(&cx, label).is_err());
+            }
+
+            // Persist a torn first configuration rewrite. A fixed [0,1] first
+            // wave destroys this member's last verified GUID; adaptive waves
+            // write [1,2] first and preserve label0 until replacements sync.
+            damaged[2].set_fault(DeviceFault::TornWriteOnCall {
+                call_index: 0,
+                keep_prefix_bytes: LABEL_CONFIG_BYTES - 40,
+            });
+            let mut options = default_write_opts(pool_guid, target_slot);
+            options.reconcile_torn_uberblocks = true;
+            let attempt = ZfsTransactionEngine::from_devices(&cx, boxed_devs(&damaged), options);
+            assert!(matches!(attempt, Err(FfsError::Io(_))));
+            assert_eq!(damaged[2].write_calls(), 1);
+            for (member, device) in damaged.iter().enumerate() {
+                let mut state = device.state.lock().unwrap();
+                if member == 2 {
+                    state.crash_flush_volatile();
+                } else {
+                    state.crash_drop_unsynced();
+                }
+            }
+            assert_eq!(
+                &damaged[2].durable_snapshot()[identity_range],
+                identity_bytes.as_slice(),
+                "reconciliation must retain the last physical identity until a replacement wave is durable",
+            );
+            durable_expansion_devices(&damaged)
+        };
+        let mut engine = reopen_expansion(&cx, &recovered, pool_guid, target_slot, previous_slot);
+        let mut mos = engine.open_read_objects(&cx).unwrap();
+        assert_eq!(
+            read_zpl_file(&cx, &mut mos, &[], b"/route.bin", payload.len()).unwrap(),
+            payload
+        );
+        let slot = finish_expansion(&cx, &mut engine, &recovered[3]);
+        assert_routing_file(&cx, &recovered, pool_guid, slot, &payload);
+    }
 }
 
 #[test]

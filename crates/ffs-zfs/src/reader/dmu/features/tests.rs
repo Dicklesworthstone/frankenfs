@@ -430,6 +430,7 @@ fn fixture(
         copy_index: 0,
         member_guid: 2,
         raidz: None,
+        imported_pool: None,
         config: VdevConfig {
             pool_guid: 1,
             top_guid: 2,

@@ -32,7 +32,7 @@ use super::dmu_cow::{
 };
 use super::{
     ZfsPersistenceStage, ZfsTransactionEngine, ZfsTxOutcome, ZfsWriteOptions, checkpoint, corrupt,
-    parse_err,
+    parse_err, unsupported,
 };
 use crate::reader::dmu::Objects;
 use crate::reader::dmu::scrub::ScrubLimits;
@@ -394,6 +394,11 @@ impl ZfsTransactionEngine {
         }
         let mut engine =
             Self::from_leaves_with_dev_inos(cx, leaves.clone(), vec![None; leaves.len()], options)?;
+        if engine.allocator.raidz_expanding {
+            return Err(unsupported(
+                "checkpoint rewind requires completed RAIDZ expansion",
+            ));
+        }
         let mut mos = engine.open_read_objects(cx)?;
         let dir = mos.zap_values(cx, 1)?;
         let Some(entry) = dir.iter().find(|e| e.name == DMU_POOL_CHECKPOINT_KEY) else {

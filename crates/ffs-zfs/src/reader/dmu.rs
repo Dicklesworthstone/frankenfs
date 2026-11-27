@@ -597,6 +597,7 @@ impl Objects {
         }
         let config = root.config;
         let reflow_info = root.uberblock.raidz_reflow_info;
+        let pool = root.imported_pool.unwrap_or(pool);
         let pool = pool
             .retain_striped_topology(cx, &config)?
             .retain_advanced_topology(cx, &config, reflow_info)?;
@@ -616,6 +617,10 @@ impl Objects {
         // Keep this view private until its complete native feature catalogs
         // admit reads. Every explicit/automatic leaf/group open joins here.
         view.admit_features(cx)?;
+        if view.pool.imported_configuration().is_some() {
+            let config = view.load_mos_config_nvlist(cx)?;
+            view.pool.verify_imported_mos(&config, reflow_info)?;
+        }
         // When `com.delphix:device_removal` is active in the labels, eagerly
         // load MOS indirect mapping tables so subsequent dataset/object reads
         // resolve removed-vdev DVAs transparently.

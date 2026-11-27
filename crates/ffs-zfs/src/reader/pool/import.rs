@@ -1,12 +1,15 @@
-//! Redundant, read-only uberblock selection for a fully supplied pool.
+//! Redundant native root selection, including interrupted RAIDZ label waves.
 //!
-//! Damaged label copies and independent ring slots are not topology changes.
-//! Every checksum-valid configuration must still agree; resolving different
-//! configuration generations, missing devices, or forked TXGs is not attempted.
+//! Physical identities, configuration generations, and uberblock authority are
+//! verified independently. Same-generation forks and missing committed members
+//! remain errors; automatic read selection never modifies a physical device.
+
+mod configuration;
 
 use super::{
     Cx, FfsError, GroupConfig, Label, Leaf, NvList, Pool, RaidzGroup, RaidzMember, Result,
-    RootBlock, Uberblock, VdevConfig, checkpoint, corrupt, integer, parse, unsupported,
+    RootBlock, Uberblock, VdevConfig, checkpoint, corrupt, integer, parse, same_candidate,
+    unsupported,
 };
 use ffs_ondisk::zfs::{
     LABEL_CONFIG_BYTES, LABEL_CONFIG_OFFSET, UBERBLOCK_RING_BYTES, UBERBLOCK_RING_OFFSET,
@@ -202,6 +205,7 @@ impl Pool {
         cx: &Cx,
         labels: &[Vec<(usize, Label)>],
         admission: &Admission,
+        strict_authority: bool,
     ) -> Result<Vec<Candidate>> {
         let mut candidates = Vec::new();
         for (member_index, member_labels) in labels.iter().enumerate() {
@@ -224,12 +228,21 @@ impl Pool {
                     let ub = match result {
                         Ok(ub) => ub,
                         Err(FfsError::Cancelled) => return Err(FfsError::Cancelled),
+                        Err(error @ FfsError::Io(_)) if strict_authority => return Err(error),
                         Err(_) => continue,
                     };
                     if ub.version == admission.config.version
                         && ub.txg >= admission.config.txg
                         && ub.guid_sum == admission.guid_sum
                     {
+                        if strict_authority
+                            && ub.raidz_reflow_info != 0
+                            && admission.expanded_raidz.is_none()
+                        {
+                            return Err(corrupt(
+                                "RAIDZ reflow authority has no admitted expansion layout",
+                            ));
+                        }
                         candidates.push(Candidate {
                             member_guid: admission.supplied_guids[member_index],
                             label_index,
@@ -251,8 +264,13 @@ impl Pool {
                 .then_with(|| left.slot.cmp(&right.slot))
         });
         for pair in candidates.windows(2) {
-            if pair[0].uberblock.txg == pair[1].uberblock.txg
-                && pair[0].uberblock.root != pair[1].uberblock.root
+            let left = &pair[0].uberblock;
+            let right = &pair[1].uberblock;
+            if left.txg == right.txg
+                && (left.root != right.root
+                    || (left.timestamp == right.timestamp
+                        && (left.checkpoint_txg != right.checkpoint_txg
+                            || left.raidz_reflow_info != right.raidz_reflow_info)))
             {
                 return Err(corrupt(
                     "checksum-valid ZFS uberblocks conflict within one TXG",
@@ -266,14 +284,160 @@ impl Pool {
         Ok(candidates)
     }
 
-    /// Select the highest readable, checksum-verified TXG from every supplied
-    /// member's rings. Ring locations need not agree across replicas, and a
-    /// ring remains readable even when its adjacent configuration copy is bad.
+    /// An explicit historical root remains readable only under the same
+    /// physical layout. Reflow progress cannot be rolled back with its slot.
+    pub(super) fn verify_explicit_raidz_candidate(
+        &self,
+        cx: &Cx,
+        selected: &GroupConfig,
+        supplied_guids: &[u64],
+        candidate: &Uberblock,
+    ) -> Result<Option<Self>> {
+        let labels = self
+            .members
+            .iter()
+            .map(|member| verified_labels(cx, member))
+            .collect::<Result<Vec<_>>>()?;
+        let pool_guid = selected.vdev.pool_guid;
+        if self.has_missing_members() {
+            // Preserve the existing explicitly degraded ordinary-RAIDZ
+            // profile, but never infer a missing successor configuration.
+            if selected.expanded_raidz.is_some() {
+                return Err(unsupported(
+                    "expanded RAIDZ authority requires its complete physical member set",
+                ));
+            }
+            let guid_sum = selected.member_guids.iter().fold(
+                pool_guid.wrapping_add(selected.vdev.top_guid),
+                |sum, guid| sum.wrapping_add(*guid),
+            );
+            self.reject_unmatched_configuration_authority(
+                cx,
+                &labels,
+                &BTreeSet::from([guid_sum]),
+                selected.vdev.version,
+                selected.vdev.txg,
+            )?;
+            let admission = Admission {
+                config: selected.vdev.clone(),
+                supplied_guids: supplied_guids.to_vec(),
+                guid_sum,
+                draid_group: None,
+                expanded_raidz: None,
+            };
+            self.import_candidates(cx, &labels, &admission, true)?;
+            return Ok(None);
+        }
+
+        let mut cohorts = self
+            .raidz_configuration_cohorts(cx, &labels, pool_guid)?
+            .ok_or_else(|| corrupt("explicit RAIDZ root has no native configuration cohort"))?;
+        let cohort = cohorts
+            .pop()
+            .ok_or_else(|| corrupt("explicit RAIDZ root has no committed configuration"))?;
+        if cohort.admission.config != selected.clone().mapped(supplied_guids)? {
+            return Err(corrupt(
+                "explicit RAIDZ root predates the authoritative native configuration",
+            ));
+        }
+        if cohort
+            .admission
+            .expanded_raidz
+            .as_ref()
+            .is_some_and(|meta| meta.expanding)
+        {
+            let newest = cohort
+                .candidates
+                .first()
+                .ok_or_else(|| corrupt("active RAIDZ expansion has no native root authority"))?;
+            if !same_candidate(candidate, &newest.uberblock) {
+                return Err(corrupt(
+                    "explicit RAIDZ root predates the authoritative reflow progress",
+                ));
+            }
+        }
+        // Expanded layouts must carry the selected cohort through MOS loading
+        // so its allocation geometry is checked before it can replace label
+        // routing. Ordinary strict historical reads keep their existing profile.
+        Ok(cohort
+            .admission
+            .expanded_raidz
+            .is_some()
+            .then_some(cohort.owner))
+    }
+
+    fn read_import_candidates(
+        cx: &Cx,
+        mut owner: Self,
+        admission: Admission,
+        candidates: Vec<Candidate>,
+    ) -> Result<(usize, usize, RootBlock)> {
+        let expanding = admission
+            .expanded_raidz
+            .as_ref()
+            .is_some_and(|meta| meta.expanding);
+        let mut last_error = corrupt("no valid active ZFS uberblock candidates in ring");
+        for candidate in candidates {
+            checkpoint(cx)?;
+            let ub = candidate.uberblock;
+            if let Some(meta) = &admission.expanded_raidz {
+                let mut updated = meta.clone();
+                updated.apply_reflow_info(ub.raidz_reflow_info)?;
+                owner.expanded_raidz = Some(Arc::new(updated));
+            }
+            match owner.read_block(cx, &admission.config, &ub.root) {
+                Ok(block) => {
+                    if block.bytes.len() < 1024
+                        || ub
+                            .root
+                            .payload_order()
+                            .u64(&block.bytes, 704)
+                            .map_err(|error| parse(&error))?
+                            != 1
+                    {
+                        last_error = corrupt("selected root is not a META object set");
+                        if expanding {
+                            break;
+                        }
+                        continue;
+                    }
+                    let member_guid = admission.supplied_guids[block.member_index];
+                    checkpoint(cx)?;
+                    return Ok((
+                        candidate.label_index,
+                        candidate.slot,
+                        RootBlock {
+                            uberblock: ub,
+                            data: block.bytes,
+                            physical_offset: block.physical_offset,
+                            copy_index: block.copy_index,
+                            member_guid,
+                            raidz: block.raidz,
+                            config: admission.config,
+                            imported_pool: Some(owner),
+                        },
+                    ));
+                }
+                Err(FfsError::Cancelled) => return Err(FfsError::Cancelled),
+                Err(error) => last_error = error,
+            }
+            // Old root bytes can survive even when some old-width descendants
+            // have already been overwritten. Active reflow authority cannot be
+            // rolled back merely because the newest root is unreadable.
+            if expanding {
+                break;
+            }
+        }
+        Err(last_error)
+    }
+
+    /// Select the highest readable, checksum-verified TXG from supplied member
+    /// rings, retaining the exact native topology that authenticated its root.
     ///
-    /// The returned label/slot belongs to the selected uberblock's source
-    /// member; `RootBlock::member_guid` continues to identify the data read.
-    /// All devices remain read-only. No ZIL replay, missing-member admission,
-    /// configuration-history resolution, or on-disk repair is performed.
+    /// RAIDZ label generations may span an interrupted expansion publication.
+    /// Physical identities and all native configuration transitions are checked
+    /// before selecting that generation. Other topologies retain strict
+    /// configuration agreement. No device is modified by this reader.
     pub fn import_active(
         &self,
         cx: &Cx,
@@ -298,6 +462,17 @@ impl Pool {
         if expected_pool_guid.is_some_and(|expected| expected != pool_guid) {
             return Err(corrupt("label belongs to another pool GUID"));
         }
+        if let Some(mut cohorts) = self.raidz_configuration_cohorts(cx, &labels, pool_guid)? {
+            let cohort = cohorts
+                .pop()
+                .ok_or_else(|| corrupt("no selected RAIDZ configuration cohort"))?;
+            return Self::read_import_candidates(
+                cx,
+                cohort.owner,
+                cohort.admission,
+                cohort.candidates,
+            );
+        }
         let mut owner = self.clone();
         let admission = if labels.len() == 1 {
             admit_single(&labels[0], pool_guid)?
@@ -309,8 +484,6 @@ impl Pool {
                     .list("vdev_tree")
                     .is_some_and(|tree| tree.text("type") == Some("mirror"))
             }) {
-                // Physical image count is not top-level vdev count. Keep every
-                // mirror child while joining subtrees in native vdev-ID order.
                 let topology = Arc::new(self.admit_striped_labels(cx, &labels, pool_guid, true)?);
                 let admission = Admission {
                     config: topology.config.clone(),
@@ -322,71 +495,20 @@ impl Pool {
                 owner.top_levels = Some(topology);
                 admission
             } else {
-                // Keep the previously admitted plain-leaf stripe profile.
                 admit_stripe(&labels, pool_guid)?
             }
         } else {
             let admission = admit_group(&labels, pool_guid)?;
-            if let Some(ref dg) = admission.draid_group {
-                owner.draid_group = Some(Arc::new(dg.clone()));
+            if let Some(group) = &admission.draid_group {
+                owner.draid_group = Some(Arc::new(group.clone()));
             }
-            if let Some(ref exp) = admission.expanded_raidz {
-                owner.expanded_raidz = Some(Arc::new(exp.clone()));
+            if let Some(meta) = &admission.expanded_raidz {
+                owner.expanded_raidz = Some(Arc::new(meta.clone()));
             }
             admission
         };
-        let candidates = self.import_candidates(cx, &labels, &admission)?;
-        let mut last_error = corrupt("no valid active ZFS uberblock candidates in ring");
-        for candidate in candidates {
-            checkpoint(cx)?;
-            let ub = candidate.uberblock;
-            if let Some(ref exp) = admission.expanded_raidz {
-                let mut updated = exp.clone();
-                if ub.raidz_reflow_info != 0
-                    && let Ok(info) = ffs_ondisk::zfs::raidz::expand::RaidzReflowInfo::decode(
-                        ub.raidz_reflow_info,
-                    )
-                {
-                    updated.reflow_offset_synced = info.offset;
-                    updated.reflow_offset_next = info.offset;
-                    updated.use_scratch = info.use_scratch();
-                }
-                owner.expanded_raidz = Some(Arc::new(updated));
-            }
-            match owner.read_block(cx, &admission.config, &ub.root) {
-                Ok(block) => {
-                    if block.bytes.len() < 1024
-                        || ub
-                            .root
-                            .payload_order()
-                            .u64(&block.bytes, 704)
-                            .map_err(|error| parse(&error))?
-                            != 1
-                    {
-                        last_error = corrupt("selected root is not a META object set");
-                        continue;
-                    }
-                    let member_guid = admission.supplied_guids[block.member_index];
-                    checkpoint(cx)?;
-                    return Ok((
-                        candidate.label_index,
-                        candidate.slot,
-                        RootBlock {
-                            uberblock: ub,
-                            data: block.bytes,
-                            physical_offset: block.physical_offset,
-                            copy_index: block.copy_index,
-                            member_guid,
-                            raidz: block.raidz,
-                            config: admission.config,
-                        },
-                    ));
-                }
-                Err(FfsError::Cancelled) => return Err(FfsError::Cancelled),
-                Err(error) => last_error = error,
-            }
-        }
-        Err(last_error)
+        let candidates = self.import_candidates(cx, &labels, &admission, false)?;
+        Self::read_import_candidates(cx, owner, admission, candidates)
     }
 }
 
@@ -668,6 +790,157 @@ companion_bin_tests! {
             assert!(pool.import_active(&Cx::for_testing(), None).is_err());
             // Two DVAs on two mirrors, not eight ring copies times four reads.
             assert_eq!(data_reads(&reads), 4);
+        }
+
+        #[test]
+        fn auto_import_rejects_same_epoch_reflow_and_checkpoint_forks_before_payload() {
+            for order in [Endian::Little, Endian::Big] {
+                for reflow in [false, true] {
+                    let mut fixture = Fixture::new(order);
+                    let offset = label_offsets(LENGTH as u64).unwrap()[0]
+                        + UBERBLOCK_RING_OFFSET + 2 * 1024;
+                    let mut raw = fixture.ub.clone();
+                    stamp(&mut raw, offset, order);
+                    let mut ub = Uberblock::parse(&raw, offset).unwrap();
+                    if reflow {
+                        ub.raidz_reflow_info = 1_u64 << 55;
+                    } else {
+                        ub.checkpoint_txg = 42;
+                    }
+                    let fork = ub.encode_with_meta(1024, offset, 5000, 0, 0).unwrap();
+                    fixture.candidate(1, 0, 2, &fork);
+                    let reads = Arc::default();
+                    let pool = fixture.pool([Fault::None; 2], false, &reads);
+                    assert!(pool.root(&Cx::for_testing(), 0, 2, 123).is_err());
+                    assert!(pool.import_active(&Cx::for_testing(), None).is_err());
+                    assert_eq!(data_reads(&reads), 0);
+                }
+            }
+        }
+
+        #[test]
+        fn strict_authority_scan_does_not_turn_ring_io_failure_into_an_older_root() {
+            let cx = Cx::for_testing();
+            for order in [Endian::Little, Endian::Big] {
+                let mut fixture = Fixture::new(order);
+                let mut newer = fixture.ub.clone();
+                newer[16..24].copy_from_slice(&order.encode(44));
+                fixture.candidate(1, 3, 7, &newer);
+                let expected = fixture.root.clone();
+                let offset = label_offsets(LENGTH as u64).unwrap()[3]
+                    + UBERBLOCK_RING_OFFSET
+                    + 7 * 1024;
+                let reads = Arc::default();
+                let pool = fixture.pool(
+                    [Fault::None, Fault::Io(BASE as u64 + offset)],
+                    false,
+                    &reads,
+                );
+                let labels = pool
+                    .members
+                    .iter()
+                    .map(|member| verified_labels(&cx, member))
+                    .collect::<Result<Vec<_>>>()
+                    .unwrap();
+                let admission = admit_group(&labels, 123).unwrap();
+                let ordinary = pool
+                    .import_candidates(&cx, &labels, &admission, false)
+                    .unwrap();
+                assert_eq!(ordinary[0].uberblock.txg, 43);
+                assert!(matches!(
+                    pool.import_candidates(&cx, &labels, &admission, true),
+                    Err(FfsError::Io(_))
+                ));
+                assert_eq!(data_reads(&reads), 0);
+                // Ordinary mirror import still recovers from another readable
+                // copy; the stricter contract belongs to mutable RAIDZ layout.
+                assert_eq!(pool.import_active(&cx, None).unwrap().2.data, expected);
+            }
+        }
+
+        #[test]
+        fn explicit_raidz_history_refuses_unknown_successor_but_keeps_unchanged_layout() {
+            use crate::reader::tests::raidz::fixture::StripedImage;
+
+            let cx = Cx::for_testing();
+            for order in [Endian::Little, Endian::Big] {
+                for successor in [false, true] {
+                    for degraded in [false, true] {
+                        let source = Fixture::new(order);
+                        let expected = source.root.clone();
+                        let image = StripedImage::graph(
+                            &source.images[0],
+                            source.root.clone(),
+                            order,
+                            3,
+                            43,
+                            42,
+                        );
+                        let seed = image.open(&[Fault::None; 3], false);
+                        let mut images: Vec<_> = seed
+                            .members
+                            .iter()
+                            .map(|member| {
+                                member
+                                    .read_raw(&cx, 0, member.length_bytes() as usize)
+                                    .unwrap()
+                            })
+                            .collect();
+                        let selected_offset = UBERBLOCK_RING_OFFSET + 2 * 1024;
+                        let selected_start = selected_offset as usize;
+                        let mut newer = Uberblock::parse(
+                            &images[0][selected_start..selected_start + 1024],
+                            selected_offset,
+                        )
+                        .unwrap();
+                        newer.txg += 1;
+                        newer.timestamp += 1;
+                        if successor {
+                            // A bootstrap UB has raw reflow state zero. The
+                            // absent appended child may own its only config.
+                            newer.guid_sum = newer.guid_sum.wrapping_add(9001);
+                        }
+                        let future_offset = label_offsets(LENGTH as u64).unwrap()[3]
+                            + UBERBLOCK_RING_OFFSET
+                            + 7 * 1024;
+                        let bytes = newer
+                            .encode_with_meta(1024, future_offset, 5000, 0, 0)
+                            .unwrap();
+                        let start = future_offset as usize;
+                        images[0][start..start + bytes.len()].copy_from_slice(&bytes);
+                        if degraded {
+                            images.truncate(2);
+                        }
+                        let reads = Arc::default();
+                        let leaves = images
+                            .into_iter()
+                            .map(|bytes| {
+                                open_bytes(
+                                    bytes,
+                                    0,
+                                    LENGTH as u64,
+                                    Arc::clone(&reads),
+                                    Fault::None,
+                                )
+                            })
+                            .collect();
+                        let pool = if degraded {
+                            Pool::from_raidz_survivors(&cx, leaves, vec![1003]).unwrap()
+                        } else {
+                            Pool::from_leaves(leaves).unwrap()
+                        };
+                        let result = pool.root(&cx, 0, 2, 123);
+                        if successor {
+                            assert!(result.is_err());
+                            assert_eq!(data_reads(&reads), 0);
+                        } else {
+                            let root = result.unwrap();
+                            assert_eq!(root.uberblock.txg, 43);
+                            assert_eq!(root.data, expected);
+                        }
+                    }
+                }
+            }
         }
     }
 }

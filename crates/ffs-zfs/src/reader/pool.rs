@@ -20,12 +20,17 @@ use super::{
     admit_vdev_state_with_mode, checkpoint, corrupt, decode_or_verify, integer, parse, unsupported,
 };
 use ffs_ondisk::zfs::draid::DraidConfig;
-use ffs_ondisk::zfs::raidz::expand::{RaidzReflowInfo, RaidzReflowScratchState};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
 const MAX_MEMBERS: usize = 8;
 const MAX_WIDE_MEMBERS: usize = 255;
+
+#[derive(Clone)]
+pub(crate) struct ImportedConfiguration {
+    pub(crate) labels: Vec<Label>,
+    pub(crate) source_indices: Vec<usize>,
+}
 
 #[derive(Clone)]
 pub struct Pool {
@@ -39,6 +44,7 @@ pub struct Pool {
     expanded_raidz: Option<Arc<vdev::ExpandedRaidzMeta>>,
     indirect_maps: Option<Arc<indirect::IndirectVdevMap>>,
     topology: Option<Arc<vdev::PoolTopology>>,
+    imported_configuration: Option<Arc<ImportedConfiguration>>,
 }
 
 impl From<Leaf> for Pool {
@@ -52,6 +58,7 @@ impl From<Leaf> for Pool {
             expanded_raidz: None,
             indirect_maps: None,
             topology: None,
+            imported_configuration: None,
         }
     }
 }
@@ -239,6 +246,8 @@ fn same_candidate(left: &Uberblock, right: &Uberblock) -> bool {
         && left.guid_sum == right.guid_sum
         && left.timestamp == right.timestamp
         && left.root == right.root
+        && left.checkpoint_txg == right.checkpoint_txg
+        && left.raidz_reflow_info == right.raidz_reflow_info
 }
 
 impl Pool {
@@ -270,7 +279,20 @@ impl Pool {
             expanded_raidz: None,
             indirect_maps: None,
             topology: None,
+            imported_configuration: None,
         })
+    }
+
+    pub(crate) fn verified_member_labels(&self, cx: &Cx) -> Result<Vec<Vec<(usize, Label)>>> {
+        self.members
+            .iter()
+            .map(|member| import::verified_labels(cx, member))
+            .collect()
+    }
+
+    #[must_use]
+    pub(crate) fn imported_configuration(&self) -> Option<&ImportedConfiguration> {
+        self.imported_configuration.as_deref()
     }
 
     #[must_use]
@@ -335,19 +357,7 @@ impl Pool {
             && let Some(Value::Lists(children)) = tree.fields.get("children")
             && let Some(mut exp) = vdev::ExpandedRaidzMeta::from_vdev_tree(tree, children.len())?
         {
-            if raidz_reflow_info != 0
-                && let Ok(info) = RaidzReflowInfo::decode(raidz_reflow_info)
-            {
-                if info.state == RaidzReflowScratchState::InvalidSyncedReflow {
-                    exp.reflow_offset_synced = u64::MAX;
-                    exp.reflow_offset_next = u64::MAX;
-                    exp.use_scratch = false;
-                } else {
-                    exp.reflow_offset_synced = info.offset;
-                    exp.reflow_offset_next = info.offset;
-                    exp.use_scratch = info.use_scratch();
-                }
-            }
+            exp.apply_reflow_info(raidz_reflow_info)?;
             self.expanded_raidz = Some(Arc::new(exp));
         }
         Ok(self)
@@ -481,21 +491,15 @@ impl Pool {
         if selected.draid_config.is_none() {
             self.validate_raidz_complement(&selected, &member_guids)?;
         }
+        let imported_owner = if selected.raidz_parity != 0 && selected.draid_config.is_none() {
+            self.verify_explicit_raidz_candidate(cx, &selected, &member_guids, &candidate)?
+        } else {
+            None
+        };
         let draid_group = selected.build_draid_group(&member_guids, &self.missing_raidz_guids)?;
         let mut expanded_meta = selected.expanded_raidz.clone();
-        if let Some(ref mut exp) = expanded_meta
-            && candidate.raidz_reflow_info != 0
-            && let Ok(info) = RaidzReflowInfo::decode(candidate.raidz_reflow_info)
-        {
-            if info.state == RaidzReflowScratchState::InvalidSyncedReflow {
-                exp.reflow_offset_synced = u64::MAX;
-                exp.reflow_offset_next = u64::MAX;
-                exp.use_scratch = false;
-            } else {
-                exp.reflow_offset_synced = info.offset;
-                exp.reflow_offset_next = info.offset;
-                exp.use_scratch = info.use_scratch();
-            }
+        if let Some(ref mut exp) = expanded_meta {
+            exp.apply_reflow_info(candidate.raidz_reflow_info)?;
         }
         // Preserve all configured children, including native RAIDZ width, and
         // every GUID in the candidate sum. Missing routes are never Leaf values.
@@ -504,7 +508,7 @@ impl Pool {
         } else {
             selected.mapped_raidz_survivors(&member_guids, &self.missing_raidz_guids)?
         };
-        let mut owner = self.clone();
+        let mut owner = imported_owner.unwrap_or_else(|| self.clone());
         if let Some(dg) = draid_group {
             owner.draid_group = Some(Arc::new(dg));
         }
@@ -545,6 +549,7 @@ impl Pool {
                 }),
             raidz: block.raidz,
             config,
+            imported_pool: Some(owner),
         })
     }
 
@@ -656,6 +661,7 @@ impl Pool {
             member_guid: member_guids_by_supplied[block.member_index],
             raidz: None,
             config,
+            imported_pool: None,
         })
     }
 

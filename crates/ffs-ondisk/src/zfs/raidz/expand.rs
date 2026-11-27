@@ -501,6 +501,206 @@ impl ExpandedRaidzMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::zfs::raidz::{Raidz1Map, parity::RaidzParityMap};
+    use std::collections::BTreeMap;
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn ordinary_stripes_survive_raw_sector_expansion_and_scratch_relocation() {
+        for parity in 1..=3 {
+            for old_width in [parity + 1, parity + 3] {
+                let new_width = old_width + 1;
+                for ashift in [9_u8, 12, 16] {
+                    let sector = 1_usize << ashift;
+                    let data_columns = old_width - parity;
+                    let mut sizes = vec![
+                        512,
+                        sector,
+                        data_columns * sector,
+                        (data_columns + 1) * sector,
+                        (2 * data_columns + 1) * sector - 512,
+                    ];
+                    sizes.sort_unstable();
+                    sizes.dedup();
+                    for offset in [
+                        0,
+                        ((old_width - 1) * sector) as u64,
+                        (1 << 20) - sector as u64,
+                        1 << 20,
+                        (1 << 20) + (old_width * sector) as u64,
+                    ] {
+                        for &physical_bytes in &sizes {
+                            // Mix byte and sector positions so a misplaced
+                            // sector cannot pass by repeating a 256-byte pattern.
+                            let payload: Vec<u8> = (0..physical_bytes)
+                                .map(|index| {
+                                    u8::try_from(
+                                        ((index * 17)
+                                            ^ (index >> 7)
+                                            ^ (index >> 15)
+                                            ^ parity
+                                            ^ old_width
+                                            ^ offset as usize)
+                                            & 0xff,
+                                    )
+                                    .unwrap()
+                                })
+                                .collect();
+                            let (columns, encoded, allocation) = if parity == 1 {
+                                let map =
+                                    Raidz1Map::new_wide(offset, physical_bytes, ashift, old_width)
+                                        .unwrap();
+                                (
+                                    map.columns().to_vec(),
+                                    map.encode(&payload).unwrap(),
+                                    map.allocated_bytes(),
+                                )
+                            } else {
+                                let map = RaidzParityMap::new_wide(
+                                    offset,
+                                    physical_bytes,
+                                    ashift,
+                                    old_width,
+                                    parity,
+                                )
+                                .unwrap();
+                                (
+                                    map.columns().to_vec(),
+                                    map.encode(&payload).unwrap(),
+                                    map.allocated_bytes(),
+                                )
+                            };
+                            let mut source = BTreeMap::new();
+                            for (column, bytes) in columns.iter().zip(&encoded) {
+                                for within in (0..column.allocated_bytes).step_by(sector) {
+                                    let data = if within < column.bytes {
+                                        bytes[within..within + sector].to_vec()
+                                    } else {
+                                        // Allocation-only skip sectors are copied
+                                        // by reflow but must not become file data.
+                                        vec![0xD3; sector]
+                                    };
+                                    assert!(
+                                        source
+                                            .insert(
+                                                (column.child_id, column.offset + within as u64),
+                                                data,
+                                            )
+                                            .is_none()
+                                    );
+                                }
+                            }
+                            assert_eq!(source.len() as u64, allocation / sector as u64);
+                            let first = offset / sector as u64;
+                            let end = first + allocation / sector as u64;
+                            for &(child, child_offset) in source.keys() {
+                                let linear =
+                                    child_offset / sector as u64 * old_width as u64 + child as u64;
+                                assert!((first..end).contains(&linear));
+                            }
+
+                            for scratch in [true, false] {
+                                let base = DATA_OFFSET - if scratch { VDEV_BOOT_SIZE } else { 0 };
+                                let mut destination = BTreeMap::new();
+                                // Interpret the physical source as one sequence
+                                // of sectors, then distribute that sequence over
+                                // the new width. No expanded-map coordinates or
+                                // writer reflow helper determine this permutation.
+                                for (&(child, child_offset), bytes) in &source {
+                                    let linear = child_offset / sector as u64 * old_width as u64
+                                        + child as u64;
+                                    let target_child = (linear % new_width as u64) as usize;
+                                    let target_offset =
+                                        base + linear / new_width as u64 * sector as u64;
+                                    assert!(destination.insert(
+                                        (target_child, target_offset), bytes.as_slice(),
+                                    ).is_none());
+                                }
+                                let copied_prefix =
+                                    (offset + allocation + (old_width * sector) as u64)
+                                        .next_multiple_of((old_width * new_width * sector) as u64);
+                                let cfg = ExpandedRaidzConfig {
+                                    ashift,
+                                    parity,
+                                    original_width: old_width,
+                                    physical_width: new_width,
+                                    expand_txgs: if scratch { vec![] } else { vec![100] },
+                                    reflow_offset_synced: if scratch {
+                                        copied_prefix
+                                    } else {
+                                        u64::MAX
+                                    },
+                                    reflow_offset_next: if scratch {
+                                        copied_prefix
+                                    } else {
+                                        u64::MAX
+                                    },
+                                    use_scratch: scratch,
+                                };
+                                assert_eq!(cfg.logical_width_for_birth(99), old_width);
+                                let map =
+                                    ExpandedRaidzMap::new(&cfg, offset, physical_bytes, old_width)
+                                        .unwrap();
+                                assert_eq!(map.allocated_bytes(), allocation);
+                                let rows: Vec<Vec<Option<&[u8]>>> = map
+                                    .rows()
+                                    .iter()
+                                    .map(|row| {
+                                        row.cols
+                                            .iter()
+                                            .map(|column| {
+                                                if column.bytes == 0 {
+                                                    None
+                                                } else {
+                                                    Some(*destination.get(&(
+                                                column.child_id, column.leaf_byte_offset().unwrap(),
+                                            )).expect("expanded map must address a copied sector"))
+                                                }
+                                            })
+                                            .collect()
+                                    })
+                                    .collect();
+                                let no_erasures = vec![&[][..]; map.rows().len()];
+                                assert!(
+                                    map.assemble(&rows, &no_erasures).unwrap() == payload,
+                                    "payload mismatch: parity={parity} width={old_width} ashift={ashift} offset={offset} bytes={physical_bytes} scratch={scratch}"
+                                );
+
+                                // Also consume the old P/Q/R bytes: healthy data
+                                // reads alone would not expose displaced parity
+                                // or short-column coefficient disagreements.
+                                let mut damaged = rows.clone();
+                                let erased: Vec<Vec<usize>> = map
+                                    .rows()
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(r, row)| {
+                                        row.cols
+                                            .iter()
+                                            .enumerate()
+                                            .skip(parity)
+                                            .filter(|(_, column)| column.bytes != 0)
+                                            .take(parity)
+                                            .map(|(column, _)| {
+                                                damaged[r][column] = None;
+                                                column
+                                            })
+                                            .collect()
+                                    })
+                                    .collect();
+                                let erased_refs: Vec<&[usize]> =
+                                    erased.iter().map(Vec::as_slice).collect();
+                                assert!(
+                                    map.assemble(&damaged, &erased_refs).unwrap() == payload,
+                                    "parity mismatch: parity={parity} width={old_width} ashift={ashift} offset={offset} bytes={physical_bytes} scratch={scratch}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn reflow_info_bitfield_roundtrip_matches_openzfs_2_4() {

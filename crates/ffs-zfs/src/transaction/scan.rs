@@ -619,6 +619,11 @@ impl ZfsTransactionEngine {
                 "ZFS scan repair requires recovery of the uncertain writer",
             ));
         }
+        if self.allocator.raidz_expanding {
+            return ZfsTxOutcome::NotCommitted(unsupported(
+                "pool scan repair requires completed RAIDZ expansion",
+            ));
+        }
         if limits.max_blocks_per_txg == 0 {
             return ZfsTxOutcome::NotCommitted(unsupported(
                 "ZfsScanLimits::max_blocks_per_txg must be >= 1",
