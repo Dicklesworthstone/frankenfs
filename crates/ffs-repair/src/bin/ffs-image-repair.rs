@@ -279,7 +279,6 @@ fn extract_native_binding_for_set(
     };
     let primary_path = primary.image_path.clone();
     match filesystem {
-        "raw" => Ok(None),
         "ext4" => {
             let mut region = vec![0_u8; EXT4_SUPERBLOCK_SIZE];
             if read_exact_range(
