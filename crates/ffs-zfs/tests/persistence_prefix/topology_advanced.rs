@@ -71,6 +71,300 @@ fn read_zpl_file(
     zpl.read(cx, obj, 0, len)
 }
 
+fn routing_fixture(
+    cx: &Cx,
+    pool_guid: u64,
+    kinds: Vec<ZfsCreateVdevKind>,
+) -> (Vec<FaultableMemberDevice>, ffs_zfs::ZfsPoolCreateReport) {
+    let members = kinds
+        .iter()
+        .map(|kind| match kind {
+            ZfsCreateVdevKind::Leaf => 1,
+            ZfsCreateVdevKind::Mirror { width } | ZfsCreateVdevKind::Raidz { width, .. } => *width,
+            ZfsCreateVdevKind::Draid { children, .. } => *children,
+        })
+        .sum();
+    let devs = blank_devs(members, 12 * 1024 * 1024);
+    let spec = ZfsPoolCreateSpec {
+        pool_name: "native_routes".to_owned(),
+        pool_guid,
+        ashift: 12,
+        hostid: 0x4646_5331,
+        hostname: "frankenfs-test".to_owned(),
+        vdevs: kinds
+            .into_iter()
+            .map(|kind| ZfsCreateVdevSpec {
+                kind,
+                alloc_class: AllocClass::Normal,
+            })
+            .collect(),
+        spare_count: 0,
+        exported: true,
+    };
+    let report = create_pool_on_devices(cx, boxed_devs(&devs), &spec).unwrap();
+    (devs, report)
+}
+
+fn routing_payload() -> Vec<u8> {
+    let mut state = 0xFEED_BEEF_0123_4567_u64;
+    (0..196_781)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state.to_le_bytes()[0]
+        })
+        .collect()
+}
+
+fn create_routing_file(cx: &Cx, engine: &mut ZfsTransactionEngine, payload: &[u8]) -> (u64, usize) {
+    let ts = Timestamp {
+        seconds: 1_735_020_000,
+        nanos: 0,
+    };
+    let (file, _) = engine
+        .create_file(
+            cx,
+            &[],
+            5,
+            b"route.bin",
+            0o644,
+            0,
+            0,
+            ts,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .expect("create file through native member routing");
+    let (_, token) = engine
+        .write_file_data(cx, &[], file, 0, payload, ts, ZfsDataChecksum::Fletcher4)
+        .into_result()
+        .expect("write through native member routing");
+    (file, token.published_slot())
+}
+
+fn assert_routing_file(
+    cx: &Cx,
+    devs: &[FaultableMemberDevice],
+    pool_guid: u64,
+    slot: usize,
+    payload: &[u8],
+) {
+    let pool = Pool::from_wide_leaves(leaves_from_devs(cx, devs)).unwrap();
+    let mut mos = pool.objects(cx, 0, slot, pool_guid).unwrap();
+    assert_eq!(
+        read_zpl_file(cx, &mut mos, &[], b"/route.bin", payload.len()).unwrap(),
+        payload
+    );
+}
+
+#[test]
+fn shuffled_native_members_preserve_raidz_and_draid_writes_after_reopen() {
+    let cx = Cx::for_testing();
+    for parity in 1..=3 {
+        for kind in [
+            ZfsCreateVdevKind::Raidz {
+                parity,
+                width: parity + 2,
+            },
+            ZfsCreateVdevKind::Draid {
+                ndata: 2,
+                nparity: parity,
+                children: parity + 3,
+                nspares: 1,
+                ngroups: 1,
+            },
+        ] {
+            let pool_guid = 0xA110_C011_0000_0000 + u64::try_from(parity).unwrap();
+            let (devs, report) = routing_fixture(&cx, pool_guid, vec![kind]);
+            let mut supplied = devs.clone();
+            supplied.rotate_right(1);
+            let mut duplicate = supplied.clone();
+            duplicate[0] = duplicate[1].clone();
+            let calls: Vec<_> = devs
+                .iter()
+                .map(FaultableMemberDevice::write_calls)
+                .collect();
+            assert!(open_wide_engine(&cx, &duplicate, pool_guid, report.initial_slot).is_err());
+            assert_eq!(
+                devs.iter()
+                    .map(FaultableMemberDevice::write_calls)
+                    .collect::<Vec<_>>(),
+                calls,
+                "duplicate or missing native members must fail before writing"
+            );
+            let mut engine = open_wide_engine(&cx, &supplied, pool_guid, report.initial_slot)
+                .expect("shuffled native children must admit writes");
+            let mut payload = routing_payload();
+            let (file, slot) = create_routing_file(&cx, &mut engine, &payload);
+            drop(engine);
+
+            // Fresh devices retain only durable bytes, then reopen in a different order.
+            let durable: Vec<_> = devs
+                .iter()
+                .map(FaultableMemberDevice::fresh_from_durable)
+                .collect();
+            assert_routing_file(&cx, &durable, pool_guid, slot, &payload);
+            let mut reopened = open_wide_engine(&cx, &durable, pool_guid, slot).unwrap();
+            let patch = vec![0x63; 8_193];
+            let (_, token) = reopened
+                .write_file_data(
+                    &cx,
+                    &[],
+                    file,
+                    4_093,
+                    &patch,
+                    Timestamp {
+                        seconds: 1_735_020_001,
+                        nanos: 0,
+                    },
+                    ZfsDataChecksum::Fletcher4,
+                )
+                .into_result()
+                .unwrap();
+            payload[4_093..4_093 + patch.len()].copy_from_slice(&patch);
+            let mut reversed = durable;
+            reversed.reverse();
+            assert_routing_file(&cx, &reversed, pool_guid, token.published_slot(), &payload);
+        }
+    }
+}
+
+#[test]
+fn shuffled_multivdev_writes_preserve_unselected_devices() {
+    let cx = Cx::for_testing();
+    for kind in [
+        ZfsCreateVdevKind::Leaf,
+        ZfsCreateVdevKind::Mirror { width: 2 },
+        ZfsCreateVdevKind::Raidz {
+            parity: 1,
+            width: 3,
+        },
+        ZfsCreateVdevKind::Draid {
+            ndata: 2,
+            nparity: 1,
+            children: 4,
+            nspares: 1,
+            ngroups: 1,
+        },
+    ] {
+        let pool_guid = 0xA110_C011_0000_0020;
+        let (devs, report) = routing_fixture(&cx, pool_guid, vec![kind, ZfsCreateVdevKind::Leaf]);
+        let unselected = devs.last().unwrap();
+        let before = unselected.durable_snapshot();
+        let mut supplied = devs.clone();
+        supplied.reverse();
+        let mut engine = open_wide_engine(&cx, &supplied, pool_guid, report.initial_slot)
+            .expect("shuffled multi-vdev writer");
+        let payload = routing_payload();
+        let (_, slot) = create_routing_file(&cx, &mut engine, &payload);
+        assert_routing_file(&cx, &devs, pool_guid, slot, &payload);
+        let data = usize::try_from(DATA_OFFSET).unwrap()
+            ..before.len() - usize::try_from(2 * LABEL_BYTES).unwrap();
+        assert_eq!(
+            &unselected.durable_snapshot()[data.clone()],
+            &before[data],
+            "allocator writes must never reach another top-level vdev's data area"
+        );
+
+        // Replacement cannot publish a multi-vdev topology yet: refuse before copying.
+        let calls: Vec<_> = devs
+            .iter()
+            .map(FaultableMemberDevice::write_calls)
+            .collect();
+        let replacement = blank_devs(1, 12 * 1024 * 1024).pop().unwrap();
+        let leaf = leaves_from_devs(&cx, std::slice::from_ref(&replacement))
+            .pop()
+            .unwrap();
+        assert!(engine.replace_member(&cx, 0, leaf).is_not_committed());
+        assert_eq!(replacement.write_calls(), 0);
+        assert_eq!(
+            devs.iter()
+                .map(FaultableMemberDevice::write_calls)
+                .collect::<Vec<_>>(),
+            calls
+        );
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn shuffled_member_replacement_preserves_native_columns_and_child_guids() {
+    let cx = Cx::for_testing();
+    for kind in [
+        ZfsCreateVdevKind::Mirror { width: 2 },
+        ZfsCreateVdevKind::Raidz {
+            parity: 1,
+            width: 3,
+        },
+        ZfsCreateVdevKind::Draid {
+            ndata: 2,
+            nparity: 1,
+            children: 4,
+            nspares: 1,
+            ngroups: 1,
+        },
+    ] {
+        let is_mirror = matches!(kind, ZfsCreateVdevKind::Mirror { .. });
+        let pool_guid = 0xA110_C011_0000_0040;
+        let (mut devs, report) = routing_fixture(&cx, pool_guid, vec![kind]);
+        let mut supplied = devs.clone();
+        supplied.reverse();
+        let mut engine = open_wide_engine(&cx, &supplied, pool_guid, report.initial_slot).unwrap();
+        let payload = routing_payload();
+        create_routing_file(&cx, &mut engine, &payload);
+        let source = supplied[0].durable_snapshot();
+        let data = usize::try_from(DATA_OFFSET).unwrap()
+            ..source.len() - usize::try_from(2 * LABEL_BYTES).unwrap();
+        if !is_mirror {
+            assert_ne!(
+                &source[data.clone()],
+                &supplied[1].durable_snapshot()[data.clone()],
+                "parity siblings must contain distinct columns in this regression"
+            );
+        }
+        let replacement = blank_devs(1, 12 * 1024 * 1024).pop().unwrap();
+        engine.with_fault_hook(|event| {
+            if matches!(
+                event.stage,
+                ZfsPersistenceStage::ChildBlocksWrite { .. }
+                    | ZfsPersistenceStage::DatasetMetadataWrite { .. }
+                    | ZfsPersistenceStage::MosSpaceMapWrite { .. }
+                    | ZfsPersistenceStage::MosRootWrite { .. }
+            ) {
+                return Err(FfsError::Io(std::io::Error::other(
+                    "stop after member copy, before first staged write",
+                )));
+            }
+            Ok(())
+        });
+        let leaf = leaves_from_devs(&cx, std::slice::from_ref(&replacement))
+            .pop()
+            .unwrap();
+        assert!(engine.replace_member(&cx, 0, leaf).is_not_committed());
+        assert_eq!(
+            &replacement.durable_snapshot()[data.clone()],
+            &source[data],
+            "replacement must retain the selected native column, not a parity sibling"
+        );
+
+        engine.with_fault_hook(|_| Ok(()));
+        let leaf = leaves_from_devs(&cx, std::slice::from_ref(&replacement))
+            .pop()
+            .unwrap();
+        let (_, token) = engine.replace_member(&cx, 0, leaf).into_result().unwrap();
+        let target = devs.len() - 1;
+        devs[target] = replacement;
+        let durable: Vec<_> = devs
+            .iter()
+            .map(FaultableMemberDevice::fresh_from_durable)
+            .collect();
+        assert_routing_file(&cx, &durable, pool_guid, token.published_slot(), &payload);
+        open_wide_engine(&cx, &durable, pool_guid, token.published_slot())
+            .expect("replacement must leave a complete native GUID topology");
+    }
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn draid1_draid2_draid3_create_write_read_and_degraded_erasure_recovery() {
@@ -245,7 +539,9 @@ fn raidz_expansion_resumable_chunked_reflow_and_fault_cut_safety() {
         exported: true,
     };
     let report = create_pool_on_devices(&cx, boxed_devs(&devs), &spec).unwrap();
-    let mut engine = open_wide_engine(&cx, &devs, pool_guid, report.initial_slot).unwrap();
+    let mut supplied = devs.clone();
+    supplied.rotate_right(1);
+    let mut engine = open_wide_engine(&cx, &supplied, pool_guid, report.initial_slot).unwrap();
 
     let (fid, _) = engine
         .create_file(
