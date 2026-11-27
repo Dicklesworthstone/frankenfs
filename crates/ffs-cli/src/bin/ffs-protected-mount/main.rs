@@ -767,7 +767,7 @@ fn verify_manifest_native_binding(
                 cluster_bytes: ec,
                 record_bytes: er,
                 mft_cluster: em,
-                boot_blake3: ebh,
+                boot_blake3: expected_boot_hash,
                 commit_lsn: el,
                 ..
             },
@@ -777,7 +777,7 @@ fn verify_manifest_native_binding(
                 cluster_bytes: ac,
                 record_bytes: ar,
                 mft_cluster: am,
-                boot_blake3: abh,
+                boot_blake3: actual_boot_hash,
                 commit_lsn: al,
                 ..
             },
@@ -787,7 +787,7 @@ fn verify_manifest_native_binding(
                 || (*ec != 0 && ec != ac)
                 || (*er != 0 && er != ar)
                 || (*em != 0 && em != am)
-                || (*ebh != [0_u8; 32] && ebh != abh)
+                || (*expected_boot_hash != [0_u8; 32] && expected_boot_hash != actual_boot_hash)
                 || (*el != 0 && el != al)
             {
                 bail!(
@@ -802,7 +802,7 @@ fn verify_manifest_native_binding(
                 top_guid: et,
                 member_guids: em,
                 committed_txg: ex,
-                root_bp_blake3: erb,
+                root_bp_blake3: expected_root_digest,
                 ..
             },
             NativeCommitBinding::Zfs {
@@ -810,11 +810,17 @@ fn verify_manifest_native_binding(
                 top_guid: at,
                 member_guids: am,
                 committed_txg: ax,
-                root_bp_blake3: arb,
+                root_bp_blake3: actual_root_digest,
                 ..
             },
         ) => {
-            if ep != ap || et != at || em != am || ex != ax || (*erb != [0_u8; 32] && erb != arb) {
+            if ep != ap
+                || et != at
+                || em != am
+                || ex != ax
+                || (*expected_root_digest != [0_u8; 32]
+                    && expected_root_digest != actual_root_digest)
+            {
                 bail!(
                     "storage-set manifest ZFS pool/member GUIDs, root digest, or committed TXG ({ex} vs {ax}) disagrees with on-disk pool"
                 );

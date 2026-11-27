@@ -257,10 +257,10 @@ fn extract_zfs_native_binding(
                 continue;
             };
             if leaf_guid.is_none() {
-                let m_guid = config.unsigned("guid").unwrap_or(0);
-                let p_guid = config.unsigned("pool_guid").unwrap_or(0);
-                leaf_guid = Some(m_guid);
-                leaf_pool_guid = Some(p_guid);
+                let member_guid = config.unsigned("guid").unwrap_or(0);
+                let label_pool_guid = config.unsigned("pool_guid").unwrap_or(0);
+                leaf_guid = Some(member_guid);
+                leaf_pool_guid = Some(label_pool_guid);
                 if first_cfg.is_none() {
                     let top_guid = config.unsigned("top_guid").unwrap_or(0);
                     let version = config.unsigned("version").unwrap_or(0);
@@ -273,7 +273,7 @@ fn extract_zfs_native_binding(
                     let vdev_type = tree.text("type").map(str::to_owned);
                     let asize = tree.unsigned("asize").unwrap_or(0);
                     first_cfg = Some((
-                        p_guid,
+                        label_pool_guid,
                         top_guid,
                         version,
                         label_txg,

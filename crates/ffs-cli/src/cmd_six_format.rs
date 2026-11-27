@@ -4078,8 +4078,10 @@ mod tests {
             stolen_from: vec![0, 0],
             stolen_to: vec![0, 0],
         };
-        let mut pc_runtime = crate::MountRuntimeConfig::default();
-        pc_runtime.mode = MountRuntimeMode::PerCore;
+        let pc_runtime = crate::MountRuntimeConfig {
+            mode: MountRuntimeMode::PerCore,
+            ..crate::MountRuntimeConfig::default()
+        };
         let obs = build_six_format_console_observation(&SixFormatConsoleInput {
             kind: FsFormatKind::Zfs,
             image_path: &zfs_img,
