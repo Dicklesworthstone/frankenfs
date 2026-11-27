@@ -4885,4 +4885,82 @@ mod bd_tqrnc {
             .expect_err("mismatched FAT volume serial must fail closed");
         assert!(err.to_string().contains("volume serial"));
     }
+
+    #[test]
+    fn bd_tqrnc_ntfs_boot_digest_and_zfs_root_digest_reject_tampering_and_label0_falls_back() {
+        let cx = Cx::for_testing();
+        let dir = TempDir::new().unwrap();
+
+        // 1. Tampered NTFS boot_blake3 or mft_cluster fails closed even with identical serial+size.
+        let ntfs_good = NativeCommitBinding::Ntfs {
+            volume_serial: 0x1122_3344_5566_7788,
+            volume_bytes: 2 * 1024 * 1024,
+            cluster_bytes: 4096,
+            record_bytes: 1024,
+            index_bytes: 4096,
+            mft_cluster: 4,
+            mirror_cluster: 16,
+            boot_blake3: [0xAA; 32],
+            transaction_id: 0,
+            commit_lsn: 0,
+            checkpoint_lsn: None,
+            generation: 0,
+            operation_digest: [0; 32],
+        };
+        let mut ntfs_bad_boot = ntfs_good.clone();
+        if let NativeCommitBinding::Ntfs { boot_blake3, .. } = &mut ntfs_bad_boot {
+            *boot_blake3 = [0xBB; 32];
+        }
+        verify_manifest_native_binding("ntfs", &ntfs_good, "ntfs", &ntfs_good)
+            .expect("matching NTFS binding must pass");
+        verify_manifest_native_binding("ntfs", &ntfs_good, "ntfs", &ntfs_bad_boot)
+            .expect_err("tampered NTFS boot_blake3 must fail closed");
+
+        let mut ntfs_bad_mft = ntfs_good.clone();
+        if let NativeCommitBinding::Ntfs { mft_cluster, .. } = &mut ntfs_bad_mft {
+            *mft_cluster = 5;
+        }
+        verify_manifest_native_binding("ntfs", &ntfs_good, "ntfs", &ntfs_bad_mft)
+            .expect_err("tampered NTFS mft_cluster must fail closed");
+
+        // 2. Tampered ZFS root_bp_blake3 at identical committed_txg fails closed.
+        let zfs_good = NativeCommitBinding::Zfs {
+            pool_guid: 0x9988_7766_5544_3322,
+            top_guid: 0x1234,
+            member_guids: vec![0x5678],
+            guid_sum: 0x5678,
+            version: 5000,
+            ashift: 12,
+            asize: 64 * 1024 * 1024,
+            label_txg: 4,
+            committed_txg: 10,
+            published_slot: 2,
+            root_bp_blake3: [0xCC; 32],
+            generation: 10,
+            operation_digest: [0; 32],
+        };
+        let mut zfs_bad_root = zfs_good.clone();
+        if let NativeCommitBinding::Zfs { root_bp_blake3, .. } = &mut zfs_bad_root {
+            *root_bp_blake3 = [0xDD; 32];
+        }
+        verify_manifest_native_binding("zfs", &zfs_good, "zfs", &zfs_good)
+            .expect("matching ZFS binding must pass");
+        verify_manifest_native_binding("zfs", &zfs_good, "zfs", &zfs_bad_root)
+            .expect_err("tampered ZFS root_bp_blake3 at same TXG must fail closed");
+
+        // 3. Corrupted ZFS label 0 falls back cleanly to healthy label 1..3 in first_valid_zfs_label.
+        let (mut raw_members, pool_guid) = build_clean_writable_zfs_pool(1);
+        let zfs_img = dir.path().join("zfs_label0_corrupt.img");
+        // Corrupt the label 0 config area (offset 16 KiB..20 KiB) while leaving labels 1..3 intact.
+        raw_members[0][16 * 1024..20 * 1024].fill(0);
+        std::fs::write(&zfs_img, &raw_members[0]).unwrap();
+        let leaf = zfs::reader::Leaf::open(&cx, &zfs_img, 0, None).expect("open zfs leaf");
+        assert!(
+            leaf.label(&cx, 0).is_err(),
+            "label 0 must be visibly corrupted"
+        );
+        let fallback = first_valid_zfs_label(&cx, &leaf)
+            .expect("first_valid_zfs_label must fall back to healthy label 1..3");
+        assert_eq!(fallback.config.unsigned("pool_guid"), Some(pool_guid));
+    }
 }

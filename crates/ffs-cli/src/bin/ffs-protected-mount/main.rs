@@ -496,6 +496,24 @@ fn clean_single_slice(
     }
 }
 
+fn first_valid_zfs_label(
+    cx: &Cx,
+    leaf: &zfs::reader::Leaf,
+) -> ffs_error::Result<zfs::reader::Label> {
+    let mut last_err = None;
+    for idx in 0..4 {
+        match leaf.label(cx, idx) {
+            Ok(label) => return Ok(label),
+            Err(FfsError::Cancelled) => return Err(FfsError::Cancelled),
+            Err(err) => last_err = Some(err),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| FfsError::Corruption {
+        block: 0,
+        detail: "no valid ZFS vdev label in copies 0..4".into(),
+    }))
+}
+
 fn compute_live_native_binding(
     cx: &Cx,
     storage_set: &ProtectedStorageSet,
@@ -606,7 +624,7 @@ fn compute_live_native_binding(
                 }
                 let dev = m.open_bounded_device(false)?;
                 let leaf = zfs::reader::Leaf::from_device(cx, dev, 0, m.length)?;
-                let lbl0 = leaf.label(cx, 0)?;
+                let lbl0 = first_valid_zfs_label(cx, &leaf)?;
                 let m_guid = lbl0.config.unsigned("guid").unwrap_or(0);
                 if first_cfg.is_none() {
                     let pool_guid = lbl0.config.unsigned("pool_guid").unwrap_or(0);
@@ -746,19 +764,34 @@ fn verify_manifest_native_binding(
             NativeCommitBinding::Ntfs {
                 volume_serial: es,
                 volume_bytes: eb,
+                cluster_bytes: ec,
+                record_bytes: er,
+                mft_cluster: em,
+                boot_blake3: ebh,
                 commit_lsn: el,
                 ..
             },
             NativeCommitBinding::Ntfs {
                 volume_serial: as_,
                 volume_bytes: ab,
+                cluster_bytes: ac,
+                record_bytes: ar,
+                mft_cluster: am,
+                boot_blake3: abh,
                 commit_lsn: al,
                 ..
             },
         ) => {
-            if es != as_ || eb != ab || (*el != 0 && el != al) {
+            if es != as_
+                || eb != ab
+                || (*ec != 0 && ec != ac)
+                || (*er != 0 && er != ar)
+                || (*em != 0 && em != am)
+                || (*ebh != [0_u8; 32] && ebh != abh)
+                || (*el != 0 && el != al)
+            {
                 bail!(
-                    "storage-set manifest NTFS volume serial or committed LSN disagrees with on-disk volume"
+                    "storage-set manifest NTFS volume identity, boot digest, or committed LSN disagrees with on-disk volume"
                 );
             }
             Ok(())
@@ -769,6 +802,7 @@ fn verify_manifest_native_binding(
                 top_guid: et,
                 member_guids: em,
                 committed_txg: ex,
+                root_bp_blake3: erb,
                 ..
             },
             NativeCommitBinding::Zfs {
@@ -776,12 +810,13 @@ fn verify_manifest_native_binding(
                 top_guid: at,
                 member_guids: am,
                 committed_txg: ax,
+                root_bp_blake3: arb,
                 ..
             },
         ) => {
-            if ep != ap || et != at || em != am || ex != ax {
+            if ep != ap || et != at || em != am || ex != ax || (*erb != [0_u8; 32] && erb != arb) {
                 bail!(
-                    "storage-set manifest ZFS pool/member GUIDs or committed TXG ({ex} vs {ax}) disagrees with on-disk pool"
+                    "storage-set manifest ZFS pool/member GUIDs, root digest, or committed TXG ({ex} vs {ax}) disagrees with on-disk pool"
                 );
             }
             Ok(())
@@ -993,8 +1028,7 @@ fn prepare(cx: &Cx, args: &Args) -> Result<Prepared> {
                         .with_context(|| format!("open writable protected ZFS member {idx}"))?;
                     member_devices.push(mutable_dev);
                 }
-                let discovered_pool_guid = probe_leaves[0]
-                    .label(cx, 0)
+                let discovered_pool_guid = first_valid_zfs_label(cx, &probe_leaves[0])
                     .ok()
                     .and_then(|l| l.config.unsigned("pool_guid"))
                     .unwrap_or(0);
