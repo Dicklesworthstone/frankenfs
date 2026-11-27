@@ -1,9 +1,10 @@
 //! Logged hole punching without reading or rewriting untouched DATA extents.
+//! LZNT1 streams retire whole compression units and COW at most two edge units.
 
 use super::{
     EditableDataStream, EditableStreamStorage, FILE_ATTR_ENCRYPTED, FILE_ATTR_REPARSE_POINT,
     FILE_ATTR_SPARSE_FILE, MIN_USER_MFT_SLOT, NtfsTransactionEngine, NtfsTxOutcome, PreparedTxPlan,
-    TxWorkspace, checkpoint, corrupt, read_editable_stream_prefix, splice_vcn_interval,
+    TxWorkspace, checkpoint, compression, corrupt, read_editable_stream_prefix, splice_vcn_interval,
     stage_runs_writes, unsupported, validate_ntfs_stream_name_utf16,
 };
 use asupersync::Cx;
@@ -29,6 +30,8 @@ impl NtfsTransactionEngine {
     /// native UTF-16 identity. Resident values remain resident. Nonresident DATA
     /// becomes sparse when allocation is removed, while at most two initialized
     /// boundary clusters are copied before the native WAL publishes the result.
+    /// LZNT1 streams retain compression: whole units become sparse, and at most
+    /// two boundary units are decoded and recompressed with bounded buffers.
     /// `ValidDataLength`, unrelated streams and metadata remain intact. Zero length
     /// is EINVAL; ranges outside the signed native byte domain are EFBIG.
     pub fn punch_hole_at(
@@ -128,17 +131,25 @@ impl NtfsTransactionEngine {
             ..
         } = &stream.storage
         {
-            if *compressed {
-                return Err(unsupported(
-                    "punch_hole is not supported directly on LZNT1-compressed streams",
-                ));
-            }
             if *encrypted {
                 return Err(unsupported(
                     "punch_hole is not supported on encrypted NTFS streams",
                 ));
             }
-            if *compression_unit != 0 && !(*sparse && *compression_unit == 4) {
+            if *compressed {
+                compression::check_lznt1_geometry(&self.geometry)?;
+                if *compression_unit != compression::COMPRESSION_UNIT_SHIFT {
+                    return Err(unsupported(
+                        "unsupported NTFS LZNT1 compression-unit encoding",
+                    ));
+                }
+                // Full-unit removal and ranges past EOF need no payload decode,
+                // so admit the complete compressed mapping before either fast
+                // path can bypass the ordinary reader's extent/unit checks.
+                let volume = self.volume_view(cx)?;
+                let record = volume.record(cx, target.record, Some(target.sequence))?;
+                let _ = volume.data_stream(cx, &record, stream_utf16)?;
+            } else if *compression_unit != 0 && !(*sparse && *compression_unit == 4) {
                 return Err(unsupported(
                     "unsupported NTFS sparse compression-unit encoding",
                 ));
@@ -210,6 +221,7 @@ fn punch_nonresident(
     let EditableStreamStorage::NonResident {
         runs,
         sparse,
+        compressed,
         compression_unit,
         data_bytes,
         initialized_bytes,
@@ -228,6 +240,9 @@ fn punch_nonresident(
             libc::EFBIG,
             "NTFS DATA exceeds the signed native limit",
         ));
+    }
+    if *compressed {
+        return punch_compressed(engine, cx, ws, stream, range);
     }
     let mut working = runs.clone();
     let full_start = range.start.div_ceil(cb);
@@ -253,6 +268,113 @@ fn punch_nonresident(
         data_bytes: *data_bytes,
         initialized_bytes: *initialized_bytes,
     })
+}
+
+fn punch_compressed(
+    engine: &NtfsTransactionEngine,
+    cx: &Cx,
+    ws: &mut TxWorkspace,
+    stream: &EditableDataStream,
+    range: &Range<u64>,
+) -> Result<EditableStreamStorage> {
+    let EditableStreamStorage::NonResident {
+        runs,
+        sparse,
+        compression_unit,
+        data_bytes,
+        initialized_bytes,
+        ..
+    } = &stream.storage
+    else {
+        return Err(corrupt(0, "compressed hole-punch source is not nonresident"));
+    };
+    let unit_bytes = compression::UNIT_CLUSTERS * u64::from(engine.geometry.cluster_bytes());
+    let mut working = runs.clone();
+    let full_start = range.start.div_ceil(unit_bytes);
+    let full_end = range.end / unit_bytes;
+    if full_start < full_end {
+        // Work is proportional to the runlist, never to the logical range: a
+        // multi-terabyte sparse interval needs just one replacement run. A
+        // compressed prefix and its sparse padding must always retire together.
+        let replacement = vec![NtfsRun {
+            vcn: full_start * compression::UNIT_CLUSTERS,
+            clusters: (full_end - full_start) * compression::UNIT_CLUSTERS,
+            lcn: None,
+        }];
+        let (next, retired) =
+            compression::splice_compressed_units(&working, full_start, full_end, replacement);
+        working = next;
+        ws.free_clusters_deferred(&retired);
+    }
+    let first = range.start / unit_bytes;
+    let last = (range.end - 1) / unit_bytes;
+    clear_boundary_compression_unit(engine, cx, ws, stream, &mut working, range, first)?;
+    if last != first {
+        clear_boundary_compression_unit(engine, cx, ws, stream, &mut working, range, last)?;
+    }
+    Ok(EditableStreamStorage::NonResident {
+        runs: working,
+        // Sparse compression padding is not the independent SPARSE attribute.
+        // Preserve the native stream flags instead of changing file policy.
+        sparse: *sparse,
+        compressed: true,
+        encrypted: false,
+        compression_unit: *compression_unit,
+        data_bytes: *data_bytes,
+        initialized_bytes: *initialized_bytes,
+    })
+}
+
+fn clear_boundary_compression_unit(
+    engine: &NtfsTransactionEngine,
+    cx: &Cx,
+    ws: &mut TxWorkspace,
+    stream: &EditableDataStream,
+    working: &mut Vec<NtfsRun>,
+    range: &Range<u64>,
+    unit: u64,
+) -> Result<()> {
+    let EditableStreamStorage::NonResident {
+        runs,
+        initialized_bytes,
+        ..
+    } = &stream.storage
+    else {
+        return Err(corrupt(
+            0,
+            "compressed hole-punch boundary is not nonresident",
+        ));
+    };
+    let unit_bytes = compression::UNIT_CLUSTERS * u64::from(engine.geometry.cluster_bytes());
+    let start = unit * unit_bytes;
+    let end = start + unit_bytes;
+    if start >= *initialized_bytes || (range.start <= start && range.end >= end) {
+        return Ok(());
+    }
+    // Always decode from the original mapping. Earlier planned COW payloads
+    // are not written yet, and the two boundary units never overlap.
+    let mut bytes =
+        compression::read_compressed_unit_plaintext(engine, cx, runs, *initialized_bytes, unit)?;
+    let from = (range.start.max(start) - start) as usize;
+    let to = (range.end.min(end) - start) as usize;
+    if bytes[from..to].iter().all(|&byte| byte == 0) {
+        return Ok(());
+    }
+    bytes[from..to].fill(0);
+    let mut pre = Vec::new();
+    let replacement = compression::encode_compressed_unit_cow(
+        &engine.geometry,
+        unit,
+        &bytes,
+        &mut pre,
+        |count| ws.alloc_clusters(count, 1),
+    )?;
+    ws.pre_payload_writes.extend(pre);
+    let (next, retired) =
+        compression::splice_compressed_units(working, unit, unit + 1, replacement);
+    *working = next;
+    ws.free_clusters_deferred(&retired);
+    Ok(())
 }
 
 fn clear_boundary_cluster(

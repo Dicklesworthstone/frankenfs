@@ -8,8 +8,6 @@
 //! resumption bookmarks in MOS object 1 `"scan"` at bounded chunk intervals,
 //! and cleanly reconciles concurrent foreground writes across pause/resume.
 
-use std::collections::BTreeMap;
-
 use asupersync::Cx;
 use ffs_error::{FfsError, Result};
 use ffs_ondisk::zfs::draid::DraidMap;
@@ -18,15 +16,12 @@ use ffs_ondisk::zfs::raidz::parity::RaidzParityMap;
 use ffs_ondisk::zfs::scan::{
     DSL_SCAN_PHYS_WORDS, DslScanFunc, DslScanPhys, DslScanState, ZBookmarkPhys,
 };
-use ffs_ondisk::zfs::{BlockPointer, DATA_OFFSET, Endian};
+use ffs_ondisk::zfs::{BlockPointer, DATA_OFFSET};
 use ffs_ondisk::zfs_dmu::{DNODE_BLOCK_BYTES, DNODE_BYTES, Dnode, ObjectSet, dnode_at};
 use ffs_ondisk::zfs_zap::Entry as RawZapEntry;
 use serde::Serialize;
 
-use super::dmu_cow::{
-    AllocatorWriteTopology, DnodeCowSpec, PoolSpaceAllocator, StagedBlockWrite, WriteBucket,
-    cow_update_dnode, encode_zap_blocks_for_dnode, put_dnode_in_table,
-};
+use super::dmu_cow::{AllocatorWriteTopology, PoolSpaceAllocator};
 use super::{
     ZfsPersistenceStage, ZfsTransactionEngine, ZfsTxOutcome, checkpoint, corrupt, parse_err,
     unsupported,
@@ -98,18 +93,16 @@ pub(super) fn read_scan_phys_from_mos(cx: &Cx, mos: &mut Objects) -> Result<Opti
 }
 
 /// Stage an updated `"scan"` 24-word ZAP entry inside MOS object 1.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn stage_scan_phys_in_mos(
     cx: &Cx,
     mos: &mut Objects,
-    mos_dirty_dnodes: &mut BTreeMap<u64, Vec<u8>>,
     alloc: &mut PoolSpaceAllocator,
-    order: Endian,
-    new_txg: u64,
     scan: &DslScanPhys,
-    staged_writes: &mut Vec<StagedBlockWrite>,
 ) -> Result<()> {
-    let mut dir_entries = mos.zap_values(cx, 1)?;
+    let mut dir_entries = match &alloc.pending_mos_directory {
+        Some(entries) => entries.clone(),
+        None => mos.zap_values(cx, 1)?,
+    };
     dir_entries.retain(|e| e.name != DMU_POOL_SCAN_KEY);
     dir_entries.push(RawZapEntry {
         name: DMU_POOL_SCAN_KEY.to_vec(),
@@ -117,53 +110,8 @@ pub(super) fn stage_scan_phys_in_mos(
         values: scan.to_words().to_vec(),
         collision: 0,
     });
-    let (dir_dn, dir_ceil) = mos.object_with_ceiling(cx, 1)?;
-    let (bsize, blocks) =
-        encode_zap_blocks_for_dnode(cx, mos, Some((&dir_dn, dir_ceil)), &dir_entries, order, 512)?;
-    let mut dirty = BTreeMap::new();
-    for (bid, blk) in blocks.into_iter().enumerate() {
-        dirty.insert(bid as u64, Some(blk));
-    }
-    let out = cow_update_dnode(
-        cx,
-        mos,
-        alloc,
-        DnodeCowSpec {
-            existing: Some((&dir_dn, dir_ceil)),
-            object_type: dir_dn.object_type(),
-            bonus_type: dir_dn.bonus_type(),
-            checksum_type: dir_dn.checksum_type(),
-            compress_type: dir_dn.compress_type(),
-            user_flags: dir_dn.flags(),
-            indirect_shift: dir_dn.indirect_shift(),
-            data_bytes: bsize,
-            max_block: (dirty.len().saturating_sub(1)) as u64,
-            slots: dir_dn.slots(),
-            nblkptr: dir_dn.pointers().len(),
-            bonus: dir_dn.bonus().to_vec(),
-            spill: dir_dn.spill().cloned(),
-            order,
-            new_txg,
-            leaf_bucket: WriteBucket::MosSpaceMap,
-            indirect_bucket: WriteBucket::MosSpaceMap,
-        },
-        &dirty,
-        staged_writes,
-    )?;
-    for rbp in &out.retired_bps {
-        alloc.free_block_dvas(rbp, new_txg)?;
-    }
-    let mos_meta = mos.meta_dnode().clone();
-    let mos_ceil = mos.root_birth_txg();
-    put_dnode_in_table(
-        cx,
-        mos,
-        &mos_meta,
-        mos_ceil,
-        mos_dirty_dnodes,
-        1,
-        &out.dnode,
-    )
+    alloc.pending_mos_directory = Some(dir_entries);
+    Ok(())
 }
 
 /// Enumerate all non-hole, non-embedded block pointers across MOS (`objset=0`)
@@ -381,12 +329,11 @@ impl ZfsTransactionEngine {
 
     /// Cancel an active scrub or resilver and persist `DslScanState::Canceled` in MOS `"scan"`.
     pub fn scrub_cancel(&mut self, cx: &Cx) -> ZfsTxOutcome<ZfsScanReport> {
-        let order = self.order;
         let ts = self.current_uberblock.timestamp.saturating_add(1);
         self.execute_staged_txg_typed(
             cx,
             "zfs_scrub_cancel",
-            |mos, mos_dirty, _features, alloc, new_txg, staged| {
+            |mos, _mos_dirty, _features, alloc, new_txg, _staged| {
                 let mut scan = read_scan_phys_from_mos(cx, mos)?
                     .ok_or_else(|| FfsError::Format("no active pool scan to cancel".into()))?;
                 if scan.state != DslScanState::Scanning {
@@ -396,7 +343,7 @@ impl ZfsTransactionEngine {
                 }
                 scan.state = DslScanState::Canceled;
                 scan.end_time = ts;
-                stage_scan_phys_in_mos(cx, mos, mos_dirty, alloc, order, new_txg, &scan, staged)?;
+                stage_scan_phys_in_mos(cx, mos, alloc, &scan)?;
                 let report = scan_report_from_phys(&scan, 0, new_txg);
                 Ok((report, new_txg))
             },
@@ -542,22 +489,12 @@ impl ZfsTransactionEngine {
             scan.end_time = self.current_uberblock.timestamp.saturating_add(1);
         }
 
-        let order = self.order;
         let final_scan = scan;
         self.execute_staged_txg_typed(
             cx,
             op_name,
-            |mos, mos_dirty, _features, alloc, new_txg, staged| {
-                stage_scan_phys_in_mos(
-                    cx,
-                    mos,
-                    mos_dirty,
-                    alloc,
-                    order,
-                    new_txg,
-                    &final_scan,
-                    staged,
-                )?;
+            |mos, _mos_dirty, _features, alloc, new_txg, _staged| {
+                stage_scan_phys_in_mos(cx, mos, alloc, &final_scan)?;
                 let report = scan_report_from_phys(&final_scan, repaired_this_chunk, new_txg);
                 Ok((report, new_txg))
             },
