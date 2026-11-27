@@ -214,10 +214,7 @@ impl mount_worker::PeriodicCommitTarget for ProtectedFs {
             Self::Core(fs) => {
                 mount_worker::PeriodicCommitTarget::default_commit_interval(fs.as_ref())
             }
-            Self::Fat { writable: true, .. } => Some(std::time::Duration::from_secs(5)),
-            Self::Fat {
-                writable: false, ..
-            } => None,
+            Self::Fat { fs, .. } => FsOps::default_commit_interval(fs.as_ref()),
             Self::Ntfs(fs) => FsOps::default_commit_interval(fs.as_ref()),
             Self::Zfs(fs) => FsOps::default_commit_interval(fs.as_ref()),
         }
@@ -226,19 +223,9 @@ impl mount_worker::PeriodicCommitTarget for ProtectedFs {
     fn periodic_commit(&self, cx: &Cx) -> ffs_error::Result<bool> {
         match self {
             Self::Core(fs) => fs.periodic_commit(cx),
-            Self::Fat { writable: true, fs } => {
-                FsOps::sync_fs(fs.as_ref(), cx, &mut RequestScope::empty())?;
-                Ok(true)
-            }
-            Self::Ntfs(fs) if fs.is_writable() => {
-                FsOps::sync_fs(fs.as_ref(), cx, &mut RequestScope::empty())?;
-                Ok(true)
-            }
-            Self::Zfs(fs) if fs.is_writable().unwrap_or(false) => {
-                FsOps::sync_fs(fs.as_ref(), cx, &mut RequestScope::empty())?;
-                Ok(true)
-            }
-            Self::Fat { .. } | Self::Ntfs(_) | Self::Zfs(_) => Ok(false),
+            Self::Fat { fs, .. } => FsOps::periodic_commit(fs.as_ref(), cx),
+            Self::Ntfs(fs) => FsOps::periodic_commit(fs.as_ref(), cx),
+            Self::Zfs(fs) => FsOps::periodic_commit(fs.as_ref(), cx),
         }
     }
 }
@@ -748,7 +735,7 @@ fn verify_manifest_native_binding(
                 ..
             },
         ) => {
-            if ek != ak || es != as_ || (*ev != 0 && ev != av) {
+            if ek != ak || es != as_ || ev != av {
                 bail!(
                     "storage-set manifest FAT geometry or volume serial disagrees with on-disk boot sector"
                 );

@@ -230,12 +230,31 @@ impl DashboardSnapshot {
     #[must_use]
     pub fn from_read_only_fs(fs: &ffs::ReadOnlyFs, mount_point: &str, uptime_seconds: u64) -> Self {
         let usage = fs.resource_usage();
+        Self::from_six_format_live(
+            fs.format.as_str(),
+            mount_point,
+            uptime_seconds,
+            usage.physical_io_bytes,
+            0,
+        )
+    }
+
+    /// Build a truthful [`DashboardSnapshot`] for a live six-format or
+    /// partitioned mount driven by FUSE transport counters.
+    #[must_use]
+    pub fn from_six_format_live(
+        fs_type: &str,
+        mount_point: &str,
+        uptime_seconds: u64,
+        bytes_read_total: u64,
+        bytes_written_total: u64,
+    ) -> Self {
         Self {
-            fs_type: fs.format.as_str().to_owned(),
+            fs_type: fs_type.to_owned(),
             mount_point: mount_point.to_owned(),
             uptime_seconds,
-            bytes_read_total: usage.physical_io_bytes,
-            bytes_written_total: 0,
+            bytes_read_total,
+            bytes_written_total,
             cache_hits: 0,
             cache_misses: 0,
             cache_evictions: 0,
@@ -476,6 +495,27 @@ impl LiveTelemetryCollector {
         snap.scrub_blocks_scanned = scrub_blocks_scanned;
         snap.scrub_blocks_corrupt = scrub_blocks_corrupt;
         snap.scrub_findings_count = scrub_findings_count;
+        self.record_sample(snap, 0, uptime)
+    }
+
+    /// Sample live transport telemetry for a mounted six-format or partitioned
+    /// filesystem, populating rolling I/O throughput sparklines.
+    #[must_use]
+    pub fn sample_six_format_live(
+        &mut self,
+        fs_type: &str,
+        mount_point: &str,
+        uptime: std::time::Duration,
+        bytes_read_total: u64,
+        bytes_written_total: u64,
+    ) -> DashboardSnapshot {
+        let snap = DashboardSnapshot::from_six_format_live(
+            fs_type,
+            mount_point,
+            uptime.as_secs(),
+            bytes_read_total,
+            bytes_written_total,
+        );
         self.record_sample(snap, 0, uptime)
     }
 

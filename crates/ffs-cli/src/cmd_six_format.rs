@@ -1765,6 +1765,9 @@ pub fn maybe_route_mount_cmd(
     let commit_interval = options.commit_interval_secs.map(Duration::from_secs);
     match options.runtime.mode {
         MountRuntimeMode::Standard => {
+            if options.console.live_refresh().is_some() {
+                bail!("--console-live requires --runtime-mode=managed or --runtime-mode=per-core");
+            }
             ffs_fuse::mount_with_commit_interval(
                 &cx,
                 fs_ops,
@@ -1794,8 +1797,52 @@ pub fn maybe_route_mount_cmd(
             let _ = ctrlc::set_handler(move || {
                 stop_sig.store(true, Ordering::SeqCst);
             });
+            let per_core = if let Some(interval) = options.console.live_refresh() {
+                use std::io::IsTerminal;
+
+                let started = std::time::Instant::now();
+                let mut collector = ffs_tui::LiveTelemetryCollector::new();
+                let mountpoint_label = mountpoint_canon.display().to_string();
+                let stdout = io::stdout();
+                let terminal = stdout.is_terminal();
+                let mut output = stdout.lock();
+                let (_metrics, per_core) = handle
+                    .wait_with_observer(interval, |metrics| {
+                        let elapsed = started.elapsed();
+                        let snapshot = collector.sample_six_format_live(
+                            kind.as_str(),
+                            &mountpoint_label,
+                            elapsed,
+                            metrics.bytes_read,
+                            0,
+                        );
+                        if terminal {
+                            write!(output, "\x1b[H\x1b[2J")?;
+                        }
+                        writeln!(
+                            output,
+                            "Source: {}\nSample: {} ms | Requests: {} | Read: {} bytes",
+                            image_path.display(),
+                            elapsed.as_millis(),
+                            metrics.requests_total,
+                            metrics.bytes_read,
+                        )?;
+                        write!(
+                            output,
+                            "{}",
+                            ffs_tui::Dashboard::with_snapshot(snapshot).render_ascii()
+                        )?;
+                        output.flush()
+                    })
+                    .context("six-format live dashboard failed during observation or unmount")?;
+                per_core
+            } else if options.runtime.mode == MountRuntimeMode::PerCore {
+                handle.wait_with_per_core_metrics()?.1
+            } else {
+                handle.wait()?;
+                None
+            };
             if options.runtime.mode == MountRuntimeMode::PerCore {
-                let (_metrics, per_core) = handle.wait_with_per_core_metrics()?;
                 let lanes = per_core.as_ref().map_or(0, |m| m.cpus.len());
                 let total_requests: u64 = per_core
                     .as_ref()
@@ -1806,8 +1853,6 @@ pub fn maybe_route_mount_cmd(
                     total_requests,
                     "six_format_per_core_shutdown"
                 );
-            } else {
-                handle.wait()?;
             }
         }
     }
@@ -3889,5 +3934,31 @@ mod tests {
         assert_eq!(zfs_snap.fs_type, "zfs");
         assert!(zfs_snap.scrub_blocks_scanned > 0);
         assert_eq!(zfs_snap.scrub_blocks_corrupt, 0);
+
+        // 5. Verify `LiveTelemetryCollector::sample_six_format_live` drives live
+        //    six-format mount dashboard rendering and rolling I/O throughput history.
+        let mut live_collector = ffs_tui::LiveTelemetryCollector::new();
+        let s1 = live_collector.sample_six_format_live(
+            "ntfs",
+            "/mnt/ntfs",
+            Duration::from_millis(500),
+            4096,
+            0,
+        );
+        assert_eq!(s1.fs_type, "ntfs");
+        assert_eq!(s1.bytes_read_total, 4096);
+        let s2 = live_collector.sample_six_format_live(
+            "ntfs",
+            "/mnt/ntfs",
+            Duration::from_millis(1500),
+            1_052_672,
+            0,
+        );
+        assert_eq!(s2.bytes_read_total, 1_052_672);
+        assert!(
+            ffs_tui::Dashboard::with_snapshot(s2)
+                .render_ascii()
+                .contains("ntfs")
+        );
     }
 }

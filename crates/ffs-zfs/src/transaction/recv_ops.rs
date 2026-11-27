@@ -14,8 +14,8 @@ use super::dmu_cow::{
     write_dataset_objset_block, write_dataset_objset_block_raw_protected, zap_optional_u64,
 };
 use super::dsl_ops::{
-    DMU_OT_DSL_DATASET, DMU_OT_DSL_DIR_CHILD_MAP, DMU_OT_DSL_DS_SNAP_MAP, DMU_OT_DSL_PROPS,
-    DS_FLAG_UNIQUE_ACCURATE, ObjectSetWalkMode, activate_dataset_block_features,
+    DD_FLAG_USED_BREAKDOWN, DMU_OT_DSL_DATASET, DMU_OT_DSL_DIR_CHILD_MAP, DMU_OT_DSL_DS_SNAP_MAP,
+    DMU_OT_DSL_PROPS, DS_FLAG_UNIQUE_ACCURATE, ObjectSetWalkMode, activate_dataset_block_features,
     activate_initial_compression_feature, adjust_dsl_crypto_key_refcount, allocate_fresh_deadlist,
     bump_filesystem_limits_counter_if_present, dataset_block_feature_owners,
     dataset_feature_entries, derive_fsid_guid, derive_unique_guid,
@@ -2316,6 +2316,7 @@ impl ZfsTransactionEngine {
                     dd_bonus[48..56].copy_from_slice(&order.encode(os_space.comp));
                     dd_bonus[56..64].copy_from_slice(&order.encode(os_space.uncomp));
                     dd_bonus[80..88].copy_from_slice(&order.encode(props_zap));
+                    dd_bonus[96..104].copy_from_slice(&order.encode(DD_FLAG_USED_BREAKDOWN));
                     dd_bonus[104..112].copy_from_slice(&order.encode(os_space.dsize)); // DD_USED_HEAD
                     put_new_dsl_dir_in_mos(
                         cx,
@@ -2652,6 +2653,7 @@ impl ZfsTransactionEngine {
                     recv_dd_bonus[24..32].copy_from_slice(&order.encode(prev_snap_obj));
                     recv_dd_bonus[32..40].copy_from_slice(&order.encode(recv_cz_obj));
                     recv_dd_bonus[80..88].copy_from_slice(&order.encode(recv_props_obj));
+                    recv_dd_bonus[96..104].copy_from_slice(&order.encode(DD_FLAG_USED_BREAKDOWN));
                     put_new_dsl_dir_in_mos(
                         cx,
                         mos,
@@ -4257,9 +4259,73 @@ impl ZfsTransactionEngine {
                     }
 
                     // Reconcile `target_dd` space counters: `%recv`'s `dd_used` was already counted
-                    // in `target_dd`'s `dd_used_child`; move it to `dd_used_snap` and subtract
-                    // any force-rolled-back `old_head_freed_space`.
+                    // in `target_dd`'s `dd_used_child`; absorb it into `target_dd`, subtract any
+                    // force-rolled-back `old_head_freed_space`, and align `DD_USED_HEAD` /
+                    // `DD_USED_SNAP` with the promoted snapshot's live referenced bytes.
                     let head_drop = i128::from(target_old_unique.max(old_head_freed_space.dsize));
+                    let target_dd_origin = order
+                        .u64(target_dd_dn.bonus(), 24)
+                        .map_err(|e| parse_err(&e))?;
+                    let target_dd_flags = order
+                        .u64(target_dd_dn.bonus(), 96)
+                        .map_err(|e| parse_err(&e))?;
+                    let (head_dsize_delta, snap_dsize_delta) = if target_dd_flags
+                        & DD_FLAG_USED_BREAKDOWN
+                        != 0
+                    {
+                        let old_dd_head = order
+                            .u64(target_dd_dn.bonus(), 104)
+                            .map_err(|e| parse_err(&e))?;
+                        let old_dd_snap = order
+                            .u64(target_dd_dn.bonus(), 112)
+                            .map_err(|e| parse_err(&e))?;
+                        let new_head_live = if target_dd_origin == 0 {
+                            stage_ref
+                        } else {
+                            let (origin_dn, _) = read_staged_or_committed_dnode(
+                                cx,
+                                mos,
+                                &mos_meta,
+                                mos_ceiling,
+                                mos_dirty_dnodes,
+                                target_dd_origin,
+                                order,
+                            )?;
+                            let origin_txg = order
+                                .u64(origin_dn.bonus(), 56)
+                                .map_err(|e| parse_err(&e))?;
+                            if origin_txg <= 1 {
+                                stage_ref
+                            } else {
+                                let promoted_bp =
+                                    BlockPointer::parse(&stage_head_dn.bonus()[128..256], order)
+                                        .map_err(|e| parse_err(&e))?;
+                                let (measured, _) = walk_objectset_above_txg(
+                                    cx,
+                                    mos,
+                                    &promoted_bp,
+                                    stage_head_ceil,
+                                    target_crypto.as_ref(),
+                                    origin_txg,
+                                    ObjectSetWalkMode::MeasureOnly,
+                                    alloc,
+                                    new_txg,
+                                )?;
+                                measured.dsize
+                            }
+                        };
+                        let self_used_after = i128::from(old_dd_head)
+                            + i128::from(old_dd_snap)
+                            + i128::from(recv_used)
+                            - head_drop;
+                        let clamped_head = new_head_live
+                            .min(u64::try_from(self_used_after.max(0)).unwrap_or(u64::MAX));
+                        let hd = i128::from(clamped_head) - i128::from(old_dd_head);
+                        let sd = (i128::from(recv_used) - head_drop) - hd;
+                        (hd, sd)
+                    } else {
+                        (-head_drop, i128::from(recv_used))
+                    };
                     propagate_dsl_dir_space_delta(
                         cx,
                         mos,
@@ -4267,8 +4333,8 @@ impl ZfsTransactionEngine {
                         mos_ceiling,
                         mos_dirty_dnodes,
                         stage_cloned.target_dd_obj,
-                        -head_drop,
-                        i128::from(recv_used),
+                        head_dsize_delta,
+                        snap_dsize_delta,
                         -i128::from(recv_used),
                         0,
                         0,
@@ -4508,23 +4574,12 @@ impl ZfsTransactionEngine {
                         )?;
                     }
 
-                    // Shift `dd_used_head` -> `dd_used_snap` on full receive snapshot.
-                    propagate_dsl_dir_space_delta(
-                        cx,
-                        mos,
-                        &mos_meta,
-                        mos_ceiling,
-                        mos_dirty_dnodes,
-                        stage_cloned.stage_dd_obj,
-                        -i128::from(stage_unique),
-                        i128::from(stage_unique),
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        order,
-                    )?;
+                    // Like `stage_create_snapshot`, full receive promotion leaves
+                    // `DD_USED_HEAD == dd_used_bytes` and `DD_USED_SNAP == 0`
+                    // because HEAD and the promoted snapshot share the exact same
+                    // ObjectSet; retired blocks shift into `DD_USED_SNAP` only when
+                    // subsequent mutations COW or delete them from HEAD.
+                    let _ = stage_unique;
 
                     if !props_owned.is_empty() {
                         apply_received_props(

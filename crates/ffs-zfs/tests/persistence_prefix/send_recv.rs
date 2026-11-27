@@ -4496,3 +4496,244 @@ fn send_recv_strict_refusals_force_rollback_and_cancel_enospc_controls() {
         DrrRecord::Begin(b) if b.hdr_type == StreamHeaderType::Substream
     ));
 }
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn received_dataset_sets_used_breakdown_flag_and_tracks_head_and_snap() {
+    let cx = Cx::for_testing();
+    let ts = Timestamp {
+        seconds: 1_735_007_000,
+        nanos: 0,
+    };
+    let src_built = build_clean_zfs_pool(&send_recv_pool_spec(32 * 1024 * 1024));
+    let dst_built = build_clean_zfs_pool(&send_recv_pool_spec(32 * 1024 * 1024));
+    let src_dev = FaultableMemberDevice::new(src_built.members[0].clone());
+    let dst_dev = FaultableMemberDevice::new(dst_built.members[0].clone());
+    let mut src_engine = open_engine_on_devices(
+        &cx,
+        std::slice::from_ref(&src_dev),
+        default_write_opts(src_built.pool_guid, src_built.initial_slot),
+    )
+    .expect("open source pool");
+    let mut dst_engine = open_engine_on_devices(
+        &cx,
+        std::slice::from_ref(&dst_dev),
+        default_write_opts(dst_built.pool_guid, dst_built.initial_slot),
+    )
+    .expect("open destination pool");
+
+    let src_ds = vec![b"data".to_vec()];
+    let dst_ds = vec![b"data".to_vec(), b"replica".to_vec()];
+
+    let (fid, _) = src_engine
+        .create_file(
+            &cx,
+            &src_ds,
+            2,
+            b"payload.bin",
+            0o644,
+            0,
+            0,
+            ts,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .expect("create payload.bin");
+    let payload: Vec<u8> = (0_u32..4096)
+        .flat_map(|i| i.wrapping_mul(2_654_435_761).to_le_bytes())
+        .collect();
+    src_engine
+        .write_file_data(
+            &cx,
+            &src_ds,
+            fid,
+            0,
+            &payload,
+            ts,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .expect("write payload.bin");
+    src_engine
+        .create_snapshot(&cx, &src_ds, b"s1", ts)
+        .into_result()
+        .expect("snapshot data@s1");
+
+    let mut stream = Vec::new();
+    let src_mos = open_mos(
+        &cx,
+        std::slice::from_ref(&src_dev),
+        src_built.pool_guid,
+        src_engine.committed_slot(),
+    );
+    send_stream(
+        &cx,
+        &src_mos,
+        &ZfsSendRequest::full(src_ds, b"s1".to_vec()),
+        &mut stream,
+    )
+    .expect("send full stream");
+
+    dst_engine
+        .receive_stream(
+            &cx,
+            &ZfsRecvRequest::new(dst_ds.clone()),
+            &mut Cursor::new(&stream),
+        )
+        .into_result()
+        .expect("receive full stream into data/replica");
+
+    let read_replica_breakdown = |eng: &ZfsTransactionEngine| -> (u64, u64, u64, u64) {
+        let mut mos = eng.open_read_objects(&cx).unwrap();
+        let row = mos
+            .datasets(&cx)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.components == dst_ds)
+            .expect("find received dataset");
+        let dn = mos.object(&cx, row.directory_object).unwrap();
+        let ord = dn.order();
+        let b = dn.bonus();
+        (
+            ord.u64(b, 40).unwrap(),
+            ord.u64(b, 96).unwrap(),
+            ord.u64(b, 104).unwrap(),
+            ord.u64(b, 112).unwrap(),
+        )
+    };
+
+    let (used_after_recv, flags_after_recv, head_after_recv, snap_after_recv) =
+        read_replica_breakdown(&dst_engine);
+    assert_ne!(
+        flags_after_recv & 0x1,
+        0,
+        "received dataset dsl_dir must set DD_FLAG_USED_BREAKDOWN"
+    );
+    assert!(used_after_recv > 0);
+    assert_eq!(
+        head_after_recv, used_after_recv,
+        "immediately after full receive promotion, DD_USED_HEAD must equal dd_used_bytes"
+    );
+    assert_eq!(
+        snap_after_recv, 0,
+        "immediately after full receive promotion, DD_USED_SNAP must be 0"
+    );
+
+    // Deleting the received file immediately after full receive must shrink
+    // DD_USED_HEAD without underflow and shift its retained blocks into DD_USED_SNAP.
+    let dst_root = {
+        let mut mos = dst_engine.open_read_objects(&cx).unwrap();
+        mos.zpl(&cx, &dst_ds).unwrap().resolve(&cx, b"/").unwrap()
+    };
+    dst_engine
+        .unlink_entry(&cx, &dst_ds, dst_root, b"payload.bin", false, ts)
+        .into_result()
+        .expect("unlink payload.bin immediately after full receive");
+
+    let (used_post_unlink, flags_post_unlink, head_post_unlink, snap_post_unlink) =
+        read_replica_breakdown(&dst_engine);
+    assert_ne!(flags_post_unlink & 0x1, 0);
+    assert!(
+        head_post_unlink < head_after_recv,
+        "unlinking received payload must reduce DD_USED_HEAD"
+    );
+    assert!(
+        snap_post_unlink > 0,
+        "retiring received snapshot blocks must credit DD_USED_SNAP"
+    );
+    assert_eq!(
+        head_post_unlink + snap_post_unlink,
+        used_post_unlink,
+        "received dataset DD_USED_HEAD + DD_USED_SNAP must equal dd_used_bytes"
+    );
+
+    // Now send an incremental @s1 -> @s2 where payload.bin is replaced by a larger file,
+    // force-receive onto the diverged replica, and verify DD_USED_HEAD/DD_USED_SNAP
+    // reconcile cleanly AND destroying @s1 drains DD_USED_SNAP to exactly 0!
+    src_engine
+        .unlink_entry(&cx, &src_ds, 2, b"payload.bin", false, ts)
+        .into_result()
+        .expect("unlink payload.bin in source for s2");
+    let (fid2, _) = src_engine
+        .create_file(
+            &cx,
+            &src_ds,
+            2,
+            b"v2.bin",
+            0o644,
+            0,
+            0,
+            ts,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .expect("create v2.bin");
+    src_engine
+        .write_file_data(
+            &cx,
+            &src_ds,
+            fid2,
+            0,
+            &vec![0x7C; 24 * 1024],
+            ts,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .expect("write v2.bin");
+    src_engine
+        .create_snapshot(&cx, &src_ds, b"s2", ts)
+        .into_result()
+        .expect("snapshot data@s2");
+
+    let mut incr_stream = Vec::new();
+    let src_mos2 = open_mos(
+        &cx,
+        std::slice::from_ref(&src_dev),
+        src_built.pool_guid,
+        src_engine.committed_slot(),
+    );
+    send_stream(
+        &cx,
+        &src_mos2,
+        &ZfsSendRequest::incremental(
+            src_ds,
+            ZfsSendFrom::Snapshot(b"s1".to_vec()),
+            b"s2".to_vec(),
+        ),
+        &mut incr_stream,
+    )
+    .expect("send incremental s1 -> s2");
+
+    let mut force_req = ZfsRecvRequest::new(dst_ds.clone());
+    force_req.force = true;
+    dst_engine
+        .receive_stream(&cx, &force_req, &mut Cursor::new(&incr_stream))
+        .into_result()
+        .expect("forced incremental receive s1 -> s2");
+
+    let (used_after_s2, _, head_after_s2, snap_after_s2) = read_replica_breakdown(&dst_engine);
+    assert!(head_after_s2 > 0 && snap_after_s2 > 0);
+    assert_eq!(
+        head_after_s2 + snap_after_s2,
+        used_after_s2,
+        "after incremental receive, DD_USED_HEAD + DD_USED_SNAP must equal dd_used_bytes"
+    );
+
+    dst_engine
+        .destroy_snapshot(&cx, &dst_ds, b"s1", false)
+        .into_result()
+        .expect("destroy @s1 after incremental receive");
+    let (used_no_s1, _, head_no_s1, snap_no_s1) = read_replica_breakdown(&dst_engine);
+    assert_eq!(
+        snap_no_s1, 0,
+        "destroying @s1 must drain DD_USED_SNAP to exactly 0"
+    );
+    assert_eq!(head_no_s1, used_no_s1);
+
+    assert_pool_scrub_and_allocation_clean(
+        &cx,
+        std::slice::from_ref(&dst_dev),
+        dst_built.pool_guid,
+        Some(dst_engine.committed_slot()),
+    );
+}

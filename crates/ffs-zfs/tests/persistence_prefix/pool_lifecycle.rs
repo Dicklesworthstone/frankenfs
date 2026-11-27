@@ -843,7 +843,7 @@ fn clone_with_own_snapshot_cow_of_origin_block_preserves_head_and_snap_breakdown
     let data_ds = vec![b"data".to_vec()];
     let clone_ds = vec![b"data".to_vec(), b"fork".to_vec()];
 
-    // Seed a 32 KiB file in origin dataset `data`, then snapshot `data@origin`.
+    // Seed a 64 KiB file in origin dataset `data`, then snapshot `data@origin`.
     let (origin_fid, _) = engine
         .create_file(
             &cx,
@@ -858,7 +858,7 @@ fn clone_with_own_snapshot_cow_of_origin_block_preserves_head_and_snap_breakdown
         )
         .into_result()
         .expect("create origin.bin");
-    let big_origin: Vec<u8> = (0_u32..8192)
+    let big_origin: Vec<u8> = (0_u32..16_384)
         .flat_map(|i| {
             i.wrapping_mul(1_664_525)
                 .wrapping_add(1_013_904_223)
@@ -876,7 +876,7 @@ fn clone_with_own_snapshot_cow_of_origin_block_preserves_head_and_snap_breakdown
             ZfsDataChecksum::Fletcher4,
         )
         .into_result()
-        .expect("write 32 KiB origin.bin");
+        .expect("write 64 KiB origin.bin");
     engine
         .create_snapshot(&cx, &data_ds, b"origin", ts)
         .into_result()
@@ -919,9 +919,55 @@ fn clone_with_own_snapshot_cow_of_origin_block_preserves_head_and_snap_breakdown
         .into_result()
         .expect("snapshot data/fork@c1");
 
-    // Now COW & delete the 32 KiB origin file (birth <= origin_txg) AFTER `clone@c1`,
+    let clone_dir_obj = {
+        let mut mos = engine.open_read_objects(&cx).unwrap();
+        let root_dd = mos.object(&cx, 2).unwrap();
+        let root_cz = root_dd.order().u64(root_dd.bonus(), 32).unwrap();
+        let parent_dir_obj = mos
+            .zap(&cx, root_cz)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == b"data")
+            .unwrap()
+            .value;
+        let parent_dir_dnode = mos.object(&cx, parent_dir_obj).unwrap();
+        let parent_child_zap = parent_dir_dnode
+            .order()
+            .u64(parent_dir_dnode.bonus(), 32)
+            .unwrap();
+        mos.zap(&cx, parent_child_zap)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == b"fork")
+            .unwrap()
+            .value
+    };
+
+    let read_clone_breakdown = |eng: &ZfsTransactionEngine| -> (u64, u64, u64, u64) {
+        let mut mos = eng.open_read_objects(&cx).unwrap();
+        let dn = mos.object(&cx, clone_dir_obj).unwrap();
+        let ord = dn.order();
+        let b = dn.bonus();
+        (
+            ord.u64(b, 40).unwrap(),
+            ord.u64(b, 96).unwrap(),
+            ord.u64(b, 104).unwrap(),
+            ord.u64(b, 112).unwrap(),
+        )
+    };
+
+    let (used_at_c1, flags_at_c1, head_at_c1, snap_at_c1) = read_clone_breakdown(&engine);
+    assert_ne!(flags_at_c1 & 0x1, 0);
+    assert_eq!(snap_at_c1, 0);
+    assert_eq!(head_at_c1, used_at_c1);
+    assert!(
+        used_at_c1 > 0 && used_at_c1 < u64::try_from(big_origin.len()).unwrap(),
+        "clone bytes at c1 ({used_at_c1}) must be strictly smaller than 64 KiB origin file so retiring origin.bin would underflow DD_USED_HEAD if misattributed"
+    );
+
+    // Now COW & delete the 64 KiB origin file (birth <= origin_txg) AFTER `clone@c1`,
     // and also overwrite the 4 KiB clone-owned file (origin_txg < birth <= c1_txg).
-    // Previously `stage_head_space` debited the 32 KiB origin block from `DD_USED_HEAD`
+    // Previously `stage_head_space` debited the 64 KiB origin block from `DD_USED_HEAD`
     // (causing underflow) and misattributed it to `DD_USED_SNAP`.
     engine
         .write_file_data(
@@ -963,43 +1009,6 @@ fn clone_with_own_snapshot_cow_of_origin_block_preserves_head_and_snap_breakdown
         .into_result()
         .expect("overwrite clone_only.bin after c1");
 
-    let clone_dir_obj = {
-        let mut mos = engine.open_read_objects(&cx).unwrap();
-        let root_dd = mos.object(&cx, 2).unwrap();
-        let root_cz = root_dd.order().u64(root_dd.bonus(), 32).unwrap();
-        let parent_dir_obj = mos
-            .zap(&cx, root_cz)
-            .unwrap()
-            .into_iter()
-            .find(|e| e.name == b"data")
-            .unwrap()
-            .value;
-        let parent_dir_dnode = mos.object(&cx, parent_dir_obj).unwrap();
-        let parent_child_zap = parent_dir_dnode
-            .order()
-            .u64(parent_dir_dnode.bonus(), 32)
-            .unwrap();
-        mos.zap(&cx, parent_child_zap)
-            .unwrap()
-            .into_iter()
-            .find(|e| e.name == b"fork")
-            .unwrap()
-            .value
-    };
-
-    let read_clone_breakdown = |eng: &ZfsTransactionEngine| -> (u64, u64, u64, u64) {
-        let mut mos = eng.open_read_objects(&cx).unwrap();
-        let dn = mos.object(&cx, clone_dir_obj).unwrap();
-        let ord = dn.order();
-        let b = dn.bonus();
-        (
-            ord.u64(b, 40).unwrap(),
-            ord.u64(b, 96).unwrap(),
-            ord.u64(b, 104).unwrap(),
-            ord.u64(b, 112).unwrap(),
-        )
-    };
-
     let (used_with_c1, flags_with_c1, head_with_c1, snap_with_c1) = read_clone_breakdown(&engine);
     assert_ne!(flags_with_c1 & 0x1, 0);
     assert_eq!(
@@ -1008,8 +1017,8 @@ fn clone_with_own_snapshot_cow_of_origin_block_preserves_head_and_snap_breakdown
         "clone DD_USED_HEAD + DD_USED_SNAP must equal dd_used_bytes"
     );
     assert!(
-        snap_with_c1 > 0 && snap_with_c1 < 32 * 1024,
-        "clone DD_USED_SNAP ({snap_with_c1}) must hold only clone@c1's own retired blocks, not the 32 KiB origin file"
+        snap_with_c1 > 0 && snap_with_c1 <= used_at_c1,
+        "clone DD_USED_SNAP ({snap_with_c1}) must hold only clone@c1's own retired blocks (<= used_at_c1={used_at_c1}), not the 64 KiB origin file"
     );
 
     // Destroying `data/fork@c1` must return `DD_USED_SNAP` cleanly to 0 while
