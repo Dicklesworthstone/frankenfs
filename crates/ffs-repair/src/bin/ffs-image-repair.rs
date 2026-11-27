@@ -194,6 +194,18 @@ struct ExtractedNativeSet {
     topology_hint: Option<StorageSetTopology>,
 }
 
+struct ZfsPoolLabelMeta {
+    pool_guid: u64,
+    top_guid: u64,
+    version: u64,
+    label_txg: u64,
+    ashift: u8,
+    asize: u64,
+    vdev_children: u64,
+    required_children: usize,
+    vdev_type: Option<String>,
+}
+
 fn read_exact_range(path: &Path, offset: u64, out: &mut [u8]) -> Result<u64> {
     let mut file = File::open(path)?;
     let len = file.metadata()?.len();
@@ -216,7 +228,7 @@ fn extract_zfs_native_binding(
 ) -> Result<Option<ExtractedNativeSet>> {
     let mut pending_member_guids: Vec<(usize, u64)> = Vec::new();
     let mut seen_guids = BTreeSet::new();
-    let mut first_cfg: Option<(u64, u64, u64, u64, u8, u64, u64, usize, Option<String>)> = None;
+    let mut first_cfg: Option<ZfsPoolLabelMeta> = None;
     let mut best_ub: Option<(usize, Uberblock)> = None;
     let mut config_buf = vec![0_u8; LABEL_CONFIG_BYTES];
     let mut ring_buf = vec![0_u8; UBERBLOCK_RING_BYTES];
@@ -272,8 +284,8 @@ fn extract_zfs_native_binding(
                     };
                     let vdev_type = tree.text("type").map(str::to_owned);
                     let asize = tree.unsigned("asize").unwrap_or(0);
-                    first_cfg = Some((
-                        label_pool_guid,
+                    first_cfg = Some(ZfsPoolLabelMeta {
+                        pool_guid: label_pool_guid,
                         top_guid,
                         version,
                         label_txg,
@@ -282,7 +294,7 @@ fn extract_zfs_native_binding(
                         vdev_children,
                         required_children,
                         vdev_type,
-                    ));
+                    });
                 }
             }
             let ring_offset = label_offset + UBERBLOCK_RING_OFFSET;
@@ -311,12 +323,12 @@ fn extract_zfs_native_binding(
         let Some(m_guid) = leaf_guid else {
             return Ok(None);
         };
-        if let (Some((expected_pool_guid, ..)), Some(actual_pool_guid)) =
-            (&first_cfg, leaf_pool_guid)
-            && *expected_pool_guid != actual_pool_guid
+        if let (Some(expected), Some(actual_pool_guid)) = (&first_cfg, leaf_pool_guid)
+            && expected.pool_guid != actual_pool_guid
         {
             return Err(FfsError::Format(format!(
-                "ZFS member {idx} belongs to pool_guid {actual_pool_guid:#x}, expected {expected_pool_guid:#x}"
+                "ZFS member {idx} belongs to pool_guid {actual_pool_guid:#x}, expected {:#x}",
+                expected.pool_guid
             )));
         }
         if m_guid != 0 && !seen_guids.insert(m_guid) {
@@ -328,7 +340,7 @@ fn extract_zfs_native_binding(
     }
 
     let (
-        Some((
+        Some(ZfsPoolLabelMeta {
             pool_guid,
             top_guid,
             version,
@@ -338,7 +350,7 @@ fn extract_zfs_native_binding(
             vdev_children,
             required_children,
             vdev_type,
-        )),
+        }),
         Some((slot, ub)),
     ) = (first_cfg, best_ub)
     else {
