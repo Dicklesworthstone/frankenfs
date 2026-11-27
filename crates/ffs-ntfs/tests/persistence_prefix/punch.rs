@@ -176,6 +176,444 @@ fn assert_name_copies(
 }
 
 #[test]
+fn compressed_hole_punch_reclaims_units_preserves_links_streams_and_eof() {
+    let cx = Cx::for_testing();
+    let cb = CLUSTER_BYTES as u64;
+    let unit = 16 * CLUSTER_BYTES;
+    let mut expected = vec![0x6D; 4 * unit + 37];
+    // Keep one literal (incompressible) unit alongside compressed units. Both
+    // representations must survive the partial-unit decode/COW path.
+    let mut random = 0x8B1D_716E_0154_32A9_u64;
+    for byte in &mut expected[unit..2 * unit] {
+        random = random
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        *byte = (random >> 33) as u8;
+    }
+    let (device, mut engine, file) = fixture(256, &expected);
+    engine
+        .set_compression_at(&cx, file, true, DEFAULT_FILETIME)
+        .into_result()
+        .unwrap();
+    engine
+        .link_file(&cx, "/punch.bin", "/", "alias.bin")
+        .into_result()
+        .unwrap();
+    let ads: Vec<_> = "audit".encode_utf16().collect();
+    engine
+        .create_file_stream(&cx, "/punch.bin", &ads, b"independent stream")
+        .into_result()
+        .unwrap();
+    let before = used_clusters(&device);
+    let start = unit + 137;
+    let end = 3 * unit + 29;
+    let trace_start = engine.persistence_trace().len();
+    engine
+        .punch_hole_at(
+            &cx,
+            file,
+            &[],
+            start as u64,
+            (end - start) as u64,
+            DEFAULT_FILETIME + 1,
+        )
+        .into_result()
+        .unwrap();
+    expected[start..end].fill(0);
+    let payload_bytes: usize = engine.persistence_trace()[trace_start..]
+        .iter()
+        .filter(|event| event.stage == NtfsPersistenceStage::PayloadDataWrite)
+        .map(|event| event.bytes)
+        .sum();
+    assert!(payload_bytes <= 2 * unit);
+    assert_stream(&engine, file, &[], &expected, 4 * cb, expected.len() as u64);
+    assert!(used_clusters(&device) < before);
+    assert_name_copies(&device, &engine, file, 4 * cb, expected.len() as u64);
+    let (volume, record) = view(&engine, file);
+    assert_eq!(standard_flags(&record) & (0x800 | 0x200), 0x800);
+    assert_eq!(
+        u64::from(volume.resolve(&cx, "/alias.bin").unwrap().number),
+        file.record
+    );
+    let alternate = volume.data_stream(&cx, &record, &ads).unwrap();
+    assert_eq!(
+        volume.read(&cx, &alternate, 0, 64).unwrap(),
+        b"independent stream"
+    );
+    engine.check_clean_consistency(&cx).unwrap();
+
+    // Removing every visible byte must retain compressed identity and EOF,
+    // including the short final unit, while reclaiming all physical DATA.
+    engine
+        .punch_hole_at(
+            &cx,
+            file,
+            &[],
+            0,
+            (expected.len() + unit) as u64,
+            DEFAULT_FILETIME + 2,
+        )
+        .into_result()
+        .unwrap();
+    expected.fill(0);
+    assert_stream(&engine, file, &[], &expected, 0, expected.len() as u64);
+    assert_name_copies(&device, &engine, file, 0, expected.len() as u64);
+    engine.check_clean_consistency(&cx).unwrap();
+
+    let image = device.snapshot_durable_only();
+    let length = image.len() as u64 - SECTOR_BYTES as u64;
+    let reopened_device = FaultInjectingNtfsDevice::new(image);
+    let reopened = NtfsTransactionEngine::from_device(
+        &cx,
+        Arc::clone(&reopened_device) as Arc<dyn ByteDevice>,
+        0,
+        length,
+        write_options_clean(),
+    )
+    .unwrap();
+    assert_stream(&reopened, file, &[], &expected, 0, expected.len() as u64);
+    assert_eq!(
+        standard_flags(&view(&reopened, file).1) & (0x800 | 0x200),
+        0x800
+    );
+    reopened.check_clean_consistency(&cx).unwrap();
+    assert_eq!(reopened_device.write_bytes_total(), 0);
+}
+
+#[test]
+fn compressed_hole_punch_large_sparse_tail_preserves_valid_data_length() {
+    let cx = Cx::for_testing();
+    let cb = CLUSTER_BYTES as u64;
+    let unit = 16 * cb;
+    let original = vec![0xB2; 4 * unit as usize];
+    let (device, mut engine, file) = fixture(256, &original);
+    engine
+        .set_compression_at(&cx, file, true, DEFAULT_FILETIME)
+        .into_result()
+        .unwrap();
+    let size = 1_u64 << 40;
+    engine
+        .truncate_stream_at(&cx, file, &[], size, DEFAULT_FILETIME)
+        .into_result()
+        .unwrap();
+    let before = used_clusters(&device);
+    let trace_start = engine.persistence_trace().len();
+    let start = unit + 7;
+    let end = size - 9;
+    engine
+        .punch_hole_at(&cx, file, &[], start, end - start, DEFAULT_FILETIME + 1)
+        .into_result()
+        .unwrap();
+    let payload_bytes: usize = engine.persistence_trace()[trace_start..]
+        .iter()
+        .filter(|event| event.stage == NtfsPersistenceStage::PayloadDataWrite)
+        .map(|event| event.bytes)
+        .sum();
+    assert_eq!(payload_bytes, CLUSTER_BYTES);
+    assert_eq!(used_clusters(&device), before - 2);
+    let (volume, record) = view(&engine, file);
+    let stream = volume.data_stream(&cx, &record, &[]).unwrap();
+    assert_eq!(stream.size, size);
+    assert_eq!(stream.initialized, original.len() as u64);
+    assert_eq!(stream.allocated, 2 * cb);
+    assert_eq!(standard_flags(&record) & (0x800 | 0x200), 0x800);
+    assert_eq!(volume.read(&cx, &stream, start - 1, 2).unwrap(), [0xB2, 0]);
+    assert_eq!(volume.read(&cx, &stream, size / 2, 17).unwrap(), [0; 17]);
+    assert_eq!(volume.read(&cx, &stream, size - 17, 32).unwrap(), [0; 17]);
+    assert_name_copies(&device, &engine, file, 2 * cb, size);
+    engine.check_clean_consistency(&cx).unwrap();
+
+    // A range beyond EOF is still a read-only no-op for a compressed stream.
+    let snapshot = device.snapshot_durable_only();
+    let written = device.write_bytes_total();
+    engine
+        .punch_hole_at(&cx, file, &[], size, 1, DEFAULT_FILETIME + 2)
+        .into_result()
+        .unwrap();
+    assert_eq!(device.write_bytes_total(), written);
+    assert_eq!(device.snapshot_live(), snapshot);
+}
+
+#[test]
+fn compressed_hole_punch_on_full_volume_retires_only_whole_units_without_cow() {
+    let cx = Cx::for_testing();
+    let unit = 16 * CLUSTER_BYTES;
+    let mut expected = vec![0x92; 4 * unit];
+    let (device, mut engine, file) = fixture(180, &expected);
+    engine
+        .set_compression_at(&cx, file, true, DEFAULT_FILETIME)
+        .into_result()
+        .unwrap();
+    let free = 180 - used_clusters(&device) as usize;
+    engine
+        .create_file(&cx, "/", "fill.bin", &vec![0x53; free * CLUSTER_BYTES])
+        .into_result()
+        .unwrap();
+    assert_eq!(used_clusters(&device), 180);
+    let before = device.snapshot_durable_only();
+    let writes = device.write_bytes_total();
+    let outcome = engine.punch_hole_at(
+        &cx,
+        file,
+        &[],
+        1,
+        (3 * unit) as u64 - 2,
+        DEFAULT_FILETIME + 1,
+    );
+    let NtfsTxOutcome::NotCommitted(error) = outcome else {
+        panic!("partial compressed units require fresh COW allocation: {outcome:?}");
+    };
+    assert_eq!(error.to_errno(), libc::ENOSPC);
+    assert_eq!(device.snapshot_live(), before);
+    assert_eq!(device.write_bytes_total(), writes);
+
+    let trace_start = engine.persistence_trace().len();
+    engine
+        .punch_hole_at(
+            &cx,
+            file,
+            &[],
+            unit as u64,
+            (2 * unit) as u64,
+            DEFAULT_FILETIME + 2,
+        )
+        .into_result()
+        .unwrap();
+    assert!(!engine.persistence_trace()[trace_start..].iter().any(|event| {
+        event.stage == NtfsPersistenceStage::PayloadDataWrite
+    }));
+    expected[unit..3 * unit].fill(0);
+    assert_stream(
+        &engine,
+        file,
+        &[],
+        &expected,
+        (2 * CLUSTER_BYTES) as u64,
+        expected.len() as u64,
+    );
+    assert_eq!(used_clusters(&device), 178);
+    engine.check_clean_consistency(&cx).unwrap();
+}
+
+#[test]
+fn compressed_hole_punch_recovers_data_allocation_and_usn_at_every_cut() {
+    let cx = Cx::for_testing();
+    let cb = CLUSTER_BYTES as u64;
+    let unit = 16 * CLUSTER_BYTES;
+    let original = vec![0xA8; 4 * unit + 11];
+    let (device, mut engine, file) = journal_fixture(&original);
+    engine
+        .set_compression_at(&cx, file, true, DEFAULT_FILETIME)
+        .into_result()
+        .unwrap();
+    let journal_before = journal_records(&engine.volume_view(&cx).unwrap());
+    let mut expected = original.clone();
+    expected[13..3 * unit + 13].fill(0);
+
+    // A failed payload barrier must leave the previously committed compressed
+    // stream authoritative; deferred frees must not become reusable early.
+    device.set_fail_sync_call(Some(1));
+    assert!(matches!(
+        engine.punch_hole_at(&cx, file, &[], 13, (3 * unit) as u64, DEFAULT_FILETIME + 1),
+        NtfsTxOutcome::NotCommitted(_)
+    ));
+    device.set_fail_sync_call(None);
+    assert_stream(&engine, file, &[], &original, 5 * cb, original.len() as u64);
+    assert_eq!(
+        journal_records(&engine.volume_view(&cx).unwrap()),
+        journal_before
+    );
+    engine.check_clean_consistency(&cx).unwrap();
+
+    type Cut = (NtfsPersistenceStage, bool, Vec<u8>, Vec<u8>);
+    let cuts: Arc<Mutex<Vec<Cut>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&cuts);
+    let source = Arc::clone(&device);
+    let mut committed = false;
+    engine.set_stage_hook(Some(Box::new(move |event| {
+        committed |= event.stage == NtfsPersistenceStage::LogCommitBarrier;
+        captured.lock().unwrap().push((
+            event.stage,
+            committed,
+            source.snapshot_durable_only(),
+            source.snapshot_reordered_pending(true),
+        ));
+        Ok(())
+    })));
+    engine
+        .punch_hole_at(&cx, file, &[], 13, (3 * unit) as u64, DEFAULT_FILETIME + 1)
+        .into_result()
+        .unwrap();
+    engine.set_stage_hook(None);
+    let journal_after = assert_punch_record(
+        &engine,
+        file,
+        &journal_before,
+        USN_REASON_DATA_OVERWRITE | USN_REASON_CLOSE,
+        DEFAULT_FILETIME + 1,
+    );
+    let captured = cuts.lock().unwrap();
+    assert!(captured.iter().any(|(_, committed, _, _)| !committed));
+    assert!(captured.iter().any(|(_, committed, _, _)| *committed));
+    for (stage, committed, durable, reordered) in captured.iter() {
+        for (image, may_be_newer) in [(durable, false), (reordered, true)] {
+            let recovered_device = FaultInjectingNtfsDevice::new(image.clone());
+            let recovered = NtfsTransactionEngine::from_device(
+                &cx,
+                Arc::clone(&recovered_device) as Arc<dyn ByteDevice>,
+                0,
+                image.len() as u64 - SECTOR_BYTES as u64,
+                write_options_recover(),
+            )
+            .unwrap_or_else(|error| panic!("compressed punch recovery at {stage:?}: {error}"));
+            let (volume, record) = view(&recovered, file);
+            let stream = volume.data_stream(&cx, &record, &[]).unwrap();
+            let observed = volume.read(&cx, &stream, 0, original.len() + 1).unwrap();
+            let applied = observed == expected;
+            assert!(
+                applied || observed == original,
+                "mixed compressed bytes at {stage:?}"
+            );
+            if *committed || !may_be_newer {
+                assert_eq!(
+                    applied, *committed,
+                    "wrong compressed durable prefix at {stage:?}"
+                );
+            }
+            assert_eq!(stream.size, original.len() as u64);
+            assert_eq!(stream.initialized, original.len() as u64);
+            assert_eq!(stream.allocated, if applied { 3 * cb } else { 5 * cb });
+            assert_eq!(standard_flags(&record) & (0x800 | 0x200), 0x800);
+            assert_eq!(
+                journal_records(&volume).as_slice(),
+                if applied {
+                    journal_after.as_slice()
+                } else {
+                    journal_before.as_slice()
+                }
+            );
+            assert_name_copies(
+                &recovered_device,
+                &recovered,
+                file,
+                if applied { 3 * cb } else { 5 * cb },
+                original.len() as u64,
+            );
+            recovered.check_clean_consistency(&cx).unwrap();
+        }
+    }
+}
+
+#[test]
+fn compressed_hole_punch_rejects_malformed_unit_layout_before_noop_or_writes() {
+    let cx = Cx::for_testing();
+    let unit = 16 * CLUSTER_BYTES;
+    let (device, mut engine, file) = fixture(256, &vec![0x5D; unit]);
+    engine
+        .set_compression_at(&cx, file, true, DEFAULT_FILETIME)
+        .into_result()
+        .unwrap();
+    let (volume, record) = view(&engine, file);
+    let record_start =
+        CLUSTER_BYTES + usize::try_from(file.record).unwrap() * super::RECORD_BYTES;
+    let before = device.snapshot_durable_only();
+    let mut attributes = super::copied_test_record_attributes(
+        &before[record_start..record_start + super::RECORD_BYTES],
+    );
+    let data = attributes
+        .iter_mut()
+        .find(|attribute| u32::from_le_bytes(attribute[..4].try_into().unwrap()) == DATA)
+        .unwrap();
+    let pairs_at = usize::from(u16::from_le_bytes(data[32..34].try_into().unwrap()));
+    let last_vcn = u64::from_le_bytes(data[24..32].try_into().unwrap());
+    let runs = decode_mapping_pairs(
+        &data[pairs_at..],
+        0,
+        last_vcn,
+        volume.geometry.cluster_count(),
+    )
+    .unwrap();
+    assert_eq!(last_vcn, 15);
+    assert_eq!(
+        runs.iter()
+            .filter(|run| run.lcn.is_some())
+            .map(|run| run.clusters)
+            .sum::<u64>(),
+        1
+    );
+    let lcn = runs.iter().find_map(|run| run.lcn).unwrap();
+    // Keep the physical allocation and full unit span intact, but move the
+    // physical prefix after sparse padding. The ordinary reader rejects this.
+    let malformed = [
+        ffs_ondisk::ntfs::NtfsRun {
+            vcn: 0,
+            clusters: 1,
+            lcn: None,
+        },
+        ffs_ondisk::ntfs::NtfsRun {
+            vcn: 1,
+            clusters: 1,
+            lcn: Some(lcn),
+        },
+        ffs_ondisk::ntfs::NtfsRun {
+            vcn: 2,
+            clusters: 14,
+            lcn: None,
+        },
+    ];
+    let (pairs, last_vcn) = ffs_ondisk::ntfs::encode_mapping_pairs(
+        &malformed,
+        0,
+        volume.geometry.cluster_count(),
+    )
+    .unwrap();
+    data.resize((pairs_at + pairs.len()).next_multiple_of(8), 0);
+    data[pairs_at..].fill(0);
+    data[pairs_at..pairs_at + pairs.len()].copy_from_slice(&pairs);
+    let attribute_bytes = u32::try_from(data.len()).unwrap();
+    data[4..8].copy_from_slice(&attribute_bytes.to_le_bytes());
+    data[24..32].copy_from_slice(&last_vcn.to_le_bytes());
+    let changed = super::build_file_record(
+        u32::try_from(file.record).unwrap(),
+        file.sequence,
+        record.hard_links,
+        false,
+        &attributes,
+    );
+    device
+        .write_all_at(&cx, ffs_types::ByteOffset(record_start as u64), &changed)
+        .unwrap();
+    device.sync(&cx).unwrap();
+    let (volume, record) = view(&engine, file);
+    assert!(matches!(
+        volume.data_stream(&cx, &record, &[]),
+        Err(FfsError::Corruption { .. })
+    ));
+
+    let before = device.snapshot_durable_only();
+    let writes = device.write_bytes_total();
+    let events = engine.persistence_trace().len();
+    for (offset, length) in [(unit as u64, 1), (0, unit as u64)] {
+        let outcome = engine.punch_hole_at(
+            &cx,
+            file,
+            &[],
+            offset,
+            length,
+            DEFAULT_FILETIME + 1,
+        );
+        assert!(
+            matches!(outcome, NtfsTxOutcome::NotCommitted(FfsError::Corruption { .. })),
+            "malformed compressed mapping must be refused before publication: {outcome:?}"
+        );
+        assert_eq!(device.write_bytes_total(), writes);
+        assert_eq!(engine.persistence_trace().len(), events);
+        assert_eq!(device.snapshot_live(), before);
+        assert_eq!(device.snapshot_durable_only(), before);
+    }
+}
+
+#[test]
 fn hole_punch_reclaims_clusters_preserves_hard_links_and_native_metadata() {
     let cx = Cx::for_testing();
     let cb = CLUSTER_BYTES as u64;
@@ -975,9 +1413,9 @@ fn hole_punch_fsops_updates_the_active_native_change_journal() {
 }
 
 #[test]
-fn hole_punch_refuses_transformed_files_before_writes_or_noop_acknowledgment() {
+fn hole_punch_refuses_provider_and_encrypted_files_before_writes_or_noop_acknowledgment() {
     let cx = Cx::for_testing();
-    for transform in ["reparse", "encrypted", "compressed"] {
+    for transform in ["reparse", "encrypted"] {
         let (device, mut engine, file) = journal_fixture(&vec![0x4B; 3 * CLUSTER_BYTES]);
         match transform {
             "reparse" => {
@@ -995,12 +1433,6 @@ fn hole_punch_refuses_transformed_files_before_writes_or_noop_acknowledgment() {
                 let key = NtfsEfsKey::from_raw_bytes([0x37; 32]);
                 engine
                     .encrypt_file_at(&cx, file, &key, DEFAULT_FILETIME)
-                    .into_result()
-                    .unwrap();
-            }
-            "compressed" => {
-                engine
-                    .set_compression_at(&cx, file, true, DEFAULT_FILETIME)
                     .into_result()
                     .unwrap();
             }
@@ -1033,6 +1465,70 @@ fn hole_punch_refuses_transformed_files_before_writes_or_noop_acknowledgment() {
             assert_eq!(journal_records(&engine.volume_view(&cx).unwrap()), journal);
         }
     }
+}
+
+#[test]
+fn compressed_hole_punch_fsops_publishes_native_usn_and_invalidates_read_cache() {
+    let cx = Cx::for_testing();
+    let unit = 16 * CLUSTER_BYTES;
+    let mut expected = vec![0x79; 3 * unit];
+    let (device, mut engine, file) = journal_fixture(&expected);
+    engine
+        .set_compression_at(&cx, file, true, DEFAULT_FILETIME)
+        .into_result()
+        .unwrap();
+    let before = journal_records(&engine.volume_view(&cx).unwrap());
+    let fs = NtfsFs::from_engine(&cx, engine, 1000, 1000).unwrap();
+    let mut scope = RequestScope::empty();
+    let attr = fs
+        .lookup(&cx, &mut scope, InodeNumber(1), OsStr::new("punch.bin"))
+        .unwrap();
+    assert_eq!(
+        fs.read(&cx, &mut scope, attr.ino, 0, expected.len() as u32).unwrap(),
+        expected
+    );
+    fs.fallocate(
+        &cx,
+        &mut scope,
+        attr.ino,
+        unit as u64 - 7,
+        unit as u64 + 14,
+        libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+    )
+    .unwrap();
+    expected[unit - 7..2 * unit + 7].fill(0);
+    assert_eq!(
+        fs.read(&cx, &mut scope, attr.ino, 0, expected.len() as u32).unwrap(),
+        expected
+    );
+    assert_eq!(
+        fs.getattr(&cx, &mut scope, attr.ino).unwrap().size,
+        expected.len() as u64
+    );
+
+    let image = device.snapshot_durable_only();
+    let volume = NtfsVolume::from_device(
+        &cx,
+        Box::new(FaultInjectingNtfsDevice::new(image.clone())),
+        0,
+        image.len() as u64 - SECTOR_BYTES as u64,
+    )
+    .unwrap();
+    let record = volume.record(&cx, file.record, Some(file.sequence)).unwrap();
+    let stream = volume.data_stream(&cx, &record, &[]).unwrap();
+    assert_eq!(
+        volume.read(&cx, &stream, 0, expected.len()).unwrap(),
+        expected
+    );
+    assert_eq!(stream.allocated, (2 * CLUSTER_BYTES) as u64);
+    assert_eq!(standard_flags(&record) & (0x800 | 0x200), 0x800);
+    let records = journal_records(&volume);
+    assert_eq!(records.len(), before.len() + 1);
+    assert_eq!(&records[..before.len()], before.as_slice());
+    let event = records.last().unwrap();
+    assert_eq!(event.file_ref, file);
+    assert_eq!(event.reason, USN_REASON_DATA_OVERWRITE | USN_REASON_CLOSE);
+    assert_eq!(standard_usn(&record), event.usn);
 }
 
 #[test]
