@@ -83,6 +83,46 @@ const DMU_OTN_UINT64_METADATA: u8 = 195;
 const DMU_OTN_ZAP_METADATA: u8 = 196;
 const DMU_POOL_TRIM_PROGRESS_KEY: &[u8] = b"vdev_trim_progress";
 
+/// Physical TRIM is admitted only for the allocator's own top-level vdev.
+/// Ordinary RAIDZ maps complete logical rows onto equal per-child spans. Partial
+/// rows are deliberately retained: allocation-only parity padding and the RAIDZ1
+/// parity/address swap must never turn a neighboring allocation into a discard.
+struct TrimGeometry {
+    members: Vec<usize>,
+    sector: u64,
+    row_bytes: u64,
+    divisor: u64,
+    asize: u64,
+    vdev_guid: u64,
+}
+
+impl TrimGeometry {
+    fn physical_range(&self, start: u64, end: u64) -> Result<Option<std::ops::Range<u64>>> {
+        if start > end
+            || end > self.asize
+            || !start.is_multiple_of(self.sector)
+            || !end.is_multiple_of(self.sector)
+        {
+            return Err(corrupt("invalid logical free extent for ZFS TRIM"));
+        }
+        let first = start
+            .div_ceil(self.row_bytes)
+            .checked_mul(self.row_bytes)
+            .ok_or_else(|| corrupt("ZFS TRIM row alignment overflow"))?;
+        let last = end / self.row_bytes * self.row_bytes;
+        if first >= last {
+            return Ok(None);
+        }
+        let physical_start = DATA_OFFSET
+            .checked_add(first / self.divisor)
+            .ok_or_else(|| corrupt("ZFS TRIM physical start overflow"))?;
+        let physical_end = DATA_OFFSET
+            .checked_add(last / self.divisor)
+            .ok_or_else(|| corrupt("ZFS TRIM physical end overflow"))?;
+        Ok(Some(physical_start..physical_end))
+    }
+}
+
 /// Kind of top-level vdev to create via [`create_pool_on_devices`] / [`create_pool_files`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum ZfsCreateVdevKind {
@@ -173,7 +213,9 @@ pub struct ZfsLifecycleReport {
 /// Summary returned by resumable [`ZfsTransactionEngine::trim_pool`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ZfsTrimReport {
+    /// Successful physical discard operations in this chunk, including replicas.
     pub ranges_trimmed: u64,
+    /// Bytes actually discarded in this chunk, summed across selected members.
     pub bytes_trimmed: u64,
     pub cursor_offset: u64,
     pub completed: bool,
@@ -2402,13 +2444,136 @@ impl ZfsTransactionEngine {
         )
     }
 
-    /// Resumable pool TRIM across free metaslab extents!
+    #[allow(clippy::too_many_lines)]
+    fn trim_geometry(
+        &self,
+        cx: &Cx,
+        mos: &mut crate::reader::dmu::Objects,
+    ) -> Result<TrimGeometry> {
+        use crate::reader::pool::vdev::{PoolTopology, TopVdevKind, VdevHealth};
+
+        if self.current_uberblock.raidz_reflow_info != 0 {
+            return Err(unsupported(
+                "ZFS TRIM requires a completed ordinary vdev layout",
+            ));
+        }
+        let config = mos.load_mos_config_nvlist(cx)?;
+        if self.storage_identity.member_guids.len() != self.pool.leaves().len() {
+            return Err(corrupt("ZFS TRIM admitted member count has changed"));
+        }
+        let mut supplied_guids = Vec::with_capacity(self.pool.leaves().len());
+        for (member_index, leaf) in self.pool.leaves().iter().enumerate() {
+            let label = leaf.label(cx, 0)?;
+            if label.config.unsigned("pool_guid") != Some(self.storage_identity.pool_guid) {
+                return Err(corrupt("ZFS TRIM member belongs to another pool"));
+            }
+            let guid = label
+                .config
+                .unsigned("guid")
+                .ok_or_else(|| corrupt("ZFS TRIM member has no native GUID"))?;
+            if guid == 0 || supplied_guids.contains(&guid) {
+                return Err(corrupt("ZFS TRIM member GUIDs are zero or duplicated"));
+            }
+            if guid != self.storage_identity.member_guids[member_index] {
+                return Err(corrupt("ZFS TRIM admitted member identity has changed"));
+            }
+            supplied_guids.push(guid);
+        }
+        let topology = PoolTopology::from_mos_config(&config, &supplied_guids)?;
+        if topology.pool_guid != self.storage_identity.pool_guid {
+            return Err(corrupt("ZFS TRIM MOS belongs to another pool"));
+        }
+        let top = topology
+            .top_vdev(self.allocator.vdev_id)
+            .ok_or_else(|| corrupt("ZFS TRIM allocator vdev is absent"))?;
+        if !top.is_complete()
+            || !top.health.is_healthy()
+            || top.nonallocating
+            || !matches!(
+                top.alloc_class,
+                AllocClass::Normal | AllocClass::Special | AllocClass::Dedup
+            )
+        {
+            return Err(unsupported(
+                "ZFS TRIM requires the complete healthy allocating vdev",
+            ));
+        }
+        if top.ashift != self.allocator.ashift || !(9..=16).contains(&top.ashift) || top.asize == 0
+        {
+            return Err(corrupt("ZFS TRIM allocator and vdev geometry disagree"));
+        }
+        let tree = config
+            .list("vdev_tree")
+            .and_then(|root| root.fields.get("children"))
+            .and_then(|children| match children {
+                Value::Lists(children) => children.get(self.allocator.vdev_id as usize),
+                _ => None,
+            })
+            .ok_or_else(|| corrupt("ZFS TRIM allocator vdev tree is absent"))?;
+        if let Some(children) = tree.fields.get("children") {
+            let Value::Lists(children) = children else {
+                return Err(corrupt("ZFS TRIM children are not a native vdev array"));
+            };
+            if children.iter().any(|child| {
+                !matches!(child.text("type"), Some("file" | "disk"))
+                    || !VdevHealth::from_vdev_tree(child).is_healthy()
+            }) {
+                return Err(unsupported(
+                    "ZFS TRIM requires healthy direct physical children",
+                ));
+            }
+        }
+        let divisor = match (&top.kind, &self.allocator.write_topology) {
+            (TopVdevKind::Leaf | TopVdevKind::Mirror, AllocatorWriteTopology::LeafOrMirror) => 1,
+            (
+                TopVdevKind::Raidz {
+                    parity,
+                    expanded: None,
+                },
+                AllocatorWriteTopology::Raidz {
+                    parity: allocated_parity,
+                    width,
+                },
+            ) if parity == allocated_parity
+                && *width == top.supplied_indices.len()
+                && !tree.fields.contains_key("raidz_expand_txgs")
+                && !tree.fields.contains_key("raidz_expanding") =>
+            {
+                u64::try_from(*width).map_err(|_| corrupt("ZFS TRIM RAIDZ width overflow"))?
+            }
+            _ => {
+                return Err(unsupported(
+                    "ZFS TRIM requires leaf, mirror, or ordinary unexpanded RAIDZ allocation",
+                ));
+            }
+        };
+        let members = top
+            .supplied_indices
+            .iter()
+            .copied()
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| corrupt("ZFS TRIM member routing is incomplete"))?;
+        let sector = 1_u64 << top.ashift;
+        let row_bytes = sector
+            .checked_mul(divisor)
+            .ok_or_else(|| corrupt("ZFS TRIM row size overflow"))?;
+        Ok(TrimGeometry {
+            members,
+            sector,
+            row_bytes,
+            divisor,
+            asize: top.asize,
+            vdev_guid: top.guid,
+        })
+    }
+
+    /// Resumable TRIM of free extents owned by the selected native allocator.
     ///
-    /// Persists `[cursor_offset, total_bytes_trimmed, completed_flag]` in MOS
-    /// directory ZAP entry `"vdev_trim_progress"` so an interrupted TRIM resumes
-    /// deterministically, checks `supports_discard_raw()` before issuing
-    /// `discard_raw`, and cleanly reports `EOPNOTSUPP` devices in
-    /// `ZfsTrimReport::unsupported_members` without failing pool durability.
+    /// Leaf and mirror offsets are direct; ordinary RAIDZ discards only whole
+    /// logical rows. Other vdevs, auxiliary devices, partial RAIDZ rows, and
+    /// checkpoint-retained allocations are never discarded. Expanded RAIDZ and
+    /// dRAID require separate native mappings and refuse before any discard or publication.
+    /// Progress is bound to the top-level GUID; old unbound progress restarts.
     #[allow(clippy::too_many_lines)]
     pub fn trim_pool(
         &mut self,
@@ -2416,146 +2581,234 @@ impl ZfsTransactionEngine {
         max_ranges_per_txg: usize,
         reset_cursor: bool,
     ) -> ZfsTxOutcome<ZfsTrimReport> {
+        if self.requires_recovery() {
+            return ZfsTxOutcome::NotCommitted(unsupported(
+                "ZFS TRIM requires recovery of the uncertain writer before using allocation maps",
+            ));
+        }
         if max_ranges_per_txg == 0 {
             return ZfsTxOutcome::NotCommitted(unsupported("max_ranges_per_txg must be >= 1"));
         }
+        let Some(next_txg) = self.committed_txg.checked_add(1) else {
+            return ZfsTxOutcome::NotCommitted(corrupt("ZFS TXG counter overflow"));
+        };
         let mut mos = match self.open_read_objects(cx) {
             Ok(m) => m,
+            Err(err) => return ZfsTxOutcome::NotCommitted(err),
+        };
+        let geometry = match self.trim_geometry(cx, &mut mos) {
+            Ok(geometry) => geometry,
             Err(err) => return ZfsTxOutcome::NotCommitted(err),
         };
         let dir = match mos.zap_values(cx, 1) {
             Ok(d) => d,
             Err(err) => return ZfsTxOutcome::NotCommitted(err),
         };
-        let (mut cursor, mut cumulative_bytes) = if reset_cursor {
-            (0_u64, 0_u64)
-        } else if let Some(entry) = dir.iter().find(|e| e.name == DMU_POOL_TRIM_PROGRESS_KEY)
-            && entry.values.len() >= 2
-        {
-            (entry.values[0], entry.values[1])
-        } else {
-            (0_u64, 0_u64)
+        let progress = dir
+            .iter()
+            .find(|entry| entry.name == DMU_POOL_TRIM_PROGRESS_KEY);
+        let (mut cursor, cumulative_bytes) = match progress.filter(|_| !reset_cursor) {
+            Some(entry)
+                if entry.integer_bytes != 8
+                    || !matches!(entry.values.len(), 3 | 4)
+                    || entry.values[2] > 1 =>
+            {
+                return ZfsTxOutcome::NotCommitted(corrupt("invalid native ZFS TRIM progress"));
+            }
+            Some(entry) if entry.values.get(3) == Some(&geometry.vdev_guid) => {
+                if entry.values[0] > geometry.asize
+                    || !entry.values[0].is_multiple_of(geometry.sector)
+                {
+                    return ZfsTxOutcome::NotCommitted(corrupt(
+                        "ZFS TRIM progress is outside its allocating vdev",
+                    ));
+                }
+                (entry.values[0], entry.values[1])
+            }
+            // A legacy cursor or another vdev's cursor cannot skip this domain.
+            _ => (0, 0),
         };
 
-        // Collect all currently FREE extents strictly above `cursor` across all metaslabs.
         let mut free_extents = Vec::new();
+        let mut previous_end = 0;
         for ms in &self.allocator.metaslabs {
+            let Some(ms_end) = ms.start.checked_add(ms.size) else {
+                return ZfsTxOutcome::NotCommitted(corrupt("ZFS TRIM metaslab end overflow"));
+            };
+            if ms.start < previous_end || ms_end > geometry.asize {
+                return ZfsTxOutcome::NotCommitted(corrupt(
+                    "ZFS TRIM metaslabs overlap or exceed vdev",
+                ));
+            }
             let mut pos = ms.start;
-            let ms_end = ms.start + ms.size;
-            for alloc_r in ms.final_map.ranges() {
-                if alloc_r.start > pos {
-                    free_extents.push(pos..alloc_r.start);
+            for allocated in ms.final_map.ranges() {
+                if allocated.start < pos
+                    || allocated.end < allocated.start
+                    || allocated.end > ms_end
+                {
+                    return ZfsTxOutcome::NotCommitted(corrupt(
+                        "invalid ZFS TRIM allocation extent",
+                    ));
                 }
-                pos = alloc_r.end;
+                if allocated.start > pos && allocated.start > cursor {
+                    free_extents.push(pos.max(cursor)..allocated.start);
+                }
+                pos = allocated.end;
             }
-            if pos < ms_end {
-                free_extents.push(pos..ms_end);
+            if pos < ms_end && ms_end > cursor {
+                free_extents.push(pos.max(cursor)..ms_end);
             }
+            previous_end = ms_end;
         }
-        free_extents.retain(|r| r.end > cursor);
 
-        let member_count = self.pool.leaves().len();
+        // Prove every selected physical range and member before the first
+        // destructive operation. A later bad member must not leave a partial
+        // discard plan behind, or silently advance a cursor past untrimmed data.
+        let completed = free_extents.len() <= max_ranges_per_txg;
+        let mut ranges = Vec::new();
+        for range in free_extents.into_iter().take(max_ranges_per_txg) {
+            let physical = match geometry.physical_range(range.start, range.end) {
+                Ok(physical) => physical,
+                Err(err) => return ZfsTxOutcome::NotCommitted(err),
+            };
+            if let Some(physical) = physical {
+                for &member in &geometry.members {
+                    let Some(leaf) = self.pool.leaves().get(member) else {
+                        return ZfsTxOutcome::NotCommitted(corrupt("ZFS TRIM member is absent"));
+                    };
+                    let data_end = match label_offsets(leaf.length_bytes()) {
+                        Ok(offsets) => offsets[2],
+                        Err(err) => return ZfsTxOutcome::NotCommitted(parse_err(&err)),
+                    };
+                    if physical.start < DATA_OFFSET || physical.end > data_end {
+                        return ZfsTxOutcome::NotCommitted(corrupt(
+                            "ZFS TRIM free extent overlaps reserved labels or exceeds its member",
+                        ));
+                    }
+                }
+                ranges.push(physical);
+            }
+            cursor = range.end;
+        }
+
+        let maximum_bytes = ranges.iter().try_fold(0_u64, |total, range| {
+            let len = range.end - range.start;
+            usize::try_from(len).map_err(|_| corrupt("ZFS TRIM length exceeds host size"))?;
+            let copies = u64::try_from(geometry.members.len())
+                .map_err(|_| corrupt("ZFS TRIM member count overflow"))?;
+            len.checked_mul(copies)
+                .and_then(|bytes| total.checked_add(bytes))
+                .ok_or_else(|| corrupt("ZFS TRIM byte accounting overflow"))
+        });
+        let maximum_bytes = match maximum_bytes {
+            Ok(bytes) => bytes,
+            Err(err) => return ZfsTxOutcome::NotCommitted(err),
+        };
+        if cumulative_bytes.checked_add(maximum_bytes).is_none() {
+            return ZfsTxOutcome::NotCommitted(corrupt("ZFS TRIM cumulative byte count overflow"));
+        }
+
+        let pool = self.pool.clone();
+        let mut protection = match pool.defer_protection(cx) {
+            Ok(holds) => holds,
+            Err(err) => return ZfsTxOutcome::NotCommitted(err),
+        };
         let mut supported_members = 0_usize;
         let mut unsupported_members = 0_usize;
-        let mut member_supports = vec![false; member_count];
-        for (m_idx, leaf) in self.pool.leaves().iter().enumerate() {
-            if leaf.supports_discard_raw() {
-                member_supports[m_idx] = true;
+        let mut member_supports = Vec::with_capacity(geometry.members.len());
+        for &member in &geometry.members {
+            let supported = pool.leaves()[member].supports_discard_raw();
+            member_supports.push(supported);
+            if supported {
                 supported_members += 1;
             } else {
                 unsupported_members += 1;
             }
         }
 
-        let next_txg = self.committed_txg.saturating_add(1);
         let mut trimmed_ranges = 0_u64;
-        let mut trimmed_bytes_chunk = 0_u64;
-        let mut reached_end = true;
-
-        for range in &free_extents {
-            if let Err(err) = checkpoint(cx) {
-                return ZfsTxOutcome::NotCommitted(err);
-            }
-            if trimmed_ranges as usize >= max_ranges_per_txg {
-                reached_end = false;
-                break;
-            }
-            let start = range.start.max(cursor);
-            let len = range.end.saturating_sub(start);
-            if len == 0 {
-                continue;
-            }
-            let phys_off = DATA_OFFSET + start;
-            for (m_idx, supports_discard) in
-                member_supports.iter_mut().enumerate().take(member_count)
-            {
+        let mut trimmed_bytes = 0_u64;
+        for physical in ranges {
+            let len = physical.end - physical.start;
+            let Ok(event_len) = usize::try_from(len) else {
+                return ZfsTxOutcome::NotCommitted(corrupt("ZFS TRIM length exceeds host size"));
+            };
+            for (&member, supports_discard) in geometry.members.iter().zip(&mut member_supports) {
                 if !*supports_discard {
                     continue;
                 }
-                if phys_off + len > self.pool.leaves()[m_idx].length_bytes() - 2 * LABEL_BYTES {
-                    continue;
+                if let Err(err) = checkpoint(cx) {
+                    return ZfsTxOutcome::NotCommitted(err);
                 }
                 if let Err(err) = self.emit_event(
                     "zfs_pool_trim",
                     ZfsPersistenceStage::TrimDiscard {
-                        member_index: m_idx,
+                        member_index: member,
                     },
                     next_txg,
-                    m_idx,
-                    phys_off,
-                    usize::try_from(len).unwrap_or(usize::MAX),
+                    member,
+                    physical.start,
+                    event_len,
                 ) {
                     return ZfsTxOutcome::NotCommitted(err);
                 }
-                match self.pool.leaves()[m_idx].discard_raw(cx, phys_off, len) {
-                    Ok(()) => {}
-                    Err(FfsError::Io(e))
-                        if e.raw_os_error().is_some_and(|code| {
+                match pool.leaves()[member].discard_raw(cx, physical.start, len) {
+                    Ok(()) => {
+                        trimmed_ranges += 1;
+                        trimmed_bytes += len;
+                    }
+                    Err(FfsError::Io(error))
+                        if error.raw_os_error().is_some_and(|code| {
                             code == libc::EOPNOTSUPP || code == libc::ENOSYS
                         }) =>
                     {
                         *supports_discard = false;
-                        supported_members = supported_members.saturating_sub(1);
+                        supported_members -= 1;
                         unsupported_members += 1;
                     }
                     Err(err) => return ZfsTxOutcome::NotCommitted(err),
                 }
             }
-            cursor = range.end;
-            trimmed_ranges += 1;
-            trimmed_bytes_chunk = trimmed_bytes_chunk.saturating_add(len);
         }
-        cumulative_bytes = cumulative_bytes.saturating_add(trimmed_bytes_chunk);
-
-        let final_cursor = cursor;
-        let final_completed = reached_end;
-        self.execute_staged_txg_typed(
+        let total_bytes = cumulative_bytes + trimmed_bytes;
+        let outcome = self.execute_staged_txg_typed(
             cx,
             "zfs_pool_trim",
             |mos, _mos_dirty, _features, alloc, txg, _staged| {
                 let mut entries = mos.zap_values(cx, 1)?;
-                entries.retain(|e| e.name != DMU_POOL_TRIM_PROGRESS_KEY);
+                entries.retain(|entry| entry.name != DMU_POOL_TRIM_PROGRESS_KEY);
                 entries.push(RawZapEntry {
                     name: DMU_POOL_TRIM_PROGRESS_KEY.to_vec(),
                     integer_bytes: 8,
-                    values: vec![final_cursor, cumulative_bytes, u64::from(final_completed)],
+                    values: vec![
+                        cursor,
+                        total_bytes,
+                        u64::from(completed),
+                        geometry.vdev_guid,
+                    ],
                     collision: 0,
                 });
                 alloc.pending_mos_directory = Some(entries);
                 Ok((
                     ZfsTrimReport {
                         ranges_trimmed: trimmed_ranges,
-                        bytes_trimmed: trimmed_bytes_chunk,
-                        cursor_offset: final_cursor,
-                        completed: final_completed,
+                        bytes_trimmed: trimmed_bytes,
+                        cursor_offset: cursor,
+                        completed,
                         supported_members,
                         unsupported_members,
                         txg,
                     },
-                    final_cursor,
+                    cursor,
                 ))
             },
-        )
+        );
+        if outcome.is_committed() {
+            for hold in &mut protection {
+                hold.complete();
+            }
+        }
+        outcome
     }
 
     /// Resumable top-level vdev removal (`com.delphix:device_removal` +
@@ -3553,4 +3806,98 @@ fn write_mos_config_nvlist(
     let mos_meta = mos.meta_dnode().clone();
     let mos_ceil = mos.root_birth_txg();
     put_dnode_in_table(cx, mos, &mos_meta, mos_ceil, mos_dirty, cfg_id, &out.dnode)
+}
+
+#[cfg(test)]
+mod trim_tests {
+    use super::*;
+
+    fn geometry(width: u64, ashift: u8) -> TrimGeometry {
+        TrimGeometry {
+            members: Vec::new(),
+            sector: 1_u64 << ashift,
+            row_bytes: width << ashift,
+            divisor: width,
+            asize: 64 * 1024 * 1024,
+            vdev_guid: 1,
+        }
+    }
+
+    #[test]
+    fn trim_rounds_raidz_free_ranges_inward_and_rejects_invalid_geometry() {
+        let map = geometry(3, 12);
+        assert_eq!(map.physical_range(4096, 8192).unwrap(), None);
+        assert_eq!(
+            map.physical_range(4096, 49_152).unwrap(),
+            Some(DATA_OFFSET + 4096..DATA_OFFSET + 16_384)
+        );
+        assert_eq!(map.physical_range(12_288, 12_288).unwrap(), None);
+        assert!(map.physical_range(1, 4096).is_err());
+        assert!(map.physical_range(8192, 4096).is_err());
+        assert!(map.physical_range(0, map.asize + 4096).is_err());
+
+        let leaf = geometry(1, 12);
+        assert_eq!(
+            leaf.physical_range(4096, 8192).unwrap(),
+            Some(DATA_OFFSET + 4096..DATA_OFFSET + 8192)
+        );
+    }
+
+    #[test]
+    fn trim_whole_rows_never_overlap_ordinary_raidz_allocation_or_skip_sectors() {
+        for parity in 1..=3 {
+            for width in [parity + 1, parity + 3, 13] {
+                for ashift in [9, 12] {
+                    let geometry = geometry(u64::try_from(width).unwrap(), ashift);
+                    let sector = 1_u64 << ashift;
+                    for offset in [
+                        0,
+                        sector,
+                        17 * sector,
+                        (1 << 20) - sector,
+                        1 << 20,
+                        (1 << 20) + sector,
+                    ] {
+                        for physical_bytes in [512, 4096, 65_536, 131_072, 1_048_576] {
+                            let (allocated_bytes, columns) = if parity == 1 {
+                                let map =
+                                    Raidz1Map::new_wide(offset, physical_bytes, ashift, width)
+                                        .unwrap();
+                                (map.allocated_bytes(), map.columns().to_vec())
+                            } else {
+                                let map = RaidzParityMap::new_wide(
+                                    offset,
+                                    physical_bytes,
+                                    ashift,
+                                    width,
+                                    parity,
+                                )
+                                .unwrap();
+                                (map.allocated_bytes(), map.columns().to_vec())
+                            };
+                            for (start, end) in
+                                [(0, offset), (offset + allocated_bytes, geometry.asize)]
+                            {
+                                if let Some(trim) = geometry.physical_range(start, end).unwrap() {
+                                    for column in &columns {
+                                        let used_start = DATA_OFFSET + column.offset;
+                                        let used_end = used_start
+                                            + u64::try_from(column.allocated_bytes).unwrap();
+                                        assert!(
+                                            used_start == used_end
+                                                || trim.end <= used_start
+                                                || used_end <= trim.start,
+                                            "TRIM overlaps RAIDZ{parity}/{width} allocation: \
+                                             offset={offset}, psize={physical_bytes}, \
+                                             column={column:?}, trim={trim:?}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
