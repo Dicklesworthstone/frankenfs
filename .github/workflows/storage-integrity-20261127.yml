@@ -1,0 +1,186 @@
+name: Storage integrity validation 20261127
+
+on:
+  push:
+    branches: [validation/storage-integrity-20261127]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: storage-integrity-20261127
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: never
+  RUSTUP_TOOLCHAIN: nightly-2026-08-31
+  CARGO_BUILD_JOBS: "1"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: "-Z threads=1 -Z no-parallel-backend"
+  CFLAGS: "-g0 -O2"
+  CARGO_HTTP_USER_AGENT: "frankenfs-agent (+https://github.com/Dicklesworthstone/frankenfs)"
+  FFS_REQUIRE_ORACLES: "1"
+
+jobs:
+  validate:
+    name: Storage integrity / ${{ matrix.lane }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [gates, tests]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install pinned compiler and native image oracles
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ffs-storage-logs"
+          printf 'CARGO_TARGET_DIR=%s\nCARGO_BUILD_BUILD_DIR=%s\n' "$RUNNER_TEMP/ffs-storage-target" "$RUNNER_TEMP/ffs-storage-target" >> "$GITHUB_ENV"
+          rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends e2fsprogs btrfs-progs ntfs-3g zfsutils-linux pkg-config
+          export PATH="/usr/sbin:/sbin:$PATH"
+          printf '%s\n' "/usr/sbin" "/sbin" >> "$GITHUB_PATH"
+          for tool in mke2fs mkfs.ext4 e2fsck mkfs.btrfs mkfs.ntfs ntfscat ntfsinfo zdb; do
+            command -v "$tool"
+          done
+          validation_swap=$(sudo mktemp /mnt/ffs-storage-XXXXXX.swap)
+          sudo fallocate -l 12G "$validation_swap"
+          sudo chmod 0600 "$validation_swap"
+          sudo mkswap "$validation_swap"
+          sudo swapon "$validation_swap"
+          free -h
+          df -h .
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ffs-storage-registry-v1
+          shared-key: nightly-2026-08-31
+          cache-targets: "false"
+          cache-bin: "false"
+          cache-on-failure: "true"
+
+      - name: Record exact candidate source and compiler
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git rev-parse HEAD HEAD^{tree} | tee "$RUNNER_TEMP/ffs-storage-logs/source.txt"
+          rustc -Vv | tee "$RUNNER_TEMP/ffs-storage-logs/toolchain.txt"
+          git diff --check
+          test -z "$(git status --porcelain)"
+
+      - name: Workspace formatting
+        if: ${{ !cancelled() && matrix.lane == 'gates' }}
+        run: |
+          set -euo pipefail
+          cargo fmt --check 2>&1 | tee "$RUNNER_TEMP/ffs-storage-logs/fmt.log"
+
+      - name: Workspace compiler check
+        if: ${{ !cancelled() && matrix.lane == 'gates' }}
+        run: |
+          set -euo pipefail
+          cargo check --locked --workspace --all-targets 2>&1 | tee "$RUNNER_TEMP/ffs-storage-logs/check.log"
+
+      - name: Workspace strict Clippy
+        if: ${{ !cancelled() && matrix.lane == 'gates' }}
+        run: |
+          set -euo pipefail
+          cargo clippy --locked --workspace --all-targets -- -D warnings 2>&1 | tee "$RUNNER_TEMP/ffs-storage-logs/clippy.log"
+
+      - name: Prepare executed-suite verification
+        if: ${{ !cancelled() && matrix.lane == 'tests' }}
+        run: |
+          cat > "$RUNNER_TEMP/ffs-run-storage-suite.sh" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          suite="$1"
+          shift
+          logs="$RUNNER_TEMP/ffs-storage-logs"
+          inventory="$logs/$suite.inventory.log"
+          output="$logs/$suite.log"
+          "$@" -- --include-ignored --list 2>&1 | tee "$inventory"
+          case "$suite" in
+            ntfs)
+              required=(
+                punch::compressed_hole_punch_reclaims_units_preserves_links_streams_and_eof
+                punch::compressed_hole_punch_large_sparse_tail_preserves_valid_data_length
+                punch::compressed_hole_punch_recovers_data_allocation_and_usn_at_every_cut
+                punch::compressed_hole_punch_rejects_malformed_unit_layout_before_noop_or_writes
+              )
+              test "$(grep -c '^punch::compressed_hole_punch_.*: test$' "$inventory")" -ge 6
+              ;;
+            zfs)
+              required=(
+                pool_lifecycle::checkpoint_metadata_retirements_survive_reopen_and_discard
+                pool_lifecycle::checkpoint_foreground_frees_preserve_scan_and_trim_state_after_restart
+                native_openzfs_zdb_oracle_verifies_committed_pool_and_space_maps
+              )
+              ;;
+            core)
+              required=(
+                tests::native_freshness_cancelled_final_seal_releases_guard_and_fences_escaped_writes
+                tests::native_freshness_nested_abort_cannot_be_sealed_by_another_guard
+                tests::native_freshness_nested_completion_and_write_free_abort_preserve_publication
+                tests::native_freshness_shared_device_deferral_holds_protection_until_native_completion
+                tests::native_freshness_shared_and_format_guards_share_one_abortable_epoch
+              )
+              ;;
+            *) exit 2 ;;
+          esac
+          for name in "${required[@]}"; do
+            grep -Fx "$name: test" "$inventory"
+          done
+          "$@" -- --include-ignored --nocapture --test-threads=1 2>&1 | tee "$output"
+          python3 - "$inventory" "$output" <<'PY'
+          import pathlib, re, sys
+          inventory = pathlib.Path(sys.argv[1]).read_text()
+          output = pathlib.Path(sys.argv[2]).read_text()
+          selected = re.findall(r'^(.+): test$', inventory, re.M)
+          assert selected and len(selected) == len(set(selected)), selected
+          summaries = re.findall(r'test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;', output)
+          assert summaries == [(str(len(selected)), '0', '0')], (len(selected), summaries)
+          assert not re.search(r'^\s*SKIP(?:\||:)', output, re.I | re.M), output
+          print(f'EXECUTED_SUITE_PASS|selected={len(selected)}|passed={len(selected)}|ignored=0')
+          PY
+          SH
+
+      - name: Complete NTFS persistence and transform suite
+        if: ${{ !cancelled() && matrix.lane == 'tests' }}
+        run: bash "$RUNNER_TEMP/ffs-run-storage-suite.sh" ntfs cargo test --locked -p ffs-ntfs --test persistence_prefix
+
+      - name: Complete ZFS persistence and pool lifecycle suite
+        if: ${{ !cancelled() && matrix.lane == 'tests' }}
+        run: bash "$RUNNER_TEMP/ffs-run-storage-suite.sh" zfs cargo test --locked -p ffs-zfs --test persistence_prefix
+
+      - name: Native repair freshness and cancellation suite
+        if: ${{ !cancelled() && matrix.lane == 'tests' }}
+        run: bash "$RUNNER_TEMP/ffs-run-storage-suite.sh" core cargo test --locked -p ffs-core --lib native_freshness_
+
+      - name: Confirm candidate source stayed unchanged
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git diff --check
+          test -z "$(git status --porcelain)"
+
+      - name: Retain compiler and executed-test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: storage-integrity-${{ matrix.lane }}-${{ github.sha }}
+          path: ${{ runner.temp }}/ffs-storage-logs/
+          if-no-files-found: error
+          retention-days: 7
