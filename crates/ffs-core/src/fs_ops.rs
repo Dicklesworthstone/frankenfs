@@ -5309,6 +5309,7 @@ impl FsOps for OpenFs {
         Ok(RequestScope {
             snapshot,
             tx,
+            fixed_snapshot: false,
             read_snapshot_pinned,
             commit_mode: RequestCommitMode::PerRequest,
             isolation_mode,
