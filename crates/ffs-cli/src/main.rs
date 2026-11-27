@@ -11724,7 +11724,7 @@ fn mkfs_cmd(
 ) -> Result<()> {
     if !delegate_host_mkfs {
         bail!(
-            "ffs mkfs delegates ext4 volume creation to host mkfs.ext4; pass --delegate-host-mkfs to authorize external tool execution (or use `ffs format --filesystem fat16|fat32` for pure-Rust formatting)"
+            "ffs mkfs delegates ext4 volume creation to host mkfs.ext4; pass --delegate-host-mkfs to authorize external tool execution (or use `ffs format --filesystem fat16|fat32|ntfs|zfs` for pure-Rust formatting)"
         );
     }
     mkfs_cmd_with_program(
