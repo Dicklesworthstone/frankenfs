@@ -3036,6 +3036,7 @@ mod bd_tqrnc {
             parent: 2,
             uid: 0,
             gid: 0,
+            rdev: 0,
             flags: 0x408,
             generation: birth,
             times: [ts; 4],

@@ -2017,6 +2017,7 @@ pub(super) fn stage_zpl_mutation(
                 kind,
                 uid: *uid,
                 gid: *gid,
+                rdev: 0,
                 size: symlink_target
                     .as_ref()
                     .map_or(0, |target| target.len() as u64),
@@ -2188,6 +2189,7 @@ pub(super) fn stage_zpl_mutation(
                 kind: Kind::Directory,
                 uid: *uid,
                 gid: *gid,
+                rdev: 0,
                 size: 2,
                 links: 2,
                 parent: *parent_dir,

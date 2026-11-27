@@ -546,7 +546,7 @@ byte strings. Reads preserve native EOF, sparse zeroes, checksums, compression,
 embedded payloads and cancellation errors.
 
 Mounted ownership is the supplied synthetic UID/GID, with modes 0555 for
-directories, 0444 for files and 0777 for symlinks. Native ZFS ACLs, FUID mapping
+directories, 0444 for files and special entries, and 0777 for symlinks. Native ZFS ACLs, FUID mapping
 and permission enforcement are not projected; `stat` continues to expose the
 native metadata separately. `allow_other` and writable mount options are not
 offered. Writable opens and filesystem mutations return read-only errors.
@@ -554,10 +554,25 @@ offered. Writable opens and filesystem mutations return read-only errors.
 the image. Native symlink targets are returned to the host kernel, which applies
 normal mounted symlink semantics; this extraction mount is not a path sandbox.
 
-User xattr list/get use the shared native storage traversal above. Special
-files, native ACL/privileged xattr projection and pool free-space reporting
-(`statfs`) remain explicitly unsupported. A reached directory containing a special file fails
-rather than fabricating a device number or successful partial listing.
+FIFO, socket, character-device and block-device entries participate in lookup,
+`getattr` and complete directory enumeration with their native file types and
+shared hard-link identities. Their presence does not prevent ordinary siblings
+from being read. Legacy `zp_rdev` and SA `ZPL_RDEV` values retain their full native
+width and each buffer's byte order; SA device nodes require a valid scalar
+`ZPL_RDEV`. Device numbers use the Linux OpenZFS encoding (12-bit major and
+20-bit minor) and are converted to Linux FUSE's `new_encode_dev` representation.
+Values exceeding 32 bits fail with `EOVERFLOW` before a directory listing is
+published. Device IDs produced with another host encoding are not portably
+translated. Non-device entries report `rdev = 0`.
+
+These entries expose namespace and metadata only: backend `open`, `read`,
+`readlink` and seek operations refuse special-file streams. Mount `nodev` policy
+is unchanged. Native contracts are documented in
+[OpenZFS Linux znode handling](https://github.com/openzfs/zfs/blob/zfs-2.3.0/module/os/linux/zfs/zfs_znode_os.c)
+and [Linux device-number encoding](https://github.com/torvalds/linux/blob/v6.19/include/linux/kdev_t.h).
+User xattr list/get use the shared native storage traversal above. Native
+ACL/privileged xattr projection and pool free-space reporting (`statfs`) remain
+explicitly unsupported.
 `SEEK_DATA`/`SEEK_HOLE` use the permitted conservative projection of file data
 through EOF; they do not claim an exact physical-allocation map. At most 131,072
 object identities are retained per mount, with up to 32 cached directories and
@@ -566,7 +581,10 @@ These bounds do not represent a whole-process memory limit.
 
 Constructed regression fixtures exercise mounted lookup/read/readdir behavior,
 hard links, root identity, legacy and SA metadata, both byte orders, historical
-cache isolation, write refusal, corrupt directories and cancellation. The test
+cache isolation, write refusal, corrupt directories and cancellation. Special-entry
+fixtures cover all four types, legacy/SA bonus/spill metadata, device-number
+conversion and overflow, missing SA device IDs, and refusal of backend stream
+access while ordinary siblings remain readable. The test
 devices reject every backing write or flush. These are unit-level fixtures;
 they do not establish executed kernel FUSE or native OpenZFS interchange.
 

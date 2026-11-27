@@ -215,7 +215,10 @@ impl ViewState {
         for entry in entries {
             checkpoint(cx)?;
             let identity = Identity::from_metadata(entry.object, &entry.metadata);
-            let kind = file_type(entry.metadata.kind)?;
+            let kind = file_type(entry.metadata.kind);
+            // Validate host device-number representability before publishing
+            // any row or mount identity from this native directory.
+            let _ = device_number(&entry.metadata)?;
             let target =
                 self.stage_identity(identity, &mut pending, &mut pending_objects, &mut next_ino)?;
             rows.push(DirEntry {
@@ -510,7 +513,7 @@ impl ZfsFs {
         let writable_head = native_ownership && ino.0 & CTL_FLAG == 0;
         let view_state = state.view_for_ino(cx, ino)?;
         let (metadata, allocated) = view_state.metadata(cx, ino)?;
-        let kind = file_type(metadata.kind)?;
+        let kind = file_type(metadata.kind);
         let perm = if native_ownership {
             let native = (metadata.mode & 0o7777) as u16;
             if writable_head {
@@ -548,7 +551,7 @@ impl ZfsFs {
             nlink,
             uid,
             gid,
-            rdev: 0,
+            rdev: device_number(&metadata)?,
             blksize: 4096,
             generation: metadata.generation,
         })
@@ -1587,15 +1590,30 @@ impl FsOps for ZfsFs {
     }
 }
 
-fn file_type(kind: Kind) -> Result<FileType> {
+fn file_type(kind: Kind) -> FileType {
     match kind {
-        Kind::Directory => Ok(FileType::Directory),
-        Kind::Regular => Ok(FileType::RegularFile),
-        Kind::Symlink => Ok(FileType::Symlink),
-        _ => Err(unsupported(
-            "ZPL extraction mount does not expose special files",
-        )),
+        Kind::Directory => FileType::Directory,
+        Kind::Regular => FileType::RegularFile,
+        Kind::Symlink => FileType::Symlink,
+        Kind::Fifo => FileType::Fifo,
+        Kind::CharDevice => FileType::CharDevice,
+        Kind::BlockDevice => FileType::BlockDevice,
+        Kind::Socket => FileType::Socket,
     }
+}
+
+fn device_number(metadata: &Metadata) -> Result<u32> {
+    if !matches!(metadata.kind, Kind::CharDevice | Kind::BlockDevice) {
+        return Ok(0);
+    }
+    // OpenZFS zfs-2.3.0 on Linux stores kernel dev_t unchanged in ZPL_RDEV
+    // (zfs_znode_os.c:zfs_mknode/zfs_inode_set_ops). FUSE attr.rdev instead
+    // uses new_encode_dev from Linux include/linux/kdev_t.h: 12-bit major,
+    // 20-bit minor, split around the major. Never truncate a foreign u64 ID.
+    let native = u32::try_from(metadata.rdev).map_err(|_| errno(libc::EOVERFLOW))?;
+    let major = native >> 20;
+    let minor = native & 0x000f_ffff;
+    Ok((minor & 0xff) | (major << 8) | ((minor & !0xff) << 12))
 }
 
 fn system_time(time: Timestamp) -> Result<SystemTime> {
@@ -1614,6 +1632,34 @@ fn system_time(time: Timestamp) -> Result<SystemTime> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_linux_device_numbers_are_encoded_for_fuse_without_truncation() {
+        let mut raw = [0_u8; ffs_ondisk::zfs_zpl::LEGACY_BYTES];
+        raw[64..72].copy_from_slice(&1_u64.to_le_bytes());
+        raw[72..80].copy_from_slice(&0o020_600_u64.to_le_bytes());
+        raw[88..96].copy_from_slice(&1_u64.to_le_bytes());
+        let mut metadata = Metadata::legacy(&raw, ffs_ondisk::zfs::Endian::Little).unwrap();
+        for (native, expected) in [
+            (0, 0),
+            (0x0010_0003, 0x0000_0103),
+            (0x0080_0100, 0x0010_0800),
+            (0x0081_2345, 0x1230_0845),
+            (0xffff_ffff, 0xffff_ffff),
+        ] {
+            metadata.rdev = native;
+            assert_eq!(device_number(&metadata).unwrap(), expected);
+        }
+        metadata.rdev = 1_u64 << 32;
+        assert_eq!(
+            device_number(&metadata).unwrap_err().to_errno(),
+            libc::EOVERFLOW
+        );
+        metadata.kind = Kind::Fifo;
+        assert_eq!(device_number(&metadata).unwrap(), 0);
+        metadata.kind = Kind::Socket;
+        assert_eq!(device_number(&metadata).unwrap(), 0);
+    }
 
     #[test]
     fn timestamps_keep_negative_fractional_seconds_and_native_precision() {

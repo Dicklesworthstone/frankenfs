@@ -11,6 +11,103 @@ mod sparse;
 const ROOT: InodeNumber = InodeNumber(1);
 
 #[test]
+fn extraction_mount_exposes_special_files_without_reading_or_following_them() {
+    let cx = Cx::for_testing();
+    for order in [Endian::Little, Endian::Big] {
+        for sa in 0..=2 {
+            for (case, kind, rdev) in [
+                (34, FileType::Fifo, 0),
+                (35, FileType::CharDevice, 0x0000_0103),
+                (36, FileType::BlockDevice, 0x1230_0845),
+                (37, FileType::Socket, 0),
+            ] {
+                let reads: Reads = Arc::default();
+                let (leaf, meta) = graph(order, sa, case, Arc::clone(&reads), None);
+                let view = mos(&leaf, meta).zpl(&cx, &[]).unwrap();
+                let fs = ZfsFs::new(&cx, view, 1234, 5678).unwrap();
+                let mut scope = RequestScope::empty();
+                let attr = fs
+                    .lookup(&cx, &mut scope, ROOT, OsStr::new("file.bin"))
+                    .unwrap();
+                let alias = fs
+                    .lookup(&cx, &mut scope, ROOT, OsStr::new("alias.bin"))
+                    .unwrap();
+                assert_eq!((attr.kind, attr.rdev, attr.size), (kind, rdev, 0));
+                assert_eq!((attr.uid, attr.gid, attr.perm), (1234, 5678, 0o444));
+                assert_eq!(attr.ino, alias.ino);
+                assert_eq!(fs.getattr(&cx, &mut scope, attr.ino).unwrap(), attr);
+                let entries = fs.readdir(&cx, &mut scope, ROOT, 0).unwrap();
+                for name in [b"file.bin".as_slice(), b"alias.bin"] {
+                    assert_eq!(
+                        entries
+                            .iter()
+                            .find(|entry| entry.name == name)
+                            .unwrap()
+                            .kind,
+                        kind
+                    );
+                }
+                let sub = fs.lookup(&cx, &mut scope, ROOT, OsStr::new("sub")).unwrap();
+                assert_eq!(
+                    fs.lookup(&cx, &mut scope, sub.ino, OsStr::new("nested"))
+                        .unwrap()
+                        .ino,
+                    attr.ino
+                );
+                // Special nodes are namespace metadata, never byte streams to
+                // read from the image or paths to open on the host.
+                for result in [
+                    fs.open(&cx, &mut scope, attr.ino, libc::O_RDONLY)
+                        .map(|_| ()),
+                    fs.read(&cx, &mut scope, attr.ino, 0, 512).map(|_| ()),
+                    fs.readlink(&cx, &mut scope, attr.ino).map(|_| ()),
+                    fs.lseek(&cx, &mut scope, attr.ino, 0, SeekWhence::Data)
+                        .map(|_| ()),
+                ] {
+                    assert!(result.is_err());
+                }
+                let ordinary = fs
+                    .lookup(&cx, &mut scope, ROOT, OsStr::new("sparse"))
+                    .unwrap();
+                assert_eq!(ordinary.kind, FileType::RegularFile);
+                assert_eq!(
+                    fs.read(&cx, &mut scope, ordinary.ino, 0, 8).unwrap(),
+                    vec![0; 8]
+                );
+                assert!(reads.lock().unwrap().iter().all(|(at, _)| {
+                    ![FIRST, LAST, INDIRECT]
+                        .iter()
+                        .any(|offset| *at == BASE as u64 + offset)
+                }));
+            }
+        }
+    }
+}
+
+#[test]
+fn extraction_mount_refuses_missing_or_unrepresentable_native_device_numbers() {
+    let cx = Cx::for_testing();
+    for order in [Endian::Little, Endian::Big] {
+        for sa in 0..=2 {
+            let (leaf, meta) = graph(order, sa, 38, Arc::default(), None);
+            let view = mos(&leaf, meta).zpl(&cx, &[]).unwrap();
+            let Err(error) = ZfsFs::new(&cx, view, 0, 0) else {
+                panic!("oversized native rdev must not be truncated");
+            };
+            assert_eq!(error.to_errno(), libc::EOVERFLOW);
+            if sa != 0 {
+                let (leaf, meta) = graph(order, sa, 39, Arc::default(), None);
+                let view = mos(&leaf, meta).zpl(&cx, &[]).unwrap();
+                assert!(matches!(
+                    ZfsFs::new(&cx, view, 0, 0),
+                    Err(FfsError::Corruption { .. })
+                ));
+            }
+        }
+    }
+}
+
+#[test]
 fn extraction_mount_reads_native_graph_and_preserves_hardlinks_and_root_identity() {
     let cx = Cx::for_testing();
     for order in [Endian::Little, Endian::Big] {

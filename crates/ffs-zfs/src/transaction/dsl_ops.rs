@@ -4492,6 +4492,7 @@ fn build_fresh_zpl_objectset(
         flags: ZFS_ACL_TRIVIAL | ZFS_NO_EXECS_DENIED,
         uid: 0,
         gid: 0,
+        rdev: 0,
         times: [timestamp; 4],
         inline_symlink: None,
     };

@@ -1197,6 +1197,7 @@ fn build_zpl_objectset(
             parent: 2,
             uid: 1000,
             gid: 1000,
+            rdev: 0,
             flags: 0x408
                 | spec.zpl_flags.get(&4).copied().unwrap_or(0)
                 | if spec.sa_project_id.is_some() {
@@ -1352,6 +1353,7 @@ fn build_zpl_objectset(
             parent: 2,
             uid: 0,
             gid: 0,
+            rdev: 0,
             flags: 0x408
                 | spec.zpl_flags.get(&6).copied().unwrap_or(0)
                 | if spec.directory_projects.contains_key(&6) {
@@ -1405,6 +1407,7 @@ fn build_zpl_objectset(
             parent: 2,
             uid: 1000,
             gid: 1000,
+            rdev: 0,
             flags: 0x408
                 | spec.zpl_flags.get(&4).copied().unwrap_or(0)
                 | if spec.sa_project_id.is_some() {
@@ -1702,6 +1705,7 @@ fn build_zpl_objectset(
                     parent: 2,
                     uid: 1000,
                     gid: 1000,
+                    rdev: 0,
                     flags: 0x408,
                     generation: birth,
                     times: [ts; 4],
@@ -1760,6 +1764,7 @@ fn build_zpl_objectset(
         parent: 2,
         uid: spec.root_ids.0,
         gid: spec.root_ids.1,
+        rdev: 0,
         flags: 0x408
             | spec.zpl_flags.get(&2).copied().unwrap_or(0)
             | if spec.directory_projects.contains_key(&2) {

@@ -695,6 +695,7 @@ pub fn create_pool_on_leaves(
         flags: 0,
         uid: 0,
         gid: 0,
+        rdev: 0,
         times: [ffs_ondisk::zfs_zpl::Timestamp {
             seconds: 1_700_000_000,
             nanos: 0,
