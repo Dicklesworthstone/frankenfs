@@ -49,8 +49,8 @@ pub use reader::{
     TopVdevKind, VdevHealth,
 };
 pub use send_recv::{
-    ZfsRecvReport, ZfsRecvRequest, ZfsResumeState, ZfsSendFrom, ZfsSendReport, ZfsSendRequest,
-    inspect_receive_resume_state_in_mos, send_stream,
+    ZfsRecvOutcome, ZfsRecvProgress, ZfsRecvReport, ZfsRecvRequest, ZfsRecvStage, ZfsResumeState,
+    ZfsSendFrom, ZfsSendReport, ZfsSendRequest, inspect_receive_resume_state_in_mos, send_stream,
 };
 pub use transaction::{
     DEFAULT_VOLBLOCKSIZE, MAX_VOLBLOCKSIZE, MAX_ZVOL_IO_BYTES, ZVOL_LOGICAL_SECTOR_BYTES,

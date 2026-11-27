@@ -4081,3 +4081,127 @@ hosted runners were backlogged. These changes have source review and new
 regressions, but no completed compiler, strict-Clippy, UBS, or runtime result is
 claimed. The FUSE change and existing formatting corrections passed local
 formatting before the outage; subsequent changes await hosted formatting checks.
+
+## NTFS creation security admission and audit inheritance (2026-11-27)
+
+Path-based and sequence-bound file/directory creation now share the same parent
+security admission. I/O, corruption and cancellation while resolving a parent
+descriptor refuse creation before native writes; they no longer select the
+ordinary creator as though the parent had no inheritance rules. Only a genuinely
+absent legacy descriptor retains the existing default-security policy. A nonzero
+shared security ID remains authoritative over a legacy descriptor, and a missing
+shared store is an error rather than permission to synthesize security.
+
+Creation checks both discretionary and system ACLs for inheritable entries.
+An inheritable audit SACL therefore takes the existing native inheritance path
+even when the DACL has no inheritable entries. The public path APIs now use the
+same selection as the reference APIs, retaining ordinary creation where that
+selection is valid. This does not add Windows audit-event delivery or qualify
+the broader native security/interchange profile.
+
+Two authored regressions cover four creation entry points against I/O,
+corruption and cancellation faults, unchanged live/durable media, and successful
+subsequent reuse. The positive regression covers NTFS 3.0 and 3.1, file versus
+directory audit inheritance, retained success/failure audit flags, exclusion of
+non-inheritable audit entries, parent preservation and durable-only cold reopen.
+The focused entry point is
+`cargo test -p ffs-ntfs --test persistence_prefix ntfs_creation_ -- --nocapture`.
+
+Qualification is source review, targeted formatting and whitespace validation.
+The initial workspace formatting check passed before edits. Workspace checking
+then failed when the dependency compiler was killed with SIGKILL; a reduced-memory
+focused test build had not reached test execution when the shared executor
+disconnected under disk/memory pressure. No compiler, strict-Clippy or runtime
+pass is claimed. The direct publication records the documented gate bypass;
+bd-h8n46 remains open for its full acceptance contract.
+
+## ZFS receive durable progress and cleanup outcomes (2026-11-27)
+
+`receive_stream` now returns `ZfsRecvOutcome`, a receive-specific result for
+operations that can publish multiple native TXGs. `NotCommitted` is reserved
+for invocations with no new publication. `Interrupted` retains the last known
+durable token, completed substream count and snapshot identity, successful TXG
+count, and whether the latest durable action checkpointed staging, promoted a
+substream, or reclaimed incomplete staging. A later compound framing or
+substream error no longer hides an already published snapshot.
+
+Native publication uncertainty remains distinct and retains the actual target
+TXG/slot together with any earlier known durable progress. A resumed invocation
+that publishes nothing and cannot reclaim its prior staging reports both errors
+as `CleanupFailed`; `is_not_committed` recognizes this no-new-publication case.
+Automatic abort cleanup results are checked, including uncertain cleanup;
+an uncertain owner retains its existing fresh-engine recovery requirement.
+The CLI emits structured interruption/recovery details and returns failure for
+incomplete receives. The generic single-transaction `ZfsTxOutcome` is unchanged;
+callers of `receive_stream` must use the new receive outcome.
+
+Two authored faultable-device regressions cover six later-compound failures
+and eight publication, cleanup and cancellation cuts. They check snapshot/data
+survival using fresh engines over durable-only media, staging visibility, and
+the refusal to reuse an uncertain writer. Existing receive regressions retain
+their media, allocation, namespace and resume checks while asserting the new
+outcome categories. The existing resume regression also checks failed cleanup
+before any new publication, preserving both errors and the prior durable state.
+Focused entry points are
+`cargo test -p ffs-zfs --test persistence_prefix receive_outcome_ -- --nocapture --test-threads=1`
+and
+`cargo test -p ffs-zfs --test persistence_prefix send_recv:: -- --nocapture --test-threads=1`.
+
+Qualification is independent source review, pinned formatting of all six final
+changed Rust files, and whitespace validation, including the resumed-cleanup
+and explicit torn-root recovery corrections. Compiler and runtime qualification
+remain pending after dependency compilation was killed and the executor suffered
+repeated disk/memory exhaustion. A later limited recovery allowed formatting,
+but no completed compiler, Clippy or runtime result is claimed. Direct publication
+records the documented gate bypass. This change does not close bd-jbo9q or
+establish native OpenZFS interchange qualification.
+
+## ZFS native filesystem/snapshot limits and receive accounting (2026-11-27)
+
+Native count admission now reads `filesystem_limit` and `snapshot_limit`,
+including local/received precedence, while preserving the native
+`com.joyent:filesystem_count` and `com.joyent:snapshot_count` fields. Property
+read errors, malformed scalar values, inconsistent tracking, ancestry cycles,
+and counter overflow/underflow refuse the transaction. Namespaced user
+properties resembling limit names do not become native policy.
+
+Rename computes both counter deltas across both ancestor chains before
+rewriting each affected directory once. Shared ancestors with zero net growth
+remain valid when their limits have been lowered below current usage. Clone
+destruction and deferred origin-snapshot destruction likewise combine their
+filesystem and snapshot decrements in one update. New-directory counter
+initialization reads the active filesystem-limits feature from the native write
+feature map.
+
+Numeric set/inherit is supported for already initialized native tracking.
+Zero prohibits further growth, `u64::MAX` is unlimited, and inheriting restores
+a received value or the unlimited default. Lowering a limit below current
+usage is permitted; subsequent growth is checked. Imported untracked
+hierarchies still require native initialization: the setter and moves requiring
+unknown subtree counts refuse instead of inventing counts.
+
+Receive now counts and admits its final native snapshot. Private incremental
+`%recv` creation follows the native distinction between a persisted count and
+limit admission: it adds one filesystem to the target/ancestor counters while
+remaining exempt from the filesystem ceiling check. Promotion coalesces removal
+of that temporary filesystem with addition of the published snapshot; abort
+performs the normal filesystem decrement. Full receive promotion adds one
+snapshot. Final-publication refusal preserves the earlier receive checkpoints
+reported by `ZfsRecvOutcome`.
+
+Eight authored integration tests cover canonical/local/received properties,
+unknown user keys, malformed values and property-read faults, checked arithmetic
+and tracking refusal, shared-ancestor moves above lowered limits, deferred clone
+and snapshot destruction, active-versus-enabled feature state, and full and
+incremental receive refusal/reopen/abort/retry. Their count oracle traverses raw
+MOS directory catalogs so it can inspect inconsistent receive staging.
+The focused entry point is
+`cargo test -p ffs-zfs --test persistence_prefix dsl_native_count_limits_ -- --test-threads=1`.
+
+Qualification is independent source review, pinned formatting of the final
+changed Rust files and `git diff --check`. A narrow offline metadata check,
+with one job, no debug information, no incremental compilation and one compiler
+thread, also failed when upstream `asupersync` rustc was killed by SIGKILL before
+repository diagnostics. No completed compiler, Clippy or runtime result is
+claimed. Direct publication records the documented gate bypass. Broader writable
+ZFS/native interoperability qualification and the associated beads remain open.

@@ -21,8 +21,8 @@ use clap::Subcommand;
 use ffs_ondisk::zfs::Endian;
 use ffs_ondisk::zfs::send_stream::ReceiveResumeToken;
 use ffs_zfs::{
-    ZfsRecvRequest, ZfsSendFrom, ZfsSendRequest, ZfsTxOutcome, inspect_receive_resume_state_in_mos,
-    send_stream,
+    ZfsRecvOutcome, ZfsRecvRequest, ZfsSendFrom, ZfsSendRequest, ZfsTxOutcome,
+    inspect_receive_resume_state_in_mos, send_stream,
 };
 
 use super::write_commands::{WritePoolArgs, parse_dataset_components};
@@ -286,7 +286,7 @@ impl SendRecvCommand {
                 };
 
                 match outcome {
-                    ZfsTxOutcome::Committed { value, token } => {
+                    ZfsRecvOutcome::Committed { value, token } => {
                         engine
                             .verify_token(&token)
                             .context("verifying storage/topology/TXG-bound ZFS durable token")?;
@@ -301,7 +301,42 @@ impl SendRecvCommand {
                             "token": token,
                         }))
                     }
-                    ZfsTxOutcome::NotCommitted(err) => {
+                    ZfsRecvOutcome::NotCommitted(err) => {
+                        bail!("ZFS recv NotCommitted: {err}");
+                    }
+                    ZfsRecvOutcome::CleanupFailed {
+                        reason,
+                        cleanup_error,
+                    } => {
+                        json(&serde_json::json!({
+                            "format": "ZFS",
+                            "operation": "recv",
+                            "outcome": "CleanupFailed",
+                            "dataset": pool.dataset,
+                            "reason": reason.to_string(),
+                            "cleanup_error": cleanup_error.to_string(),
+                        }))?;
+                        bail!(
+                            "ZFS recv CleanupFailed; prior receive state retained: {reason}; cleanup: {cleanup_error}"
+                        );
+                    }
+                    ZfsRecvOutcome::Interrupted {
+                        reason,
+                        progress,
+                        cleanup_error,
+                    } => {
+                        engine.verify_token(&progress.durable_token).context(
+                            "verifying the known durable prefix of interrupted ZFS receive",
+                        )?;
+                        json(&serde_json::json!({
+                            "format": "ZFS",
+                            "operation": "recv",
+                            "outcome": "Interrupted",
+                            "dataset": pool.dataset,
+                            "reason": reason.to_string(),
+                            "progress": progress,
+                            "cleanup_error": cleanup_error.as_ref().map(ToString::to_string),
+                        }))?;
                         if resumable
                             && let Ok(Some(state)) =
                                 engine.inspect_receive_resume_state(cx, &components)
@@ -311,10 +346,27 @@ impl SendRecvCommand {
                                 state.token, state.object, state.offset, state.bytes
                             );
                         }
-                        bail!("ZFS TXG recv NotCommitted: {err}");
+                        bail!("ZFS recv Interrupted after durable publication: {reason}");
                     }
-                    ZfsTxOutcome::Uncertain { reason, .. } => {
-                        bail!("ZFS TXG recv Uncertain: {reason}");
+                    ZfsRecvOutcome::Uncertain {
+                        reason,
+                        target_txg,
+                        target_slot,
+                        progress,
+                        receive_error,
+                    } => {
+                        json(&serde_json::json!({
+                            "format": "ZFS",
+                            "operation": "recv",
+                            "outcome": "Uncertain",
+                            "dataset": pool.dataset,
+                            "reason": reason.to_string(),
+                            "target_txg": target_txg,
+                            "target_slot": target_slot,
+                            "progress": progress,
+                            "receive_error": receive_error.as_ref().map(ToString::to_string),
+                        }))?;
+                        bail!("ZFS recv Uncertain; reopen to reconcile publication: {reason}");
                     }
                 }
             }

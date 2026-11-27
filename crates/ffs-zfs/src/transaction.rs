@@ -55,7 +55,8 @@ pub use self::lifecycle::{
     create_pool_on_devices, export_pool_leaves, import_pool_leaves,
 };
 pub use self::recv_ops::{
-    ZfsRecvReport, ZfsRecvRequest, ZfsResumeState, inspect_receive_resume_state_in_mos,
+    ZfsRecvOutcome, ZfsRecvProgress, ZfsRecvReport, ZfsRecvRequest, ZfsRecvStage, ZfsResumeState,
+    inspect_receive_resume_state_in_mos,
 };
 pub use self::scan::{ZfsScanLimits, ZfsScanReport};
 pub use self::zpl_ops::{

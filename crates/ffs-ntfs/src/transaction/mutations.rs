@@ -720,18 +720,28 @@ impl TxWorkspace {
         cx: &Cx,
         cat: &EditableCatalog,
     ) -> Result<Option<Vec<u8>>> {
-        if let Some(ref raw) = cat.security_descriptor {
-            return Ok(Some(raw.clone()));
-        }
-        if let Some(sec_id) = cat.std_security_id()
-            && self.mft_slot_is_allocated(9)
-        {
+        if let Some(sec_id) = cat.std_security_id() {
+            if !self.mft_slot_is_allocated(9) {
+                return Err(corrupt(
+                    0,
+                    format!("missing shared metadata for NTFS security ID {sec_id}"),
+                ));
+            }
             let _ = self.ensure_secure_store(engine, cx)?;
             let store = self.secure_store.as_ref().expect("secure store");
-            let desc = store.read_descriptor_by_id(engine, cx, sec_id)?;
+            let desc =
+                store
+                    .read_descriptor_by_id(engine, cx, sec_id)
+                    .map_err(|error| match error {
+                        FfsError::NotFound(_) => corrupt(
+                            0,
+                            format!("missing shared metadata for NTFS security ID {sec_id}"),
+                        ),
+                        other => other,
+                    })?;
             return Ok(Some(desc));
         }
-        Ok(None)
+        Ok(cat.security_descriptor.clone())
     }
 
     pub(super) fn lookup_extend_child(
@@ -1749,15 +1759,22 @@ impl NtfsTransactionEngine {
         }
         let volume = self.volume_view(cx)?;
         let record = Self::checked_reference(&volume, cx, parent)?;
-        if let Ok(info) = volume.security_descriptor(cx, &record)
-            && info.descriptor.dacl.present
-            && info.descriptor.dacl.aces.iter().any(|ace| {
-                (ace.flags & (ACE_FLAG_OBJECT_INHERIT | ACE_FLAG_CONTAINER_INHERIT)) != 0
-            })
-        {
-            return Ok(true);
-        }
-        Ok(false)
+        let info = match volume.security_descriptor(cx, &record) {
+            Ok(info) => info,
+            // A genuinely absent legacy descriptor retains the ordinary
+            // creation policy. A referenced shared descriptor, malformed ACL,
+            // failed read or cancellation is not evidence of no inheritance.
+            Err(FfsError::NotFound(_)) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        Ok([&info.descriptor.dacl, &info.descriptor.sacl]
+            .into_iter()
+            .any(|acl| {
+                acl.present
+                    && acl.aces.iter().any(|ace| {
+                        (ace.flags & (ACE_FLAG_OBJECT_INHERIT | ACE_FLAG_CONTAINER_INHERIT)) != 0
+                    })
+            }))
     }
 
     pub(super) fn ensure_mft_headroom(
@@ -1838,9 +1855,10 @@ impl NtfsTransactionEngine {
         if let Err(err) = validate_ntfs_component_utf16(name) {
             return NtfsTxOutcome::NotCommitted(err);
         }
-        let use_extended = self
-            .parent_requires_extended_create(cx, parent)
-            .unwrap_or(true);
+        let use_extended = match self.parent_requires_extended_create(cx, parent) {
+            Ok(use_extended) => use_extended,
+            Err(error) => return NtfsTxOutcome::NotCommitted(error),
+        };
         if !use_extended
             && let Ok(path) = self.resolve_reference_path(cx, parent)
             && let Ok(text) = String::from_utf16(name)
@@ -1850,7 +1868,7 @@ impl NtfsTransactionEngine {
                 Err(FfsError::NotFound(_)) => {}
                 Err(err) => return NtfsTxOutcome::NotCommitted(err),
             }
-            let outcome = self.create_file(cx, &path, &text, data);
+            let outcome = self.create_file_ordinary(cx, &path, &text, data);
             if !matches!(
                 outcome,
                 NtfsTxOutcome::NotCommitted(FfsError::UnsupportedFeature(_) | FfsError::NoSpace)
@@ -1872,9 +1890,10 @@ impl NtfsTransactionEngine {
         if let Err(err) = validate_ntfs_component_utf16(name) {
             return NtfsTxOutcome::NotCommitted(err);
         }
-        let use_extended = self
-            .parent_requires_extended_create(cx, parent)
-            .unwrap_or(true);
+        let use_extended = match self.parent_requires_extended_create(cx, parent) {
+            Ok(use_extended) => use_extended,
+            Err(error) => return NtfsTxOutcome::NotCommitted(error),
+        };
         if !use_extended
             && let Ok(path) = self.resolve_reference_path(cx, parent)
             && let Ok(text) = String::from_utf16(name)
@@ -1884,7 +1903,7 @@ impl NtfsTransactionEngine {
                 Err(FfsError::NotFound(_)) => {}
                 Err(err) => return NtfsTxOutcome::NotCommitted(err),
             }
-            let outcome = self.mkdir(cx, &path, &text);
+            let outcome = self.mkdir_ordinary(cx, &path, &text);
             if !matches!(
                 outcome,
                 NtfsTxOutcome::NotCommitted(FfsError::UnsupportedFeature(_) | FfsError::NoSpace)

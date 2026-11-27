@@ -9,7 +9,8 @@
 pub mod send;
 
 pub use crate::transaction::{
-    ZfsRecvReport, ZfsRecvRequest, ZfsResumeState, inspect_receive_resume_state_in_mos,
+    ZfsRecvOutcome, ZfsRecvProgress, ZfsRecvReport, ZfsRecvRequest, ZfsRecvStage, ZfsResumeState,
+    inspect_receive_resume_state_in_mos,
 };
 pub use send::{ZfsSendFrom, ZfsSendReport, ZfsSendRequest, send_stream};
 

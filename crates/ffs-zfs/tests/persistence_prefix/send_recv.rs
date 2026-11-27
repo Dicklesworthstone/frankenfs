@@ -12,8 +12,9 @@ use ffs_ondisk::zfs::send_stream::{
 use ffs_zfs::reader::dmu::properties::PropertyValue;
 use ffs_zfs::reader::dmu::zpl::PathPolicy;
 use ffs_zfs::{
-    ZfsEncryptionCreateOptions, ZfsKeyMaterial, ZfsKeyStatus, ZfsPropertySetValue, ZfsRecvRequest,
-    ZfsSendFrom, ZfsSendRequest, ZfsXattrSetMode, ZfsZvolCreateOptions, send_stream,
+    ZfsEncryptionCreateOptions, ZfsKeyMaterial, ZfsKeyStatus, ZfsPropertySetValue, ZfsRecvOutcome,
+    ZfsRecvRequest, ZfsRecvStage, ZfsSendFrom, ZfsSendRequest, ZfsXattrSetMode,
+    ZfsZvolCreateOptions, send_stream,
 };
 use std::io::Cursor;
 
@@ -309,7 +310,7 @@ fn compound_native_header_checksum_is_validated_before_any_backing_write() {
         assert!(
             matches!(
                 receiver.receive_stream(&cx, &receive, &mut Cursor::new(bad)),
-                ZfsTxOutcome::NotCommitted(_)
+                ZfsRecvOutcome::NotCommitted(_)
             ),
             "malformed compound header case {case} was accepted"
         );
@@ -365,7 +366,7 @@ fn compound_native_header_checksum_is_validated_before_any_backing_write() {
         assert!(
             matches!(
                 receiver.receive_stream(&cx, &receive, &mut Cursor::new(bad)),
-                ZfsTxOutcome::NotCommitted(_)
+                ZfsRecvOutcome::NotCommitted(_)
             ),
             "compound metadata case {case} was accepted"
         );
@@ -388,7 +389,7 @@ fn compound_native_header_checksum_is_validated_before_any_backing_write() {
     let mixed_source = native_compound_package(&[], &unrelated);
     assert!(matches!(
         receiver.receive_stream(&cx, &receive, &mut Cursor::new(mixed_source)),
-        ZfsTxOutcome::NotCommitted(FfsError::Corruption { .. })
+        ZfsRecvOutcome::NotCommitted(FfsError::Corruption { .. })
     ));
     assert_eq!(
         devices
@@ -451,6 +452,418 @@ fn compound_native_header_checksum_is_validated_before_any_backing_write() {
             .unwrap(),
         expected
     );
+}
+
+struct ReceiveOutcomeStreams {
+    full: Vec<u8>,
+    incremental: Vec<u8>,
+    first_data: Vec<u8>,
+    first_guid: u64,
+}
+
+fn receive_outcome_streams(cx: &Cx) -> ReceiveOutcomeStreams {
+    let built = build_clean_zfs_pool(&send_recv_pool_spec(32 * 1024 * 1024));
+    let devices: Vec<_> = built
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut sender = open_engine_on_devices(
+        cx,
+        &devices,
+        default_write_opts(built.pool_guid, built.initial_slot),
+    )
+    .unwrap();
+    let source = vec![b"data".to_vec()];
+    let timestamp = Timestamp {
+        seconds: 1_730_000_510,
+        nanos: 0,
+    };
+    let first_data = vec![0x42; 8192];
+    sender
+        .write_file_data(
+            cx,
+            &source,
+            4,
+            0,
+            &first_data,
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    sender
+        .create_snapshot(cx, &source, b"first", timestamp)
+        .into_result()
+        .unwrap();
+    sender
+        .write_file_data(
+            cx,
+            &source,
+            4,
+            0,
+            &[0x84; 8192],
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    sender
+        .create_snapshot(cx, &source, b"second", timestamp)
+        .into_result()
+        .unwrap();
+    let mut mos = sender.open_read_objects(cx).unwrap();
+    let mut full = Vec::new();
+    let first_report = send_stream(
+        cx,
+        &mut mos,
+        &ZfsSendRequest::full(source.clone(), b"first".to_vec()),
+        &mut full,
+    )
+    .unwrap();
+    let mut incremental = Vec::new();
+    let mut request = ZfsSendRequest::full(source, b"second".to_vec());
+    request.from = Some(ZfsSendFrom::Snapshot(b"first".to_vec()));
+    send_stream(cx, &mut mos, &request, &mut incremental).unwrap();
+    ReceiveOutcomeStreams {
+        full,
+        incremental,
+        first_data,
+        first_guid: first_report.to_guid,
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn receive_outcome_preserves_durable_compound_prefix_after_later_failure() {
+    let cx = Cx::for_testing();
+    let streams = receive_outcome_streams(&cx);
+    let package = native_compound_package(&[], &streams.full);
+    let package_end = package.len() - DMU_REPLAY_RECORD_BYTES;
+    let wrong_base = restamp_substream(&streams.incremental, false, |mut record, payload| {
+        if let DrrRecord::Begin(begin) = &mut record {
+            begin.fromguid ^= 1;
+        }
+        Some((record, payload))
+    });
+    let target = build_clean_zfs_pool(&send_recv_pool_spec(32 * 1024 * 1024));
+    let destination = vec![b"data".to_vec(), b"received".to_vec()];
+
+    for case in 0..6 {
+        let (input, expected_stage) = match case {
+            0 => (package[..package_end].to_vec(), ZfsRecvStage::Promoted),
+            1 => {
+                let mut invalid_end = package.clone();
+                invalid_end[package_end + 8] = 1;
+                (invalid_end, ZfsRecvStage::Promoted)
+            }
+            2 => {
+                let mut trailing = package.clone();
+                trailing.extend_from_slice(b"trailing bytes");
+                (trailing, ZfsRecvStage::Promoted)
+            }
+            3 => (
+                native_compound_package(
+                    &[],
+                    &[streams.full.as_slice(), wrong_base.as_slice()].concat(),
+                ),
+                ZfsRecvStage::Promoted,
+            ),
+            4 | 5 => (
+                [
+                    &package[..package_end],
+                    &streams.incremental[..DMU_REPLAY_RECORD_BYTES],
+                ]
+                .concat(),
+                if case == 4 {
+                    ZfsRecvStage::Checkpoint
+                } else {
+                    ZfsRecvStage::Aborted
+                },
+            ),
+            _ => unreachable!(),
+        };
+        let devices: Vec<_> = target
+            .members
+            .iter()
+            .cloned()
+            .map(FaultableMemberDevice::new)
+            .collect();
+        let mut receiver = open_engine_on_devices(
+            &cx,
+            &devices,
+            default_write_opts(target.pool_guid, target.initial_slot),
+        )
+        .unwrap();
+        let initial_txg = receiver.committed_txg();
+        let mut request = ZfsRecvRequest::new(destination.clone());
+        request.resumable = case == 4;
+        let outcome = receiver.receive_stream(&cx, &request, &mut Cursor::new(input));
+        assert!(!outcome.is_committed() && !outcome.is_not_committed());
+        let ZfsRecvOutcome::Interrupted {
+            reason,
+            progress,
+            cleanup_error,
+        } = *outcome.into_result().unwrap_err()
+        else {
+            panic!("case {case}: a completed substream must be reported as durable");
+        };
+        assert!(!reason.to_string().is_empty());
+        assert!(cleanup_error.is_none(), "case {case}: {cleanup_error:?}");
+        assert_eq!(progress.substreams_received, 1, "case {case}");
+        assert_eq!(progress.last_snapshot.as_deref(), Some("first"));
+        assert_eq!(progress.last_snapshot_guid, Some(streams.first_guid));
+        assert_eq!(progress.last_durable_stage, expected_stage, "case {case}");
+        assert_eq!(
+            progress.committed_txgs,
+            receiver.committed_txg() - initial_txg
+        );
+        assert_eq!(
+            progress.durable_token.committed_txg(),
+            receiver.committed_txg()
+        );
+        receiver.verify_token(&progress.durable_token).unwrap();
+        assert!(!receiver.requires_recovery());
+
+        let durable: Vec<_> = devices
+            .iter()
+            .map(FaultableMemberDevice::fresh_from_durable)
+            .collect();
+        let fresh = open_engine_on_devices(
+            &cx,
+            &durable,
+            default_write_opts(target.pool_guid, progress.durable_token.published_slot()),
+        )
+        .unwrap();
+        assert_eq!(
+            fresh
+                .inspect_receive_resume_state(&cx, &destination)
+                .unwrap()
+                .is_some(),
+            expected_stage == ZfsRecvStage::Checkpoint,
+            "case {case}: reported staging state disagrees with durable reopen"
+        );
+        let mut mos = fresh.open_read_objects(&cx).unwrap();
+        let snapshots = mos.snapshots(&cx, &destination).unwrap();
+        assert_eq!(snapshots.len(), 1, "case {case}");
+        assert_eq!(
+            mos.zpl_snapshot(&cx, &destination, b"first")
+                .unwrap()
+                .read(&cx, 4, 0, streams.first_data.len())
+                .unwrap(),
+            streams.first_data,
+            "case {case}: acknowledged prefix changed"
+        );
+        assert_eq!(
+            mos.zpl(&cx, &destination)
+                .unwrap()
+                .read(&cx, 4, 0, streams.first_data.len())
+                .unwrap(),
+            streams.first_data,
+            "case {case}: incomplete successor changed the live head"
+        );
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn receive_outcome_distinguishes_checkpoint_cleanup_and_uncertain_cuts() {
+    let inspection_cx = Cx::for_testing();
+    let streams = receive_outcome_streams(&inspection_cx);
+    let target = build_clean_zfs_pool(&send_recv_pool_spec(32 * 1024 * 1024));
+    let destination = vec![b"data".to_vec(), b"received".to_vec()];
+
+    // The second Uberblock wave starts only after the first wave's real device
+    // barrier. Those cuts therefore recover the new root, while still requiring
+    // an Uncertain result from an owner that did not complete every barrier.
+    for case in 0..8 {
+        let cx = Cx::for_testing();
+        let devices: Vec<_> = target
+            .members
+            .iter()
+            .cloned()
+            .map(FaultableMemberDevice::new)
+            .collect();
+        let mut receiver = open_engine_on_devices(
+            &cx,
+            &devices,
+            default_write_opts(target.pool_guid, target.initial_slot),
+        )
+        .unwrap();
+        let initial_txg = receiver.committed_txg();
+        let fired = Arc::new(Mutex::new(false));
+        let fired_for_hook = Arc::clone(&fired);
+        let cancelled = cx.clone();
+        receiver.with_fault_hook(move |event| {
+            if case == 7
+                && event.operation == "recv_begin"
+                && event.stage == ZfsPersistenceStage::AckPublished
+            {
+                *fired_for_hook.lock().unwrap() = true;
+                cancelled.cancel_with(asupersync::types::CancelKind::User, Some("recv checkpoint"));
+                return Ok(());
+            }
+            let operation = match case {
+                0 | 1 => "recv_begin",
+                2 | 3 => "recv_chunk",
+                4 | 5 => "abort_receive",
+                _ => return Ok(()),
+            };
+            let expected_label = if case % 2 == 0 { 0 } else { 2 };
+            if event.operation == operation
+                && matches!(event.stage, ZfsPersistenceStage::UberblockWrite { label, .. } if label == expected_label)
+            {
+                *fired_for_hook.lock().unwrap() = true;
+                return Err(FfsError::Io(std::io::Error::other("receive publication cut")));
+            }
+            Ok(())
+        });
+        let mut request = ZfsRecvRequest::new(destination.clone());
+        request.resumable = case < 4;
+        request.checkpoint_bytes = 512;
+        let input = if (4..=6).contains(&case) {
+            &streams.full[..DMU_REPLAY_RECORD_BYTES]
+        } else {
+            streams.full.as_slice()
+        };
+        let outcome = receiver.receive_stream(&cx, &request, &mut Cursor::new(input));
+        assert_eq!(
+            *fired.lock().unwrap(),
+            case != 6,
+            "case {case}: cut not reached"
+        );
+        let uncertain = matches!(case, 1 | 3 | 5);
+        assert_eq!(receiver.requires_recovery(), uncertain, "case {case}");
+        let recovery_slot = match outcome {
+            ZfsRecvOutcome::NotCommitted(FfsError::Io(_)) => {
+                assert_eq!(case, 0, "durable receive progress was lost");
+                assert_eq!(receiver.committed_txg(), initial_txg);
+                target.initial_slot
+            }
+            ZfsRecvOutcome::Interrupted {
+                reason,
+                progress,
+                cleanup_error,
+            } => {
+                assert!(matches!(case, 2 | 4 | 6 | 7), "case {case}");
+                assert_eq!(progress.substreams_received, 0);
+                assert_eq!(progress.last_snapshot, None);
+                assert_eq!(progress.last_snapshot_guid, None);
+                assert_eq!(
+                    progress.committed_txgs,
+                    receiver.committed_txg() - initial_txg
+                );
+                assert_eq!(
+                    progress.durable_token.committed_txg(),
+                    receiver.committed_txg()
+                );
+                receiver.verify_token(&progress.durable_token).unwrap();
+                assert_eq!(
+                    progress.last_durable_stage,
+                    if case == 6 {
+                        ZfsRecvStage::Aborted
+                    } else {
+                        ZfsRecvStage::Checkpoint
+                    }
+                );
+                match case {
+                    2 => {
+                        assert!(matches!(reason, FfsError::Io(_)));
+                        assert!(cleanup_error.is_none());
+                    }
+                    4 => {
+                        assert!(matches!(reason, FfsError::Format(_)));
+                        assert!(matches!(cleanup_error, Some(FfsError::Io(_))));
+                    }
+                    6 => {
+                        assert!(matches!(reason, FfsError::Format(_)));
+                        assert!(cleanup_error.is_none());
+                    }
+                    7 => {
+                        assert!(matches!(reason, FfsError::Cancelled));
+                        assert!(matches!(cleanup_error, Some(FfsError::Cancelled)));
+                        assert!(cx.checkpoint().is_err());
+                    }
+                    _ => unreachable!(),
+                }
+                progress.durable_token.published_slot()
+            }
+            ZfsRecvOutcome::Uncertain {
+                reason,
+                target_txg,
+                target_slot,
+                progress,
+                receive_error,
+            } => {
+                assert!(uncertain, "case {case}");
+                assert!(matches!(reason, FfsError::Io(_)));
+                assert_eq!(target_txg, receiver.committed_txg() + 1);
+                if case == 1 {
+                    assert!(progress.is_none());
+                    assert!(receive_error.is_none());
+                } else {
+                    let progress = progress.expect("the initial checkpoint is known durable");
+                    assert_eq!(progress.substreams_received, 0);
+                    assert_eq!(progress.last_durable_stage, ZfsRecvStage::Checkpoint);
+                    assert_eq!(
+                        progress.durable_token.committed_txg(),
+                        receiver.committed_txg()
+                    );
+                    assert_eq!(
+                        progress.committed_txgs,
+                        receiver.committed_txg() - initial_txg
+                    );
+                    if case == 5 {
+                        assert!(matches!(receive_error, Some(FfsError::Format(_))));
+                    } else {
+                        assert!(receive_error.is_none());
+                    }
+                }
+                let before = devices[0].write_calls();
+                assert!(matches!(
+                    receiver.receive_stream(
+                        &inspection_cx,
+                        &request,
+                        &mut Cursor::new(&streams.full)
+                    ),
+                    ZfsRecvOutcome::NotCommitted(_)
+                ));
+                assert_eq!(
+                    devices[0].write_calls(),
+                    before,
+                    "uncertain owner was reused"
+                );
+                target_slot
+            }
+            other => panic!("case {case}: unexpected receive outcome {other:?}"),
+        };
+
+        let durable: Vec<_> = devices
+            .iter()
+            .map(FaultableMemberDevice::fresh_from_durable)
+            .collect();
+        let mut reopen_options = default_write_opts(target.pool_guid, recovery_slot);
+        reopen_options.reconcile_torn_uberblocks = uncertain;
+        let fresh = open_engine_on_devices(&inspection_cx, &durable, reopen_options).unwrap();
+        let state = fresh
+            .inspect_receive_resume_state(&inspection_cx, &destination)
+            .unwrap();
+        assert_eq!(
+            state.is_some(),
+            matches!(case, 1 | 2 | 3 | 4 | 7),
+            "case {case}"
+        );
+        // No case completed a substream, even when a new native staging or
+        // cleanup TXG survives the simulated loss of all unsynced device bytes.
+        let mut mos = fresh.open_read_objects(&inspection_cx).unwrap();
+        assert!(
+            mos.zpl(&inspection_cx, &destination).is_err(),
+            "case {case}"
+        );
+        if uncertain {
+            assert_eq!(fresh.committed_txg(), receiver.committed_txg() + 1);
+        }
+    }
 }
 
 #[test]
@@ -574,7 +987,10 @@ fn compressed_zstd_receive_retains_native_blocks_and_owners_across_resume_and_ab
         for abort in [true, false] {
             assert!(matches!(
                 receiver.receive_stream(&cx, &receive, &mut Cursor::new(incomplete)),
-                ZfsTxOutcome::NotCommitted(_)
+                ZfsRecvOutcome::Interrupted {
+                    cleanup_error: None,
+                    ..
+                }
             ));
             let state = receiver
                 .inspect_receive_resume_state(&cx, &destination)
@@ -833,7 +1249,8 @@ fn receive_feature_owners_survive_checkpoints_resume_abort_and_destruction() {
         let feature = std::str::from_utf8(missing).unwrap();
         assert!(matches!(
             receiver.receive_stream(&cx, &request, &mut Cursor::new(&full)),
-            ZfsTxOutcome::NotCommitted(error) if error.to_string().contains(feature)
+            ZfsRecvOutcome::Interrupted { reason: error, cleanup_error: None, .. }
+                if error.to_string().contains(feature)
         ));
         assert!(
             receiver
@@ -890,7 +1307,7 @@ fn receive_feature_owners_survive_checkpoints_resume_abort_and_destruction() {
             let media = snapshot_media_bytes(&devices);
             assert!(matches!(
                 receiver.receive_stream(&cx, &receive, &mut Cursor::new(&downconverted_incremental)),
-                ZfsTxOutcome::NotCommitted(error) if error.to_string().contains("large-block support")
+                ZfsRecvOutcome::NotCommitted(error) if error.to_string().contains("large-block support")
             ));
             assert_media_unchanged(&devices, &media);
         }
@@ -900,7 +1317,10 @@ fn receive_feature_owners_survive_checkpoints_resume_abort_and_destruction() {
         for abort in [true, false] {
             assert!(matches!(
                 receiver.receive_stream(&cx, &receive, &mut Cursor::new(incomplete)),
-                ZfsTxOutcome::NotCommitted(_)
+                ZfsRecvOutcome::Interrupted {
+                    cleanup_error: None,
+                    ..
+                }
             ));
             let state = receiver
                 .inspect_receive_resume_state(&cx, &destination)
@@ -1606,7 +2026,11 @@ fn assert_receive_dnode_read_failure_preserves_checkpoint(corruption: bool) {
         let mut receive = ZfsRecvRequest::new(destination.clone());
         receive.resumable = true;
         match receiver.receive_stream(&cx, &receive, &mut Cursor::new(&probe)) {
-            ZfsTxOutcome::NotCommitted(error) => assert!(
+            ZfsRecvOutcome::Interrupted {
+                reason: error,
+                cleanup_error: None,
+                ..
+            } => assert!(
                 error.to_string().contains(diagnostic),
                 "{case}: original metadata read error was replaced: {error}"
             ),
@@ -1789,7 +2213,10 @@ fn malformed_plain_compressed_records_preserve_the_last_durable_checkpoint() {
     .unwrap();
     assert!(matches!(
         baseline.receive_stream(&cx, &receive, &mut Cursor::new(&stream[..second_record])),
-        ZfsTxOutcome::NotCommitted(_)
+        ZfsRecvOutcome::Interrupted {
+            cleanup_error: None,
+            ..
+        }
     ));
     let expected_state = baseline
         .inspect_receive_resume_state(&cx, &destination)
@@ -1855,7 +2282,11 @@ fn malformed_plain_compressed_records_preserve_the_last_durable_checkpoint() {
         )
         .unwrap();
         match receiver.receive_stream(&cx, &receive, &mut Cursor::new(&malformed)) {
-            ZfsTxOutcome::NotCommitted(error) => assert!(
+            ZfsRecvOutcome::Interrupted {
+                reason: error,
+                cleanup_error: None,
+                ..
+            } => assert!(
                 !error.to_string().contains("Fletcher4"),
                 "case {case}: {error}"
             ),
@@ -2119,7 +2550,10 @@ fn compressed_send_exports_logical_metadata_and_native_untyped_sa_spills() {
             &ZfsRecvRequest::new(destination.clone()),
             &mut Cursor::new(malformed)
         ),
-        ZfsTxOutcome::NotCommitted(_)
+        ZfsRecvOutcome::Interrupted {
+            cleanup_error: None,
+            ..
+        }
     ));
     assert!(
         !rejected
@@ -2247,7 +2681,8 @@ fn receive_preserves_native_checksum_policy_across_incremental_updates_and_rewri
     });
     assert!(matches!(
         receiver.receive_stream(&cx, &receive, &mut Cursor::new(invalid_compression)),
-        ZfsTxOutcome::NotCommitted(FfsError::Format(message)) if message.contains("compression selector")
+        ZfsRecvOutcome::Interrupted { reason: FfsError::Format(message), cleanup_error: None, .. }
+            if message.contains("compression selector")
     ));
     assert!(
         receiver
@@ -2259,7 +2694,7 @@ fn receive_preserves_native_checksum_policy_across_incremental_updates_and_rewri
         let invalid = stream_with_object_checksum(&full, object, invalid_checksum);
         assert!(matches!(
             receiver.receive_stream(&cx, &receive, &mut Cursor::new(&invalid)),
-            ZfsTxOutcome::NotCommitted(FfsError::Format(message))
+            ZfsRecvOutcome::Interrupted { reason: FfsError::Format(message), cleanup_error: None, .. }
                 if message.contains("outside the native legacy range")
         ));
         assert!(
@@ -2312,7 +2747,10 @@ fn receive_preserves_native_checksum_policy_across_incremental_updates_and_rewri
             &resumable,
             &mut Cursor::new(&without_object[..write_start])
         ),
-        ZfsTxOutcome::NotCommitted(_)
+        ZfsRecvOutcome::Interrupted {
+            cleanup_error: None,
+            ..
+        }
     ));
     let expected_commits = receiver.committed_txg() - control_txg;
     let expected_state = receiver
@@ -2347,7 +2785,10 @@ fn receive_preserves_native_checksum_policy_across_incremental_updates_and_rewri
         assert!(
             matches!(
                 receiver.receive_stream(&cx, &resumable, &mut Cursor::new(invalid)),
-                ZfsTxOutcome::NotCommitted(_)
+                ZfsRecvOutcome::Interrupted {
+                    cleanup_error: None,
+                    ..
+                }
             ),
             "existing-object geometry case {case}"
         );
@@ -3421,7 +3862,8 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
         let feature = std::str::from_utf8(missing).unwrap();
         assert!(matches!(
             receiver.receive_stream(&cx, &request, &mut Cursor::new(&raw_e1)),
-            ZfsTxOutcome::NotCommitted(error) if error.to_string().contains(feature)
+            ZfsRecvOutcome::Interrupted { reason: error, cleanup_error: None, .. }
+                if error.to_string().contains(feature)
         ));
         assert!(
             receiver
@@ -3474,7 +3916,7 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
     });
     assert!(matches!(
         dst_engine.receive_stream(&cx, &receive, &mut Cursor::new(missing_keydata)),
-        ZfsTxOutcome::NotCommitted(_)
+        ZfsRecvOutcome::NotCommitted(_)
     ));
     assert_media_unchanged(&dst_devs, &before_missing_keydata);
     assert!(
@@ -3506,7 +3948,7 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
         assert!(
             matches!(
                 dst_engine.receive_stream(&cx, &receive, &mut Cursor::new(invalid)),
-                ZfsTxOutcome::NotCommitted(_)
+                ZfsRecvOutcome::NotCommitted(_)
             ),
             "invalid raw field {field}={value:?}"
         );
@@ -3552,7 +3994,10 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
                 &ZfsRecvRequest::new(vault_dst.clone()),
                 &mut Cursor::new(malformed)
             ),
-            ZfsTxOutcome::NotCommitted(_)
+            ZfsRecvOutcome::Interrupted {
+                cleanup_error: None,
+                ..
+            }
         ));
         assert!(
             dst_engine
@@ -3582,7 +4027,10 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
             &receive,
             &mut Cursor::new(&raw_e1[..raw_e1.len() - DMU_REPLAY_RECORD_BYTES]),
         ),
-        ZfsTxOutcome::NotCommitted(_)
+        ZfsRecvOutcome::Interrupted {
+            cleanup_error: None,
+            ..
+        }
     ));
     assert_eq!(&dsl_block_feature_counts(&cx, &dst_engine)[..2], &[1, 1]);
     let mut checkpoint_mos = dst_engine.open_read_objects(&cx).unwrap();
@@ -3619,7 +4067,7 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
     let before_geometry = snapshot_media_bytes(&dst_devs);
     assert!(matches!(
         dst_engine.receive_stream(&cx, &receive, &mut Cursor::new(changed_resume_geometry)),
-        ZfsTxOutcome::NotCommitted(_)
+        ZfsRecvOutcome::NotCommitted(_)
     ));
     assert_media_unchanged(&dst_devs, &before_geometry);
     let downgraded = restamp_substream(&resumed_e1, true, |mut record, payload| {
@@ -3633,7 +4081,7 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
     let checkpoint_media = snapshot_media_bytes(&dst_devs);
     assert!(matches!(
         dst_engine.receive_stream(&cx, &receive, &mut Cursor::new(downgraded)),
-        ZfsTxOutcome::NotCommitted(_)
+        ZfsRecvOutcome::NotCommitted(_)
     ));
     assert_media_unchanged(&dst_devs, &checkpoint_media);
     assert_eq!(
@@ -3699,7 +4147,7 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
                     &ZfsRecvRequest::new(vault_dst.clone()),
                     &mut Cursor::new(invalid)
                 ),
-                ZfsTxOutcome::NotCommitted(_)
+                ZfsRecvOutcome::NotCommitted(_)
             ),
             "raw identity case {case}"
         );
@@ -3727,7 +4175,7 @@ fn raw_encrypted_send_recv_is_keyless_and_verifies_macs_on_unlock() {
             &ZfsRecvRequest::new(vault_dst.clone()),
             &mut Cursor::new(plain_incremental)
         ),
-        ZfsTxOutcome::NotCommitted(_)
+        ZfsRecvOutcome::NotCommitted(_)
     ));
     assert_media_unchanged(&dst_devs, &before_plain);
 
@@ -4014,7 +4462,13 @@ fn resumable_receive_interrupt_isolation_resume_abort_and_fault_cut_matrix() {
     nr_req.checkpoint_bytes = 8192;
     let cut_len = full_s1.len() / 2;
     let nr_outcome = dst_engine.receive_stream(&cx, &nr_req, &mut Cursor::new(&full_s1[..cut_len]));
-    assert!(matches!(nr_outcome, ZfsTxOutcome::NotCommitted(_)));
+    assert!(matches!(
+        nr_outcome,
+        ZfsRecvOutcome::Interrupted {
+            cleanup_error: None,
+            ..
+        }
+    ));
     assert!(
         dst_engine
             .inspect_receive_resume_state(&cx, &dst_nonres)
@@ -4046,7 +4500,13 @@ fn resumable_receive_interrupt_isolation_resume_abort_and_fault_cut_matrix() {
     res_req.checkpoint_bytes = 8192;
     let interrupted =
         dst_engine.receive_stream(&cx, &res_req, &mut Cursor::new(&full_s1[..cut_len]));
-    assert!(matches!(interrupted, ZfsTxOutcome::NotCommitted(_)));
+    assert!(matches!(
+        interrupted,
+        ZfsRecvOutcome::Interrupted {
+            cleanup_error: None,
+            ..
+        }
+    ));
 
     // Namespace isolation: live `Objects::datasets` and `mos.zpl` MUST NOT expose incomplete target!
     {
@@ -4124,7 +4584,13 @@ fn resumable_receive_interrupt_isolation_resume_abort_and_fault_cut_matrix() {
     );
     let incr_cut = incr_s2.len() / 2;
     let inc_int = dst_engine.receive_stream(&cx, &res_req, &mut Cursor::new(&incr_s2[..incr_cut]));
-    assert!(matches!(inc_int, ZfsTxOutcome::NotCommitted(_)));
+    assert!(matches!(
+        inc_int,
+        ZfsRecvOutcome::Interrupted {
+            cleanup_error: None,
+            ..
+        }
+    ));
     let inc_state = dst_engine
         .inspect_receive_resume_state(&cx, &dst_res)
         .unwrap()
@@ -4176,8 +4642,89 @@ fn resumable_receive_interrupt_isolation_resume_abort_and_fault_cut_matrix() {
     r_tok2.resume_token = Some(inc_state.token);
     send_stream(&cx, &mut src_mos, &r_tok2, &mut resume_s2).unwrap();
     let fault_out = fault_engine.receive_stream(&cx, &res_req, &mut Cursor::new(&resume_s2));
-    assert!(matches!(fault_out, ZfsTxOutcome::NotCommitted(_)));
+    assert!(matches!(fault_out, ZfsRecvOutcome::NotCommitted(_)));
     assert_eq!(fault_engine.committed_txg(), cut_txg);
+
+    // A resumed invocation can fail before its first new checkpoint. If the
+    // caller requests non-resumable handling, failed abort cleanup must retain
+    // both errors even though this invocation published no new native TXG.
+    {
+        let cleanup_devices: Vec<_> = dst_devs
+            .iter()
+            .map(FaultableMemberDevice::fresh_from_durable)
+            .collect();
+        let mut cleanup_engine = open_engine_on_devices(
+            &cx,
+            &cleanup_devices,
+            default_write_opts(dst_built.pool_guid, dst_engine.committed_slot()),
+        )
+        .unwrap();
+        let previous_state = cleanup_engine
+            .inspect_receive_resume_state(&cx, &dst_res)
+            .unwrap()
+            .unwrap();
+        let previous_slot = cleanup_engine.committed_slot();
+        let reached = Arc::new(Mutex::new(false));
+        let reached_for_hook = Arc::clone(&reached);
+        cleanup_engine.with_fault_hook(move |event| {
+            if event.operation == "abort_receive"
+                && matches!(
+                    event.stage,
+                    ZfsPersistenceStage::UberblockWrite { label: 0, .. }
+                )
+            {
+                *reached_for_hook.lock().unwrap() = true;
+                return Err(FfsError::Io(std::io::Error::other("resume abort failed")));
+            }
+            Ok(())
+        });
+        let (begin, _) =
+            DrrRecord::parse_header(&resume_s2[..DMU_REPLAY_RECORD_BYTES], Endian::Little).unwrap();
+        let begin_bytes = DMU_REPLAY_RECORD_BYTES + begin.expected_payload_len(false).unwrap();
+        assert!(begin_bytes < resume_s2.len());
+        let mut cleanup_request = res_req.clone();
+        cleanup_request.resumable = false;
+        let outcome = cleanup_engine.receive_stream(
+            &cx,
+            &cleanup_request,
+            &mut Cursor::new(&resume_s2[..begin_bytes]),
+        );
+        assert!(outcome.is_not_committed() && !outcome.is_committed());
+        assert!(matches!(
+            outcome,
+            ZfsRecvOutcome::CleanupFailed {
+                reason: FfsError::Format(_),
+                cleanup_error: FfsError::Io(_),
+            }
+        ));
+        assert!(*reached.lock().unwrap(), "abort failure was not reached");
+        assert_eq!(cleanup_engine.committed_txg(), cut_txg);
+        assert_eq!(cleanup_engine.committed_slot(), previous_slot);
+        let reopened_devices: Vec<_> = cleanup_devices
+            .iter()
+            .map(FaultableMemberDevice::fresh_from_durable)
+            .collect();
+        let reopened = open_engine_on_devices(
+            &cx,
+            &reopened_devices,
+            default_write_opts(dst_built.pool_guid, previous_slot),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened
+                .inspect_receive_resume_state(&cx, &dst_res)
+                .unwrap(),
+            Some(previous_state),
+            "failed cleanup changed the pre-existing durable checkpoint"
+        );
+        let mut mos = reopened.open_read_objects(&cx).unwrap();
+        let mut view = mos.zpl(&cx, &dst_res).unwrap();
+        let file = view.resolve(&cx, b"/multi.bin").unwrap();
+        assert_eq!(
+            view.read(&cx, file, 0, payload_s1.len()).unwrap(),
+            payload_s1
+        );
+    }
 
     // Abort the `%recv` staging and prove 100% space reclamation back to `pre_incr_alloc`!
     let mut clean_engine = open_engine_on_devices(
@@ -4341,7 +4888,7 @@ fn send_recv_strict_refusals_force_rollback_and_cancel_enospc_controls() {
             &ZfsRecvRequest::new(dst_ds.clone()),
             &mut Cursor::new(&s1_stream),
         ),
-        ZfsTxOutcome::NotCommitted(FfsError::Cancelled)
+        ZfsRecvOutcome::NotCommitted(FfsError::Cancelled)
     ));
     assert_media_unchanged(&dst_devs, &snap_before);
 
@@ -4357,7 +4904,7 @@ fn send_recv_strict_refusals_force_rollback_and_cancel_enospc_controls() {
             &ZfsRecvRequest::new(dst_ds.clone()),
             &mut Cursor::new(&bad_feat),
         ),
-        ZfsTxOutcome::NotCommitted(_)
+        ZfsRecvOutcome::NotCommitted(_)
     ));
     assert_media_unchanged(&dst_devs, &snap_before);
 
@@ -4371,7 +4918,10 @@ fn send_recv_strict_refusals_force_rollback_and_cancel_enospc_controls() {
             &ZfsRecvRequest::new(dst_ds.clone()),
             &mut Cursor::new(&bad_cksum),
         ),
-        ZfsTxOutcome::NotCommitted(_)
+        ZfsRecvOutcome::Interrupted {
+            cleanup_error: None,
+            ..
+        }
     ));
     assert_pool_scrub_and_allocation_clean(
         &cx,
@@ -4389,7 +4939,10 @@ fn send_recv_strict_refusals_force_rollback_and_cancel_enospc_controls() {
             &ZfsRecvRequest::new(dst_ds.clone()),
             &mut Cursor::new(&trailing),
         ),
-        ZfsTxOutcome::NotCommitted(_)
+        ZfsRecvOutcome::Interrupted {
+            cleanup_error: None,
+            ..
+        }
     ));
 
     // 5. Incremental stream without existing target base -> refused without mutation!
@@ -4400,7 +4953,7 @@ fn send_recv_strict_refusals_force_rollback_and_cancel_enospc_controls() {
             &ZfsRecvRequest::new(dst_ds.clone()),
             &mut Cursor::new(&s2_incr),
         ),
-        ZfsTxOutcome::NotCommitted(_)
+        ZfsRecvOutcome::NotCommitted(_)
     ));
     assert_media_unchanged(&dst_devs, &before_missing);
 
@@ -4457,7 +5010,7 @@ fn send_recv_strict_refusals_force_rollback_and_cancel_enospc_controls() {
         &ZfsRecvRequest::new(dst_ds.clone()),
         &mut Cursor::new(&s2_incr),
     );
-    assert!(matches!(no_force, ZfsTxOutcome::NotCommitted(_)));
+    assert!(matches!(no_force, ZfsRecvOutcome::NotCommitted(_)));
     assert_media_unchanged(&dst_devs, &before_diverge);
 
     // With force: true -> rolls back unsnapshotted divergence and applies @s2 cleanly!

@@ -164,6 +164,8 @@ struct PoolFixtureSpec {
     hello_ownership: Option<ffs_ondisk::zfs_zpl::ReclamationOwnership>,
     root_properties: Vec<(&'static [u8], u64)>,
     data_properties: Vec<(&'static [u8], u64)>,
+    dsl_property_entries: BTreeMap<usize, Vec<RawZapEntry>>,
+    dsl_counts: BTreeMap<usize, [u64; 2]>,
     data_head_features: Vec<(&'static [u8], u64)>,
     data_objectset_checksum: Option<u8>,
     auxiliary_ownership: Option<(u64, AuxiliaryOwnership)>,
@@ -216,6 +218,8 @@ impl Default for PoolFixtureSpec {
             hello_ownership: None,
             root_properties: Vec::new(),
             data_properties: Vec::new(),
+            dsl_property_entries: BTreeMap::new(),
+            dsl_counts: BTreeMap::new(),
             data_head_features: Vec::new(),
             data_objectset_checksum: None,
             auxiliary_ownership: None,
@@ -2170,6 +2174,20 @@ fn build_clean_zfs_pool(spec: &PoolFixtureSpec) -> BuiltPool {
         (34, 13, 0x114),
         (35, 13, 0x115),
     ] {
+        if let Some(entries) = spec.dsl_property_entries.get(&id) {
+            let blocks = encode_fatzap_with_flags(entries, 4096, salt, false, order)
+                .expect("encode native DSL properties");
+            let pointers = blocks
+                .iter()
+                .map(|block| arena.alloc_block(block, kind, 0, INITIAL_TXG, order))
+                .collect();
+            set_mos(
+                &mut mos_tables,
+                id,
+                &make_dnode(kind, 4096, pointers, 0, Vec::new(), None, 0, order),
+            );
+            continue;
+        }
         let properties = match id {
             16 => spec.root_properties.as_slice(),
             20 => spec.data_properties.as_slice(),
@@ -2470,25 +2488,32 @@ fn build_clean_zfs_pool(spec: &PoolFixtureSpec) -> BuiltPool {
 
     // Object 17: `data` `DSL_DIR` & Object 2: root `DSL_DIR`
     let data_dir_bonus = encode_dsl_dir_bonus(18, 2, 26, 19, 20, data_ref_bytes, order);
-    set_mos(
-        &mut mos_tables,
-        17,
-        &make_dnode(12, 512, Vec::new(), 12, data_dir_bonus, None, 0, order),
-    );
     let root_dir_bonus =
         encode_dsl_dir_bonus(3, 0, 26, 15, 16, root_ref_bytes.sum(data_ref_bytes), order);
-    set_mos(
-        &mut mos_tables,
-        2,
-        &make_dnode(12, 512, Vec::new(), 12, root_dir_bonus, None, 0, order),
-    );
+    for (id, bonus) in [(2, root_dir_bonus), (17, data_dir_bonus)] {
+        let node = if let Some([filesystems, snapshots]) = spec.dsl_counts.get(&id) {
+            let bytes = mzap(
+                &[
+                    (b"com.joyent:filesystem_count", *filesystems),
+                    (b"com.joyent:snapshot_count", *snapshots),
+                ],
+                0x120 + id as u64,
+                order,
+            );
+            let pointer = arena.alloc_block(&bytes, 196, 0, INITIAL_TXG, order);
+            make_dnode(196, 4096, vec![pointer], 12, bonus, None, 0, order)
+        } else {
+            make_dnode(12, 512, Vec::new(), 12, bonus, None, 0, order)
+        };
+        set_mos(&mut mos_tables, id, &node);
+    }
 
     // Objects 10, 11, 12: MOS feature catalogs
     let mut rf_entries: Vec<(&[u8], u64)> = vec![
         (b"com.delphix:hole_birth", 1),
         (
             b"com.delphix:extensible_dataset",
-            u64::from(!spec.data_head_features.is_empty()),
+            u64::from(!spec.data_head_features.is_empty()) + spec.dsl_counts.len() as u64,
         ),
     ];
     if let Some(count) = spec.lz4_feature {

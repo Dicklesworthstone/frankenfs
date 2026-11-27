@@ -16,7 +16,8 @@ use super::dmu_cow::{
 use super::dsl_ops::{
     DD_FLAG_USED_BREAKDOWN, DMU_OT_DSL_DATASET, DMU_OT_DSL_DIR_CHILD_MAP, DMU_OT_DSL_DS_SNAP_MAP,
     DMU_OT_DSL_PROPS, DS_FLAG_UNIQUE_ACCURATE, ObjectSetWalkMode, activate_dataset_block_features,
-    activate_initial_compression_feature, adjust_dsl_crypto_key_refcount, allocate_fresh_deadlist,
+    activate_initial_compression_feature, adjust_dsl_crypto_key_refcount,
+    adjust_filesystem_limits_counters, allocate_fresh_deadlist,
     bump_filesystem_limits_counter_if_present, dataset_block_feature_owners,
     dataset_feature_entries, derive_fsid_guid, derive_unique_guid,
     effective_compression_for_new_dataset, enforce_dataset_quotas_for_growth,
@@ -64,6 +65,7 @@ use ffs_ondisk::zfs_dmu::{
 use ffs_ondisk::zfs_zap::Entry as RawZapEntry;
 use ffs_ondisk::zfs_zap::names::NamePolicy as ZapNamePolicy;
 use serde::Serialize;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 
@@ -117,6 +119,160 @@ pub struct ZfsRecvReport {
     pub stream_bytes_read: u64,
     pub checkpoint_txgs: u64,
     pub durable_token: ZfsDurableToken,
+}
+
+/// Last known durable action performed by an interrupted receive invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ZfsRecvStage {
+    /// Private receive staging was created or advanced; it has not been promoted.
+    Checkpoint,
+    /// A complete substream and its snapshot were published in the target dataset.
+    Promoted,
+    /// The incomplete substream's private staging was durably reclaimed.
+    /// Earlier completed substreams, if any, remain published.
+    Aborted,
+}
+
+/// Known durable prefix of this receive invocation, including private checkpoints.
+///
+/// A later `Uncertain` publication may supersede this token. In that case this is
+/// a lower bound on completed work, not authority to select an older pool root.
+#[derive(Debug, Clone, Serialize)]
+pub struct ZfsRecvProgress {
+    pub substreams_received: usize,
+    pub last_snapshot: Option<String>,
+    pub last_snapshot_guid: Option<u64>,
+    /// Successful staging, checkpoint, promotion and abort TXGs in this invocation.
+    pub committed_txgs: u64,
+    pub last_durable_stage: ZfsRecvStage,
+    pub durable_token: ZfsDurableToken,
+}
+
+/// Outcome of an entire receive, which can publish several independent native TXGs.
+///
+/// Unlike `ZfsTxOutcome`, a receive can fail after a known durable prefix without
+/// any uncertainty about its final publication. Such a failure is `Interrupted`,
+/// never `NotCommitted`, and must not be retried as an untouched operation.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+pub enum ZfsRecvOutcome {
+    /// Every substream and the complete outer framing were accepted.
+    Committed {
+        value: ZfsRecvReport,
+        token: ZfsDurableToken,
+    },
+    /// This invocation published no native TXG. Prior resumable state is unchanged.
+    NotCommitted(FfsError),
+    /// Receive failed without a new TXG, and aborting its pre-existing staging
+    /// also failed before publication. The prior receive state remains intact.
+    CleanupFailed {
+        reason: FfsError,
+        cleanup_error: FfsError,
+    },
+    /// Receive failed after the known durable prefix, with no uncertain publication.
+    Interrupted {
+        reason: FfsError,
+        progress: ZfsRecvProgress,
+        /// Failure to reclaim non-resumable staging, when cleanup was attempted.
+        cleanup_error: Option<FfsError>,
+    },
+    /// A native publication (possibly abort cleanup) needs fresh-engine recovery.
+    Uncertain {
+        reason: FfsError,
+        target_txg: u64,
+        target_slot: usize,
+        progress: Option<ZfsRecvProgress>,
+        /// Original stream error when the uncertain transaction was abort cleanup.
+        receive_error: Option<FfsError>,
+    },
+}
+
+impl ZfsRecvOutcome {
+    #[must_use]
+    pub const fn is_committed(&self) -> bool {
+        matches!(self, Self::Committed { .. })
+    }
+
+    /// Whether this invocation published no new native TXG. A cleanup failure
+    /// still requires handling the pre-existing receive state and both errors.
+    #[must_use]
+    pub const fn is_not_committed(&self) -> bool {
+        matches!(self, Self::NotCommitted(_) | Self::CleanupFailed { .. })
+    }
+
+    /// Extract successful completion without discarding interruption or recovery
+    /// information from the error case.
+    pub fn into_result(self) -> std::result::Result<(ZfsRecvReport, ZfsDurableToken), Box<Self>> {
+        match self {
+            Self::Committed { value, token } => Ok((value, token)),
+            outcome => Err(Box::new(outcome)),
+        }
+    }
+}
+
+#[derive(Default)]
+struct RecvAttempt {
+    progress: Option<ZfsRecvProgress>,
+    cleanup_error: Option<FfsError>,
+    receive_error: Option<FfsError>,
+}
+
+impl RecvAttempt {
+    fn record(&mut self, token: ZfsDurableToken, stage: ZfsRecvStage) {
+        if let Some(progress) = &mut self.progress {
+            progress.committed_txgs += 1;
+            progress.last_durable_stage = stage;
+            progress.durable_token = token;
+        } else {
+            self.progress = Some(ZfsRecvProgress {
+                substreams_received: 0,
+                last_snapshot: None,
+                last_snapshot_guid: None,
+                committed_txgs: 1,
+                last_durable_stage: stage,
+                durable_token: token,
+            });
+        }
+    }
+
+    fn promoted(&mut self, token: ZfsDurableToken, name: &[u8], guid: u64) {
+        self.record(token, ZfsRecvStage::Promoted);
+        if let Some(progress) = &mut self.progress {
+            progress.substreams_received += 1;
+            progress.last_snapshot = Some(String::from_utf8_lossy(name).into_owned());
+            progress.last_snapshot_guid = Some(guid);
+        }
+    }
+
+    fn finish(self, outcome: ZfsTxOutcome<ZfsRecvReport>) -> ZfsRecvOutcome {
+        match outcome {
+            ZfsTxOutcome::Committed { value, token } => ZfsRecvOutcome::Committed { value, token },
+            ZfsTxOutcome::NotCommitted(reason) => match (self.progress, self.cleanup_error) {
+                (Some(progress), cleanup_error) => ZfsRecvOutcome::Interrupted {
+                    reason,
+                    progress,
+                    cleanup_error,
+                },
+                (None, Some(cleanup_error)) => ZfsRecvOutcome::CleanupFailed {
+                    reason,
+                    cleanup_error,
+                },
+                (None, None) => ZfsRecvOutcome::NotCommitted(reason),
+            },
+            ZfsTxOutcome::Uncertain {
+                reason,
+                target_txg,
+                target_slot,
+            } => ZfsRecvOutcome::Uncertain {
+                reason,
+                target_txg,
+                target_slot,
+                progress: self.progress,
+                receive_error: self.receive_error,
+            },
+        }
+    }
 }
 
 /// Persisted state of an interrupted resumable receive (`%recv` or `DS_FLAG_INCONSISTENT`),
@@ -853,12 +1009,29 @@ impl ZfsTransactionEngine {
     /// Ingest a native OpenZFS `DMU_BACKUP_STREAM` (single substream or `-p`/`-I` compound
     /// stream, full or incremental, logical/compressed/embedded/large-block or keyless raw
     /// encrypted `-w`, optionally resumable `-s`) into `req.target_dataset`.
-    #[allow(clippy::too_many_lines)]
+    ///
+    /// Interrupted receives report every known durable checkpoint or completed
+    /// substream separately from an uncertain native publication. Automatic abort
+    /// cleanup is itself a native transaction and does not undo an earlier
+    /// completed compound substream.
     pub fn receive_stream(
         &mut self,
         cx: &Cx,
         req: &ZfsRecvRequest,
         input: &mut impl Read,
+    ) -> ZfsRecvOutcome {
+        let attempt = RefCell::new(RecvAttempt::default());
+        let outcome = self.receive_stream_inner(cx, req, input, &attempt);
+        attempt.into_inner().finish(outcome)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn receive_stream_inner(
+        &mut self,
+        cx: &Cx,
+        req: &ZfsRecvRequest,
+        input: &mut impl Read,
+        attempt: &RefCell<RecvAttempt>,
     ) -> ZfsTxOutcome<ZfsRecvReport> {
         if self.poisoned_uncertain {
             return ZfsTxOutcome::NotCommitted(unsupported(
@@ -1047,6 +1220,7 @@ impl ZfsTransactionEngine {
                             sub_props,
                             false,
                             &mut reader,
+                            attempt,
                         ) {
                             ZfsTxOutcome::Committed {
                                 value: sub_rep,
@@ -1099,6 +1273,7 @@ impl ZfsTransactionEngine {
                 &[],
                 true,
                 &mut reader,
+                attempt,
             ) {
                 ZfsTxOutcome::Committed {
                     value: sub_rep,
@@ -1163,6 +1338,7 @@ impl ZfsTransactionEngine {
         compound_props: &[(String, ZfsPropertySetValue)],
         require_eof_before_commit: bool,
         reader: &mut StreamReader<'_, R>,
+        attempt: &RefCell<RecvAttempt>,
     ) -> ZfsTxOutcome<ZfsRecvReport> {
         // 1. Fail-closed admission of DRR_BEGIN header BEFORE allocating any block!
         let bad_feats = begin.features.unsupported_bits();
@@ -1279,14 +1455,17 @@ impl ZfsTransactionEngine {
             }
         } else {
             match self.commit_recv_begin_txg(cx, req, begin, keydata.as_ref()) {
-                ZfsTxOutcome::Committed { value: meta, .. } => (
-                    meta,
-                    ChunkProgress {
-                        object: 0,
-                        offset: 0,
-                        bytes: reader.bytes_read,
-                    },
-                ),
+                ZfsTxOutcome::Committed { value: meta, token } => {
+                    attempt.borrow_mut().record(token, ZfsRecvStage::Checkpoint);
+                    (
+                        meta,
+                        ChunkProgress {
+                            object: 0,
+                            offset: 0,
+                            bytes: reader.bytes_read,
+                        },
+                    )
+                }
                 ZfsTxOutcome::NotCommitted(e) => return ZfsTxOutcome::NotCommitted(e),
                 ZfsTxOutcome::Uncertain {
                     reason,
@@ -1304,7 +1483,26 @@ impl ZfsTransactionEngine {
 
         let cleanup_on_abort = |engine: &mut Self, err: FfsError| -> ZfsTxOutcome<ZfsRecvReport> {
             if !req.resumable && !engine.poisoned_uncertain {
-                let _ = engine.abort_receive(cx, &req.target_dataset);
+                match engine.abort_receive(cx, &req.target_dataset) {
+                    ZfsTxOutcome::Committed { token, .. } => {
+                        attempt.borrow_mut().record(token, ZfsRecvStage::Aborted);
+                    }
+                    ZfsTxOutcome::NotCommitted(cleanup_error) => {
+                        attempt.borrow_mut().cleanup_error = Some(cleanup_error);
+                    }
+                    ZfsTxOutcome::Uncertain {
+                        reason,
+                        target_txg,
+                        target_slot,
+                    } => {
+                        attempt.borrow_mut().receive_error = Some(err);
+                        return ZfsTxOutcome::Uncertain {
+                            reason,
+                            target_txg,
+                            target_slot,
+                        };
+                    }
+                }
             }
             ZfsTxOutcome::NotCommitted(err)
         };
@@ -1823,7 +2021,8 @@ impl ZfsTransactionEngine {
                     &next_prog,
                     saw_end,
                 ) {
-                    ZfsTxOutcome::Committed { .. } => {
+                    ZfsTxOutcome::Committed { token, .. } => {
+                        attempt.borrow_mut().record(token, ZfsRecvStage::Checkpoint);
                         committed_progress = next_prog;
                         pending_ops.clear();
                         pending_bytes = 0;
@@ -1857,23 +2056,28 @@ impl ZfsTransactionEngine {
             ZfsTxOutcome::Committed {
                 value: snap_guid,
                 token: tok,
-            } => ZfsTxOutcome::Committed {
-                value: ZfsRecvReport {
-                    substreams_received: 1,
-                    compound: false,
-                    raw: stage_meta.is_raw_encrypted,
-                    resumed: is_resuming,
-                    final_snapshot: String::from_utf8_lossy(&snap_name).into_owned(),
-                    final_snapshot_guid: snap_guid,
-                    records_applied,
-                    objects_received,
-                    blocks_received,
-                    stream_bytes_read: reader.bytes_read,
-                    checkpoint_txgs: checkpoint_txgs + 1,
-                    durable_token: tok.clone(),
-                },
-                token: tok,
-            },
+            } => {
+                attempt
+                    .borrow_mut()
+                    .promoted(tok.clone(), &snap_name, snap_guid);
+                ZfsTxOutcome::Committed {
+                    value: ZfsRecvReport {
+                        substreams_received: 1,
+                        compound: false,
+                        raw: stage_meta.is_raw_encrypted,
+                        resumed: is_resuming,
+                        final_snapshot: String::from_utf8_lossy(&snap_name).into_owned(),
+                        final_snapshot_guid: snap_guid,
+                        records_applied,
+                        objects_received,
+                        blocks_received,
+                        stream_bytes_read: reader.bytes_read,
+                        checkpoint_txgs: checkpoint_txgs + 1,
+                        durable_token: tok.clone(),
+                    },
+                    token: tok,
+                }
+            }
             ZfsTxOutcome::NotCommitted(err) => cleanup_on_abort(self, err),
             ZfsTxOutcome::Uncertain {
                 reason,
@@ -2699,6 +2903,22 @@ impl ZfsTransactionEngine {
                         Vec::new(),
                         &t_cz_entries,
                         0,
+                        false,
+                        order,
+                        new_txg,
+                        staged_writes,
+                    )?;
+
+                    // Native %recv children count as filesystems while the
+                    // temporary receive clone bypasses filesystem-limit admission.
+                    adjust_filesystem_limits_counters(
+                        cx,
+                        mos,
+                        &mos_meta,
+                        mos_ceiling,
+                        mos_dirty_dnodes,
+                        alloc,
+                        &[(target_dd_obj, [1, 0])],
                         false,
                         order,
                         new_txg,
@@ -4359,6 +4579,19 @@ impl ZfsTransactionEngine {
                             staged_writes,
                         )?;
                     }
+                    adjust_filesystem_limits_counters(
+                        cx,
+                        mos,
+                        &mos_meta,
+                        mos_ceiling,
+                        mos_dirty_dnodes,
+                        alloc,
+                        &[(stage_cloned.target_dd_obj, [-1, 1])],
+                        true,
+                        order,
+                        new_txg,
+                        staged_writes,
+                    )?;
                     Ok((snap_guid, snap_ds_obj))
                 } else {
                     // Full receive promotion: strip resume ZAP keys, clear `DS_FLAG_INCONSISTENT`,
@@ -4596,6 +4829,19 @@ impl ZfsTransactionEngine {
                             staged_writes,
                         )?;
                     }
+                    adjust_filesystem_limits_counters(
+                        cx,
+                        mos,
+                        &mos_meta,
+                        mos_ceiling,
+                        mos_dirty_dnodes,
+                        alloc,
+                        &[(stage_cloned.stage_dd_obj, [0, 1])],
+                        true,
+                        order,
+                        new_txg,
+                        staged_writes,
+                    )?;
                     Ok((snap_guid, snap_ds_obj))
                 }
             },
