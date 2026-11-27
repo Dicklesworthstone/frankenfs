@@ -4130,6 +4130,6 @@ mod tests {
             started_at,
             shutdown_at,
         });
-        assert!(idle_obs.per_core.is_empty());
+        assert_eq!(idle_obs.per_core, Vec::new());
     }
 }
