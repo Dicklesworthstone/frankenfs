@@ -4560,7 +4560,7 @@ fn received_dataset_sets_used_breakdown_flag_and_tracks_head_and_snap() {
         .expect("snapshot data@s1");
 
     let mut stream = Vec::new();
-    let src_mos = open_mos(
+    let mut src_mos = open_mos(
         &cx,
         std::slice::from_ref(&src_dev),
         src_built.pool_guid,
@@ -4568,8 +4568,8 @@ fn received_dataset_sets_used_breakdown_flag_and_tracks_head_and_snap() {
     );
     send_stream(
         &cx,
-        &src_mos,
-        &ZfsSendRequest::full(src_ds, b"s1".to_vec()),
+        &mut src_mos,
+        &ZfsSendRequest::full(src_ds.clone(), b"s1".to_vec()),
         &mut stream,
     )
     .expect("send full stream");
@@ -4686,23 +4686,16 @@ fn received_dataset_sets_used_breakdown_flag_and_tracks_head_and_snap() {
         .expect("snapshot data@s2");
 
     let mut incr_stream = Vec::new();
-    let src_mos2 = open_mos(
+    let mut src_mos2 = open_mos(
         &cx,
         std::slice::from_ref(&src_dev),
         src_built.pool_guid,
         src_engine.committed_slot(),
     );
-    send_stream(
-        &cx,
-        &src_mos2,
-        &ZfsSendRequest::incremental(
-            src_ds,
-            ZfsSendFrom::Snapshot(b"s1".to_vec()),
-            b"s2".to_vec(),
-        ),
-        &mut incr_stream,
-    )
-    .expect("send incremental s1 -> s2");
+    let mut incr_req = ZfsSendRequest::full(src_ds, b"s2".to_vec());
+    incr_req.from = Some(ZfsSendFrom::Snapshot(b"s1".to_vec()));
+    send_stream(&cx, &mut src_mos2, &incr_req, &mut incr_stream)
+        .expect("send incremental s1 -> s2");
 
     let mut force_req = ZfsRecvRequest::new(dst_ds.clone());
     force_req.force = true;
