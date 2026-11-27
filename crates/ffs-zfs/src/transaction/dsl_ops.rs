@@ -2908,7 +2908,7 @@ pub(super) fn adjust_filesystem_limits_counters(
         } else {
             Vec::new()
         };
-        let mut changed = false;
+        let mut dirty = false;
         for ((counter_key, property), delta) in [
             (
                 b"com.joyent:filesystem_count".as_slice(),
@@ -2941,9 +2941,9 @@ pub(super) fn adjust_filesystem_limits_counters(
                 return Err(reject_edquot("ZFS filesystem/snapshot limit exceeded"));
             }
             entries[pos].values = vec![next];
-            changed = true;
+            dirty = true;
         }
-        if changed {
+        if dirty {
             updates.push((directory, dd_dn, dd_ceil, entries));
         }
     }
