@@ -86477,6 +86477,265 @@ mod tests {
             .expect_err("dirty or failed freshness publication cannot authorize cold recovery");
     }
 
+    #[test]
+    fn native_freshness_cancelled_final_seal_releases_guard_and_fences_escaped_writes() {
+        let baseline = native_freshness_baseline();
+        for write_before_cancel in [false, true] {
+            let cx = Cx::for_testing();
+            let dev = TestDevice::from_vec(baseline.sealed.clone());
+            let mut fs =
+                OpenFs::from_device(&cx, Box::new(dev.clone()), &native_preparation_options())
+                    .unwrap();
+            let payload = native_existing_payload_block(&fs, &cx);
+            fs.activate_native_ext4_repair(&cx, NATIVE_PARITY_TEST_BUDGET)
+                .unwrap();
+            let offset = ByteOffset(payload.0 * 1024 + 17);
+            let mut guard = fs.begin_durability_commit(&cx, 42, &[payload]).unwrap();
+            if write_before_cancel {
+                fs.dev.write_all_at(&cx, offset, &[0x3D; 31]).unwrap();
+            }
+            let cancelled = Cx::for_testing();
+            cancelled.set_cancel_requested(true);
+            assert!(matches!(
+                guard.arm_final_seal(&cancelled),
+                Err(FfsError::Cancelled)
+            ));
+            drop(guard);
+
+            if write_before_cancel {
+                let before = dev.snapshot_bytes();
+                let error = fs.dev.sync(&cx).expect_err(
+                    "an aborted native commit must not acknowledge an unprotected raw sync",
+                );
+                assert!(error.to_string().contains("poisoned"), "{error}");
+                fs.dev
+                    .write_all_at(&cx, offset, &[0x6E; 31])
+                    .expect_err("the incomplete epoch must fence later writes");
+                fs.dev
+                    .read_exact_at(&cx, offset, &mut [0; 31])
+                    .expect_err("the incomplete epoch must fence later reads");
+                assert!(dev.snapshot_bytes() == before);
+                native_freshness_cold_refuses(before);
+            } else {
+                assert!(dev.snapshot_bytes() == baseline.sealed);
+                let mut retry = fs.begin_durability_commit(&cx, 43, &[payload]).unwrap();
+                fs.dev.write_all_at(&cx, offset, &[0x6E; 31]).unwrap();
+                retry.arm_final_seal(&cx).unwrap();
+                drop(retry);
+                fs.dev.sync(&cx).unwrap();
+                let report = fs.check_native_ext4_repair(&cx).expect(
+                    "write-free cancellation must not leak a deferred-seal hold into the next commit",
+                );
+                assert!(report.generations.iter().any(|generation| *generation > 1));
+                let cold = OpenFs::from_device(
+                    &cx,
+                    Box::new(TestDevice::from_vec(dev.snapshot_bytes())),
+                    &native_preparation_options(),
+                )
+                .unwrap();
+                assert_eq!(cold.check_native_ext4_repair(&cx).unwrap(), report);
+                let mut bytes = [0; 31];
+                cold.dev.read_exact_at(&cx, offset, &mut bytes).unwrap();
+                assert_eq!(bytes, [0x6E; 31]);
+            }
+            assert!(cancelled.is_cancel_requested());
+        }
+    }
+
+    #[test]
+    fn native_freshness_nested_abort_cannot_be_sealed_by_another_guard() {
+        let baseline = native_freshness_baseline();
+        for abort_inner in [true, false] {
+            let cx = Cx::for_testing();
+            let dev = TestDevice::from_vec(baseline.sealed.clone());
+            let mut fs =
+                OpenFs::from_device(&cx, Box::new(dev.clone()), &native_preparation_options())
+                    .unwrap();
+            let payload = native_existing_payload_block(&fs, &cx);
+            fs.activate_native_ext4_repair(&cx, NATIVE_PARITY_TEST_BUDGET)
+                .unwrap();
+            let mut outer = fs.begin_durability_commit(&cx, 42, &[payload]).unwrap();
+            let mut inner = fs.begin_durability_commit(&cx, 42, &[payload]).unwrap();
+            fs.dev
+                .write_all_at(&cx, ByteOffset(payload.0 * 1024 + 17), &[0x3D; 31])
+                .unwrap();
+            let before_abort = dev.snapshot_bytes();
+            if abort_inner {
+                drop(inner);
+                let error = outer
+                    .arm_final_seal(&cx)
+                    .expect_err("outer completion must not hide an aborted inner native commit");
+                assert!(error.to_string().contains("poisoned"), "{error}");
+                fs.dev
+                    .sync(&cx)
+                    .expect_err("the still-live outer guard must not acknowledge escaped writes");
+                drop(outer);
+            } else {
+                inner.arm_final_seal(&cx).unwrap();
+                drop(inner);
+                drop(outer);
+            }
+            fs.dev
+                .sync(&cx)
+                .expect_err("aborted shared native epoch must remain fenced after all guards drop");
+            assert!(dev.snapshot_bytes() == before_abort);
+            native_freshness_cold_refuses(before_abort);
+        }
+    }
+
+    #[test]
+    fn native_freshness_nested_completion_and_write_free_abort_preserve_publication() {
+        let baseline = native_freshness_baseline();
+        for abort_empty_inner in [false, true] {
+            let cx = Cx::for_testing();
+            let dev = TestDevice::from_vec(baseline.sealed.clone());
+            let mut fs =
+                OpenFs::from_device(&cx, Box::new(dev.clone()), &native_preparation_options())
+                    .unwrap();
+            let payload = native_existing_payload_block(&fs, &cx);
+            fs.activate_native_ext4_repair(&cx, NATIVE_PARITY_TEST_BUDGET)
+                .unwrap();
+            let offset = ByteOffset(payload.0 * 1024 + 17);
+            let mut outer = fs.begin_durability_commit(&cx, 42, &[payload]).unwrap();
+            let mut inner = fs.begin_durability_commit(&cx, 42, &[payload]).unwrap();
+            if abort_empty_inner {
+                drop(inner);
+                assert!(dev.snapshot_bytes() == baseline.sealed);
+                fs.dev.write_all_at(&cx, offset, &[0x3D; 31]).unwrap();
+            } else {
+                fs.dev.write_all_at(&cx, offset, &[0x3D; 31]).unwrap();
+                inner.arm_final_seal(&cx).unwrap();
+                drop(inner);
+            }
+            fs.dev.sync(&cx).unwrap();
+            native_freshness_cold_refuses(dev.snapshot_bytes());
+            outer.arm_final_seal(&cx).unwrap();
+            drop(outer);
+            fs.dev.sync(&cx).unwrap();
+            let report = fs.check_native_ext4_repair(&cx).unwrap();
+            assert!(report.generations.iter().any(|generation| *generation > 1));
+            let cold = OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(dev.snapshot_bytes())),
+                &native_preparation_options(),
+            )
+            .unwrap();
+            assert_eq!(cold.check_native_ext4_repair(&cx).unwrap(), report);
+            let mut bytes = [0; 31];
+            cold.dev.read_exact_at(&cx, offset, &mut bytes).unwrap();
+            assert_eq!(bytes, [0x3D; 31]);
+        }
+    }
+
+    #[test]
+    fn native_freshness_shared_device_deferral_holds_protection_until_native_completion() {
+        let baseline = native_freshness_baseline();
+        for complete in [false, true] {
+            let cx = Cx::for_testing();
+            let dev = TestDevice::from_vec(baseline.sealed.clone());
+            let mut fs =
+                OpenFs::from_device(&cx, Box::new(dev.clone()), &native_preparation_options())
+                    .unwrap();
+            let payload = native_existing_payload_block(&fs, &cx);
+            fs.activate_native_ext4_repair(&cx, NATIVE_PARITY_TEST_BUDGET)
+                .unwrap();
+            let shared = fs.shared_fenced_device();
+            let mut guard = ffs_block::DurabilityCommitDeferral::enter(&cx, shared.as_ref())
+                .expect("generic callers must share the native protection fence");
+            shared
+                .write_all_at(&cx, ByteOffset(payload.0 * 1024 + 17), &[0x3D; 31])
+                .unwrap();
+            shared.sync(&cx).unwrap();
+            let intermediate = dev.snapshot_bytes();
+            native_freshness_cold_refuses(intermediate.clone());
+            if complete {
+                guard.complete();
+                drop(guard);
+                shared.sync(&cx).unwrap();
+                let report = fs.check_native_ext4_repair(&cx).unwrap();
+                assert!(report.generations.iter().any(|generation| *generation > 1));
+                let cold = OpenFs::from_device(
+                    &cx,
+                    Box::new(TestDevice::from_vec(dev.snapshot_bytes())),
+                    &native_preparation_options(),
+                )
+                .unwrap();
+                assert_eq!(cold.check_native_ext4_repair(&cx).unwrap(), report);
+                let mut bytes = [0; 31];
+                cold.dev
+                    .read_exact_at(&cx, ByteOffset(payload.0 * 1024 + 17), &mut bytes)
+                    .unwrap();
+                assert_eq!(bytes, [0x3D; 31]);
+            } else {
+                drop(guard);
+                shared
+                    .sync(&cx)
+                    .expect_err("generic abort must fence its incomplete native state");
+                assert!(dev.snapshot_bytes() == intermediate);
+                native_freshness_cold_refuses(intermediate);
+            }
+        }
+    }
+
+    #[test]
+    fn native_freshness_shared_and_format_guards_share_one_abortable_epoch() {
+        let baseline = native_freshness_baseline();
+        for abort_inner in [false, true] {
+            let cx = Cx::for_testing();
+            let dev = TestDevice::from_vec(baseline.sealed.clone());
+            let mut fs =
+                OpenFs::from_device(&cx, Box::new(dev.clone()), &native_preparation_options())
+                    .unwrap();
+            let payload = native_existing_payload_block(&fs, &cx);
+            fs.activate_native_ext4_repair(&cx, NATIVE_PARITY_TEST_BUDGET)
+                .unwrap();
+            let shared = fs.shared_fenced_device();
+            let mut outer =
+                ffs_block::DurabilityCommitDeferral::enter(&cx, shared.as_ref()).unwrap();
+            let mut inner = fs.begin_durability_commit(&cx, 42, &[payload]).unwrap();
+            shared
+                .write_all_at(&cx, ByteOffset(payload.0 * 1024 + 17), &[0x3D; 31])
+                .unwrap();
+            if !abort_inner {
+                inner.arm_final_seal(&cx).unwrap();
+            }
+            drop(inner);
+            let before_outer_completion = dev.snapshot_bytes();
+            if abort_inner {
+                shared
+                    .sync(&cx)
+                    .expect_err("nested abort must remain visible");
+            } else {
+                shared.sync(&cx).unwrap();
+                native_freshness_cold_refuses(dev.snapshot_bytes());
+            }
+            outer.complete();
+            drop(outer);
+            if abort_inner {
+                shared
+                    .sync(&cx)
+                    .expect_err("generic outer completion cannot hide a format-commit abort");
+                assert!(dev.snapshot_bytes() == before_outer_completion);
+                native_freshness_cold_refuses(before_outer_completion);
+            } else {
+                shared.sync(&cx).unwrap();
+                let cold = OpenFs::from_device(
+                    &cx,
+                    Box::new(TestDevice::from_vec(dev.snapshot_bytes())),
+                    &native_preparation_options(),
+                )
+                .unwrap();
+                assert!(
+                    cold.check_native_ext4_repair(&cx)
+                        .unwrap()
+                        .generations
+                        .iter()
+                        .any(|generation| *generation > 1)
+                );
+            }
+        }
+    }
+
     fn native_freshness_recovery_cut(pending: bool) -> (Vec<u8>, BlockNumber) {
         let baseline = native_freshness_baseline();
         let cx = Cx::for_testing();
