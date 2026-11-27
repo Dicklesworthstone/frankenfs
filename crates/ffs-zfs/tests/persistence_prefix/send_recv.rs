@@ -608,7 +608,7 @@ fn receive_outcome_preserves_durable_compound_prefix_after_later_failure() {
         else {
             panic!("case {case}: a completed substream must be reported as durable");
         };
-        assert!(!reason.to_string().is_empty());
+        assert_ne!(reason.to_string(), "");
         assert!(cleanup_error.is_none(), "case {case}: {cleanup_error:?}");
         assert_eq!(progress.substreams_received, 1, "case {case}");
         assert_eq!(progress.last_snapshot.as_deref(), Some("first"));
