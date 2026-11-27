@@ -1933,7 +1933,7 @@ pub fn format_cmd(
         "ext4" => {
             if !delegate_host_mkfs {
                 bail!(
-                    "native Rust ext4 formatting is not yet implemented; pass --delegate-host-mkfs to explicitly invoke host mkfs.ext4 (or use --filesystem fat16|fat32 for pure-Rust formatting)"
+                    "native Rust ext4 formatting is not yet implemented; pass --delegate-host-mkfs to explicitly invoke host mkfs.ext4 (or use --filesystem fat16|fat32|ntfs|zfs for pure-Rust formatting)"
                 );
             }
             mkfs_cmd(
