@@ -7,6 +7,8 @@
 //! directly on disk (`ScanHealWrite` + `ScanHealBarrier`), persists exact
 //! resumption bookmarks in MOS object 1 `"scan"` at bounded chunk intervals,
 //! and cleanly reconciles concurrent foreground writes across pause/resume.
+//! As in native `dsl_scan.c`, blocks retained only by a pool checkpoint are
+//! excluded. Reports expose that scope; this scanner never clears native DTLs.
 
 use asupersync::Cx;
 use ffs_error::{FfsError, Result};
@@ -18,21 +20,37 @@ use ffs_ondisk::zfs::scan::{
     DSL_SCAN_PHYS_WORDS, DslScanFunc, DslScanPhys, DslScanState, ZBookmarkPhys,
 };
 use ffs_ondisk::zfs::{BlockPointer, DATA_OFFSET, Dva, label_offsets};
-use ffs_ondisk::zfs_dmu::{DNODE_BLOCK_BYTES, DNODE_BYTES, Dnode, ObjectSet, dnode_at};
+use ffs_ondisk::zfs_dmu::{
+    DNODE_BLOCK_BYTES, DNODE_BYTES, Dnode, OBJSET_GROUPUSED_OFFSET, OBJSET_PROJECTUSED_OFFSET,
+    OBJSET_USERUSED_OFFSET, ObjectSet,
+};
 use ffs_ondisk::zfs_zap::Entry as RawZapEntry;
 use serde::Serialize;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use super::dmu_cow::{AllocatorWriteTopology, PoolSpaceAllocator};
 use super::{
     ZfsPersistenceStage, ZfsTransactionEngine, ZfsTxOutcome, checkpoint, corrupt, parse_err,
     unsupported,
 };
-use crate::reader::dmu::Objects;
+use crate::reader::dmu::{DatasetCryptoContext, Objects};
 use crate::reader::pool::vdev::{PoolTopology, TopVdevKind, VdevHealth};
 
 const DMU_POOL_SCAN_KEY: &[u8] = b"scan";
+// OpenZFS zfs-2.4.0 include/sys/{zio,dmu}.h. Object-set roots must not
+// collide with their level-zero meta-dnode block at (object=0, blkid=0).
+const ZB_ROOT_LEVEL: i64 = -1;
+const DMU_SPILL_BLKID: u64 = u64::MAX - 1;
+const DMU_USERUSED_OBJECT: u64 = u64::MAX;
+const DMU_GROUPUSED_OBJECT: u64 = u64::MAX - 1;
+const DMU_PROJECTUSED_OBJECT: u64 = u64::MAX - 2;
+const MAX_SCAN_POINTERS: usize = 1 << 20;
+const MAX_SCAN_OBJECTS: usize = 1 << 20;
+const MAX_SCAN_OBJECTSETS: usize = 65_536;
+const MAX_SCAN_METADATA_BYTES: usize = 64 * 1024 * 1024;
+const MAX_DMU_OBJECT: u64 = 1 << 48;
 
 /// Per-invocation work bound for resumable scrub and resilver chunks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -61,6 +79,9 @@ pub struct ZfsScanReport {
     /// Blocks verified in this chunk whose physical repair layout is not admitted.
     /// Their readable contents are not counted as checksum failures.
     pub repair_unavailable_blocks: u64,
+    /// Native scans exclude blocks freed from the live pool but retained only
+    /// by an active pool checkpoint. Completion does not certify those blocks.
+    pub checkpoint_only_blocks_excluded: bool,
     pub unrecoverable_errors: u64,
     pub completed: bool,
     pub bookmark_objset: u64,
@@ -253,192 +274,375 @@ pub(super) fn stage_scan_phys_in_mos(
     Ok(())
 }
 
-/// Enumerate all non-hole, non-embedded block pointers across MOS (`objset=0`)
-/// and every dataset head & snapshot in deterministic ascending bookmark order.
-pub(super) fn collect_pool_blocks(cx: &Cx, mos: &mut Objects) -> Result<Vec<DiscoveredBlock>> {
-    checkpoint(cx)?;
-    let mut blocks = Vec::new();
-    let mos_meta = mos.meta_dnode().clone();
-    let mos_ceil = mos.root_birth_txg();
-    collect_objset_blocks(cx, mos, 0, &mos_meta, mos_ceil, &mut blocks)?;
+struct ScanTree<'a> {
+    objset: u64,
+    object: u64,
+    node: &'a Dnode,
+    dnodes: bool,
+}
 
-    let datasets = mos.datasets(cx)?;
-    for ds in datasets {
-        checkpoint(cx)?;
-        if ds.objectset_kind.is_none() {
-            continue;
+/// The complete discovery pass precedes repair. Running out of a discovery
+/// budget is an error, never an apparently complete prefix of the pool.
+struct ScanInventory {
+    blocks: Vec<DiscoveredBlock>,
+    datasets: Vec<(u64, Dnode, u64)>,
+    pointers_left: usize,
+    objects_left: usize,
+    metadata_left: usize,
+}
+
+impl ScanInventory {
+    fn new() -> Self {
+        Self {
+            blocks: Vec::new(),
+            datasets: Vec::new(),
+            pointers_left: MAX_SCAN_POINTERS,
+            objects_left: MAX_SCAN_OBJECTS,
+            metadata_left: MAX_SCAN_METADATA_BYTES,
         }
-        let (hd_dn, hd_ceil) = mos.object_with_ceiling(cx, ds.head_object)?;
-        if hd_dn.bonus().len() < 256 {
-            continue;
-        }
-        let ds_bp = BlockPointer::parse(&hd_dn.bonus()[128..256], hd_dn.order())
-            .map_err(|e| parse_err(&e))?;
-        if !ds_bp.hole() && !ds_bp.embedded() {
-            blocks.push(DiscoveredBlock {
-                bookmark: ZBookmarkPhys {
-                    objset: ds.head_object,
-                    object: 0,
-                    level: 0,
-                    blkid: 0,
-                },
-                bp: ds_bp.clone(),
+    }
+
+    fn charge_pointer(&mut self) -> Result<()> {
+        self.pointers_left = self
+            .pointers_left
+            .checked_sub(1)
+            .ok_or_else(|| unsupported("pool scan inventory exceeds its block-pointer budget"))?;
+        Ok(())
+    }
+
+    fn charge_metadata(&mut self, bytes: usize) -> Result<()> {
+        self.metadata_left = self
+            .metadata_left
+            .checked_sub(bytes)
+            .ok_or_else(|| unsupported("pool scan inventory exceeds 64 MiB of decoded metadata"))?;
+        Ok(())
+    }
+
+    fn push(&mut self, bookmark: ZBookmarkPhys, bp: &BlockPointer) {
+        if !bp.hole() && !bp.embedded() {
+            self.blocks.push(DiscoveredBlock {
+                bookmark,
+                bp: bp.clone(),
             });
-            if let Ok((ds_raw, ds_ord, ds_birth)) =
-                mos.read_dataset_objset_block_raw(cx, &ds_bp, hd_ceil, None, true)
-                && let Ok(ds_os) = ObjectSet::parse(&ds_raw, ds_ord)
-            {
-                let mut ds_view = mos.open_objectset_view(ds_os.meta.clone(), ds_birth, mos.txg);
-                collect_objset_blocks(
-                    cx,
-                    &mut ds_view,
-                    ds.head_object,
-                    &ds_os.meta,
-                    ds_birth,
-                    &mut blocks,
-                )?;
-            }
         }
     }
 
-    blocks.sort_by_key(|item| bookmark_key(&item.bookmark));
-    Ok(blocks)
-}
-
-fn collect_objset_blocks(
-    cx: &Cx,
-    view: &mut Objects,
-    objset_id: u64,
-    meta: &Dnode,
-    ceiling: u64,
-    out: &mut Vec<DiscoveredBlock>,
-) -> Result<()> {
-    collect_dnode_tree(cx, view, objset_id, 0, meta, ceiling, out)?;
-    let slots_per_blk = (DNODE_BLOCK_BYTES / DNODE_BYTES) as u64;
-    let max_blk = meta.max_block().min(4096);
-    for bid in 0..=max_blk {
+    fn objectset(
+        &mut self,
+        cx: &Cx,
+        view: &mut Objects,
+        id: u64,
+        root: &BlockPointer,
+        os: &ObjectSet,
+    ) -> Result<()> {
         checkpoint(cx)?;
-        let Some((blk_bytes, blk_ord, blk_birth)) =
-            view.object_data_block(cx, meta, ceiling, bid)?
-        else {
-            continue;
-        };
-        for slot in 0..(slots_per_blk as usize) {
-            let obj_id = bid * slots_per_blk + slot as u64;
-            if obj_id == 0 {
-                continue;
-            }
-            if let Ok(Some(dn)) = dnode_at(&blk_bytes, slot, blk_ord) {
-                collect_dnode_tree(cx, view, objset_id, obj_id, &dn, blk_birth, out)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn collect_dnode_tree(
-    cx: &Cx,
-    view: &mut Objects,
-    objset_id: u64,
-    object_id: u64,
-    node: &Dnode,
-    ceiling: u64,
-    out: &mut Vec<DiscoveredBlock>,
-) -> Result<()> {
-    let top_level = node.levels().saturating_sub(1);
-    let fanout = (node.indirect_bytes() / 128) as u64;
-    for (slot, bp) in node.pointers().iter().enumerate() {
-        walk_bp_tree(
-            cx,
-            view,
-            objset_id,
-            object_id,
-            node,
-            bp,
-            top_level,
-            slot as u64,
-            fanout,
-            ceiling,
-            out,
-        )?;
-    }
-    if let Some(spill) = node.spill()
-        && !spill.hole()
-        && !spill.embedded()
-    {
-        out.push(DiscoveredBlock {
-            bookmark: ZBookmarkPhys {
-                objset: objset_id,
-                object: object_id,
-                level: -1,
+        self.charge_pointer()?;
+        self.push(
+            ZBookmarkPhys {
+                objset: id,
+                object: 0,
+                level: ZB_ROOT_LEVEL,
                 blkid: 0,
             },
-            bp: spill.clone(),
-        });
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn walk_bp_tree(
-    cx: &Cx,
-    view: &mut Objects,
-    objset_id: u64,
-    object_id: u64,
-    node: &Dnode,
-    bp: &BlockPointer,
-    level: u8,
-    blkid: u64,
-    fanout: u64,
-    ceiling: u64,
-    out: &mut Vec<DiscoveredBlock>,
-) -> Result<()> {
-    checkpoint(cx)?;
-    if bp.hole() || bp.embedded() {
-        return Ok(());
-    }
-    out.push(DiscoveredBlock {
-        bookmark: ZBookmarkPhys {
-            objset: objset_id,
-            object: object_id,
-            level: i64::from(level),
-            blkid,
-        },
-        bp: bp.clone(),
-    });
-    if level == 0 {
-        return Ok(());
-    }
-    if let Ok(Some((raw, ord, birth))) = view.checked_raw(
-        cx,
-        bp,
-        node.object_type(),
-        level,
-        node.indirect_bytes(),
-        ceiling,
-    ) {
-        for (slot, chunk) in raw.as_chunks::<128>().0.iter().enumerate() {
-            if let Ok(child) = BlockPointer::parse(chunk, ord)
-                && !child.hole()
+            root,
+        );
+        self.tree(
+            cx,
+            view,
+            &ScanTree {
+                objset: id,
+                object: 0,
+                node: &os.meta,
+                dnodes: true,
+            },
+            root.birth(),
+        )?;
+        for (offset, object) in [
+            (OBJSET_USERUSED_OFFSET, DMU_USERUSED_OBJECT),
+            (OBJSET_GROUPUSED_OFFSET, DMU_GROUPUSED_OBJECT),
+            (OBJSET_PROJECTUSED_OFFSET, DMU_PROJECTUSED_OBJECT),
+        ] {
+            if let Some(node) = os
+                .embedded_dnode(offset, root.payload_order())
+                .map_err(|error| parse_err(&error))?
             {
-                let child_blkid = blkid.saturating_mul(fanout).saturating_add(slot as u64);
-                walk_bp_tree(
+                self.tree(
                     cx,
                     view,
-                    objset_id,
-                    object_id,
-                    node,
-                    &child,
-                    level - 1,
-                    child_blkid,
-                    fanout,
-                    birth,
-                    out,
+                    &ScanTree {
+                        objset: id,
+                        object,
+                        node: &node,
+                        dnodes: false,
+                    },
+                    root.birth(),
                 )?;
             }
         }
+        Ok(())
     }
-    Ok(())
+
+    fn tree(
+        &mut self,
+        cx: &Cx,
+        view: &mut Objects,
+        tree: &ScanTree<'_>,
+        ceiling: u64,
+    ) -> Result<()> {
+        let level = tree.node.levels() - 1;
+        for (slot, bp) in tree.node.pointers().iter().enumerate() {
+            self.visit(cx, view, tree, bp, level, slot as u64, ceiling)?;
+        }
+        if let Some(spill) = tree.node.spill() {
+            checkpoint(cx)?;
+            self.charge_pointer()?;
+            if !view.validate_pointer(
+                spill,
+                tree.node.bonus_type(),
+                0,
+                spill.logical_bytes(),
+                ceiling,
+            )? || spill.embedded()
+            {
+                return Err(corrupt("allocated DMU spill has no physical block"));
+            }
+            self.push(
+                ZBookmarkPhys {
+                    objset: tree.objset,
+                    object: tree.object,
+                    level: 0,
+                    blkid: DMU_SPILL_BLKID,
+                },
+                spill,
+            );
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn visit(
+        &mut self,
+        cx: &Cx,
+        view: &mut Objects,
+        tree: &ScanTree<'_>,
+        bp: &BlockPointer,
+        level: u8,
+        blkid: u64,
+        ceiling: u64,
+    ) -> Result<()> {
+        checkpoint(cx)?;
+        self.charge_pointer()?;
+        let fanout = (tree.node.indirect_bytes() / 128) as u64;
+        let span = u128::from(fanout).pow(u32::from(level));
+        let first_leaf = u128::from(blkid)
+            .checked_mul(span)
+            .ok_or_else(|| corrupt("scan logical block position overflow"))?;
+        if !bp.hole() && first_leaf > u128::from(tree.node.max_block()) {
+            return Err(corrupt("scan pointer exceeds its dnode's maximum block"));
+        }
+        let size = if level == 0 {
+            tree.node.data_bytes()
+        } else {
+            tree.node.indirect_bytes()
+        };
+        if !view.validate_pointer(bp, tree.node.object_type(), level, size, ceiling)? {
+            return Ok(());
+        }
+        self.push(
+            ZBookmarkPhys {
+                objset: tree.objset,
+                object: tree.object,
+                level: i64::from(level),
+                blkid,
+            },
+            bp,
+        );
+        if level == 0 && !tree.dnodes {
+            return Ok(());
+        }
+        self.charge_metadata(size)?;
+        let (raw, order, birth) = view
+            .checked_raw(cx, bp, tree.node.object_type(), level, size, ceiling)?
+            .ok_or_else(|| corrupt("scan metadata pointer became a hole"))?;
+        if level == 0 {
+            return self.dnodes(cx, view, tree.objset, blkid, &raw, order, birth);
+        }
+        for (slot, bytes) in raw.as_chunks::<128>().0.iter().enumerate() {
+            let child = BlockPointer::parse(bytes, order).map_err(|error| parse_err(&error))?;
+            let child_blkid = blkid
+                .checked_mul(fanout)
+                .and_then(|start| start.checked_add(slot as u64))
+                .ok_or_else(|| corrupt("scan indirect block ID overflow"))?;
+            self.visit(cx, view, tree, &child, level - 1, child_blkid, birth)?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dnodes(
+        &mut self,
+        cx: &Cx,
+        view: &mut Objects,
+        objset: u64,
+        block: u64,
+        bytes: &[u8],
+        order: ffs_ondisk::zfs::Endian,
+        birth: u64,
+    ) -> Result<()> {
+        let slots_per_block = DNODE_BLOCK_BYTES / DNODE_BYTES;
+        let first = block
+            .checked_mul(slots_per_block as u64)
+            .filter(|first| *first <= MAX_DMU_OBJECT - slots_per_block as u64)
+            .ok_or_else(|| corrupt("scan meta-dnode exceeds the native object namespace"))?;
+        let mut slot = 0;
+        while slot < slots_per_block {
+            checkpoint(cx)?;
+            self.objects_left = self
+                .objects_left
+                .checked_sub(1)
+                .ok_or_else(|| unsupported("pool scan inventory exceeds its dnode-slot budget"))?;
+            let start = slot * DNODE_BYTES;
+            if bytes[start] == 0 {
+                slot += 1;
+                continue;
+            }
+            let count = usize::from(bytes[start + 12]) + 1;
+            if slot + count > slots_per_block {
+                return Err(corrupt("scan large dnode crosses its metadata block"));
+            }
+            let object = first + slot as u64;
+            if object == 0 {
+                return Err(corrupt("scan found an allocated reserved object zero"));
+            }
+            let node = Dnode::parse(&bytes[start..(slot + count) * DNODE_BYTES], order)
+                .map_err(|error| parse_err(&error))?;
+            slot += node.slots();
+            if objset == 0 && (node.object_type() == 16 || node.bonus_type() == 16) {
+                if !matches!(node.object_type(), 16 | 196)
+                    || node.bonus_type() != 16
+                    || node.bonus().len() != 320
+                    || node.spill().is_some()
+                {
+                    return Err(corrupt("scan found an invalid native DSL dataset dnode"));
+                }
+                if self.datasets.len() == MAX_SCAN_OBJECTSETS {
+                    return Err(unsupported(
+                        "pool scan inventory exceeds its object-set budget",
+                    ));
+                }
+                self.datasets.push((object, node.clone(), birth));
+            }
+            self.tree(
+                cx,
+                view,
+                &ScanTree {
+                    objset,
+                    object,
+                    node: &node,
+                    dnodes: false,
+                },
+                birth,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Enumerate complete native roots, including snapshots and private receive
+/// datasets, from allocated MOS DSL dnodes rather than the visible namespace.
+/// A sparse high object ID costs only its real indirect and metadata blocks.
+pub(super) fn collect_pool_blocks(
+    cx: &Cx,
+    mos: &mut Objects,
+    mos_root: &BlockPointer,
+    mos_os: &ObjectSet,
+) -> Result<Vec<DiscoveredBlock>> {
+    let mut inventory = ScanInventory::new();
+    inventory.charge_metadata(mos_root.logical_bytes())?;
+    inventory.objectset(cx, mos, 0, mos_root, mos_os)?;
+    for (id, node, ceiling) in std::mem::take(&mut inventory.datasets) {
+        checkpoint(cx)?;
+        let order = node.order();
+        let directory = order
+            .u64(node.bonus(), 0)
+            .map_err(|error| parse_err(&error))?;
+        let next = order
+            .u64(node.bonus(), 24)
+            .map_err(|error| parse_err(&error))?;
+        let created = order
+            .u64(node.bonus(), 56)
+            .map_err(|error| parse_err(&error))?;
+        let guid = order
+            .u64(node.bonus(), 112)
+            .map_err(|error| parse_err(&error))?;
+        if directory == 0 || guid == 0 || created == 0 || created > ceiling || created > mos.txg {
+            return Err(corrupt(
+                "scan DSL dataset identity or creation TXG is invalid",
+            ));
+        }
+        let root_bytes = &node.bonus()[128..256];
+        if root_bytes.iter().all(|byte| *byte == 0) {
+            // Native $ORIGIN records can own no initialized object set.
+            if node.bonus()[72..104].iter().any(|byte| *byte != 0) {
+                return Err(corrupt(
+                    "uninitialized scan dataset accounts for live blocks",
+                ));
+            }
+            continue;
+        }
+        let root = BlockPointer::parse(root_bytes, order).map_err(|error| parse_err(&error))?;
+        let ceiling = if next == 0 {
+            ceiling
+        } else {
+            ceiling.min(created)
+        };
+        inventory.charge_metadata(root.logical_bytes())?;
+        let (raw, order, birth) =
+            mos.read_dataset_objset_block_raw(cx, &root, ceiling, None, true)?;
+        let os = ObjectSet::parse(&raw, order).map_err(|error| parse_err(&error))?;
+        if !matches!(os.kind, 2 | 3) {
+            return Err(unsupported(
+                "scan dataset is not a filesystem or volume object set",
+            ));
+        }
+        // Only a head's ZIL is live; snapshots can retain stale log pointers
+        // which native dsl_scan_visitds explicitly ignores. Check every head,
+        // including receive staging that visible dataset enumeration hides.
+        if next == 0
+            && mos.dataset_has_pending_zil_work(cx, id, guid, &node, &root, &raw, order, &os)?
+        {
+            return Err(unsupported(
+                "pool scan requires native replay of a pending head ZIL",
+            ));
+        }
+        let crypto = if root.protected() {
+            Some(Arc::new(DatasetCryptoContext {
+                info: mos
+                    .dataset_crypto_info_for_dir(cx, directory)?
+                    .ok_or_else(|| {
+                        corrupt("protected scan dataset has no native encryption metadata")
+                    })?,
+                raw_scrub_only: true,
+            }))
+        } else {
+            None
+        };
+        let mut view = mos.open_objectset_view_with_crypto(os.meta.clone(), birth, mos.txg, crypto);
+        inventory.objectset(cx, &mut view, id, &root, &os)?;
+    }
+    inventory
+        .blocks
+        .sort_by_key(|item| bookmark_key(&item.bookmark));
+    if inventory
+        .blocks
+        .windows(2)
+        .any(|pair| pair[0].bookmark == pair[1].bookmark)
+    {
+        return Err(corrupt(
+            "scan block inventory contains duplicate resume bookmarks",
+        ));
+    }
+    Ok(inventory.blocks)
 }
 
 impl ZfsTransactionEngine {
@@ -560,6 +764,7 @@ impl ZfsTransactionEngine {
     /// Cancel an active scrub or resilver and persist `DslScanState::Canceled` in MOS `"scan"`.
     pub fn scrub_cancel(&mut self, cx: &Cx) -> ZfsTxOutcome<ZfsScanReport> {
         let ts = self.current_uberblock.timestamp.saturating_add(1);
+        let checkpoint_only_blocks_excluded = self.scan_excludes_checkpoint_blocks();
         self.execute_staged_txg_typed(
             cx,
             "zfs_scrub_cancel",
@@ -574,7 +779,8 @@ impl ZfsTransactionEngine {
                 scan.state = DslScanState::Canceled;
                 scan.end_time = ts;
                 stage_scan_phys_in_mos(cx, mos, alloc, &scan)?;
-                let report = scan_report_from_phys(&scan, 0, 0, new_txg);
+                let report =
+                    scan_report_from_phys(&scan, 0, 0, checkpoint_only_blocks_excluded, new_txg);
                 Ok((report, new_txg))
             },
         )
@@ -675,10 +881,11 @@ impl ZfsTransactionEngine {
         };
         let resuming = start_new.is_none();
 
-        let all_blocks = match collect_pool_blocks(cx, &mut mos) {
-            Ok(b) => b,
-            Err(err) => return ZfsTxOutcome::NotCommitted(err),
-        };
+        let all_blocks =
+            match collect_pool_blocks(cx, &mut mos, &self.current_uberblock.root, &self.mos_os) {
+                Ok(b) => b,
+                Err(err) => return ZfsTxOutcome::NotCommitted(err),
+            };
         let repair_routes = match self.scan_repair_routes(cx, &mut mos) {
             Ok(routes) => routes,
             Err(err) => return ZfsTxOutcome::NotCommitted(err),
@@ -756,6 +963,7 @@ impl ZfsTransactionEngine {
         }
 
         let final_scan = scan;
+        let checkpoint_only_blocks_excluded = self.scan_excludes_checkpoint_blocks();
         let outcome = self.execute_staged_txg_typed(
             cx,
             op_name,
@@ -765,6 +973,7 @@ impl ZfsTransactionEngine {
                     &final_scan,
                     repaired_this_chunk,
                     repair_unavailable_this_chunk,
+                    checkpoint_only_blocks_excluded,
                     new_txg,
                 );
                 Ok((report, new_txg))
@@ -780,6 +989,12 @@ impl ZfsTransactionEngine {
             self.poisoned_uncertain = true;
         }
         outcome
+    }
+
+    fn scan_excludes_checkpoint_blocks(&self) -> bool {
+        self.current_uberblock.checkpoint_txg != 0
+            || self.allocator.checkpoint_txg != 0
+            || !self.allocator.checkpoint_deferred_frees.is_empty()
     }
 
     /// Verify before planning repair, so readable layouts retain checksum
@@ -918,6 +1133,7 @@ fn scan_report_from_phys(
     phys: &DslScanPhys,
     repaired_blocks: u64,
     repair_unavailable_blocks: u64,
+    checkpoint_only_blocks_excluded: bool,
     txg: u64,
 ) -> ZfsScanReport {
     ZfsScanReport {
@@ -927,6 +1143,7 @@ fn scan_report_from_phys(
         processed_blocks: phys.processed,
         repaired_blocks,
         repair_unavailable_blocks,
+        checkpoint_only_blocks_excluded,
         unrecoverable_errors: phys.errors,
         completed: phys.state == DslScanState::Finished,
         bookmark_objset: phys.bookmark.objset,
@@ -935,4 +1152,196 @@ fn scan_report_from_phys(
         bookmark_blkid: phys.bookmark.blkid,
         txg,
     }
+}
+
+companion_bin_tests! {
+#[cfg(test)]
+mod inventory_tests {
+    use super::*;
+    use crate::{ZfsPoolCreateSpec, ZfsWriteOptions, create_pool_on_devices};
+    use ffs_block::ByteDevice;
+    use ffs_ondisk::zfs::{Endian, RegularBlockSpec};
+    use ffs_ondisk::zfs_dmu::{DMU_OT_DNODE, DMU_OT_OBJSET, DnodeSpec, ZilHeader, write_dnode_at};
+    use ffs_types::ByteOffset;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct Media {
+        bytes: Vec<u8>,
+        reads: Vec<(u64, usize)>,
+        writes: usize,
+    }
+
+    #[derive(Clone)]
+    struct MemoryDevice(Arc<Mutex<Media>>);
+
+    impl ByteDevice for MemoryDevice {
+        fn len_bytes(&self) -> u64 { self.0.lock().unwrap().bytes.len() as u64 }
+
+        fn read_exact_at(&self, cx: &Cx, offset: ByteOffset, out: &mut [u8]) -> Result<()> {
+            checkpoint(cx)?;
+            let mut media = self.0.lock().unwrap();
+            let start = offset.0 as usize;
+            out.copy_from_slice(media.bytes.get(start..start + out.len())
+                .ok_or_else(|| corrupt("scan test read outside media"))?);
+            media.reads.push((offset.0, out.len()));
+            Ok(())
+        }
+
+        fn write_all_at(&self, cx: &Cx, offset: ByteOffset, bytes: &[u8]) -> Result<()> {
+            checkpoint(cx)?;
+            let mut media = self.0.lock().unwrap();
+            let start = offset.0 as usize;
+            media.bytes.get_mut(start..start + bytes.len())
+                .ok_or_else(|| corrupt("scan test write outside media"))?
+                .copy_from_slice(bytes);
+            media.writes += 1;
+            Ok(())
+        }
+
+        fn sync(&self, cx: &Cx) -> Result<()> { checkpoint(cx) }
+    }
+
+    struct SparseFixture {
+        device: MemoryDevice,
+        view: Objects,
+        root: BlockPointer,
+        os: ObjectSet,
+        payload: BlockPointer,
+        interior: BlockPointer,
+    }
+
+    fn store_block(
+        device: &MemoryDevice,
+        cursor: &mut u64,
+        bytes: &[u8],
+        kind: u8,
+        level: u8,
+        order: Endian,
+    ) -> BlockPointer {
+        let offset = *cursor;
+        *cursor += bytes.len() as u64;
+        let mut media = device.0.lock().unwrap();
+        let start = (DATA_OFFSET + offset) as usize;
+        media.bytes[start..start + bytes.len()].copy_from_slice(bytes);
+        BlockPointer::new_regular(&RegularBlockSpec {
+            dvas: &[Dva { vdev: 0, offset, allocated_bytes: bytes.len() as u64, gang: false }],
+            logical_bytes: bytes.len(), physical: bytes, compression: 2,
+            checksum_type: 7, object_type: kind, level, payload_order: order, birth: 1, fill: 1,
+        }).unwrap()
+    }
+
+    fn sparse_fixture(cx: &Cx, order: Endian, malformed: bool) -> SparseFixture {
+        let device = MemoryDevice(Arc::new(Mutex::new(Media {
+            bytes: vec![0; 12 * 1024 * 1024], ..Media::default()
+        })));
+        let pool_guid = 0x5CA1_1A7E_0000_0001;
+        let created = create_pool_on_devices(
+            cx, vec![Box::new(device.clone())],
+            &ZfsPoolCreateSpec::single_leaf("scan_sparse", pool_guid),
+        ).unwrap();
+        let engine = ZfsTransactionEngine::from_devices(
+            cx, vec![Box::new(device.clone())],
+            ZfsWriteOptions {
+                offline_image: true, allow_write: true, pool_guid,
+                label: 0, slot: created.initial_slot, reconcile_torn_uberblocks: false,
+            },
+        ).unwrap();
+        let mos = engine.open_read_objects(cx).unwrap();
+
+        // A standalone native object set on this reader's real leaf. Its one
+        // dnode block is above the previous 4096-block cutoff, with large holes
+        // represented by zero BPs instead of millions of synthetic reads.
+        let mut cursor = 2 * 1024 * 1024;
+        let payload = store_block(&device, &mut cursor, &vec![0x63; 4096], 19, 0, order);
+        let interior = store_block(&device, &mut cursor, &vec![0xA4; 4096], 19, 0, order);
+        let small = DnodeSpec {
+            object_type: 19, bonus_type: 17, checksum_type: 7, compress_type: 2,
+            flags: 1, order, levels: 1, indirect_shift: 12, data_bytes: 4096,
+            max_block: 0, used_bytes: 4096, slots: 1, pointers: vec![interior.clone()],
+            bonus: Vec::new(), spill: None,
+        };
+        let fake = Dnode::from_spec(small.clone()).unwrap().encode().unwrap();
+        let mut bonus = vec![0; 832];
+        // This valid-looking dnode begins inside the first object's second
+        // slot. Its BP is payload bytes, not another allocation owner.
+        bonus[320..].copy_from_slice(&fake);
+        let large = Dnode::from_spec(DnodeSpec {
+            slots: 2, pointers: vec![payload.clone()], bonus, ..small.clone()
+        }).unwrap();
+        let trailing = Dnode::from_spec(DnodeSpec {
+            pointers: vec![payload.clone()], ..small
+        }).unwrap();
+        let mut table = vec![0; DNODE_BLOCK_BYTES];
+        write_dnode_at(&mut table, 5, &large).unwrap();
+        write_dnode_at(&mut table, 7, &trailing).unwrap();
+        if malformed { table[7 * DNODE_BYTES + 2] = 0; }
+        let table_bp = store_block(&device, &mut cursor, &table, DMU_OT_DNODE, 0, order);
+        let mut indirect = vec![0; 4096];
+        indirect[128..256].copy_from_slice(&table_bp.encode(order));
+        let first = store_block(&device, &mut cursor, &indirect, DMU_OT_DNODE, 1, order);
+        indirect.fill(0);
+        indirect[..128].copy_from_slice(&first.encode(order));
+        let second = store_block(&device, &mut cursor, &indirect, DMU_OT_DNODE, 2, order);
+        indirect.fill(0);
+        indirect[4 * 128..5 * 128].copy_from_slice(&second.encode(order));
+        let third = store_block(&device, &mut cursor, &indirect, DMU_OT_DNODE, 3, order);
+        let meta = Dnode::from_spec(DnodeSpec {
+            object_type: DMU_OT_DNODE, bonus_type: 0, checksum_type: 7,
+            compress_type: 2, flags: 1, order, levels: 4, indirect_shift: 12,
+            data_bytes: DNODE_BLOCK_BYTES, max_block: 4097, used_bytes: 28_672,
+            slots: 1, pointers: vec![third], bonus: Vec::new(), spill: None,
+        }).unwrap();
+        let os = ObjectSet::new(2, 0, meta, ZilHeader::empty(), 4096).unwrap();
+        let root = store_block(&device, &mut cursor, &os.encode(order).unwrap(), DMU_OT_OBJSET, 0, order);
+        let view = mos.open_objectset_view(os.meta.clone(), 1, mos.txg);
+        device.0.lock().unwrap().reads.clear();
+        SparseFixture { device, view, root, os, payload, interior }
+    }
+
+    #[test]
+    fn scan_inventory_visits_sparse_high_objects_and_skips_large_dnode_interiors() {
+        let cx = Cx::for_testing();
+        for order in [Endian::Little, Endian::Big] {
+            let mut fixture = sparse_fixture(&cx, order, false);
+            let writes = fixture.device.0.lock().unwrap().writes;
+            let mut inventory = ScanInventory::new();
+            inventory.objectset(&cx, &mut fixture.view, 99, &fixture.root, &fixture.os).unwrap();
+            let objects: Vec<_> = inventory.blocks.iter()
+                .filter(|block| block.bp == fixture.payload)
+                .map(|block| block.bookmark.object).collect();
+            assert_eq!(objects, vec![4097 * 32 + 5, 4097 * 32 + 7]);
+            assert!(!inventory.blocks.iter().any(|block| block.bp == fixture.interior));
+            assert_eq!(inventory.blocks.len(), 7, "root, three indirects, table and two real objects");
+            let media = fixture.device.0.lock().unwrap();
+            assert_eq!(media.reads.len(), 4, "holes must not expand into linear metadata reads");
+            assert_eq!(media.writes, writes, "inventory is read-only");
+        }
+    }
+
+    #[test]
+    fn scan_inventory_metadata_budget_and_last_allocated_dnode_errors_are_terminal() {
+        let cx = Cx::for_testing();
+        for order in [Endian::Little, Endian::Big] {
+            let mut fixture = sparse_fixture(&cx, order, false);
+            let writes = fixture.device.0.lock().unwrap().writes;
+            let mut inventory = ScanInventory::new();
+            inventory.metadata_left = 3 * 4096 + DNODE_BLOCK_BYTES - 1;
+            assert!(matches!(
+                inventory.objectset(&cx, &mut fixture.view, 99, &fixture.root, &fixture.os),
+                Err(FfsError::UnsupportedFeature(_)),
+            ));
+            assert_eq!(fixture.device.0.lock().unwrap().reads.len(), 3);
+            assert_eq!(fixture.device.0.lock().unwrap().writes, writes);
+
+            let mut fixture = sparse_fixture(&cx, order, true);
+            let mut inventory = ScanInventory::new();
+            assert!(matches!(
+                inventory.objectset(&cx, &mut fixture.view, 99, &fixture.root, &fixture.os),
+                Err(FfsError::Corruption { .. }),
+            ));
+            assert_eq!(fixture.device.0.lock().unwrap().reads.len(), 4);
+        }
+    }
+}
 }

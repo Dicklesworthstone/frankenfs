@@ -1105,7 +1105,7 @@ fn checkpoint_foreground_frees_preserve_scan_and_trim_state_after_restart() {
 
     // Both operations edit MOS directory object 1 while checkpoint bookkeeping
     // edits the same object. All entries must survive the same native TXG.
-    engine
+    let (report, _) = engine
         .scrub_start(
             &cx,
             ZfsScanLimits {
@@ -1114,6 +1114,7 @@ fn checkpoint_foreground_frees_preserve_scan_and_trim_state_after_restart() {
         )
         .into_result()
         .unwrap();
+    assert!(report.checkpoint_only_blocks_excluded);
     let scan = engine.scan_status(&cx).unwrap().unwrap();
     assert_eq!(scan.state, DslScanState::Scanning);
     engine.trim_pool(&cx, 4, false).into_result().unwrap();
@@ -1160,6 +1161,12 @@ fn checkpoint_foreground_frees_preserve_scan_and_trim_state_after_restart() {
         expected_checkpoint.deferred_free_bytes
     );
     assert_eq!(restarted.scan_status(&cx).unwrap().unwrap(), scan);
+    let (report, _) = restarted
+        .scrub_resume(&cx, ZfsScanLimits::default())
+        .into_result()
+        .unwrap();
+    assert!(report.completed);
+    assert!(!report.checkpoint_only_blocks_excluded);
     assert_pool_scrub_and_allocation_clean(&cx, &[restarted_dev], built.pool_guid, None);
 }
 
@@ -2142,4 +2149,524 @@ fn scan_checksum_failures_remain_reported_without_poisoning_or_false_healing() {
     let scan = engine.scan_status(&cx).unwrap().unwrap();
     assert_eq!(scan.state, DslScanState::Finished);
     assert_eq!(scan.errors, report.unrecoverable_errors);
+}
+
+fn scan_inventory_read_block(device: &FaultableMemberDevice, bp: &BlockPointer) -> Vec<u8> {
+    let image = device.durable_snapshot();
+    let dva = bp.regular_dvas().unwrap()[0];
+    let start = usize::try_from(DATA_OFFSET + dva.offset).unwrap();
+    bp.verify_physical(&image[start..start + bp.physical_bytes()])
+        .unwrap();
+    bp.decode(&image[start..start + bp.physical_bytes()])
+        .unwrap()
+}
+
+fn scan_inventory_dataset_root(
+    cx: &Cx,
+    engine: &ZfsTransactionEngine,
+    device: &FaultableMemberDevice,
+    dataset: &[Vec<u8>],
+    snapshot: Option<&[u8]>,
+) -> (u64, BlockPointer, ObjectSet) {
+    let mut mos = engine.open_read_objects(cx).unwrap();
+    let object = if let Some(snapshot) = snapshot {
+        mos.snapshots(cx, dataset)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.name == snapshot)
+            .unwrap()
+            .object
+    } else {
+        mos.datasets(cx)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.components == dataset)
+            .unwrap()
+            .head_object
+    };
+    let node = mos.object(cx, object).unwrap();
+    let root = BlockPointer::parse(&node.bonus()[128..256], node.order()).unwrap();
+    let os = ObjectSet::parse(
+        &scan_inventory_read_block(device, &root),
+        root.payload_order(),
+    )
+    .unwrap();
+    (object, root, os)
+}
+
+#[test]
+fn scan_inventory_heals_snapshot_only_payloads_after_live_rewrite() {
+    let cx = Cx::for_testing();
+    for resilver in [false, true] {
+        let built = build_clean_zfs_pool(&PoolFixtureSpec {
+            mirror_width: 2,
+            ashift: 12,
+            ..PoolFixtureSpec::default()
+        });
+        let devices: Vec<_> = built
+            .members
+            .into_iter()
+            .map(FaultableMemberDevice::new)
+            .collect();
+        let mut engine = open_engine_on_devices(
+            &cx,
+            &devices,
+            default_write_opts(built.pool_guid, built.initial_slot),
+        )
+        .unwrap();
+        let dataset = vec![b"data".to_vec()];
+        let timestamp = Timestamp {
+            seconds: 1_735_060_000,
+            nanos: 0,
+        };
+        let before: Vec<u8> = (0..16_384_u32)
+            .map(|index| {
+                index
+                    .wrapping_mul(73)
+                    .wrapping_add(index >> 5)
+                    .to_le_bytes()[0]
+            })
+            .collect();
+        let (file, _) = engine
+            .create_file(
+                &cx,
+                &dataset,
+                2,
+                b"retained.bin",
+                0o644,
+                0,
+                0,
+                timestamp,
+                ZfsDataChecksum::Fletcher4,
+            )
+            .into_result()
+            .unwrap();
+        engine
+            .write_file_data(
+                &cx,
+                &dataset,
+                file,
+                0,
+                &before,
+                timestamp,
+                ZfsDataChecksum::Fletcher4,
+            )
+            .into_result()
+            .unwrap();
+        let node = native_zpl_file_slot(&cx, &engine, &devices[0], &dataset, file).unwrap();
+        let historical = native_plain_leaf_pointers(&devices[0], &node);
+        assert!(!historical.is_empty());
+        engine
+            .create_snapshot(&cx, &dataset, b"retained", timestamp)
+            .into_result()
+            .unwrap();
+        let after = vec![0xB7; before.len()];
+        engine
+            .write_file_data(
+                &cx,
+                &dataset,
+                file,
+                0,
+                &after,
+                timestamp,
+                ZfsDataChecksum::Fletcher4,
+            )
+            .into_result()
+            .unwrap();
+        let current = native_zpl_file_slot(&cx, &engine, &devices[0], &dataset, file).unwrap();
+        let current = native_plain_leaf_pointers(&devices[0], &current);
+        for bp in &historical {
+            assert!(
+                !current.contains(bp),
+                "damaged blocks must belong only to the snapshot"
+            );
+            let at = usize::try_from(DATA_OFFSET + bp.regular_dvas().unwrap()[0].offset).unwrap();
+            devices[1].state.lock().unwrap().durable[at + 17] ^= 0xA5;
+        }
+        let outcome = if resilver {
+            engine.resilver_start(&cx, 0, ZfsScanLimits::default())
+        } else {
+            engine.scrub_start(&cx, ZfsScanLimits::default())
+        };
+        let (report, token) = outcome.into_result().unwrap();
+        assert!(report.completed);
+        assert_eq!(report.unrecoverable_errors, 0);
+        assert!(!report.checkpoint_only_blocks_excluded);
+        assert!(report.repaired_blocks >= historical.len() as u64);
+        let good = devices[0].durable_snapshot();
+        let healed = devices[1].durable_snapshot();
+        for bp in &historical {
+            let at = usize::try_from(DATA_OFFSET + bp.regular_dvas().unwrap()[0].offset).unwrap();
+            assert_eq!(
+                &healed[at..at + bp.physical_bytes()],
+                &good[at..at + bp.physical_bytes()]
+            );
+        }
+        let fresh: Vec<_> = devices
+            .iter()
+            .map(FaultableMemberDevice::fresh_from_durable)
+            .collect();
+        let reopened = open_engine_on_devices(
+            &cx,
+            &fresh,
+            default_write_opts(built.pool_guid, token.published_slot()),
+        )
+        .unwrap();
+        let mut mos = reopened.open_read_objects(&cx).unwrap();
+        assert_eq!(
+            read_zpl_bytes(&cx, &mut mos, &dataset, b"/retained.bin", after.len()).unwrap(),
+            after
+        );
+        let mut snapshot = mos.zpl_snapshot(&cx, &dataset, b"retained").unwrap();
+        let file = snapshot.resolve(&cx, b"/retained.bin").unwrap();
+        assert_eq!(snapshot.read(&cx, file, 0, before.len()).unwrap(), before);
+    }
+}
+
+#[test]
+fn scan_inventory_single_block_resume_heals_roots_tables_and_embedded_accounting() {
+    let cx = Cx::for_testing();
+    let built = build_clean_zfs_pool(&PoolFixtureSpec {
+        mirror_width: 2,
+        ashift: 12,
+        user_accounting: true,
+        project_accounting: true,
+        ..PoolFixtureSpec::default()
+    });
+    let devices: Vec<_> = built
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut engine = open_engine_on_devices(
+        &cx,
+        &devices,
+        default_write_opts(built.pool_guid, built.initial_slot),
+    )
+    .unwrap();
+    let dataset = vec![b"data".to_vec()];
+    let (head, root, os) = scan_inventory_dataset_root(&cx, &engine, &devices[0], &dataset, None);
+    assert_eq!(os.meta.levels(), 1);
+    let mut expected = vec![
+        ((head, 0, -1, 0), root.clone()),
+        ((head, 0, 0, 0), os.meta.pointers()[0].clone()),
+    ];
+    for (offset, object) in [
+        (ffs_ondisk::zfs_dmu::OBJSET_USERUSED_OFFSET, u64::MAX),
+        (ffs_ondisk::zfs_dmu::OBJSET_GROUPUSED_OFFSET, u64::MAX - 1),
+        (ffs_ondisk::zfs_dmu::OBJSET_PROJECTUSED_OFFSET, u64::MAX - 2),
+    ] {
+        let node = os
+            .embedded_dnode(offset, root.payload_order())
+            .unwrap()
+            .unwrap();
+        assert_eq!(node.levels(), 1);
+        assert!(!node.pointers()[0].hole());
+        expected.push(((head, object, 0, 0), node.pointers()[0].clone()));
+    }
+    let mut leaves = Vec::new();
+    for device in &devices {
+        leaves
+            .push(Leaf::from_device(&cx, Box::new(device.clone()), 0, device.len_bytes()).unwrap());
+    }
+    let pool = Pool::from_wide_leaves(leaves).unwrap();
+    let mos_root = pool
+        .root(&cx, 0, built.initial_slot, built.pool_guid)
+        .unwrap()
+        .uberblock
+        .root;
+    expected.push(((0, 0, -1, 0), mos_root));
+    for (_, bp) in &expected {
+        let at = usize::try_from(DATA_OFFSET + bp.regular_dvas().unwrap()[0].offset).unwrap();
+        devices[1].state.lock().unwrap().durable[at + 9] ^= 0x6D;
+    }
+    let initial_good = devices[0].durable_snapshot();
+    let trace_start = engine.persistence_events().len();
+    let mut seen = BTreeSet::new();
+    let mut first = true;
+    for chunk in 0..256 {
+        let outcome = if first {
+            first = false;
+            engine.scrub_start(
+                &cx,
+                ZfsScanLimits {
+                    max_blocks_per_txg: 1,
+                },
+            )
+        } else {
+            engine.scrub_resume(
+                &cx,
+                ZfsScanLimits {
+                    max_blocks_per_txg: 1,
+                },
+            )
+        };
+        let (report, _) = outcome.into_result().unwrap();
+        let bookmark = (
+            report.bookmark_objset,
+            report.bookmark_object,
+            report.bookmark_level,
+            report.bookmark_blkid,
+        );
+        if chunk == 0 {
+            assert_eq!(
+                bookmark,
+                (0, 0, -1, 0),
+                "the MOS ObjectSet root is independently scanned"
+            );
+            assert_eq!(report.repaired_blocks, 1);
+            let bp = &expected.last().unwrap().1;
+            let at = usize::try_from(DATA_OFFSET + bp.regular_dvas().unwrap()[0].offset).unwrap();
+            assert_eq!(
+                &devices[1].durable_snapshot()[at..at + bp.physical_bytes()],
+                &initial_good[at..at + bp.physical_bytes()],
+                "repair must reach durable media before the scan COW retires this root",
+            );
+        }
+        seen.insert(bookmark);
+        assert_eq!(report.unrecoverable_errors, 0);
+        if report.completed {
+            break;
+        }
+        assert!(chunk < 255, "one-block inventory resume must make progress");
+    }
+    let healed = devices[1].durable_snapshot();
+    for (bookmark, bp) in &expected {
+        assert!(
+            seen.contains(bookmark),
+            "missing native resume bookmark {bookmark:?}"
+        );
+        let at = usize::try_from(DATA_OFFSET + bp.regular_dvas().unwrap()[0].offset).unwrap();
+        if bookmark.0 != 0 {
+            assert_eq!(
+                &healed[at..at + bp.physical_bytes()],
+                &initial_good[at..at + bp.physical_bytes()]
+            );
+        }
+        assert_eq!(
+            engine.persistence_events()[trace_start..]
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event.stage,
+                        ZfsPersistenceStage::ScanHealWrite { member_index: 1 }
+                    ) && event.offset == at as u64
+                })
+                .count(),
+            1,
+            "each damaged physical block must be repaired exactly once"
+        );
+    }
+    let fresh: Vec<_> = devices
+        .iter()
+        .map(FaultableMemberDevice::fresh_from_durable)
+        .collect();
+    let reopened = open_engine_on_devices(
+        &cx,
+        &fresh,
+        default_write_opts(built.pool_guid, engine.committed_slot()),
+    )
+    .unwrap();
+    let mut mos = reopened.open_read_objects(&cx).unwrap();
+    assert!(
+        mos.scrub_dataset(&cx, &dataset, None, ScrubLimits::default())
+            .unwrap()
+            .is_clean()
+    );
+    mos.allocation(&cx, AllocationLimits::default()).unwrap();
+}
+
+#[derive(Clone)]
+struct ScanInventoryReadFaultDevice {
+    inner: FaultableMemberDevice,
+    fault: Arc<Mutex<Option<(u64, usize, bool)>>>,
+    hits: Arc<Mutex<usize>>,
+}
+
+impl ByteDevice for ScanInventoryReadFaultDevice {
+    fn len_bytes(&self) -> u64 {
+        self.inner.len_bytes()
+    }
+
+    fn read_exact_at(&self, cx: &Cx, offset: ByteOffset, out: &mut [u8]) -> Result<()> {
+        if let Some((start, bytes, cancel)) = *self.fault.lock().unwrap()
+            && offset.0 < start + bytes as u64
+            && offset.0 + out.len() as u64 > start
+        {
+            *self.hits.lock().unwrap() += 1;
+            return Err(if cancel {
+                FfsError::Cancelled
+            } else {
+                FfsError::Io(std::io::Error::other("scan inventory metadata read failed"))
+            });
+        }
+        self.inner.read_exact_at(cx, offset, out)
+    }
+
+    fn write_all_at(&self, cx: &Cx, offset: ByteOffset, bytes: &[u8]) -> Result<()> {
+        self.inner.write_all_at(cx, offset, bytes)
+    }
+
+    fn sync(&self, cx: &Cx) -> Result<()> {
+        self.inner.sync(cx)
+    }
+
+    fn begin_durability_commit(&self, cx: &Cx) -> Result<()> {
+        self.inner.begin_durability_commit(cx)
+    }
+
+    fn complete_durability_commit(&self) {
+        self.inner.complete_durability_commit();
+    }
+
+    fn abort_durability_commit(&self) {
+        self.inner.abort_durability_commit();
+    }
+}
+
+#[test]
+fn scan_inventory_metadata_io_cancel_and_corruption_never_publish_partial_completion() {
+    let cx = Cx::for_testing();
+    let built = build_clean_zfs_pool(&PoolFixtureSpec {
+        mirror_width: 2,
+        ashift: 12,
+        ..PoolFixtureSpec::default()
+    });
+    let devices: Vec<_> = built
+        .members
+        .into_iter()
+        .map(FaultableMemberDevice::new)
+        .collect();
+    let mut seed = open_engine_on_devices(
+        &cx,
+        &devices,
+        default_write_opts(built.pool_guid, built.initial_slot),
+    )
+    .unwrap();
+    let dataset = vec![b"data".to_vec()];
+    let timestamp = Timestamp {
+        seconds: 1_735_060_100,
+        nanos: 0,
+    };
+    let (file, _) = seed
+        .create_file(
+            &cx,
+            &dataset,
+            2,
+            b"indirect.bin",
+            0o644,
+            0,
+            0,
+            timestamp,
+            ZfsDataChecksum::Fletcher4,
+        )
+        .into_result()
+        .unwrap();
+    let data = vec![0xC7; 512 * 1024];
+    seed.write_file_data(
+        &cx,
+        &dataset,
+        file,
+        0,
+        &data,
+        timestamp,
+        ZfsDataChecksum::Fletcher4,
+    )
+    .into_result()
+    .unwrap();
+    let node = native_zpl_file_slot(&cx, &seed, &devices[0], &dataset, file).unwrap();
+    assert!(
+        node.levels() > 1,
+        "fixture must force a real payload indirect tree"
+    );
+    let indirect = node.pointers().iter().find(|bp| !bp.hole()).unwrap();
+    assert!(indirect.level() > 0);
+    let offset = DATA_OFFSET + indirect.regular_dvas().unwrap()[0].offset;
+    let size = indirect.physical_bytes();
+    for failure in 0..3 {
+        for resume in [false, true] {
+            let fresh: Vec<_> = devices
+                .iter()
+                .map(FaultableMemberDevice::fresh_from_durable)
+                .collect();
+            let fault = Arc::new(Mutex::new(None));
+            let hits = Arc::new(Mutex::new(0));
+            let boxed: Vec<Box<dyn ByteDevice>> = fresh
+                .iter()
+                .cloned()
+                .map(|inner| {
+                    Box::new(ScanInventoryReadFaultDevice {
+                        inner,
+                        fault: fault.clone(),
+                        hits: hits.clone(),
+                    }) as Box<dyn ByteDevice>
+                })
+                .collect();
+            let mut engine = ZfsTransactionEngine::from_devices(
+                &cx,
+                boxed,
+                default_write_opts(built.pool_guid, seed.committed_slot()),
+            )
+            .unwrap();
+            if resume {
+                let (report, _) = engine
+                    .scrub_start(
+                        &cx,
+                        ZfsScanLimits {
+                            max_blocks_per_txg: 1,
+                        },
+                    )
+                    .into_result()
+                    .unwrap();
+                assert!(!report.completed);
+            }
+            if failure == 2 {
+                for device in &fresh {
+                    device.state.lock().unwrap().durable[offset as usize + 13] ^= 0x93;
+                }
+            } else {
+                *fault.lock().unwrap() = Some((offset, size, failure == 1));
+            }
+            let media: Vec<_> = fresh
+                .iter()
+                .map(FaultableMemberDevice::durable_snapshot)
+                .collect();
+            let writes: Vec<_> = fresh
+                .iter()
+                .map(FaultableMemberDevice::write_calls)
+                .collect();
+            let events = engine.persistence_events().len();
+            let outcome = if resume {
+                engine.scrub_resume(&cx, ZfsScanLimits::default())
+            } else {
+                engine.scrub_start(&cx, ZfsScanLimits::default())
+            };
+            match (failure, outcome) {
+                (1, ZfsTxOutcome::NotCommitted(FfsError::Cancelled)) => {}
+                (0 | 2, ZfsTxOutcome::NotCommitted(_)) => {}
+                (_, outcome) => panic!(
+                    "incomplete metadata inventory must fail before scan publication: {outcome:?}"
+                ),
+            }
+            assert!(!engine.requires_recovery(), "no repair was attempted");
+            if failure < 2 {
+                assert!(
+                    *hits.lock().unwrap() > 0,
+                    "the real metadata read must hit the injected failure"
+                );
+            }
+            assert_eq!(engine.persistence_events().len(), events);
+            for ((device, expected), writes) in fresh.iter().zip(media).zip(writes) {
+                assert_eq!(device.durable_snapshot(), expected);
+                assert_eq!(device.write_calls(), writes);
+            }
+            *fault.lock().unwrap() = None;
+            let status = engine.scan_status(&cx).unwrap();
+            if resume {
+                assert_eq!(status.unwrap().state, DslScanState::Scanning);
+            } else {
+                assert!(status.is_none());
+            }
+        }
+    }
 }
