@@ -4739,6 +4739,7 @@ impl OpenFs {
                     let report = device.inspect_repair(cx)?;
                     self.dev = device.clone();
                     self.native_repair_device = Some(device);
+                    self.refresh_native_btrfs_view(cx)?;
                     return Ok(report);
                 }
                 // No source change survived the interrupted write. Retire the
@@ -5142,6 +5143,7 @@ impl OpenFs {
         });
         self.dev = device.clone();
         self.native_repair_device = Some(device);
+        self.refresh_native_btrfs_view(cx)?;
         Ok(report)
     }
 
