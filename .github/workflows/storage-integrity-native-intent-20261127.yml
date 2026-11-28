@@ -1,0 +1,229 @@
+name: Native write intent validation 20261127
+
+on:
+  push:
+    branches: [validation/storage-integrity-native-intent-20261127]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: storage-integrity-native-intent-20261127
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  RUSTUP_TOOLCHAIN: nightly-2026-08-31
+  CARGO_BUILD_JOBS: "1"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: "-Z threads=1 -Z unstable-options --jobs-backend=1"
+  CFLAGS: "-g0 -O2"
+  CARGO_HTTP_USER_AGENT: "frankenfs-agent (+https://github.com/Dicklesworthstone/frankenfs)"
+  FFS_REQUIRE_ORACLES: "1"
+
+jobs:
+  validate:
+    name: Native write intent / ${{ matrix.lane }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [gates, tests]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install pinned compiler and native image oracles
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ffs-storage-logs"
+          printf 'CARGO_TARGET_DIR=%s\nCARGO_BUILD_BUILD_DIR=%s\n' "$RUNNER_TEMP/ffs-storage-target" "$RUNNER_TEMP/ffs-storage-target" >> "$GITHUB_ENV"
+          printf 'FFS_STORAGE_CACHE_TARGET=%s\n' "$(realpath -m --relative-to="$GITHUB_WORKSPACE" "$RUNNER_TEMP/ffs-storage-target")" >> "$GITHUB_ENV"
+          rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
+          sudo apt-get -o Acquire::http::User-Agent="$CARGO_HTTP_USER_AGENT" -o Acquire::https::User-Agent="$CARGO_HTTP_USER_AGENT" update
+          sudo apt-get -o Acquire::http::User-Agent="$CARGO_HTTP_USER_AGENT" -o Acquire::https::User-Agent="$CARGO_HTTP_USER_AGENT" install -y --no-install-recommends e2fsprogs btrfs-progs pkg-config
+          export PATH="/usr/sbin:/sbin:$PATH"
+          printf '%s\n' "/usr/sbin" "/sbin" >> "$GITHUB_PATH"
+          for tool in mke2fs mkfs.ext4 e2fsck debugfs mkfs.btrfs btrfs; do
+            command -v "$tool"
+          done
+          mke2fs -V
+          e2fsck -V
+          btrfs --version
+          validation_swap=$(sudo mktemp /mnt/ffs-native-intent-XXXXXX.swap)
+          sudo fallocate -l 12G "$validation_swap"
+          sudo chmod 0600 "$validation_swap"
+          sudo mkswap "$validation_swap"
+          sudo swapon "$validation_swap"
+          free -h
+          df -h .
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ffs-storage-target-v1
+          shared-key: nightly-2026-08-31-${{ matrix.lane }}
+          workspaces: ". -> ${{ env.FFS_STORAGE_CACHE_TARGET }}"
+          cache-bin: "false"
+          cache-on-failure: "true"
+
+      - name: Record exact candidate source and compiler
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git rev-parse HEAD HEAD^{tree} | tee "$RUNNER_TEMP/ffs-storage-logs/source.txt"
+          rustc -Vv | tee "$RUNNER_TEMP/ffs-storage-logs/toolchain.txt"
+          git diff --check
+          test -z "$(git status --porcelain)"
+
+      - name: Workspace formatting
+        if: ${{ !cancelled() && matrix.lane == 'gates' }}
+        run: |
+          set -euo pipefail
+          cargo fmt --check 2>&1 | tee "$RUNNER_TEMP/ffs-storage-logs/fmt.log"
+
+      - name: Workspace compiler check
+        if: ${{ !cancelled() && matrix.lane == 'gates' }}
+        run: |
+          set -euo pipefail
+          cargo check --locked --workspace --all-targets 2>&1 | tee "$RUNNER_TEMP/ffs-storage-logs/check.log"
+
+      - name: Workspace strict Clippy
+        if: ${{ !cancelled() && matrix.lane == 'gates' }}
+        run: |
+          set -euo pipefail
+          cargo clippy --locked --workspace --all-targets -- -D warnings 2>&1 | tee "$RUNNER_TEMP/ffs-storage-logs/clippy.log"
+
+      - name: Prepare executed-suite verification
+        if: ${{ !cancelled() && matrix.lane == 'tests' }}
+        run: |
+          cat > "$RUNNER_TEMP/ffs-run-storage-suite.sh" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          suite="$1"
+          shift
+          logs="$RUNNER_TEMP/ffs-storage-logs"
+          inventory="$logs/$suite.inventory.log"
+          output="$logs/$suite.log"
+          "$@" -- --include-ignored --list 2>&1 | tee "$inventory"
+          case "$suite" in
+            native-protocol)
+              required=(
+                native_repair::tests::native_write_intent_binds_epoch_owner_and_filesystem_identity
+                native_repair::tests::native_write_intent_binds_ordered_source_and_owned_geometry
+                native_repair::tests::native_write_intent_refuses_noncanonical_records_and_invalid_ranges
+                native_repair::tests::native_source_intent_roots_bind_every_digest_coverage_and_group_order
+                native_repair::tests::native_freshness_clean_nested_guards_retire_format_hints
+                native_repair::tests::native_freshness_write_intent_sequence_exhaustion_precedes_mutation
+              )
+              ;;
+            native-freshness)
+              required=(
+                tests::native_freshness_constructor_admits_authority_before_journal_replay
+                tests::native_freshness_constructor_replays_and_seals_a_committed_journal
+                tests::native_freshness_constructor_refuses_skipped_or_external_journal_recovery
+                tests::native_freshness_constructor_refuses_unsealed_or_invalid_authority_before_writes
+                tests::native_freshness_cancelled_final_seal_releases_guard_and_fences_escaped_writes
+                tests::native_freshness_nested_abort_cannot_be_sealed_by_another_guard
+                tests::native_freshness_nested_completion_and_write_free_abort_preserve_publication
+                tests::native_freshness_shared_device_deferral_holds_protection_until_native_completion
+                tests::native_freshness_shared_and_format_guards_share_one_abortable_epoch
+              )
+              ;;
+            native-crash)
+              required=(
+                native_repair_crash_cuts_and_healing::native_ext4_crash_cuts_a_and_b_corruption_1pct_5pct_and_e2fsck_bd_11a8t_bd_j7a4e
+                native_repair_crash_cuts_and_healing::native_ext4_crash_cuts_c_and_d_corruption_1pct_5pct_and_e2fsck_bd_11a8t_bd_j7a4e
+                native_repair_crash_cuts_and_healing::native_btrfs_crash_cuts_a_b_c_d_treelog_corruption_1pct_5pct_and_btrfs_check_bd_11a8t_bd_j7a4e
+                native_repair_crash_cuts_and_healing::native_repair_negative_controls_exhausted_tampered_stale_missing_and_cancelled_bd_j7a4e
+              )
+              ;;
+            native-cli)
+              required=(tests::native_mount_preflight_admits_authority_before_journal_replay)
+              ;;
+            btrfs-tree-log)
+              required=(
+                tests::btrfs_tree_log_data_fallback_reclaims_exact_allocations_on_rotation_and_rollback
+                tests::btrfs_tree_log_data_fallback_prepare_failures_do_not_leak
+                tests::btrfs_tree_log_data_fallback_fsync_and_full_commit_reclaim_native
+              )
+              ;;
+            snapshot-*)
+              required=("tests::${suite#snapshot-}")
+              ;;
+            *) exit 2 ;;
+          esac
+          for name in "${required[@]}"; do
+            grep -Fx "$name: test" "$inventory"
+          done
+          "$@" -- --include-ignored --nocapture --test-threads=1 2>&1 | tee "$output"
+          python3 - "$inventory" "$output" <<'PY'
+          import pathlib, re, sys
+          inventory = pathlib.Path(sys.argv[1]).read_text()
+          output = pathlib.Path(sys.argv[2]).read_text()
+          selected = re.findall(r'^(.+): test$', inventory, re.M)
+          assert selected and len(selected) == len(set(selected)), selected
+          summaries = re.findall(r'test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;', output)
+          assert summaries == [(str(len(selected)), '0', '0')], (len(selected), summaries)
+          assert not re.search(r'^\s*SKIP(?:\||:)', output, re.I | re.M), output
+          print(f'EXECUTED_SUITE_PASS|selected={len(selected)}|passed={len(selected)}|ignored=0')
+          PY
+          SH
+
+      - name: Native intent codec, source roots, and private protocol invariants
+        if: ${{ !cancelled() && matrix.lane == 'tests' }}
+        run: bash "$RUNNER_TEMP/ffs-run-storage-suite.sh" native-protocol cargo test --locked -p ffs-core --lib native_repair::tests
+
+      - name: Native freshness, cancellation, and constructor replay ordering
+        if: ${{ !cancelled() && matrix.lane == 'tests' }}
+        run: bash "$RUNNER_TEMP/ffs-run-storage-suite.sh" native-freshness cargo test --locked -p ffs-core --lib native_freshness_
+
+      - name: Real crash cuts, authority refusals, healing, and native image checks
+        if: ${{ !cancelled() && matrix.lane == 'tests' }}
+        run: bash "$RUNNER_TEMP/ffs-run-storage-suite.sh" native-crash cargo test --locked -p ffs-core --test cross_crate_integration native_repair_crash_cuts_and_healing
+
+      - name: CLI preflight admits native authority before journal replay
+        if: ${{ !cancelled() && matrix.lane == 'tests' }}
+        run: bash "$RUNNER_TEMP/ffs-run-storage-suite.sh" native-cli cargo test --locked -p ffs-cli --bin ffs-cli native_mount_preflight_admits_authority_before_journal_replay
+
+      - name: Btrfs DATA-fallback allocation, rollback, and durable retirement
+        if: ${{ !cancelled() && matrix.lane == 'tests' }}
+        run: bash "$RUNNER_TEMP/ffs-run-storage-suite.sh" btrfs-tree-log cargo test --locked -p ffs-core --lib btrfs_tree_log_data_fallback
+
+      - name: Explicit snapshots, inline promotion, and current-view reads
+        if: ${{ !cancelled() && matrix.lane == 'tests' }}
+        run: |
+          set -euo pipefail
+          for test_name in \
+            open_fs_explicit_snapshot_scope_preserves_versions_without_owning_pins \
+            ext4_inline_fallocate_modes_promote_once_and_preserve_xattrs \
+            ext4_inline_file_write_truncate_and_promotion_preserve_data_and_xattrs \
+            ext4_writeback_current_mapping_cache_rejects_precommit_inode_root; do
+            bash "$RUNNER_TEMP/ffs-run-storage-suite.sh" "snapshot-$test_name" cargo test --locked -p ffs-core --lib "$test_name"
+          done
+
+      - name: Confirm candidate source stayed unchanged
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git diff --check
+          test -z "$(git status --porcelain)"
+
+      - name: Retain compiler and executed-test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-write-intent-${{ matrix.lane }}-${{ github.sha }}
+          path: ${{ runner.temp }}/ffs-storage-logs/
+          if-no-files-found: error
+          retention-days: 7
