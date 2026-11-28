@@ -661,13 +661,14 @@ impl NtfsFs {
         // These are the Linux fallocate ABI flags, independent of host libc.
         const KEEP_SIZE: i32 = 0x01;
         const PUNCH_HOLE: i32 = 0x02;
+        const ZERO_RANGE: i32 = 0x10;
         self.ensure_writable()?;
         if length == 0 || mode & PUNCH_HOLE != 0 && mode & KEEP_SIZE == 0 {
             return Err(invalid_argument());
         }
-        if mode != (KEEP_SIZE | PUNCH_HOLE) {
+        if ![KEEP_SIZE | PUNCH_HOLE, ZERO_RANGE, ZERO_RANGE | KEEP_SIZE].contains(&mode) {
             return Err(unsupported(
-                "NTFS fallocate supports only PUNCH_HOLE with KEEP_SIZE",
+                "NTFS fallocate supports PUNCH_HOLE with KEEP_SIZE and ZERO_RANGE with optional KEEP_SIZE",
             ));
         }
         if offset
@@ -679,7 +680,19 @@ impl NtfsFs {
         let (target, stream) = self.data_target(cx, ino)?;
         let now = system_time_to_filetime(SystemTime::now())?;
         self.transact(cx, |engine| {
-            engine.punch_hole_at(cx, target, &stream, offset, length, now)
+            if mode & ZERO_RANGE != 0 {
+                engine.zero_range_at(
+                    cx,
+                    target,
+                    &stream,
+                    offset,
+                    length,
+                    mode & KEEP_SIZE != 0,
+                    now,
+                )
+            } else {
+                engine.punch_hole_at(cx, target, &stream, offset, length, now)
+            }
         })
     }
 

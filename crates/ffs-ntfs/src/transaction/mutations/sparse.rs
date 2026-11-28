@@ -1,17 +1,18 @@
-//! Logged hole punching without reading or rewriting untouched DATA extents.
+//! Logged hole punching and allocated zero ranges without rewriting untouched DATA extents.
 //! LZNT1 streams retire whole compression units and COW at most two edge units.
 
 use super::{
-    EditableDataStream, EditableStreamStorage, FILE_ATTR_ENCRYPTED, FILE_ATTR_REPARSE_POINT,
-    FILE_ATTR_SPARSE_FILE, MIN_USER_MFT_SLOT, NtfsTransactionEngine, NtfsTxOutcome, PreparedTxPlan,
-    TxWorkspace, checkpoint, compression, corrupt, read_editable_stream_prefix,
-    splice_vcn_interval, stage_runs_writes, unsupported, validate_ntfs_stream_name_utf16,
+    EditableDataStream, EditableStreamStorage, FILE_ATTR_COMPRESSED, FILE_ATTR_ENCRYPTED,
+    FILE_ATTR_REPARSE_POINT, FILE_ATTR_SPARSE_FILE, MAX_FILE_EDIT_BYTES, MIN_USER_MFT_SLOT,
+    NtfsTransactionEngine, NtfsTxOutcome, PreparedTxPlan, TxWorkspace, checkpoint, compression,
+    corrupt, read_editable_stream_prefix, splice_vcn_interval, stage_runs_writes, unsupported,
+    validate_ntfs_stream_name_utf16,
 };
 use asupersync::Cx;
 use ffs_error::{FfsError, Result};
 use ffs_ondisk::ntfs::usn::{
-    USN_REASON_BASIC_INFO_CHANGE, USN_REASON_CLOSE, USN_REASON_DATA_OVERWRITE,
-    USN_REASON_NAMED_DATA_OVERWRITE,
+    USN_REASON_BASIC_INFO_CHANGE, USN_REASON_CLOSE, USN_REASON_DATA_EXTEND,
+    USN_REASON_DATA_OVERWRITE, USN_REASON_NAMED_DATA_EXTEND, USN_REASON_NAMED_DATA_OVERWRITE,
 };
 use ffs_ondisk::ntfs::{NtfsReference, NtfsRun};
 use std::ops::Range;
@@ -24,6 +25,162 @@ fn invalid_range(errno: i32, detail: &'static str) -> FfsError {
 }
 
 impl NtfsTransactionEngine {
+    /// Zero and allocate a range of an ordinary resident or nonresident DATA stream.
+    ///
+    /// Existing bytes outside the range survive, including both partial boundary
+    /// clusters. Sparse holes inside the range acquire initialized physical
+    /// storage. `keep_size` retains EOF while still allocating the requested tail;
+    /// otherwise EOF grows to the range end. Nonresident ValidDataLength is
+    /// preserved, so untouched allocation beyond it cannot become visible.
+    ///
+    /// Payloads are copied to new clusters and flushed before native WAL commit.
+    /// The existing edit budget bounds new payload storage, not the stream's
+    /// total logical size. Compressed, encrypted and provider-backed unnamed
+    /// streams require their own allocation semantics and remain unsupported.
+    #[allow(clippy::too_many_arguments)]
+    pub fn zero_range_at(
+        &mut self,
+        cx: &Cx,
+        target: NtfsReference,
+        stream_utf16: &[u16],
+        offset: u64,
+        length: u64,
+        keep_size: bool,
+        now_ticks: u64,
+    ) -> NtfsTxOutcome<()> {
+        let plan = (|| {
+            checkpoint(cx)?;
+            self.require_clean_writer()?;
+            validate_ntfs_stream_name_utf16(stream_utf16)?;
+            if length == 0 {
+                return Err(invalid_range(
+                    libc::EINVAL,
+                    "NTFS zero-range length is zero",
+                ));
+            }
+            let end = offset
+                .checked_add(length)
+                .filter(|&end| i64::try_from(end).is_ok())
+                .ok_or_else(|| {
+                    invalid_range(
+                        libc::EFBIG,
+                        "NTFS zero range exceeds the signed native limit",
+                    )
+                })?;
+            let mut digest = blake3::Hasher::new();
+            digest.update(b"ntfs.zero_range_at:");
+            digest.update(&target.record.to_le_bytes());
+            digest.update(&target.sequence.to_le_bytes());
+            digest.update(&(stream_utf16.len() as u64).to_le_bytes());
+            for unit in stream_utf16 {
+                digest.update(&unit.to_le_bytes());
+            }
+            digest.update(&offset.to_le_bytes());
+            digest.update(&length.to_le_bytes());
+            digest.update(&[u8::from(keep_size)]);
+            digest.update(&now_ticks.to_le_bytes());
+            self.plan_zero_range(
+                cx,
+                target,
+                stream_utf16,
+                offset..end,
+                keep_size,
+                now_ticks,
+                *digest.finalize().as_bytes(),
+            )
+        })();
+        match plan {
+            Ok(plan) => self.execute_logged_tx(cx, plan),
+            Err(error) => NtfsTxOutcome::NotCommitted(error),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn plan_zero_range(
+        &self,
+        cx: &Cx,
+        target: NtfsReference,
+        stream_utf16: &[u16],
+        range: Range<u64>,
+        keep_size: bool,
+        now_ticks: u64,
+        digest: [u8; 32],
+    ) -> Result<PreparedTxPlan<()>> {
+        let mut ws = TxWorkspace::load(self, cx)?;
+        let catalog = ws.load_catalog(self, cx, target)?.clone();
+        if catalog.is_directory {
+            return Err(FfsError::IsDirectory);
+        }
+        if target.record < MIN_USER_MFT_SLOT {
+            return Err(FfsError::PermissionDenied);
+        }
+        if stream_utf16.is_empty()
+            && (catalog.reparse_point.is_some()
+                || catalog.std_flags()
+                    & (FILE_ATTR_COMPRESSED | FILE_ATTR_ENCRYPTED | FILE_ATTR_REPARSE_POINT)
+                    != 0)
+        {
+            return Err(unsupported(
+                "NTFS zero range requires uncompressed, unencrypted, non-provider DATA",
+            ));
+        }
+        let stream_index = catalog
+            .data_streams
+            .iter()
+            .position(|stream| stream.name == stream_utf16)
+            .ok_or_else(|| FfsError::NotFound("NTFS exact DATA stream not found".into()))?;
+        let stream = &catalog.data_streams[stream_index];
+        let old_size = stream.logical_size();
+        let new_size = if keep_size {
+            old_size
+        } else {
+            old_size.max(range.end)
+        };
+        let cb = u64::from(self.geometry.cluster_bytes());
+        if new_size.max(range.end).div_ceil(cb) > i64::MAX as u64 / cb {
+            return Err(invalid_range(
+                libc::EFBIG,
+                "NTFS zero-range rounded allocation exceeds the signed native limit",
+            ));
+        }
+        let storage = match &stream.storage {
+            EditableStreamStorage::Resident(bytes)
+                if new_size <= super::MAX_RESIDENT_DATA_PAYLOAD as u64
+                    && (!keep_size || range.end <= old_size) =>
+            {
+                let mut bytes = bytes.clone();
+                bytes.resize(new_size as usize, 0);
+                bytes[range.start as usize..range.end as usize].fill(0);
+                EditableStreamStorage::Resident(bytes)
+            }
+            _ => zero_allocated_range(self, cx, &mut ws, stream, &range, new_size)?,
+        };
+        let reason = if stream_utf16.is_empty() {
+            USN_REASON_DATA_OVERWRITE
+                | if new_size > old_size {
+                    USN_REASON_DATA_EXTEND
+                } else {
+                    0
+                }
+        } else {
+            USN_REASON_NAMED_DATA_OVERWRITE
+                | if new_size > old_size {
+                    USN_REASON_NAMED_DATA_EXTEND
+                } else {
+                    0
+                }
+        } | USN_REASON_CLOSE;
+        let snapshot = {
+            let catalog = ws.catalog_mut(self, cx, target)?;
+            catalog.data_streams[stream_index].storage = storage;
+            catalog.set_std_times(None, Some(now_ticks), Some(now_ticks), None);
+            catalog.clone()
+        };
+        ws.push_usn_event_for_catalog(&snapshot, reason, now_ticks);
+        ws.sync_target_into_parent_dirs(self, cx, target)?;
+        ws.finalize(self, cx, "zero_range_at", digest, ())
+    }
+
     /// Zero a byte range and reclaim fully covered clusters without changing EOF.
     ///
     /// Empty `stream_utf16` selects unnamed DATA; a named stream uses its exact
@@ -235,6 +392,130 @@ impl NtfsTransactionEngine {
         ws.sync_target_into_parent_dirs(self, cx, target)?;
         ws.finalize(self, cx, "punch_hole_at", digest, ())
     }
+}
+
+/// Allocate only the modified VCN interval. Whole overwritten clusters require
+/// no source reads; only their live boundary bytes survive the zero operation.
+fn zero_allocated_range(
+    engine: &NtfsTransactionEngine,
+    cx: &Cx,
+    ws: &mut TxWorkspace,
+    stream: &EditableDataStream,
+    range: &Range<u64>,
+    new_size: u64,
+) -> Result<EditableStreamStorage> {
+    let cb = u64::from(engine.geometry.cluster_bytes());
+    let (old_runs, sparse, compression_unit, initialized, resident) = match &stream.storage {
+        EditableStreamStorage::Resident(bytes) => (&[][..], false, 0, bytes.len() as u64, true),
+        EditableStreamStorage::NonResident {
+            runs,
+            sparse,
+            compressed,
+            encrypted,
+            compression_unit,
+            initialized_bytes,
+            ..
+        } => {
+            if *compressed || *encrypted {
+                return Err(unsupported(
+                    "NTFS zero range requires an uncompressed and unencrypted DATA stream",
+                ));
+            }
+            if *compression_unit != 0 && !(*sparse && *compression_unit == 4) {
+                return Err(unsupported(
+                    "unsupported NTFS sparse compression-unit encoding",
+                ));
+            }
+            (
+                runs.as_slice(),
+                *sparse,
+                *compression_unit,
+                *initialized_bytes,
+                false,
+            )
+        }
+    };
+    let old_coverage = old_runs.last().map_or(0, |run| run.vcn + run.clusters);
+    if old_coverage > i64::MAX as u64 / cb {
+        return Err(invalid_range(
+            libc::EFBIG,
+            "NTFS DATA allocation exceeds the signed limit",
+        ));
+    }
+    let first = range.start / cb;
+    // A plain stream cannot leave a sparse gap between its previous allocation
+    // and a distant zero range. Resident promotion also retains the whole value.
+    let start = if sparse {
+        first
+    } else {
+        first.min(old_coverage)
+    };
+    let end = range
+        .end
+        .div_ceil(cb)
+        .max(if resident { new_size.div_ceil(cb) } else { 0 });
+    let bytes_len = (end - start)
+        .checked_mul(cb)
+        .filter(|&bytes| bytes <= MAX_FILE_EDIT_BYTES + 2 * cb)
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .ok_or_else(|| {
+            invalid_range(
+                libc::EFBIG,
+                "NTFS zero range exceeds the payload staging budget",
+            )
+        })?;
+    let mut bytes = vec![0_u8; bytes_len];
+    let byte_start = start * cb;
+    if resident {
+        let EditableStreamStorage::Resident(old) = &stream.storage else {
+            unreachable!("resident promotion selected for a nonresident stream");
+        };
+        bytes[..old.len()].copy_from_slice(old);
+        bytes[range.start as usize..range.end as usize].fill(0);
+    } else {
+        if range.start % cb != 0 && first * cb < initialized {
+            let prefix = read_editable_stream_prefix(engine, cx, stream, first * cb, cb as usize)?;
+            let keep = (range.start % cb) as usize;
+            let at = (first * cb - byte_start) as usize;
+            bytes[at..at + keep].copy_from_slice(&prefix[..keep]);
+        }
+        if range.end % cb != 0 && range.end < initialized {
+            let last = range.end / cb;
+            let suffix = read_editable_stream_prefix(engine, cx, stream, last * cb, cb as usize)?;
+            let from = (range.end % cb) as usize;
+            let at = (last * cb - byte_start) as usize;
+            bytes[at + from..at + cb as usize].copy_from_slice(&suffix[from..]);
+        }
+    }
+    checkpoint(cx)?;
+    let spans = ws.alloc_clusters(end - start, 1)?;
+    let mut stage_runs = Vec::with_capacity(spans.len());
+    let mut vcn = 0;
+    for &(lcn, clusters) in &spans {
+        stage_runs.push(NtfsRun {
+            vcn,
+            clusters,
+            lcn: Some(lcn),
+        });
+        vcn += clusters;
+    }
+    stage_runs_writes(
+        &engine.geometry,
+        &stage_runs,
+        &bytes,
+        &mut ws.pre_payload_writes,
+    )?;
+    let (runs, retired) = splice_vcn_interval(old_runs, start, end, &spans, sparse)?;
+    ws.free_clusters_deferred(&retired);
+    Ok(EditableStreamStorage::NonResident {
+        runs,
+        sparse,
+        compressed: false,
+        encrypted: false,
+        compression_unit,
+        data_bytes: new_size,
+        initialized_bytes: initialized,
+    })
 }
 
 fn punch_nonresident(
