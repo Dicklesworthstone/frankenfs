@@ -715,10 +715,12 @@ mod native_repair_crash_cuts_and_healing {
     use asupersync::Cx;
     use ffs_block::ByteDevice;
     use ffs_core::native_repair::NativeRepairStorage;
-    use ffs_core::{Ext4JournalReplayMode, OpenFs, OpenOptions, VolumeAccess};
+    use ffs_core::{Ext4JournalReplayMode, OpenFs, OpenOptions, RequestScope, VolumeAccess};
     use ffs_error::FfsError;
+    use ffs_journal::Jbd2Superblock;
     use ffs_types::{BTRFS_SUPER_INFO_OFFSET, BlockNumber, ByteOffset, InodeNumber, MountMode};
     use parking_lot::Mutex;
+    use std::collections::BTreeSet;
     use std::ffi::OsStr;
     use std::path::Path;
     use std::process::Command;
@@ -729,6 +731,9 @@ mod native_repair_crash_cuts_and_healing {
     const PARITY_HEADER_START: usize = 320;
     const EPOCH_TOKEN_START: usize = 448;
     const EPOCH_TOKEN_LEN: usize = 160;
+    const SOURCE_INTENT_START: usize = EPOCH_TOKEN_START + EPOCH_TOKEN_LEN;
+    const SOURCE_INTENT_LEN: usize = 160;
+    const JBD2_MAGIC: u32 = 0xC03B_3998;
     const VALIDATION_PENDING: u32 = 1;
     const VALIDATION_SEALED: u32 = 2;
     const PLAN_DIRTY: u32 = 4;
@@ -745,12 +750,28 @@ mod native_repair_crash_cuts_and_healing {
     struct FaultState {
         bytes: Vec<u8>,
         block_size: usize,
-        tail_starts: Vec<u64>,
+        storage: NativeRepairStorage,
         cut: Option<CrashCut>,
         fail_next_write: bool,
         triggered: bool,
-        dirty_writes_after_token: usize,
-        dirty_syncs_seen: usize,
+        write_attempts: usize,
+        source_progress: SourceWriteProgress,
+        journal: Option<JournalCommitProgress>,
+    }
+
+    #[derive(Default)]
+    struct SourceWriteProgress {
+        writes: usize,
+        changed_writes: usize,
+        synced_intent: Option<[u8; SOURCE_INTENT_LEN]>,
+    }
+
+    struct JournalCommitProgress {
+        blocks: BTreeSet<u64>,
+        sequence: u32,
+        descriptor_seen: bool,
+        commit_block: Option<u64>,
+        commit_durable: bool,
     }
 
     #[derive(Clone)]
@@ -760,19 +781,60 @@ mod native_repair_crash_cuts_and_healing {
 
     impl FaultInjectingMemDevice {
         fn new(bytes: Vec<u8>, block_size: u32, storage: &NativeRepairStorage) -> Self {
-            let tail_starts = storage.tails.iter().map(|t| t.start.0).collect();
             Self {
                 state: Arc::new(Mutex::new(FaultState {
                     bytes,
                     block_size: block_size as usize,
-                    tail_starts,
+                    storage: storage.clone(),
                     cut: None,
                     fail_next_write: false,
                     triggered: false,
-                    dirty_writes_after_token: 0,
-                    dirty_syncs_seen: 0,
+                    write_attempts: 0,
+                    source_progress: SourceWriteProgress::default(),
+                    journal: None,
                 })),
             }
+        }
+
+        fn track_ext4_journal(&self, cx: &Cx, fs: &OpenFs) {
+            let sb = fs.ext4_superblock().expect("ext4 journal fixture");
+            let inode = fs
+                .read_inode(cx, InodeNumber(u64::from(sb.journal_inum)))
+                .expect("read journal inode");
+            let block_count = u32::try_from(inode.size.div_ceil(u64::from(sb.block_size)))
+                .expect("bounded fixture journal");
+            let mut blocks = BTreeSet::new();
+            let mut first_block = None;
+            for logical in 0..block_count {
+                let (physical, unwritten) = fs
+                    .resolve_extent(cx, &RequestScope::empty(), &inode, logical)
+                    .expect("resolve journal block")
+                    .expect("journal must not have holes");
+                assert!(!unwritten, "journal must contain initialized blocks");
+                assert!(blocks.insert(physical), "journal block must not alias");
+                first_block.get_or_insert(physical);
+            }
+            let mut raw = vec![0_u8; sb.block_size as usize];
+            fs.shared_fenced_device()
+                .read_exact_at(
+                    cx,
+                    ByteOffset(first_block.expect("nonempty journal") * u64::from(sb.block_size)),
+                    &mut raw,
+                )
+                .expect("read verified journal superblock");
+            let journal = Jbd2Superblock::parse(&raw).expect("native JBD2 superblock");
+            assert_eq!(journal.start_block, 0, "baseline journal must be empty");
+            let replayed_next = fs
+                .ext4_journal_replay()
+                .and_then(|replay| replay.committed_sequences.iter().max().copied())
+                .map_or(0, |sequence| sequence.wrapping_add(1));
+            self.state.lock().journal = Some(JournalCommitProgress {
+                blocks,
+                sequence: journal.start_sequence.max(replayed_next).max(1),
+                descriptor_seen: false,
+                commit_block: None,
+                commit_durable: false,
+            });
         }
 
         fn snapshot(&self) -> Vec<u8> {
@@ -790,8 +852,12 @@ mod native_repair_crash_cuts_and_healing {
             guard.cut = Some(cut);
             guard.fail_next_write = false;
             guard.triggered = false;
-            guard.dirty_writes_after_token = 0;
-            guard.dirty_syncs_seen = 0;
+            guard.source_progress = SourceWriteProgress::default();
+            if let Some(journal) = guard.journal.as_mut() {
+                journal.descriptor_seen = false;
+                journal.commit_block = None;
+                journal.commit_durable = false;
+            }
         }
 
         fn disarm(&self) -> bool {
@@ -805,7 +871,7 @@ mod native_repair_crash_cuts_and_healing {
 
     fn inspect_plan_and_groups(state: &FaultState) -> (u32, bool, [u8; 64], Vec<(u32, u64)>) {
         let bs = state.block_size;
-        let o0 = (state.tail_starts[0] as usize) * bs;
+        let o0 = (state.storage.tails[0].start.0 as usize) * bs;
         let plan_state = u32::from_le_bytes(
             state.bytes[o0 + PLAN_HEADER_START + 96..o0 + PLAN_HEADER_START + 100]
                 .try_into()
@@ -817,9 +883,9 @@ mod native_repair_crash_cuts_and_healing {
             [o0 + EPOCH_TOKEN_START + 88..o0 + EPOCH_TOKEN_START + 152]
             .try_into()
             .unwrap();
-        let mut groups = Vec::with_capacity(state.tail_starts.len());
-        for &tail_start in &state.tail_starts {
-            let off = (tail_start as usize) * bs;
+        let mut groups = Vec::with_capacity(state.storage.tails.len());
+        for tail in &state.storage.tails {
+            let off = (tail.start.0 as usize) * bs;
             let par_state = u32::from_le_bytes(
                 state.bytes[off + PARITY_HEADER_START + 112..off + PARITY_HEADER_START + 116]
                     .try_into()
@@ -845,6 +911,139 @@ mod native_repair_crash_cuts_and_healing {
         u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap())
     }
 
+    fn overlaps_native_sources(state: &FaultState, offset: u64, length: usize) -> bool {
+        if length == 0 {
+            return false;
+        }
+        let end = offset.checked_add(length as u64).expect("bounded write");
+        let size = state.block_size as u64;
+        state.storage.tails.iter().any(|tail| {
+            offset < tail.source_end_exclusive().0 * size && tail.group_start.0 * size < end
+        })
+    }
+
+    fn observe_journal_write(state: &mut FaultState, offset: u64, bytes: &[u8]) {
+        let Some(journal) = state.journal.as_mut() else {
+            return;
+        };
+        let size = state.block_size;
+        if !offset.is_multiple_of(size as u64) {
+            return;
+        }
+        for (index, block) in bytes.chunks_exact(size).enumerate() {
+            let physical = offset / size as u64 + index as u64;
+            if !journal.blocks.contains(&physical) || block[..4] != JBD2_MAGIC.to_be_bytes() {
+                continue;
+            }
+            let kind = u32::from_be_bytes(block[4..8].try_into().unwrap());
+            if !matches!(kind, 1 | 2) {
+                continue;
+            }
+            let sequence = u32::from_be_bytes(block[8..12].try_into().unwrap());
+            assert_eq!(sequence, journal.sequence, "unexpected journal transaction");
+            if kind == 1 {
+                journal.descriptor_seen = true;
+            } else {
+                assert!(journal.descriptor_seen, "commit must follow its descriptor");
+                assert!(
+                    journal.commit_block.is_none(),
+                    "one native transaction per cut"
+                );
+                journal.commit_block = Some(physical);
+            }
+        }
+    }
+
+    fn assert_dirty_intent_failures_refuse_without_writes(
+        cx: &Cx,
+        dev: &FaultInjectingMemDevice,
+        cut_name: &str,
+    ) {
+        let (crash_bytes, storage, block_size) = {
+            let guard = dev.state.lock();
+            (guard.bytes.clone(), guard.storage.clone(), guard.block_size)
+        };
+        let intent_start = storage.tails[0].start.0 as usize * block_size + SOURCE_INTENT_START;
+        let intent = &crash_bytes[intent_start..intent_start + SOURCE_INTENT_LEN];
+        assert_eq!(
+            &intent[..8],
+            b"FFSINT01",
+            "{cut_name} must persist source intent"
+        );
+        assert_ne!(
+            &intent[40..72],
+            &intent[72..104],
+            "{cut_name} must contain a real source change"
+        );
+        for case in ["missing", "wrong_binding", "wrong_after_root"] {
+            let mut changed = crash_bytes.clone();
+            match case {
+                "missing" => changed[intent_start..intent_start + SOURCE_INTENT_LEN].fill(0),
+                "wrong_binding" => changed[intent_start + 8] ^= 0x80,
+                "wrong_after_root" => changed[intent_start + 72] ^= 0x40,
+                _ => unreachable!(),
+            }
+            if case != "missing" {
+                // A valid record checksum must not substitute for the expected
+                // filesystem/epoch binding or the persisted source-digest root.
+                let checksum =
+                    ffs_ondisk::ext4::ext4_chksum(!0, &changed[intent_start..intent_start + 152]);
+                changed[intent_start + 152..intent_start + 156]
+                    .copy_from_slice(&checksum.to_le_bytes());
+            }
+            let rejected =
+                FaultInjectingMemDevice::new(changed.clone(), block_size as u32, &storage);
+            let error = match OpenFs::from_devices(
+                cx,
+                Box::new(rejected.clone()),
+                &native_active_options(false),
+                VolumeAccess::ReadWrite,
+                None,
+                Vec::new(),
+            ) {
+                Ok(_) => panic!("{cut_name} {case} intent admitted native recovery"),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(
+                    &error,
+                    FfsError::Corruption { .. } | FfsError::RepairFailed(_)
+                ),
+                "{cut_name} {case} intent returned an unexpected error: {error}"
+            );
+            assert_eq!(
+                rejected.state.lock().write_attempts,
+                0,
+                "{cut_name} {case} intent must be rejected before replay, healing or publication"
+            );
+            assert_eq!(
+                rejected.snapshot(),
+                changed,
+                "{cut_name} {case} intent must preserve the crash image"
+            );
+        }
+    }
+
+    fn assert_native_epoch_retired(dev: &FaultInjectingMemDevice, cut_name: &str) {
+        let guard = dev.state.lock();
+        let o0 = guard.storage.tails[0].start.0 as usize * guard.block_size;
+        let (plan_state, has_token, ..) = inspect_plan_and_groups(&guard);
+        assert_eq!(plan_state, VALIDATION_SEALED, "{cut_name} must reseal");
+        assert!(!has_token, "{cut_name} must retire the epoch token");
+        assert!(
+            guard.bytes[o0 + EPOCH_TOKEN_START..o0 + EPOCH_TOKEN_START + EPOCH_TOKEN_LEN]
+                .iter()
+                .all(|&byte| byte == 0),
+            "{cut_name} must zero the complete epoch token"
+        );
+        assert!(
+            guard.bytes[o0 + SOURCE_INTENT_START..o0 + SOURCE_INTENT_START + SOURCE_INTENT_LEN]
+                .iter()
+                .all(|&byte| byte == 0),
+            "{cut_name} must retire source intent with the sealed epoch"
+        );
+    }
+
     impl ByteDevice for FaultInjectingMemDevice {
         fn len_bytes(&self) -> u64 {
             self.state.lock().bytes.len() as u64
@@ -865,6 +1064,7 @@ mod native_repair_crash_cuts_and_healing {
 
         fn write_all_at(&self, _cx: &Cx, offset: ByteOffset, buf: &[u8]) -> Result<(), FfsError> {
             let mut guard = self.state.lock();
+            guard.write_attempts += 1;
             if guard.fail_next_write {
                 guard.fail_next_write = false;
                 guard.cut = None;
@@ -874,25 +1074,39 @@ mod native_repair_crash_cuts_and_healing {
                 )));
             }
             let (plan_state, has_token, ..) = inspect_plan_and_groups(&guard);
-            if matches!(guard.cut, Some(CrashCut::CutA))
-                && plan_state == PLAN_DIRTY
-                && has_token
-                && guard.dirty_syncs_seen >= 1
-            {
-                let start = usize::try_from(offset.0).unwrap();
-                let end = start.checked_add(buf.len()).unwrap();
-                guard.bytes[start..end].copy_from_slice(buf);
-                guard.dirty_writes_after_token += 1;
-                if guard.dirty_writes_after_token >= 1 {
-                    // One uncommitted journal/COW write landed after PLAN_DIRTY; cut power now
-                    // before JBD2 commit block or Btrfs superblock can be written!
-                    guard.fail_next_write = true;
-                }
-                return Ok(());
-            }
             let start = usize::try_from(offset.0).unwrap();
             let end = start.checked_add(buf.len()).unwrap();
+            let source_write =
+                guard.cut.is_some() && overlaps_native_sources(&guard, offset.0, buf.len());
+            if source_write {
+                assert_eq!(
+                    plan_state, PLAN_DIRTY,
+                    "source write requires Dirty fencing"
+                );
+                assert!(has_token, "source write requires an epoch token");
+                let o0 = guard.storage.tails[0].start.0 as usize * guard.block_size;
+                let intent: [u8; SOURCE_INTENT_LEN] = guard.bytes
+                    [o0 + SOURCE_INTENT_START..o0 + SOURCE_INTENT_START + SOURCE_INTENT_LEN]
+                    .try_into()
+                    .unwrap();
+                assert_eq!(&intent[..8], b"FFSINT01", "source write requires intent");
+                assert_eq!(
+                    guard.source_progress.synced_intent,
+                    Some(intent),
+                    "the exact current source intent must sync before source I/O"
+                );
+                guard.source_progress.writes += 1;
+                if &guard.bytes[start..end] != buf {
+                    guard.source_progress.changed_writes += 1;
+                }
+                observe_journal_write(&mut guard, offset.0, buf);
+            }
             guard.bytes[start..end].copy_from_slice(buf);
+            if source_write && matches!(guard.cut, Some(CrashCut::CutA)) {
+                // Cut after the first real source write. Owner/intent/table/parity
+                // writes must never stand in for the uncommitted journal/COW I/O.
+                guard.fail_next_write = true;
+            }
             Ok(())
         }
 
@@ -910,20 +1124,34 @@ mod native_repair_crash_cuts_and_healing {
                 return Ok(());
             };
             let (plan_state, has_token, buckets, groups) = inspect_plan_and_groups(&guard);
+            if plan_state == PLAN_DIRTY && has_token {
+                let o0 = guard.storage.tails[0].start.0 as usize * guard.block_size;
+                guard.source_progress.synced_intent = Some(
+                    guard.bytes
+                        [o0 + SOURCE_INTENT_START..o0 + SOURCE_INTENT_START + SOURCE_INTENT_LEN]
+                        .try_into()
+                        .unwrap(),
+                );
+            }
+            if let Some(journal) = guard.journal.as_mut()
+                && journal.commit_block.is_some()
+            {
+                journal.commit_durable = true;
+            }
             match cut {
-                CrashCut::CutA => {
-                    if plan_state == PLAN_DIRTY && has_token {
-                        guard.dirty_syncs_seen += 1;
-                    }
-                }
+                CrashCut::CutA => {}
                 CrashCut::CutBExt4 => {
-                    if plan_state == PLAN_DIRTY && has_token {
-                        guard.dirty_syncs_seen += 1;
-                        if guard.dirty_syncs_seen == 3 {
-                            // Sync #1: PLAN_DIRTY; Sync #2: JBD2 body barrier before commit block;
-                            // Sync #3: JBD2 Phase 1b commit-record sync! Fail before home checkpoint!
-                            guard.fail_next_write = true;
-                        }
+                    if plan_state == PLAN_DIRTY
+                        && has_token
+                        && guard
+                            .journal
+                            .as_ref()
+                            .is_some_and(|journal| journal.commit_durable)
+                    {
+                        // The current transaction's JBD2 commit block has crossed
+                        // its durability barrier; no home checkpoint write may run.
+                        // Additional source-intent barriers do not advance this cut.
+                        guard.fail_next_write = true;
                     }
                 }
                 CrashCut::CutBBtrfs { pre_btrfs_gen } => {
@@ -1300,6 +1528,7 @@ mod native_repair_crash_cuts_and_healing {
                 .expect("open active ext4");
                 assert!(fs.attach_ext4_internal_jbd2_writer(&cx).unwrap());
                 fs.enable_writes(&cx).expect("enable writes");
+                cut_dev.track_ext4_journal(&cx, &fs);
 
                 // Arm BEFORE staging so we also prove zero premature physical flush before fsync!
                 cut_dev.arm_cut(cut.clone());
@@ -1344,6 +1573,35 @@ mod native_repair_crash_cuts_and_healing {
                     has_token,
                     "ext4 {cut_name} must leave FFSEPK02 epoch token on disk"
                 );
+                assert!(
+                    guard.source_progress.changed_writes > 0,
+                    "{cut_name} changed no sources"
+                );
+                let journal = guard.journal.as_ref().expect("tracked ext4 journal");
+                if cut == CrashCut::CutA {
+                    assert_eq!(
+                        guard.source_progress.writes, 1,
+                        "cut_a must stop after one source write"
+                    );
+                    assert!(
+                        journal.commit_block.is_none(),
+                        "cut_a must precede the journal commit"
+                    );
+                    assert!(!journal.commit_durable, "cut_a must not commit v2");
+                } else {
+                    assert!(
+                        journal.descriptor_seen,
+                        "{cut_name} must write a journal descriptor"
+                    );
+                    assert!(
+                        journal.commit_block.is_some(),
+                        "{cut_name} must write a journal commit"
+                    );
+                    assert!(
+                        journal.commit_durable,
+                        "{cut_name} must cross the commit barrier"
+                    );
+                }
                 match &cut {
                     CrashCut::CutA | CrashCut::CutBExt4 => {
                         assert_eq!(plan_state, PLAN_DIRTY, "ext4 {cut_name} plan_state");
@@ -1379,6 +1637,37 @@ mod native_repair_crash_cuts_and_healing {
                 }
             }
 
+            if matches!(cut, CrashCut::CutA | CrashCut::CutBExt4) {
+                assert_dirty_intent_failures_refuse_without_writes(&cx, &cut_dev, cut_name);
+            }
+            if cut == CrashCut::CutBExt4 {
+                let crash_bytes = cut_dev.snapshot();
+                let unreplayed = OpenFs::from_devices(
+                    &cx,
+                    Box::new(cut_dev.clone()),
+                    &OpenOptions {
+                        ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+                        ..OpenOptions::default()
+                    },
+                    VolumeAccess::ReadOnly,
+                    None,
+                    Vec::new(),
+                )
+                .expect("inspect uncheckpointed homes without replay");
+                assert!(
+                    matches!(
+                        unreplayed.lookup(&cx, InodeNumber(2), OsStr::new("v2.bin")),
+                        Err(FfsError::NotFound(_))
+                    ),
+                    "cut_b must precede the home checkpoint: v2 must exist only in the journal"
+                );
+                assert_eq!(
+                    cut_dev.snapshot(),
+                    crash_bytes,
+                    "Skip inspection must not mutate the crash image"
+                );
+            }
+
             // Cold reopen: must automatically replay JBD2 (if committed), reconcile FFSEPK02,
             // clear FFSEPK02, and re-seal VALIDATION_SEALED without manual re-initialization!
             let mut reopened = OpenFs::from_devices(
@@ -1398,16 +1687,7 @@ mod native_repair_crash_cuts_and_healing {
                 .check_native_repair(&cx)
                 .expect("post-reopen native repair check");
             assert_eq!(post_report.groups, 2);
-            {
-                let guard = cut_dev.state.lock();
-                let o0 = (storage.tails[0].start.0 as usize) * 1024;
-                assert!(
-                    guard.bytes[o0 + EPOCH_TOKEN_START..o0 + EPOCH_TOKEN_START + EPOCH_TOKEN_LEN]
-                        .iter()
-                        .all(|&b| b == 0),
-                    "ext4 {cut_name}: FFSEPK02 token must be retired after reconciliation"
-                );
-            }
+            assert_native_epoch_retired(&cut_dev, cut_name);
 
             if v2_expected {
                 verify_1pct_and_5pct_healing(
@@ -1681,6 +1961,37 @@ mod native_repair_crash_cuts_and_healing {
                 "btrfs {cut_name} fault rule must have fired"
             );
 
+            {
+                let guard = cut_dev.state.lock();
+                let (plan_state, has_token, ..) = inspect_plan_and_groups(&guard);
+                assert!(has_token, "btrfs {cut_name} must preserve the epoch token");
+                assert!(
+                    guard.source_progress.changed_writes > 0,
+                    "{cut_name} changed no sources"
+                );
+                if cut == CrashCut::CutA {
+                    assert_eq!(
+                        guard.source_progress.writes, 1,
+                        "cut_a must stop after one source write"
+                    );
+                    assert_eq!(read_btrfs_generation(&guard.bytes), baseline_btrfs_gen);
+                } else {
+                    assert!(read_btrfs_generation(&guard.bytes) > baseline_btrfs_gen);
+                }
+                assert_eq!(
+                    plan_state,
+                    if matches!(cut, CrashCut::CutA | CrashCut::CutBBtrfs { .. }) {
+                        PLAN_DIRTY
+                    } else {
+                        VALIDATION_PENDING
+                    },
+                    "btrfs {cut_name} must interrupt the intended publication phase"
+                );
+            }
+            if matches!(cut, CrashCut::CutA | CrashCut::CutBBtrfs { .. }) {
+                assert_dirty_intent_failures_refuse_without_writes(&cx, &cut_dev, cut_name);
+            }
+
             let mut reopened = OpenFs::from_devices(
                 &cx,
                 Box::new(cut_dev.clone()),
@@ -1696,6 +2007,7 @@ mod native_repair_crash_cuts_and_healing {
             reopened
                 .check_native_repair(&cx)
                 .expect("post-reopen btrfs native repair check");
+            assert_native_epoch_retired(&cut_dev, cut_name);
 
             if v2_expected {
                 verify_1pct_and_5pct_healing(

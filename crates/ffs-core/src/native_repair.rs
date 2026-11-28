@@ -62,6 +62,10 @@ const EPOCH_TOKEN_START: usize = PARITY_HEADER_END;
 const EPOCH_TOKEN_BYTES: usize = 160;
 const EPOCH_TOKEN_END: usize = EPOCH_TOKEN_START + EPOCH_TOKEN_BYTES;
 const EPOCH_TOKEN_FLAG_FORMAT_COMMIT: u32 = 1 << 0;
+const WRITE_INTENT_MAGIC: &[u8; 8] = b"FFSINT01";
+const WRITE_INTENT_START: usize = EPOCH_TOKEN_END;
+const WRITE_INTENT_BYTES: usize = 160;
+const WRITE_INTENT_END: usize = WRITE_INTENT_START + WRITE_INTENT_BYTES;
 const DIRTY_BUCKET_COUNT: usize = 512;
 const MAX_DELTA_BEFOREIMAGE_BLOCKS: usize = 512;
 const BTRFS_NATIVE_GROUP_MAX_BLOCKS: u32 = 512;
@@ -178,8 +182,9 @@ impl NativeEpochToken {
             dirty_group_buckets,
         };
         if prev_sealed_epoch == 0
-            || target_epoch != prev_sealed_epoch.saturating_add(1)
+            || prev_sealed_epoch.checked_add(1) != Some(target_epoch)
             || flags & !EPOCH_TOKEN_FLAG_FORMAT_COMMIT != 0
+            || (flags == 0 && pre_epoch_commit_seq != 0)
             || bytes != token.encode(id)
         {
             return Err(validation_error(
@@ -188,6 +193,107 @@ impl NativeEpochToken {
             ));
         }
         Ok(Some(token))
+    }
+}
+
+/// The two complete source states authorized around one physical write.
+/// Earlier writes reach disk before this record replaces their authority.
+/// A torn current write must still fail closed: dirty buckets never authorize
+/// deriving a baseline from arbitrary bytes observed after a crash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NativeWriteIntent {
+    binding: [u8; 32],
+    before_root: [u8; 32],
+    after_root: [u8; 32],
+    sequence: u64,
+    offset: u64,
+    length: u64,
+}
+
+impl NativeWriteIntent {
+    fn binding(
+        id: &NativeFsIdentity,
+        storage: &NativeRepairStorage,
+        token: &NativeEpochToken,
+    ) -> Result<[u8; 32], FfsError> {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"FrankenFS native write intent binding v1");
+        hasher.update(&token.encode(id));
+        hasher.update(&id.block_size.to_le_bytes());
+        hasher.update(&id.group_count.to_le_bytes());
+        hasher.update(&storage.repair_basis_points.to_le_bytes());
+        for tail in &storage.tails {
+            hasher.update(&tail.group.0.to_le_bytes());
+            hasher.update(&tail.group_start.0.to_le_bytes());
+            hasher.update(&tail.source_blocks()?.to_le_bytes());
+            hasher.update(&tail.start.0.to_le_bytes());
+            hasher.update(&tail.validation_blocks.to_le_bytes());
+            hasher.update(&tail.repair_blocks.to_le_bytes());
+        }
+        Ok(*hasher.finalize().as_bytes())
+    }
+
+    fn encode(self, id: &NativeFsIdentity) -> [u8; WRITE_INTENT_BYTES] {
+        let mut bytes = [0; WRITE_INTENT_BYTES];
+        bytes[..8].copy_from_slice(WRITE_INTENT_MAGIC);
+        bytes[8..40].copy_from_slice(&self.binding);
+        bytes[40..72].copy_from_slice(&self.before_root);
+        bytes[72..104].copy_from_slice(&self.after_root);
+        bytes[104..112].copy_from_slice(&self.sequence.to_le_bytes());
+        bytes[112..120].copy_from_slice(&self.offset.to_le_bytes());
+        bytes[120..128].copy_from_slice(&self.length.to_le_bytes());
+        bytes[128..132].copy_from_slice(&id.block_size.to_le_bytes());
+        let checksum = ffs_ondisk::ext4::ext4_chksum(!0, &bytes[..152]);
+        bytes[152..156].copy_from_slice(&checksum.to_le_bytes());
+        bytes
+    }
+
+    fn decode_optional(
+        bytes: &[u8],
+        id: &NativeFsIdentity,
+        storage: &NativeRepairStorage,
+        token: Option<&NativeEpochToken>,
+    ) -> Result<Option<Self>, FfsError> {
+        let tail0 = &storage.tails[0];
+        if bytes.len() != WRITE_INTENT_BYTES {
+            return Err(validation_error(tail0, "write intent length mismatch"));
+        }
+        if bytes.iter().all(|&byte| byte == 0) {
+            return Ok(None);
+        }
+        let token = token
+            .ok_or_else(|| validation_error(tail0, "write intent has no bound epoch token"))?;
+        let intent = Self {
+            binding: Self::binding(id, storage, token)?,
+            before_root: bytes[40..72].try_into().expect("fixed slice"),
+            after_root: bytes[72..104].try_into().expect("fixed slice"),
+            sequence: u64::from_le_bytes(bytes[104..112].try_into().expect("fixed slice")),
+            offset: u64::from_le_bytes(bytes[112..120].try_into().expect("fixed slice")),
+            length: u64::from_le_bytes(bytes[120..128].try_into().expect("fixed slice")),
+        };
+        if intent.sequence == 0 || intent.length == 0 || bytes != intent.encode(id) {
+            return Err(validation_error(
+                tail0,
+                "write intent identity, sequence, or checksum mismatch",
+            ));
+        }
+        let end = intent
+            .offset
+            .checked_add(intent.length)
+            .ok_or_else(|| validation_error(tail0, "write intent range overflows"))?;
+        let size = u64::from(id.block_size);
+        let mut block = intent.offset / size;
+        while block <= (end - 1) / size {
+            let tail = native_target(storage, BlockNumber(block))?;
+            if !token.is_group_dirty(tail.group) {
+                return Err(validation_error(
+                    tail,
+                    "write intent escapes dirty coverage",
+                ));
+            }
+            block = tail.source_end_exclusive().0;
+        }
+        Ok(Some(intent))
     }
 }
 
@@ -345,6 +451,7 @@ impl ParityIntent {
     }
 }
 
+#[derive(Clone)]
 struct NativeBaseline {
     storage: NativeRepairStorage,
     owner_generation: u32,
@@ -389,6 +496,9 @@ struct NativeFreshnessState {
     tables: Vec<Vec<u8>>,
     parity: Vec<ParityIntent>,
     intended: BTreeMap<BlockNumber, [u8; 32]>,
+    source_roots: Vec<[u8; 32]>,
+    epoch_token: Option<NativeEpochToken>,
+    write_intent: Option<NativeWriteIntent>,
     beforeimages: BTreeMap<BlockNumber, Vec<u8>>,
     dirty_groups: Vec<bool>,
     persisted_dirty_buckets: [u8; 64],
@@ -398,6 +508,8 @@ struct NativeFreshnessState {
     scrub_monitor: VilleWaldScrubMonitor,
     phase: FreshnessPhase,
 }
+
+type NativeStagedBlock = (BlockNumber, GroupNumber, [u8; 32], Option<Vec<u8>>);
 
 /// Guard holding a multi-barrier format commit (`ext4_journal_and_checkpoint`,
 /// `btrfs_commit_locked`, `btrfs_sync_ephemeral_tree_log`) in deferred-seal
@@ -747,7 +859,7 @@ impl NativeFreshnessDevice {
         }
     }
 
-    fn begin_durability_commit<'a>(
+    pub(super) fn begin_durability_commit<'a>(
         &'a self,
         cx: &Cx,
         pre_commit_seq: u64,
@@ -782,6 +894,10 @@ impl NativeFreshnessDevice {
             .defer_seal
             .checked_sub(1)
             .ok_or_else(|| freshness_error("durability commit guard underflow"))?;
+        if state.defer_seal == 0 && state.phase == FreshnessPhase::Clean {
+            state.format_commit_seq = None;
+            state.pending_dirty_buckets = [0; 64];
+        }
         Ok(())
     }
 
@@ -797,6 +913,10 @@ impl NativeFreshnessDevice {
         };
         if let Some(mut state) = guard {
             state.defer_seal = state.defer_seal.saturating_sub(1);
+            if state.defer_seal == 0 && state.phase == FreshnessPhase::Clean {
+                state.format_commit_seq = None;
+                state.pending_dirty_buckets = [0; 64];
+            }
             if aborted {
                 if state.phase == FreshnessPhase::Dirty {
                     // Nested commits share physical writes and have no savepoint.
@@ -1036,8 +1156,32 @@ impl NativeFreshnessDevice {
             ValidationIntent::Dirty(root)
         };
         self.check_plan(cx, &state.baseline, intent)?;
+        self.check_write_intent(cx, state)?;
         for index in 0..state.baseline.storage.tails.len() {
             self.check_group_authority(cx, state, index, false)?;
+        }
+        Ok(())
+    }
+
+    fn check_write_intent(&self, cx: &Cx, state: &NativeFreshnessState) -> Result<(), FfsError> {
+        let owner = self
+            .device()
+            .read_block(cx, state.baseline.storage.tails[0].start)?;
+        let token = NativeEpochToken::decode_optional(
+            &owner.as_slice()[EPOCH_TOKEN_START..EPOCH_TOKEN_END],
+            &self.id,
+            state.baseline.storage.owner_inode,
+            state.baseline.owner_generation,
+            &state.baseline.storage.tails[0],
+        )?;
+        let intent = NativeWriteIntent::decode_optional(
+            &owner.as_slice()[WRITE_INTENT_START..WRITE_INTENT_END],
+            &self.id,
+            &state.baseline.storage,
+            token.as_ref(),
+        )?;
+        if token != state.epoch_token || intent != state.write_intent {
+            return Err(freshness_error("persisted source-write authority changed"));
         }
         Ok(())
     }
@@ -1211,7 +1355,6 @@ impl NativeFreshnessDevice {
         result
     }
 
-    #[expect(clippy::type_complexity)]
     fn stage_intended(
         &self,
         cx: &Cx,
@@ -1219,7 +1362,7 @@ impl NativeFreshnessDevice {
         offset: u64,
         end: u64,
         buffers: &[&[u8]],
-    ) -> Result<Vec<(BlockNumber, GroupNumber, [u8; 32], Option<Vec<u8>>)>, FfsError> {
+    ) -> Result<Vec<NativeStagedBlock>, FfsError> {
         let size = u64::from(self.id.block_size);
         let mut staged = Vec::new();
         let mut input = 0;
@@ -1274,6 +1417,35 @@ impl NativeFreshnessDevice {
         Ok(staged)
     }
 
+    fn staged_source_roots(
+        &self,
+        cx: &Cx,
+        state: &NativeFreshnessState,
+        staged: &[NativeStagedBlock],
+    ) -> Result<Vec<[u8; 32]>, FfsError> {
+        let mut roots = state.source_roots.clone();
+        let groups: BTreeSet<_> = staged.iter().map(|entry| entry.1).collect();
+        for group in groups {
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            let index = group.0 as usize;
+            let tail = &state.baseline.storage.tails[index];
+            let mut table = state.tables[index].clone();
+            for (block, digest) in state
+                .intended
+                .range(tail.group_start..tail.source_end_exclusive())
+            {
+                let offset = VALIDATION_HEADER_BYTES + (block.0 - tail.group_start.0) as usize * 32;
+                table[offset..offset + 32].copy_from_slice(digest);
+            }
+            for (block, _, digest, _) in staged.iter().filter(|entry| entry.1 == group) {
+                let offset = VALIDATION_HEADER_BYTES + (block.0 - tail.group_start.0) as usize * 32;
+                table[offset..offset + 32].copy_from_slice(digest);
+            }
+            roots[index] = native_source_group_root(&self.id, tail, &table)?;
+        }
+        Ok(roots)
+    }
+
     fn write_buffers(
         &self,
         cx: &Cx,
@@ -1312,69 +1484,89 @@ impl NativeFreshnessDevice {
         }
         let result = (|| {
             let staged = self.stage_intended(cx, &state, offset.0, end, buffers)?;
-            if let Some(pre_seq) = state.format_commit_seq {
-                let mut combined = state.pending_dirty_buckets;
-                for (dst, src) in combined.iter_mut().zip(&write_buckets) {
-                    *dst |= *src;
-                }
-                for (idx, &dirty) in state.dirty_groups.iter().enumerate() {
-                    if dirty {
-                        NativeEpochToken::mark_bucket(&mut combined, GroupNumber(idx as u32));
-                    }
-                }
-                let uncovered_bucket = write_buckets
-                    .iter()
-                    .zip(&state.persisted_dirty_buckets)
-                    .any(|(&need, &have)| need & !have != 0);
-                if state.phase == FreshnessPhase::Clean || uncovered_bucket {
-                    self.check_authority(cx, &state)?;
-                    let token = NativeEpochToken {
-                        owner_inode: state.baseline.storage.owner_inode,
-                        owner_generation: state.baseline.owner_generation,
-                        target_epoch: next_epoch,
-                        prev_sealed_epoch: state.baseline.epoch,
-                        flags: EPOCH_TOKEN_FLAG_FORMAT_COMMIT,
-                        pre_epoch_commit_seq: pre_seq,
-                        prev_sealed_plan_root: state.baseline.plan_root,
-                        dirty_group_buckets: combined,
-                    };
-                    state.phase = FreshnessPhase::Poisoned;
-                    publish_validation_plan_with_token(
-                        cx,
-                        &self.device(),
-                        &self.id,
-                        &state.baseline.storage,
-                        state.baseline.owner_generation,
-                        state.baseline.epoch,
-                        ValidationIntent::Dirty(state.baseline.plan_root),
-                        Some(&token),
-                    )?;
-                    state.pending_dirty_buckets = combined;
-                    state.persisted_dirty_buckets = combined;
-                    state.phase = FreshnessPhase::Dirty;
-                }
-            } else if state.phase == FreshnessPhase::Clean {
-                self.check_authority(cx, &state)?;
-                state.phase = FreshnessPhase::Poisoned;
-                publish_validation_plan(
-                    cx,
-                    &self.device(),
-                    &self.id,
-                    &state.baseline.storage,
-                    state.baseline.owner_generation,
-                    state.baseline.epoch,
-                    ValidationIntent::Dirty(state.baseline.plan_root),
-                )?;
-                state.phase = FreshnessPhase::Dirty;
+            let source_roots = self.staged_source_roots(cx, &state, &staged)?;
+            let sequence = state
+                .write_intent
+                .map_or(0, |intent| intent.sequence)
+                .checked_add(1)
+                .ok_or_else(|| freshness_error("source-write sequence exhausted"))?;
+            let mut combined = state.pending_dirty_buckets;
+            for ((dst, written), persisted) in combined
+                .iter_mut()
+                .zip(write_buckets)
+                .zip(state.persisted_dirty_buckets)
+            {
+                *dst |= written | persisted;
             }
+            let token = NativeEpochToken {
+                owner_inode: state.baseline.storage.owner_inode,
+                owner_generation: state.baseline.owner_generation,
+                target_epoch: next_epoch,
+                prev_sealed_epoch: state.baseline.epoch,
+                flags: if state.format_commit_seq.is_some() {
+                    EPOCH_TOKEN_FLAG_FORMAT_COMMIT
+                } else {
+                    0
+                },
+                pre_epoch_commit_seq: state.format_commit_seq.unwrap_or(0),
+                prev_sealed_plan_root: state.baseline.plan_root,
+                dirty_group_buckets: combined,
+            };
+            let intent = NativeWriteIntent {
+                binding: NativeWriteIntent::binding(&self.id, &state.baseline.storage, &token)?,
+                before_root: native_source_root(&self.id, &state.baseline, &state.source_roots)?,
+                after_root: native_source_root(&self.id, &state.baseline, &source_roots)?,
+                sequence,
+                offset: offset.0,
+                length,
+            };
+            if state.phase == FreshnessPhase::Clean {
+                self.check_authority(cx, &state)?;
+            } else {
+                self.check_write_intent(cx, &state)?;
+            }
+            // Replacing the preceding intent in the same barrier as its
+            // source writes could leave neither new root describing disk.
+            // Complete those writes first, then durably authorize this one.
+            if state.write_intent.is_some() {
+                self.inner.sync(cx)?;
+            }
+            state.phase = FreshnessPhase::Poisoned;
+            publish_native_write_intent(
+                cx,
+                &self.device(),
+                &self.id,
+                &state.baseline.storage,
+                &token,
+                &intent,
+            )?;
+            state.pending_dirty_buckets = combined;
+            state.persisted_dirty_buckets = combined;
+            state.epoch_token = Some(token);
+            state.write_intent = Some(intent);
+            state.phase = FreshnessPhase::Dirty;
             self.inner.write_vectored_all_at(cx, offset, buffers)?;
             for (block, group, digest, maybe_beforeimage) in staged {
-                state.dirty_groups[group.0 as usize] = true;
                 if let Some(beforeimage) = maybe_beforeimage {
                     state.beforeimages.entry(block).or_insert(beforeimage);
                 }
-                state.intended.insert(block, digest);
+                let tail = &state.baseline.storage.tails[group.0 as usize];
+                let digest_offset =
+                    VALIDATION_HEADER_BYTES + (block.0 - tail.group_start.0) as usize * 32;
+                if state.tables[group.0 as usize][digest_offset..digest_offset + 32] == digest {
+                    state.intended.remove(&block);
+                } else {
+                    state.intended.insert(block, digest);
+                }
+                let tail = &state.baseline.storage.tails[group.0 as usize];
+                let changed = state
+                    .intended
+                    .range(tail.group_start..tail.source_end_exclusive())
+                    .next()
+                    .is_some();
+                state.dirty_groups[group.0 as usize] = changed;
             }
+            state.source_roots = source_roots;
             cx.checkpoint().map_err(|_| FfsError::Cancelled)
         })();
         if result.is_err() {
@@ -1604,16 +1796,7 @@ impl NativeFreshnessDevice {
             }
             admissions.push(admission);
         }
-        let pending_token = state.format_commit_seq.map(|pre_seq| NativeEpochToken {
-            owner_inode: state.baseline.storage.owner_inode,
-            owner_generation: state.baseline.owner_generation,
-            target_epoch: epoch,
-            prev_sealed_epoch: state.baseline.epoch,
-            flags: EPOCH_TOKEN_FLAG_FORMAT_COMMIT,
-            pre_epoch_commit_seq: pre_seq,
-            prev_sealed_plan_root: state.baseline.plan_root,
-            dirty_group_buckets: state.persisted_dirty_buckets,
-        });
+        let pending_token = state.epoch_token;
         publish_validation_plan_with_token(
             cx,
             &dev,
@@ -1643,6 +1826,8 @@ impl NativeFreshnessDevice {
         state.tables = tables;
         state.parity = parity;
         state.intended.clear();
+        state.epoch_token = None;
+        state.write_intent = None;
         state.beforeimages.clear();
         state.dirty_groups.fill(false);
         state.persisted_dirty_buckets = [0; 64];
@@ -1717,8 +1902,8 @@ impl ByteDevice for NativeFreshnessDevice {
         self.inner.begin_durability_commit(cx)?;
         // Embedders receive this same fenced ByteDevice. Its generic deferral
         // must hold native protection as well as any underlying sidecar across
-        // intermediate barriers. No format recovery token is invented here;
-        // interrupted generic epochs retain the existing fail-closed policy.
+        // intermediate barriers. Generic writes carry source intent without
+        // claiming a format commit sequence; only its exact roots can recover.
         state.defer_seal = defer_seal;
         Ok(())
     }
@@ -1866,7 +2051,7 @@ fn check_native_validation_owner_prefix(
         tail,
     );
     let zero_tail_start = if tail.group.0 == 0 {
-        EPOCH_TOKEN_END
+        WRITE_INTENT_END
     } else {
         PARITY_HEADER_END
     };
@@ -1895,13 +2080,7 @@ fn check_native_validation_owner_prefix(
             storage,
             generation,
         )?;
-        NativeEpochToken::decode_optional(
-            &bytes[EPOCH_TOKEN_START..EPOCH_TOKEN_END],
-            id,
-            storage.owner_inode,
-            generation,
-            tail,
-        )?;
+        native_epoch_records(id, storage, generation, &bytes)?;
     }
     Ok(bytes)
 }
@@ -1911,6 +2090,52 @@ fn validation_error(tail: &NativeRepairTail, detail: &str) -> FfsError {
         block: tail.start.0,
         detail: format!("native validation group {}: {detail}", tail.group.0),
     }
+}
+
+fn native_epoch_records(
+    id: &NativeFsIdentity,
+    storage: &NativeRepairStorage,
+    generation: u32,
+    owner: &[u8],
+) -> Result<(Option<NativeEpochToken>, Option<NativeWriteIntent>), FfsError> {
+    let tail = &storage.tails[0];
+    let token = NativeEpochToken::decode_optional(
+        &owner[EPOCH_TOKEN_START..EPOCH_TOKEN_END],
+        id,
+        storage.owner_inode,
+        generation,
+        tail,
+    )?;
+    let intent = NativeWriteIntent::decode_optional(
+        &owner[WRITE_INTENT_START..WRITE_INTENT_END],
+        id,
+        storage,
+        token.as_ref(),
+    )?;
+    let plan = validation_plan_intent(
+        &owner[PLAN_HEADER_START..PLAN_HEADER_END],
+        id,
+        storage,
+        generation,
+    )?;
+    if intent.is_some() && !matches!(plan, ValidationIntent::Dirty(_)) {
+        return Err(validation_error(
+            tail,
+            "source write intent outlived its dirty plan",
+        ));
+    }
+    if token.is_some()
+        && matches!(
+            plan,
+            ValidationIntent::Sealed(_) | ValidationIntent::Prepared | ValidationIntent::Empty
+        )
+    {
+        return Err(validation_error(
+            tail,
+            "inactive plan carries an epoch token",
+        ));
+    }
+    Ok((token, intent))
 }
 
 fn validation_sizes(
@@ -2002,6 +2227,52 @@ fn validation_root(table: &[u8], used: usize) -> [u8; 32] {
     hasher.update(&table[..72]);
     hasher.update(&table[VALIDATION_HEADER_BYTES..used]);
     *hasher.finalize().as_bytes()
+}
+
+/// Source-intent roots exclude validation epochs and publication headers.
+/// Conservative bucket hints cannot change which source bytes were authorized.
+fn native_source_group_root(
+    id: &NativeFsIdentity,
+    tail: &NativeRepairTail,
+    table: &[u8],
+) -> Result<[u8; 32], FfsError> {
+    let (sources, capacity, used) = validation_sizes(id, tail)?;
+    if table.len() != capacity {
+        return Err(validation_error(
+            tail,
+            "source intent table length mismatch",
+        ));
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"FrankenFS native source intent group v1");
+    hasher.update(&id.uuid);
+    hasher.update(&id.block_size.to_le_bytes());
+    hasher.update(&tail.group.0.to_le_bytes());
+    hasher.update(&tail.group_start.0.to_le_bytes());
+    hasher.update(&sources.to_le_bytes());
+    hasher.update(&table[VALIDATION_HEADER_BYTES..used]);
+    Ok(*hasher.finalize().as_bytes())
+}
+
+fn native_source_root(
+    id: &NativeFsIdentity,
+    baseline: &NativeBaseline,
+    group_roots: &[[u8; 32]],
+) -> Result<[u8; 32], FfsError> {
+    if group_roots.len() != baseline.storage.tails.len() || group_roots.is_empty() {
+        return Err(freshness_error("source intent group count mismatch"));
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"FrankenFS native source intent plan v1");
+    hasher.update(&id.uuid);
+    hasher.update(&id.block_size.to_le_bytes());
+    hasher.update(&id.group_count.to_le_bytes());
+    hasher.update(&baseline.storage.owner_inode.0.to_le_bytes());
+    hasher.update(&baseline.owner_generation.to_le_bytes());
+    for root in group_roots {
+        hasher.update(root);
+    }
+    Ok(*hasher.finalize().as_bytes())
 }
 
 fn read_validation_table(
@@ -2271,7 +2542,16 @@ fn read_sealed_table(
 }
 
 fn read_native_baseline(fs: &OpenFs, cx: &Cx) -> Result<NativeBaseline, FfsError> {
-    let (id, storage, generation) = fs.native_identity_storage_and_generation(cx)?;
+    read_native_baseline_with_recovery(fs, cx, false)
+}
+
+fn read_native_baseline_with_recovery(
+    fs: &OpenFs,
+    cx: &Cx,
+    allow_recovery: bool,
+) -> Result<NativeBaseline, FfsError> {
+    let (id, storage, generation) =
+        fs.native_identity_storage_and_generation_with_recovery(cx, allow_recovery)?;
     let dev = ByteDeviceBlockAdapter {
         dev: fs.dev.as_ref(),
         block_size: id.block_size,
@@ -2389,8 +2669,106 @@ fn verify_dirty_recovery_sources(
     Ok(())
 }
 
+/// Reconstruct a candidate in memory, then authenticate it against a root
+/// persisted before the source write. No parity repair or source write is
+/// allowed until this comparison succeeds for the complete covered image.
+fn admit_dirty_recovery_state(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    id: &NativeFsIdentity,
+    baseline: NativeBaseline,
+    token: NativeEpochToken,
+    intent: NativeWriteIntent,
+    recovery_dirty_groups: &BTreeSet<GroupNumber>,
+) -> Result<NativeFreshnessState, FfsError> {
+    let mut tables = Vec::with_capacity(baseline.storage.tails.len());
+    let mut parity = Vec::with_capacity(baseline.storage.tails.len());
+    let mut source_roots = Vec::with_capacity(baseline.storage.tails.len());
+    let mut dirty_groups = vec![false; baseline.storage.tails.len()];
+    let mut intended = BTreeMap::new();
+    for (index, tail) in baseline.storage.tails.iter().enumerate() {
+        let (root, table) = read_sealed_table(
+            cx,
+            dev,
+            id,
+            &baseline.storage,
+            baseline.owner_generation,
+            tail,
+        )?;
+        if root != baseline.roots[index] {
+            return Err(validation_error(tail, "dirty recovery baseline changed"));
+        }
+        if token.is_group_dirty(tail.group) || recovery_dirty_groups.contains(&tail.group) {
+            let observed = build_validation_table(
+                cx,
+                dev,
+                id,
+                baseline.storage.owner_inode,
+                baseline.owner_generation,
+                tail,
+                baseline.group_epochs[index],
+            )?;
+            source_roots.push(native_source_group_root(id, tail, &observed)?);
+            let (_, _, used) = validation_sizes(id, tail)?;
+            for (offset, (old, new)) in table[VALIDATION_HEADER_BYTES..used]
+                .chunks_exact(32)
+                .zip(observed[VALIDATION_HEADER_BYTES..used].chunks_exact(32))
+                .enumerate()
+            {
+                if old != new {
+                    intended.insert(
+                        BlockNumber(tail.group_start.0 + offset as u64),
+                        new.try_into().expect("digest chunk"),
+                    );
+                    dirty_groups[index] = true;
+                }
+            }
+        } else {
+            // Clean groups contribute attested digests, retaining the ability
+            // to heal their corruption after the Dirty roots are admitted.
+            source_roots.push(native_source_group_root(id, tail, &table)?);
+        }
+        parity.push(read_native_parity_intent(cx, dev, id, &baseline, tail)?);
+        tables.push(table);
+    }
+    let root = native_source_root(id, &baseline, &source_roots)?;
+    if root != intent.before_root && root != intent.after_root {
+        return Err(validation_error(
+            &baseline.storage.tails[0],
+            "dirty epoch sources disagree with persisted intended-source authority",
+        ));
+    }
+    Ok(NativeFreshnessState {
+        baseline,
+        tables,
+        parity,
+        intended,
+        source_roots,
+        epoch_token: Some(token),
+        write_intent: Some(intent),
+        beforeimages: BTreeMap::new(),
+        dirty_groups,
+        persisted_dirty_buckets: token.dirty_group_buckets,
+        defer_seal: 0,
+        format_commit_seq: (token.flags & EPOCH_TOKEN_FLAG_FORMAT_COMMIT != 0)
+            .then_some(token.pre_epoch_commit_seq),
+        pending_dirty_buckets: token.dirty_group_buckets,
+        scrub_monitor: VilleWaldScrubMonitor::new(VilleWaldConfig::default())?,
+        phase: FreshnessPhase::Dirty,
+    })
+}
+
 fn ensure_native_baseline(fs: &OpenFs, cx: &Cx, expected: &NativeBaseline) -> Result<(), FfsError> {
-    let current = read_native_baseline(fs, cx)?;
+    ensure_native_baseline_with_recovery(fs, cx, expected, false)
+}
+
+fn ensure_native_baseline_with_recovery(
+    fs: &OpenFs,
+    cx: &Cx,
+    expected: &NativeBaseline,
+    allow_recovery: bool,
+) -> Result<(), FfsError> {
+    let current = read_native_baseline_with_recovery(fs, cx, allow_recovery)?;
     if current.plan_root != expected.plan_root
         || current.storage != expected.storage
         || current.owner_generation != expected.owner_generation
@@ -3310,8 +3688,34 @@ fn publish_validation_plan_with_token(
     } else {
         owner[EPOCH_TOKEN_START..EPOCH_TOKEN_END].fill(0);
     }
+    owner[WRITE_INTENT_START..WRITE_INTENT_END].fill(0);
     cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
     dev.write_block(cx, first, &owner)?;
+    dev.sync(cx)
+}
+
+fn publish_native_write_intent(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    id: &NativeFsIdentity,
+    storage: &NativeRepairStorage,
+    token: &NativeEpochToken,
+    intent: &NativeWriteIntent,
+) -> Result<(), FfsError> {
+    let first = &storage.tails[0];
+    let mut owner = check_native_owner_prefix(cx, dev, id, storage, token.owner_generation, first)?;
+    owner[PLAN_HEADER_START..PLAN_HEADER_END].copy_from_slice(&validation_plan_header(
+        id,
+        storage,
+        token.owner_generation,
+        token.prev_sealed_epoch,
+        PLAN_DIRTY,
+        &token.prev_sealed_plan_root,
+    )?);
+    owner[EPOCH_TOKEN_START..EPOCH_TOKEN_END].copy_from_slice(&token.encode(id));
+    owner[WRITE_INTENT_START..WRITE_INTENT_END].copy_from_slice(&intent.encode(id));
+    cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+    dev.write_block(cx, first.start, &owner)?;
     dev.sync(cx)
 }
 
@@ -4052,8 +4456,16 @@ impl OpenFs {
         &self,
         cx: &Cx,
     ) -> Result<(NativeFsIdentity, NativeRepairStorage, u32), FfsError> {
+        self.native_identity_storage_and_generation_with_recovery(cx, false)
+    }
+
+    fn native_identity_storage_and_generation_with_recovery(
+        &self,
+        cx: &Cx,
+        allow_recovery: bool,
+    ) -> Result<(NativeFsIdentity, NativeRepairStorage, u32), FfsError> {
         if let Some(sb) = self.ext4_superblock() {
-            let storage = self.native_ext4_repair_storage(cx)?;
+            let storage = self.native_ext4_repair_storage_with_recovery(cx, allow_recovery)?;
             let inode = self.read_native_owner_inode(cx, sb, storage.owner_inode)?;
             return Ok((NativeFsIdentity::from_ext4(sb), storage, inode.generation));
         }
@@ -4113,11 +4525,9 @@ impl OpenFs {
         Ok(())
     }
 
-    /// Reconcile root-bound pending epochs and dirty fences whose possible
-    /// write targets still match the old sealed sources, then activate native
-    /// read verification and write fencing. Changed Dirty sources require
-    /// durable per-source intent and are refused; a group bitmap alone cannot
-    /// distinguish a legitimate write from corruption.
+    /// Authenticate interrupted source writes and root-bound pending epochs
+    /// before activating native verification. Call before native replay: every
+    /// recovery write must pass through the admitted freshness device as well.
     #[expect(clippy::too_many_lines)]
     pub fn reconcile_and_activate_native_repair(
         &mut self,
@@ -4138,9 +4548,8 @@ impl OpenFs {
         if self.metadata_log.is_some() || self.metadata_compactor.lock().is_some() {
             return Err(freshness_error("external metadata WAL is not admitted"));
         }
-        self.finalize_replayed_ext4_journal_for_native_repair(cx)?;
-
-        let (id, storage, owner_generation) = self.native_identity_storage_and_generation(cx)?;
+        let (id, storage, owner_generation) =
+            self.native_identity_storage_and_generation_with_recovery(cx, true)?;
         let retained_budget = freshness_codec_budget(&id, &storage, max_working_bytes)?;
         let probe_constraints = if let Some(sb) = self.ext4_superblock() {
             sb.validate_v1().map_err(|e| parse_to_ffs_error(&e))?;
@@ -4170,13 +4579,8 @@ impl OpenFs {
         let plan_bytes = &owner0[PLAN_HEADER_START..PLAN_HEADER_END];
         let plan_intent = validation_plan_intent(plan_bytes, &id, &storage, owner_generation)?;
         let plan_epoch = validation_plan_epoch(plan_bytes)?;
-        let maybe_token = NativeEpochToken::decode_optional(
-            &owner0[EPOCH_TOKEN_START..EPOCH_TOKEN_END],
-            &id,
-            storage.owner_inode,
-            owner_generation,
-            &storage.tails[0],
-        )?;
+        let (maybe_token, maybe_intent) =
+            native_epoch_records(&id, &storage, owner_generation, &owner0)?;
 
         let mut recovery_dirty_groups = BTreeSet::new();
         for &blk in recovery_touched_blocks {
@@ -4192,7 +4596,7 @@ impl OpenFs {
                         "uncoordinated recovery modified a sealed native baseline without an epoch token",
                     ));
                 }
-                let baseline = read_native_baseline(self, cx)?;
+                let baseline = read_native_baseline_with_recovery(self, cx, true)?;
                 for (index, tail) in storage.tails.iter().enumerate() {
                     let (root, table) =
                         read_sealed_table(cx, &dev, &id, &storage, owner_generation, tail)?;
@@ -4227,8 +4631,7 @@ impl OpenFs {
                 ));
             }
             (ValidationIntent::Dirty(prev_root), Some(token))
-                if token.flags & EPOCH_TOKEN_FLAG_FORMAT_COMMIT != 0
-                    && token.prev_sealed_plan_root == prev_root
+                if token.prev_sealed_plan_root == prev_root
                     && token.prev_sealed_epoch == plan_epoch =>
             {
                 let baseline = read_native_group_baseline(
@@ -4240,19 +4643,58 @@ impl OpenFs {
                     token.prev_sealed_epoch,
                     prev_root,
                 )?;
-                verify_dirty_recovery_sources(
+                let recovered = maybe_intent
+                    .map(|intent| {
+                        admit_dirty_recovery_state(
+                            cx,
+                            &dev,
+                            &id,
+                            baseline.clone(),
+                            token,
+                            intent,
+                            &recovery_dirty_groups,
+                        )
+                    })
+                    .transpose()?
+                    .filter(|state| state.dirty_groups.iter().any(|dirty| *dirty));
+                if recovered.is_none() {
+                    verify_dirty_recovery_sources(
+                        cx,
+                        &dev,
+                        &id,
+                        &baseline,
+                        &token,
+                        &recovery_dirty_groups,
+                    )?;
+                }
+                if check_native_owner_prefix(
                     cx,
                     &dev,
                     &id,
-                    &baseline,
-                    &token,
-                    &recovery_dirty_groups,
-                )?;
+                    &storage,
+                    owner_generation,
+                    &storage.tails[0],
+                )? != owner0
+                {
+                    return Err(validation_error(
+                        &storage.tails[0],
+                        "dirty recovery authority changed",
+                    ));
+                }
                 for (index, tail) in storage.tails.iter().enumerate() {
                     let (root, table) =
                         read_sealed_table(cx, &dev, &id, &storage, owner_generation, tail)?;
                     if root != baseline.roots[index] {
                         return Err(validation_error(tail, "dirty recovery baseline changed"));
+                    }
+                    if recovered.is_some()
+                        && (token.is_group_dirty(tail.group)
+                            || recovery_dirty_groups.contains(&tail.group))
+                    {
+                        // These bytes already matched the whole-image intent.
+                        // Old parity must never restore the preceding version.
+                        native_sealed_generation(cx, &dev, &id, &baseline, tail, false)?;
+                        continue;
                     }
                     let corrupt = native_corrupt_indices(cx, &dev, &id, tail, &table)?;
                     if corrupt.is_empty() {
@@ -4282,6 +4724,23 @@ impl OpenFs {
                         )?;
                     }
                 }
+                if let Some(state) = recovered {
+                    // Reuse the live Pending -> tables/parity -> Sealed path.
+                    // Its hashes came from the admitted intention, never from
+                    // an unchecked rebaseline of the physical crash image.
+                    let device = Arc::new(NativeFreshnessDevice {
+                        inner: Arc::clone(&self.dev),
+                        id,
+                        state: NativeMutex::new(state),
+                        codec_budget,
+                        ownership: probe_constraints,
+                    });
+                    device.sync(cx)?;
+                    let report = device.inspect_repair(cx)?;
+                    self.dev = device.clone();
+                    self.native_repair_device = Some(device);
+                    return Ok(report);
+                }
                 // No source change survived the interrupted write. Retire the
                 // fence against the original sealed epoch instead of blessing
                 // freshly observed bytes as a new baseline.
@@ -4298,8 +4757,7 @@ impl OpenFs {
                 self.dev.sync(cx)?;
             }
             (ValidationIntent::Pending(expected_plan_root), Some(token))
-                if token.flags & EPOCH_TOKEN_FLAG_FORMAT_COMMIT != 0
-                    && token.target_epoch == plan_epoch =>
+                if token.target_epoch == plan_epoch =>
             {
                 let target_epoch = token.target_epoch;
                 let mut validations = Vec::with_capacity(storage.tails.len());
@@ -4307,9 +4765,38 @@ impl OpenFs {
                 let mut needs_parity_publish = Vec::with_capacity(storage.tails.len());
                 let mut needs_source_heal = Vec::new();
                 for (index, tail) in storage.tails.iter().enumerate() {
-                    if !token.is_group_dirty(tail.group) {
-                        let (root, table) =
-                            read_sealed_table(cx, &dev, &id, &storage, owner_generation, tail)?;
+                    // Hints and bucket aliases may name an unchanged group.
+                    // A write returning to its sealed digests does not advance
+                    // that group's epoch. Retain this attested old candidate;
+                    // the aggregate Pending root still decides admission.
+                    let unchanged = if token.is_group_dirty(tail.group) {
+                        match read_sealed_table(cx, &dev, &id, &storage, owner_generation, tail) {
+                            Ok((root, table)) => {
+                                let epoch = u32::from_le_bytes(
+                                    table[68..72].try_into().expect("checked table"),
+                                );
+                                if epoch > 0
+                                    && epoch <= token.prev_sealed_epoch
+                                    && native_corrupt_indices(cx, &dev, &id, tail, &table)?
+                                        .is_empty()
+                                {
+                                    Some((root, table))
+                                } else {
+                                    None
+                                }
+                            }
+                            Err(FfsError::Corruption { .. }) => None,
+                            Err(error) => return Err(error),
+                        }
+                    } else {
+                        None
+                    };
+                    if !token.is_group_dirty(tail.group) || unchanged.is_some() {
+                        let (root, table) = if let Some(unchanged) = unchanged {
+                            unchanged
+                        } else {
+                            read_sealed_table(cx, &dev, &id, &storage, owner_generation, tail)?
+                        };
                         let local_epoch =
                             u32::from_le_bytes(table[68..72].try_into().expect("checked table"));
                         if local_epoch == 0 || local_epoch > token.prev_sealed_epoch {
@@ -4517,7 +5004,7 @@ impl OpenFs {
             }
         }
 
-        self.activate_native_repair(cx, max_working_bytes)
+        self.activate_native_repair_with_recovery(cx, max_working_bytes, true)
     }
 
     /// Admit sealed native protection, verify reads and fence source writes on
@@ -4526,6 +5013,15 @@ impl OpenFs {
         &mut self,
         cx: &Cx,
         max_working_bytes: u64,
+    ) -> Result<NativeRepairReport, FfsError> {
+        self.activate_native_repair_with_recovery(cx, max_working_bytes, false)
+    }
+
+    fn activate_native_repair_with_recovery(
+        &mut self,
+        cx: &Cx,
+        max_working_bytes: u64,
+        allow_recovery: bool,
     ) -> Result<NativeRepairReport, FfsError> {
         self.require_write_authority()?;
         self.require_native_mode("activate_native_repair")?;
@@ -4540,7 +5036,8 @@ impl OpenFs {
         if self.metadata_log.is_some() || self.metadata_compactor.lock().is_some() {
             return Err(freshness_error("external metadata WAL is not admitted"));
         }
-        let (id, storage, _) = self.native_identity_storage_and_generation(cx)?;
+        let (id, storage, _) =
+            self.native_identity_storage_and_generation_with_recovery(cx, allow_recovery)?;
         let retained_budget = freshness_codec_budget(&id, &storage, max_working_bytes)?;
         let ownership = if let Some(sb) = self.ext4_superblock() {
             sb.validate_v1()
@@ -4555,12 +5052,11 @@ impl OpenFs {
         for tail in &storage.tails {
             native_codec_budget(&id, &storage, tail, codec_budget, false)?;
         }
-        let baseline = read_native_baseline(self, cx)?;
+        let baseline = read_native_baseline_with_recovery(self, cx, allow_recovery)?;
         baseline
             .epoch
             .checked_add(1)
             .ok_or_else(|| freshness_error("validation epoch exhausted before activation"))?;
-        let report = self.check_native_repair(cx)?;
         let dev = ByteDeviceBlockAdapter {
             dev: self.dev.as_ref(),
             block_size: id.block_size,
@@ -4568,6 +5064,7 @@ impl OpenFs {
         let group_count = storage.tails.len();
         let mut tables = Vec::with_capacity(group_count);
         let mut parity = Vec::with_capacity(group_count);
+        let mut generations = Vec::with_capacity(group_count);
         for (index, tail) in storage.tails.iter().enumerate() {
             let (root, table) =
                 read_sealed_table(cx, &dev, &id, &storage, baseline.owner_generation, tail)?;
@@ -4579,7 +5076,8 @@ impl OpenFs {
             }
             verify_validation_table(cx, &dev, &id, tail, &table, &root)?;
             let admission = admit_native_group(cx, &dev, &id, &baseline, tail, codec_budget)?;
-            if !admission.retained || admission.intent.generation() != report.generations[index] {
+            let generation = native_sealed_generation(cx, &dev, &id, &baseline, tail, false)?;
+            if !admission.retained || admission.intent.generation() != generation {
                 return Err(validation_error(
                     tail,
                     "parity authority changed during activation",
@@ -4587,8 +5085,10 @@ impl OpenFs {
             }
             tables.push(table);
             parity.push(admission.intent);
+            generations.push(generation);
         }
-        ensure_native_baseline(self, cx, &baseline)?;
+        let report = native_repair_report(&id, &baseline, generations)?;
+        ensure_native_baseline_with_recovery(self, cx, &baseline, allow_recovery)?;
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         {
             use rayon::prelude::*;
@@ -4611,6 +5111,12 @@ impl OpenFs {
             });
         }
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        let source_roots = storage
+            .tails
+            .iter()
+            .zip(&tables)
+            .map(|(tail, table)| native_source_group_root(&id, tail, table))
+            .collect::<Result<Vec<_>, _>>()?;
         let device = Arc::new(NativeFreshnessDevice {
             inner: Arc::clone(&self.dev),
             id,
@@ -4619,6 +5125,9 @@ impl OpenFs {
                 tables,
                 parity,
                 intended: BTreeMap::new(),
+                source_roots,
+                epoch_token: None,
+                write_intent: None,
                 beforeimages: BTreeMap::new(),
                 dirty_groups: vec![false; group_count],
                 persisted_dirty_buckets: [0; 64],
@@ -5859,7 +6368,7 @@ impl OpenFs {
             let stored = dev.read_block(cx, tail.start)?.into_inner();
             let expected = owner_header(&id, attr.ino, generation, basis_points, tail);
             let zero_tail_start = if tail.group.0 == 0 {
-                EPOCH_TOKEN_END
+                WRITE_INTENT_END
             } else {
                 PARITY_HEADER_END
             };
@@ -5904,13 +6413,7 @@ impl OpenFs {
                     &storage,
                     generation,
                 )?;
-                NativeEpochToken::decode_optional(
-                    &stored[EPOCH_TOKEN_START..EPOCH_TOKEN_END],
-                    &id,
-                    attr.ino,
-                    generation,
-                    tail,
-                )?;
+                native_epoch_records(&id, &storage, generation, &stored)?;
             }
         }
         Ok((storage, generation))
@@ -5923,13 +6426,26 @@ impl OpenFs {
     /// Refuses missing, malformed, or incompletely allocated ownership and
     /// propagates storage errors and cancellation.
     pub fn native_ext4_repair_storage(&self, cx: &Cx) -> Result<NativeRepairStorage, FfsError> {
+        self.native_ext4_repair_storage_with_recovery(cx, false)
+    }
+
+    fn native_ext4_repair_storage_with_recovery(
+        &self,
+        cx: &Cx,
+        allow_recovery: bool,
+    ) -> Result<NativeRepairStorage, FfsError> {
         let sb = self.ext4_superblock().ok_or_else(|| {
             FfsError::UnsupportedFeature("native repair storage requires ext4".into())
         })?;
         if let Some(reason) = Self::ext4_writer_unsupported_features(sb) {
             return Err(FfsError::UnsupportedFeature(reason));
         }
-        if sb.state != EXT4_VALID_FS || sb.has_incompat(ffs_ondisk::Ext4IncompatFeatures::RECOVER) {
+        let recoverable_state = sb.state & !(EXT4_VALID_FS | ffs_ondisk::ext4::EXT4_ORPHAN_FS) == 0;
+        if (!allow_recovery
+            && (sb.state != EXT4_VALID_FS
+                || sb.has_incompat(ffs_ondisk::Ext4IncompatFeatures::RECOVER)))
+            || (allow_recovery && (!recoverable_state || sb.journal_dev != 0))
+        {
             return Err(FfsError::Format(
                 "native ownership discovery requires a clean image".into(),
             ));
@@ -5998,7 +6514,7 @@ impl OpenFs {
             let stored = dev.read_block(cx, tail.start)?.into_inner();
             let expected = owner_header(&id, attr.ino, inode.generation, basis_points, tail);
             let zero_tail_start = if tail.group.0 == 0 {
-                EPOCH_TOKEN_END
+                WRITE_INTENT_END
             } else {
                 PARITY_HEADER_END
             };
@@ -6043,13 +6559,7 @@ impl OpenFs {
                     &storage,
                     inode.generation,
                 )?;
-                NativeEpochToken::decode_optional(
-                    &stored[EPOCH_TOKEN_START..EPOCH_TOKEN_END],
-                    &id,
-                    attr.ino,
-                    inode.generation,
-                    tail,
-                )?;
+                native_epoch_records(&id, &storage, inode.generation, &stored)?;
             }
             self.validate_native_owned_range(cx, tail.start.0, tail.blocks())?;
             if tree_blocks
@@ -6291,6 +6801,9 @@ mod tests {
                     manifest: [0; 32],
                 }],
                 intended: BTreeMap::new(),
+                source_roots: vec![[0; 32]],
+                epoch_token: None,
+                write_intent: None,
                 beforeimages: BTreeMap::new(),
                 dirty_groups: vec![false],
                 persisted_dirty_buckets: [0; 64],
@@ -6539,5 +7052,430 @@ mod tests {
             assert_eq!(layout.validation_start_block(), tail.start);
             assert_eq!(u32::from(desc.source_block_count), tail.blocks_per_group);
         }
+    }
+
+    fn native_write_intent_fixture() -> (
+        NativeFsIdentity,
+        NativeRepairStorage,
+        NativeEpochToken,
+        NativeWriteIntent,
+    ) {
+        let id = NativeFsIdentity {
+            uuid: [0x42; 16],
+            block_size: 1024,
+            group_count: 2,
+        };
+        let storage = NativeRepairStorage {
+            owner_inode: InodeNumber(12),
+            repair_basis_points: 500,
+            tails: (0..2)
+                .map(|group| NativeRepairTail {
+                    group: GroupNumber(group),
+                    group_start: BlockNumber(1 + u64::from(group) * 4),
+                    blocks_per_group: 4,
+                    start: BlockNumber(16 + u64::from(group) * 8),
+                    validation_blocks: 1,
+                    repair_blocks: 1,
+                })
+                .collect(),
+        };
+        let mut buckets = [0; 64];
+        NativeEpochToken::mark_bucket(&mut buckets, GroupNumber(0));
+        NativeEpochToken::mark_bucket(&mut buckets, GroupNumber(1));
+        let token = NativeEpochToken {
+            owner_inode: storage.owner_inode,
+            owner_generation: 7,
+            target_epoch: 5,
+            prev_sealed_epoch: 4,
+            flags: EPOCH_TOKEN_FLAG_FORMAT_COMMIT,
+            pre_epoch_commit_seq: 99,
+            prev_sealed_plan_root: [0xAB; 32],
+            dirty_group_buckets: buckets,
+        };
+        let intent = NativeWriteIntent {
+            binding: NativeWriteIntent::binding(&id, &storage, &token).unwrap(),
+            before_root: [0x3C; 32],
+            after_root: [0xD1; 32],
+            sequence: 7,
+            offset: 2 * 1024 + 13,
+            length: 3 * 1024 + 17,
+        };
+        (id, storage, token, intent)
+    }
+
+    #[test]
+    fn native_write_intent_binds_epoch_owner_and_filesystem_identity() {
+        let (id, storage, token, intent) = native_write_intent_fixture();
+        let encoded = intent.encode(&id);
+        assert_eq!(&encoded[..8], b"FFSINT01");
+        assert_eq!(&encoded[104..112], &7_u64.to_le_bytes());
+        assert_eq!(
+            NativeWriteIntent::decode_optional(&encoded, &id, &storage, Some(&token)).unwrap(),
+            Some(intent)
+        );
+        assert!(NativeWriteIntent::decode_optional(&encoded, &id, &storage, None).is_err());
+        assert_eq!(
+            NativeWriteIntent::decode_optional(&[0; WRITE_INTENT_BYTES], &id, &storage, None)
+                .unwrap(),
+            None
+        );
+        let mut buckets = token.dirty_group_buckets;
+        NativeEpochToken::mark_bucket(&mut buckets, GroupNumber(3));
+        let changed_tokens = [
+            NativeEpochToken {
+                owner_inode: InodeNumber(13),
+                ..token
+            },
+            NativeEpochToken {
+                owner_generation: 8,
+                ..token
+            },
+            NativeEpochToken {
+                target_epoch: 6,
+                ..token
+            },
+            NativeEpochToken {
+                prev_sealed_epoch: 3,
+                ..token
+            },
+            NativeEpochToken { flags: 0, ..token },
+            NativeEpochToken {
+                pre_epoch_commit_seq: 100,
+                ..token
+            },
+            NativeEpochToken {
+                prev_sealed_plan_root: [0xAC; 32],
+                ..token
+            },
+            NativeEpochToken {
+                dirty_group_buckets: buckets,
+                ..token
+            },
+        ];
+        for changed in changed_tokens {
+            assert!(
+                NativeWriteIntent::decode_optional(&encoded, &id, &storage, Some(&changed))
+                    .is_err(),
+                "the record must bind every epoch-token field"
+            );
+        }
+        for changed in [
+            NativeFsIdentity {
+                uuid: [0x43; 16],
+                ..id
+            },
+            NativeFsIdentity {
+                block_size: 2048,
+                ..id
+            },
+            NativeFsIdentity {
+                group_count: 3,
+                ..id
+            },
+        ] {
+            assert!(
+                NativeWriteIntent::decode_optional(&encoded, &changed, &storage, Some(&token))
+                    .is_err()
+            );
+        }
+        let mut wrong_binding = encoded;
+        wrong_binding[8] ^= 0x40;
+        let checksum = ffs_ondisk::ext4::ext4_chksum(!0, &wrong_binding[..152]);
+        wrong_binding[152..156].copy_from_slice(&checksum.to_le_bytes());
+        assert!(
+            NativeWriteIntent::decode_optional(&wrong_binding, &id, &storage, Some(&token))
+                .is_err(),
+            "a recomputed checksum cannot authorize another identity binding"
+        );
+    }
+
+    #[test]
+    fn native_write_intent_binds_ordered_source_and_owned_geometry() {
+        let (id, storage, token, intent) = native_write_intent_fixture();
+        let encoded = intent.encode(&id);
+        for field in 0..8 {
+            let mut changed = storage.clone();
+            match field {
+                0 => changed.repair_basis_points += 1,
+                1 => changed.tails[0].group = GroupNumber(2),
+                2 => changed.tails[0].group_start = BlockNumber(0),
+                3 => changed.tails[0].blocks_per_group = 3,
+                4 => changed.tails[0].start = BlockNumber(17),
+                5 => changed.tails[0].validation_blocks = 2,
+                6 => changed.tails[0].repair_blocks = 2,
+                7 => changed.tails.swap(0, 1),
+                _ => unreachable!(),
+            }
+            assert_ne!(
+                NativeWriteIntent::binding(&id, &changed, &token).unwrap(),
+                intent.binding,
+                "geometry field {field} was omitted from the binding"
+            );
+            assert!(
+                NativeWriteIntent::decode_optional(&encoded, &id, &changed, Some(&token)).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn native_write_intent_refuses_noncanonical_records_and_invalid_ranges() {
+        let (id, storage, token, intent) = native_write_intent_fixture();
+        let encoded = intent.encode(&id);
+        for offset in [0, 128, 132, 151, 156, 159] {
+            let mut changed = encoded;
+            changed[offset] ^= 1;
+            let checksum = ffs_ondisk::ext4::ext4_chksum(!0, &changed[..152]);
+            changed[152..156].copy_from_slice(&checksum.to_le_bytes());
+            assert!(
+                NativeWriteIntent::decode_optional(&changed, &id, &storage, Some(&token)).is_err(),
+                "noncanonical byte {offset} survived a valid record checksum"
+            );
+        }
+        let mut checksum_damage = encoded;
+        checksum_damage[152] ^= 1;
+        assert!(
+            NativeWriteIntent::decode_optional(&checksum_damage, &id, &storage, Some(&token))
+                .is_err()
+        );
+        assert!(
+            NativeWriteIntent::decode_optional(&encoded[..159], &id, &storage, Some(&token))
+                .is_err()
+        );
+        let mut overlong = encoded.to_vec();
+        overlong.push(0);
+        assert!(
+            NativeWriteIntent::decode_optional(&overlong, &id, &storage, Some(&token)).is_err()
+        );
+        for changed in [
+            NativeWriteIntent {
+                sequence: 0,
+                ..intent
+            },
+            NativeWriteIntent {
+                length: 0,
+                ..intent
+            },
+            NativeWriteIntent {
+                offset: u64::MAX - 8,
+                length: 16,
+                ..intent
+            },
+            NativeWriteIntent {
+                offset: 0,
+                length: 1,
+                ..intent
+            },
+            NativeWriteIntent {
+                offset: 16 * 1024,
+                length: 1,
+                ..intent
+            },
+            NativeWriteIntent {
+                offset: 9 * 1024 - 1,
+                length: 2,
+                ..intent
+            },
+        ] {
+            assert!(
+                NativeWriteIntent::decode_optional(
+                    &changed.encode(&id),
+                    &id,
+                    &storage,
+                    Some(&token)
+                )
+                .is_err(),
+                "invalid sequence or source range was admitted: {changed:?}"
+            );
+        }
+        let last_byte = NativeWriteIntent {
+            offset: 9 * 1024 - 1,
+            length: 1,
+            ..intent
+        };
+        assert_eq!(
+            NativeWriteIntent::decode_optional(&last_byte.encode(&id), &id, &storage, Some(&token))
+                .unwrap(),
+            Some(last_byte)
+        );
+        let mut unmarked = token;
+        unmarked.dirty_group_buckets = [0; 64];
+        NativeEpochToken::mark_bucket(&mut unmarked.dirty_group_buckets, GroupNumber(0));
+        let unmarked_intent = NativeWriteIntent {
+            binding: NativeWriteIntent::binding(&id, &storage, &unmarked).unwrap(),
+            ..intent
+        };
+        assert!(
+            NativeWriteIntent::decode_optional(
+                &unmarked_intent.encode(&id),
+                &id,
+                &storage,
+                Some(&unmarked)
+            )
+            .is_err(),
+            "a valid cross-group record must not escape persisted dirty coverage"
+        );
+    }
+
+    #[test]
+    fn native_source_intent_roots_bind_every_digest_coverage_and_group_order() {
+        let (id, storage, token, _) = native_write_intent_fixture();
+        let mut baseline = NativeBaseline {
+            storage,
+            owner_generation: token.owner_generation,
+            epoch: token.prev_sealed_epoch,
+            plan_root: token.prev_sealed_plan_root,
+            roots: vec![[0; 32]; 2],
+            group_epochs: vec![1, 4],
+        };
+        let mut roots = Vec::new();
+        for tail in &baseline.storage.tails {
+            let (sources, capacity, used) = validation_sizes(&id, tail).unwrap();
+            let mut table = vec![0; capacity];
+            for index in 0..sources {
+                let marker = u8::try_from(tail.group.0 * 16 + index).unwrap();
+                let offset = VALIDATION_HEADER_BYTES + index as usize * 32;
+                table[offset..offset + 32]
+                    .copy_from_slice(blake3::hash(&[marker; 1024]).as_bytes());
+            }
+            let root = native_source_group_root(&id, tail, &table).unwrap();
+            for offset in VALIDATION_HEADER_BYTES..used {
+                let mut changed = table.clone();
+                changed[offset] ^= 1;
+                assert_ne!(
+                    native_source_group_root(&id, tail, &changed).unwrap(),
+                    root,
+                    "source digest byte {offset} was omitted"
+                );
+            }
+            table[..VALIDATION_HEADER_BYTES].copy_from_slice(
+                &validation_header(
+                    &id,
+                    baseline.storage.owner_inode,
+                    baseline.owner_generation,
+                    tail,
+                    17,
+                    VALIDATION_SEALED,
+                    &[0xEF; 32],
+                )
+                .unwrap(),
+            );
+            assert_eq!(
+                native_source_group_root(&id, tail, &table).unwrap(),
+                root,
+                "publication headers and epochs must not change source identity"
+            );
+            for changed in [
+                NativeRepairTail {
+                    group_start: BlockNumber(tail.group_start.0 + 1),
+                    ..tail.clone()
+                },
+                NativeRepairTail {
+                    blocks_per_group: tail.blocks_per_group - 1,
+                    ..tail.clone()
+                },
+                NativeRepairTail {
+                    group: GroupNumber(tail.group.0 + 2),
+                    ..tail.clone()
+                },
+            ] {
+                assert_ne!(
+                    native_source_group_root(&id, &changed, &table).unwrap(),
+                    root
+                );
+            }
+            assert!(native_source_group_root(&id, tail, &table[..capacity - 1]).is_err());
+            roots.push(root);
+        }
+        let root = native_source_root(&id, &baseline, &roots).unwrap();
+        baseline.epoch += 1;
+        baseline.group_epochs = vec![5, 5];
+        baseline.plan_root = [0xCD; 32];
+        baseline.roots = vec![[0xEF; 32]; 2];
+        assert_eq!(native_source_root(&id, &baseline, &roots).unwrap(), root);
+        let mut reversed = roots.clone();
+        reversed.reverse();
+        assert_ne!(native_source_root(&id, &baseline, &reversed).unwrap(), root);
+        baseline.owner_generation += 1;
+        assert_ne!(native_source_root(&id, &baseline, &roots).unwrap(), root);
+        baseline.owner_generation -= 1;
+        baseline.storage.owner_inode.0 += 1;
+        assert_ne!(native_source_root(&id, &baseline, &roots).unwrap(), root);
+        assert!(native_source_root(&id, &baseline, &[]).is_err());
+        assert!(native_source_root(&id, &baseline, &roots[..1]).is_err());
+    }
+
+    #[test]
+    fn native_freshness_clean_nested_guards_retire_format_hints() {
+        let (device, reads) = native_read_lock_fixture();
+        let cx = Cx::for_testing();
+        let mut outer = device
+            .begin_durability_commit(&cx, 17, &[BlockNumber(0)])
+            .unwrap();
+        let mut inner = device
+            .begin_durability_commit(&cx, 18, &[BlockNumber(0)])
+            .unwrap();
+        inner.arm_final_seal(&cx).unwrap();
+        {
+            let state = device.state.try_lock().unwrap();
+            assert_eq!(state.defer_seal, 1);
+            assert_eq!(state.format_commit_seq, Some(17));
+            assert!(NativeEpochToken::bucket_contains(
+                &state.pending_dirty_buckets,
+                GroupNumber(0)
+            ));
+        }
+        outer.arm_final_seal(&cx).unwrap();
+        drop(inner);
+        drop(outer);
+        {
+            let state = device.state.try_lock().unwrap();
+            assert_eq!(state.defer_seal, 0);
+            assert_eq!(state.format_commit_seq, None);
+            assert_eq!(state.pending_dirty_buckets, [0; 64]);
+            assert!(matches!(state.phase, FreshnessPhase::Clean));
+        }
+        let aborted = device
+            .begin_durability_commit(&cx, 23, &[BlockNumber(0)])
+            .unwrap();
+        drop(aborted);
+        let state = device.state.try_lock().unwrap();
+        assert_eq!(state.defer_seal, 0);
+        assert_eq!(state.format_commit_seq, None);
+        assert_eq!(state.pending_dirty_buckets, [0; 64]);
+        assert!(matches!(state.phase, FreshnessPhase::Clean));
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            0,
+            "clean guard cleanup must perform no physical I/O"
+        );
+    }
+
+    #[test]
+    fn native_freshness_write_intent_sequence_exhaustion_precedes_mutation() {
+        let (device, reads) = native_read_lock_fixture();
+        let (_, _, _, intent) = native_write_intent_fixture();
+        device.state.try_lock().unwrap().write_intent = Some(NativeWriteIntent {
+            sequence: u64::MAX,
+            ..intent
+        });
+        let error = device
+            .write_all_at(&Cx::for_testing(), ByteOffset(0), &[0xB2])
+            .expect_err("source sequence exhaustion must not wrap into a new intent");
+        assert!(
+            error
+                .to_string()
+                .contains("source-write sequence exhausted"),
+            "{error}"
+        );
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "exhaustion must stop after beforeimage verification, before control I/O"
+        );
+        let state = device.state.try_lock().unwrap();
+        assert!(state.intended.is_empty());
+        assert!(state.beforeimages.is_empty());
+        assert!(matches!(state.phase, FreshnessPhase::Poisoned));
+        assert_eq!(state.write_intent.unwrap().sequence, u64::MAX);
     }
 }
