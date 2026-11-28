@@ -13,6 +13,7 @@ use ffs_ondisk::zfs_dmu::{
     OBJSET_PROJECTUSED_OFFSET, OBJSET_USERUSED_OFFSET, ObjectSet, dnode_at,
 };
 use ffs_ondisk::zfs_zap::Entry as RawZapEntry;
+use ffs_ondisk::zfs_zpl::acl::{AclInherit, AclMode, COMPUTED_FLAGS, NativeAcl};
 use ffs_ondisk::zfs_zpl::{
     Kind, Metadata, SA_BYTES, SaRegistry, Timestamp, XATTR_BYTES, XATTR_COUNT, XATTR_NAME_BYTES,
     XattrSources, directory_reference, encode_directory_reference,
@@ -418,6 +419,8 @@ struct DatasetContext {
     recordsize: usize,
     checksum: u8,
     compression: DatasetCompression,
+    acl_inherit: AclInherit,
+    acl_mode: AclMode,
     new_features: DatasetFeatureUsage,
     unlinked_set: Option<u64>,
     write_crypto: Option<DatasetWriteCrypto>,
@@ -528,6 +531,8 @@ fn open_head_dataset_context(
             "compression".into(),
             "recordsize".into(),
             "checksum".into(),
+            "aclinherit".into(),
+            "aclmode".into(),
         ],
     )?;
     match properties
@@ -552,6 +557,18 @@ fn open_head_dataset_context(
         _ => 2,
     };
     let compression = DatasetCompression::from_property(compression_raw, features)?;
+    let acl_property = |index: usize| match properties
+        .values
+        .get(index)
+        .and_then(|property| property.value.as_ref())
+    {
+        Some(PropertyValue::Number(value)) => Ok(*value),
+        _ => Err(corrupt("missing or invalid effective native ACL property")),
+    };
+    let acl_inherit = AclInherit::from_property(acl_property(4)?)
+        .map_err(|error| unsupported(error.to_string()))?;
+    let acl_mode =
+        AclMode::from_property(acl_property(5)?).map_err(|error| unsupported(error.to_string()))?;
 
     let crypto_info = mos.dataset_crypto_info(cx, dataset_components)?;
     let loaded_key = if let Some(ref info) = crypto_info {
@@ -741,6 +758,8 @@ fn open_head_dataset_context(
             recordsize,
             checksum,
             compression,
+            acl_inherit,
+            acl_mode,
             new_features: DatasetFeatureUsage::default(),
             unlinked_set,
             write_crypto,
@@ -1090,6 +1109,7 @@ fn encode_updated_zpl_bonus_with_options(
     new_meta: &Metadata,
     ds_ctx: &mut DatasetContext,
     rebuild_trivial_acl: bool,
+    native_acl: Option<&NativeAcl>,
     inline_xattrs: Option<&BTreeMap<String, Vec<u8>>>,
     alloc: &mut PoolSpaceAllocator,
     order: Endian,
@@ -1099,6 +1119,11 @@ fn encode_updated_zpl_bonus_with_options(
     let min_blk = (1_usize << alloc.ashift).max(512);
     match loaded.dnode.bonus_type() {
         DMU_OT_ZNODE => {
+            if native_acl.is_some() {
+                return Err(unsupported(
+                    "non-discard native ACL updates require an SA object",
+                ));
+            }
             if inline_xattrs.is_some() {
                 return Err(unsupported(
                     "SA extended attributes require a ZPL v5 SA-formatted object",
@@ -1127,7 +1152,7 @@ fn encode_updated_zpl_bonus_with_options(
             Ok((bonus, None))
         }
         DMU_OT_SA => {
-            if rebuild_trivial_acl {
+            if rebuild_trivial_acl || native_acl.is_some() {
                 let reg_ref = ds_ctx
                     .sa_registry
                     .as_ref()
@@ -1160,6 +1185,7 @@ fn encode_updated_zpl_bonus_with_options(
                     loaded.spill_bytes.as_deref(),
                     new_meta,
                     rebuild_trivial_acl,
+                    native_acl,
                     inline_xattrs,
                     None,
                     max_bonus_no_spill,
@@ -1395,21 +1421,139 @@ fn encode_symlink_acl(bonus: &mut [u8], order: Endian) {
     }
 }
 
+struct NewZplBonus {
+    bonus_type: u8,
+    nblkptr: usize,
+    bonus: Vec<u8>,
+    spill: Option<BlockPointer>,
+    project_id: u64,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn encode_new_zpl_bonus(
     parent_loaded: &LoadedZplNode,
     new_meta: &Metadata,
     context: &mut DatasetContext,
     order: Endian,
-) -> Result<(u8, usize, Vec<u8>, u64)> {
+    object_id: u64,
+    alloc: &mut PoolSpaceAllocator,
+    new_txg: u64,
+    staged_writes: &mut Vec<StagedBlockWrite>,
+) -> Result<NewZplBonus> {
     // ACL inheritance applies independently of project inheritance and of the
     // parent's legacy/SA representation. A fresh mode-only ACL cannot replace
     // inheritable native ACEs. Native symlinks deliberately inherit no ACEs.
     if matches!(new_meta.kind, Kind::Regular | Kind::Directory)
         && parent_loaded.metadata.flags & ZFS_INHERIT_ACE != 0
     {
-        return Err(unsupported(
-            "creation with inheritable native ACL entries is unavailable",
-        ));
+        if context.zpl_version < 5 || parent_loaded.dnode.bonus_type() != DMU_OT_SA {
+            return Err(unsupported(
+                "native ACL inheritance requires a ZPL v5 SA parent",
+            ));
+        }
+        let parent_acl = {
+            let registry = context
+                .sa_registry
+                .as_ref()
+                .ok_or_else(|| corrupt("native ACL inheritance lacks an SA registry"))?;
+            let attributes = registry
+                .decode(
+                    parent_loaded.dnode.bonus(),
+                    parent_loaded.spill_bytes.as_deref(),
+                )
+                .map_err(|error| parse_err(&error))?;
+            if attributes
+                .external_acl_object()
+                .map_err(|error| parse_err(&error))?
+                != 0
+            {
+                return Err(unsupported(
+                    "inheritance from an external legacy ACL object is unavailable",
+                ));
+            }
+            let acl = attributes
+                .native_acl()
+                .map_err(|error| unsupported(format!("native ACL inheritance profile: {error}")))?
+                .ok_or_else(|| unsupported("inheritable parent lacks native SA ACL attributes"))?;
+            if !acl.has_inheritable_aces() {
+                return Err(unsupported(
+                    "parent inheritance flag lacks inheritable native ACEs",
+                ));
+            }
+            acl
+        };
+        let inherited = parent_acl
+            .inherit(
+                new_meta.kind,
+                new_meta.mode,
+                new_meta.uid,
+                new_meta.gid,
+                context.acl_inherit,
+                context.acl_mode,
+            )
+            .map_err(|error| unsupported(error.to_string()))?;
+        let mut metadata = new_meta.clone();
+        metadata.mode = inherited.mode;
+        metadata.flags = (metadata.flags & !COMPUTED_FLAGS) | inherited.flags;
+        let project = if parent_loaded.metadata.flags & ZFS_PROJINHERIT != 0 {
+            metadata.flags |= ZFS_PROJID | ZFS_PROJINHERIT;
+            Some(parent_loaded.project_id)
+        } else {
+            None
+        };
+        let registry = context
+            .sa_registry
+            .as_mut()
+            .ok_or_else(|| corrupt("native ACL inheritance lacks an SA registry"))?;
+        let registry_len = context.sa_reg_entries.len();
+        let layouts_len = context.sa_lay_entries.len();
+        let (bonus, spill_bytes) = registry
+            .encode_new_with_acl(
+                &mut context.sa_reg_entries,
+                &mut context.sa_lay_entries,
+                parent_loaded.dnode.bonus(),
+                &metadata,
+                project,
+                &inherited.acl,
+                DNODE_BYTES - 64 - 128,
+                DNODE_BYTES - 64 - 256,
+            )
+            .map_err(|error| parse_err(&error))?;
+        context.sa_reg_dirty |= context.sa_reg_entries.len() != registry_len;
+        context.sa_lay_dirty |= context.sa_lay_entries.len() != layouts_len;
+        let spill = spill_bytes
+            .map(|raw| {
+                let target = raw.len().next_power_of_two().max(1_usize << alloc.ashift);
+                if target > SA_BYTES {
+                    return Err(unsupported("inherited ACL spill exceeds 128 KiB"));
+                }
+                let mut padded = vec![0; target];
+                padded[..raw.len()].copy_from_slice(&raw);
+                write_dataset_block(
+                    alloc,
+                    &padded,
+                    object_id,
+                    DMU_SPILL_BLKID,
+                    DMU_OT_SA,
+                    0,
+                    7,
+                    order,
+                    new_txg,
+                    1,
+                    WriteBucket::ChildBlocks,
+                    context.compression.for_block(0, DMU_OT_SA, 0)?,
+                    context.write_crypto.as_mut(),
+                    staged_writes,
+                )
+            })
+            .transpose()?;
+        return Ok(NewZplBonus {
+            bonus_type: DMU_OT_SA,
+            nblkptr: 1,
+            bonus,
+            spill,
+            project_id: project.unwrap_or(0),
+        });
     }
 
     // zfs_mknode inherits both ID and flag for regular files and directories.
@@ -1436,7 +1580,13 @@ fn encode_new_zpl_bonus(
             .map_err(|error| parse_err(&error))?;
         context.sa_reg_dirty |= context.sa_reg_entries.len() != registry_len;
         context.sa_lay_dirty |= context.sa_lay_entries.len() != layouts_len;
-        return Ok((DMU_OT_SA, 1, bonus, parent_loaded.project_id));
+        return Ok(NewZplBonus {
+            bonus_type: DMU_OT_SA,
+            nblkptr: 1,
+            bonus,
+            spill: None,
+            project_id: parent_loaded.project_id,
+        });
     }
     // Native ZPL v5 also admits legacy znodes. Creating a legacy symlink keeps
     // the target in its native inline/data form without inventing an SA layout
@@ -1453,7 +1603,13 @@ fn encode_new_zpl_bonus(
             .decode(&bonus, None)
             .and_then(|attrs| attrs.project_id())
             .map_err(|e| parse_err(&e))?;
-        return Ok((DMU_OT_SA, 1, bonus, project_id));
+        return Ok(NewZplBonus {
+            bonus_type: DMU_OT_SA,
+            nblkptr: 1,
+            bonus,
+            spill: None,
+            project_id,
+        });
     }
     let mut bonus = new_meta
         .encode_legacy(None, order)
@@ -1462,7 +1618,13 @@ fn encode_new_zpl_bonus(
         encode_symlink_acl(&mut bonus, order);
     }
     let nblkptr = super::dmu_cow::max_nblkptr_for_dnode(1, bonus.len(), false)?;
-    Ok((DMU_OT_ZNODE, nblkptr, bonus, 0))
+    Ok(NewZplBonus {
+        bonus_type: DMU_OT_ZNODE,
+        nblkptr,
+        bonus,
+        spill: None,
+        project_id: 0,
+    })
 }
 
 fn read_dir_entries(
@@ -2035,8 +2197,22 @@ pub(super) fn stage_zpl_mutation(
                     .filter(|target| target.len() <= MAX_INLINE_SYMLINK_BYTES)
                     .cloned(),
             };
-            let (bonus_type, nblkptr, bonus, project_id) =
-                encode_new_zpl_bonus(&parent_loaded, &clean_meta, &mut ds_ctx, order)?;
+            let NewZplBonus {
+                bonus_type,
+                nblkptr,
+                bonus,
+                spill,
+                project_id,
+            } = encode_new_zpl_bonus(
+                &parent_loaded,
+                &clean_meta,
+                &mut ds_ctx,
+                order,
+                new_obj,
+                alloc,
+                new_txg,
+                staged_writes,
+            )?;
             let (data_bytes, file_contents) = match symlink_target {
                 Some(target) if clean_meta.inline_symlink.is_none() => {
                     let data_bytes = target.len().next_power_of_two().max(min_blk);
@@ -2064,7 +2240,7 @@ pub(super) fn stage_zpl_mutation(
                     slots: 1,
                     nblkptr,
                     bonus,
-                    spill: None,
+                    spill,
                     order,
                     new_txg,
                     leaf_bucket: WriteBucket::ChildBlocks,
@@ -2198,8 +2374,22 @@ pub(super) fn stage_zpl_mutation(
                 times: [*timestamp; 4],
                 inline_symlink: None,
             };
-            let (bonus_type, nblkptr, bonus, project_id) =
-                encode_new_zpl_bonus(&parent_loaded, &dir_meta, &mut ds_ctx, order)?;
+            let NewZplBonus {
+                bonus_type,
+                nblkptr,
+                bonus,
+                spill,
+                project_id,
+            } = encode_new_zpl_bonus(
+                &parent_loaded,
+                &dir_meta,
+                &mut ds_ctx,
+                order,
+                new_obj,
+                alloc,
+                new_txg,
+                staged_writes,
+            )?;
             let (bsize, blocks) =
                 encode_zap_blocks_for_dnode(cx, &mut os_view, None, &[], order, min_blk)?;
             let mut dir_dirty = BTreeMap::new();
@@ -2223,7 +2413,7 @@ pub(super) fn stage_zpl_mutation(
                     slots: 1,
                     nblkptr,
                     bonus,
-                    spill: None,
+                    spill,
                     order,
                     new_txg,
                     leaf_bucket: WriteBucket::ChildBlocks,
@@ -2735,6 +2925,7 @@ pub(super) fn stage_zpl_mutation(
                 &new_meta,
                 &mut ds_ctx,
                 false,
+                None,
                 inline_xattrs.as_ref(),
                 alloc,
                 order,
@@ -2881,6 +3072,7 @@ pub(super) fn stage_zpl_mutation(
                     &new_meta,
                     &mut ds_ctx,
                     false,
+                    None,
                     inline_xattrs.as_ref(),
                     alloc,
                     order,
@@ -3037,7 +3229,7 @@ pub(super) fn stage_zpl_mutation(
                     // Native zfs_fastaccesschk_execute trusts this flag before
                     // checking mode or ACL. A regenerated trivial ACL permits
                     // that shortcut only when every mode class can execute.
-                    new_meta.flags = (new_meta.flags | ZFS_ACL_TRIVIAL) & !ZFS_NO_EXECS_DENIED;
+                    new_meta.flags = (new_meta.flags & !COMPUTED_FLAGS) | ZFS_ACL_TRIVIAL;
                     if new_meta.mode & 0o111 == 0o111 {
                         new_meta.flags |= ZFS_NO_EXECS_DENIED;
                     }
@@ -3049,6 +3241,67 @@ pub(super) fn stage_zpl_mutation(
                 && new_meta.kind != Kind::Directory
             {
                 new_meta.mode = clear_setid_bits_for_nonroot(new_meta.mode);
+            }
+            let mut native_acl = None;
+            if (rebuild_trivial_acl && ds_ctx.acl_mode != AclMode::Discard)
+                || (owner_changed && !rebuild_trivial_acl)
+            {
+                if loaded.dnode.bonus_type() != DMU_OT_SA {
+                    if rebuild_trivial_acl {
+                        return Err(unsupported(
+                            "non-discard native ACL chmod requires an SA object",
+                        ));
+                    }
+                } else {
+                    let registry = ds_ctx
+                        .sa_registry
+                        .as_ref()
+                        .ok_or_else(|| corrupt("native ACL update lacks an SA registry"))?;
+                    let attributes = registry
+                        .decode(loaded.dnode.bonus(), loaded.spill_bytes.as_deref())
+                        .map_err(|error| parse_err(&error))?;
+                    if attributes
+                        .external_acl_object()
+                        .map_err(|error| parse_err(&error))?
+                        != 0
+                    {
+                        return Err(unsupported(
+                            "native ACL ownership changes with an external ACL are unavailable",
+                        ));
+                    }
+                    let existing = attributes.native_acl().map_err(|error| {
+                        unsupported(format!("native ACL update profile: {error}"))
+                    })?;
+                    if let Some(existing) = existing {
+                        if rebuild_trivial_acl {
+                            let changed = existing
+                                .chmod(
+                                    new_meta.kind,
+                                    new_meta.mode,
+                                    new_meta.uid,
+                                    new_meta.gid,
+                                    ds_ctx.acl_mode,
+                                )
+                                .map_err(|error| unsupported(error.to_string()))?;
+                            new_meta.mode = changed.mode;
+                            new_meta.flags = (new_meta.flags & !COMPUTED_FLAGS) | changed.flags;
+                            native_acl = Some(changed.acl);
+                        } else {
+                            let (mode, flags) = existing.ownership_mode(
+                                new_meta.kind,
+                                new_meta.mode,
+                                new_meta.uid,
+                                new_meta.gid,
+                            );
+                            new_meta.mode = mode;
+                            new_meta.flags = (new_meta.flags & !COMPUTED_FLAGS) | flags;
+                        }
+                    } else if rebuild_trivial_acl || loaded.metadata.flags & ZFS_INHERIT_ACE != 0 {
+                        return Err(unsupported(
+                            "native ACL update requires complete SA ACL attributes",
+                        ));
+                    }
+                }
             }
             if let Some(atime) = attrs.atime {
                 new_meta.times[0] = atime;
@@ -3087,7 +3340,8 @@ pub(super) fn stage_zpl_mutation(
                 *file_obj,
                 &new_meta,
                 &mut ds_ctx,
-                rebuild_trivial_acl,
+                rebuild_trivial_acl && native_acl.is_none(),
+                native_acl.as_ref(),
                 inline_xattrs.as_ref(),
                 alloc,
                 order,
@@ -4499,6 +4753,7 @@ fn stage_sa_xattr_mutation(
         &new_meta,
         ds_ctx,
         false,
+        None,
         Some(&inline),
         alloc,
         order,

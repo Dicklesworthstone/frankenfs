@@ -125,6 +125,13 @@ enum ZilTailFixture {
 }
 
 #[derive(Debug, Clone)]
+struct NativeAclFixture {
+    count: u64,
+    aces: Vec<u8>,
+    in_spill: bool,
+}
+
+#[derive(Debug, Clone)]
 struct PoolFixtureSpec {
     pool_name: String,
     member_path_override: Option<String>,
@@ -143,6 +150,7 @@ struct PoolFixtureSpec {
     sa_project_id: Option<u64>,
     malformed_project_id: bool,
     directory_projects: BTreeMap<u64, u64>,
+    directory_acls: BTreeMap<u64, NativeAclFixture>,
     owner_quota_objects: Vec<(&'static [u8], u64)>,
     owner_quota_entries: BTreeMap<u64, Vec<(&'static [u8], u64)>>,
     owner_usage_overrides: Vec<(usize, &'static [u8], Option<u64>)>,
@@ -197,6 +205,7 @@ impl Default for PoolFixtureSpec {
             sa_project_id: None,
             malformed_project_id: false,
             directory_projects: BTreeMap::new(),
+            directory_acls: BTreeMap::new(),
             owner_quota_objects: Vec::new(),
             owner_quota_entries: BTreeMap::new(),
             owner_usage_overrides: Vec::new(),
@@ -581,6 +590,7 @@ fn build_sa_registry_objects(
     malformed_project_id: bool,
     with_reclamation_ownership: bool,
     with_sa_xattrs: bool,
+    with_native_acls: bool,
 ) -> (SaRegistry, Dnode, Dnode, Dnode) {
     // Attribute IDs matching OpenZFS `SaRegistry::LEGACY` (0..16) + custom attr 18:
     // 0: ATIME(16,0), 1: MTIME(16,0), 2: CTIME(16,0), 3: CRTIME(16,0), 4: GEN(8,0),
@@ -761,6 +771,33 @@ fn build_sa_registry_objects(
                 name: layout.to_vec(),
                 integer_bytes: 2,
                 values,
+                collision: 0,
+            });
+        }
+    }
+    if with_native_acls {
+        for (name, id, length, swap) in [
+            (b"ZPL_DACL_COUNT".as_slice(), 21_u64, 8_u64, 0_u64),
+            (b"ZPL_DACL_ACES".as_slice(), 22, 0, 4),
+        ] {
+            reg_entries.push(RawZapEntry {
+                name: name.to_vec(),
+                integer_bytes: 8,
+                values: vec![(length << 24) | (swap << 16) | id],
+                collision: 0,
+            });
+        }
+        for (id, attrs) in [
+            (13, vec![5, 6, 4, 12, 13, 7, 11, 0, 1, 2, 3, 8, 21, 22]),
+            (14, vec![5, 6, 4, 12, 13, 7, 11, 0, 1, 2, 3, 8, 19, 21, 22]),
+            (15, vec![5, 6, 4, 12, 13, 7, 11, 0, 1, 2, 3, 8, 21]),
+            (16, vec![5, 6, 4, 12, 13, 7, 11, 0, 1, 2, 3, 8, 19, 21]),
+            (17, vec![22]),
+        ] {
+            lay_entries.push(RawZapEntry {
+                name: id.to_string().into_bytes(),
+                integer_bytes: 2,
+                values: attrs,
                 collision: 0,
             });
         }
@@ -952,6 +989,72 @@ fn encode_zpl_bonus_for_fixture(
     }
 }
 
+/// Independent native-layout fixture: deliberately do not use the ACL writer
+/// or inheritance codec to construct the parent's stored ACEs and count.
+#[allow(clippy::too_many_arguments)]
+fn encode_directory_bonus_for_fixture(
+    metadata: &Metadata,
+    spec: &PoolFixtureSpec,
+    object: u64,
+    registry: Option<&SaRegistry>,
+    arena: &mut RawArena,
+    birth: u64,
+    order: Endian,
+) -> (u8, Vec<u8>, Option<BlockPointer>) {
+    let project = spec.directory_projects.get(&object).copied();
+    let Some(acl) = spec.directory_acls.get(&object) else {
+        return encode_zpl_bonus_for_fixture(
+            metadata,
+            spec.zpl_version,
+            registry,
+            project.map_or(SaSpillFixture::None, SaSpillFixture::ProjectCompact),
+            arena,
+            birth,
+            order,
+        );
+    };
+    assert_eq!(spec.zpl_version, 5);
+    let layout = match (project.is_some(), acl.in_spill) {
+        (false, false) => 13,
+        (true, false) => 14,
+        (false, true) => 15,
+        (true, true) => 16,
+    };
+    let mut bonus =
+        fixture_sa_xattr_header(layout, if acl.in_spill { 0 } else { acl.aces.len() }, order);
+    for value in [
+        metadata.mode,
+        metadata.size,
+        metadata.generation,
+        metadata.uid,
+        metadata.gid,
+        metadata.parent,
+        metadata.flags,
+    ] {
+        bonus.extend_from_slice(&order.encode(value));
+    }
+    for timestamp in metadata.times {
+        bonus.extend_from_slice(&order.encode(timestamp.seconds.cast_unsigned()));
+        bonus.extend_from_slice(&order.encode(u64::from(timestamp.nanos)));
+    }
+    bonus.extend_from_slice(&order.encode(metadata.links));
+    if let Some(project) = project {
+        bonus.extend_from_slice(&order.encode(project));
+    }
+    bonus.extend_from_slice(&order.encode(acl.count));
+    let spill = if acl.in_spill {
+        let mut raw = fixture_sa_xattr_header(17, acl.aces.len(), order);
+        raw.extend_from_slice(&acl.aces);
+        raw.resize(raw.len().next_power_of_two().max(arena.sector as usize), 0);
+        Some(arena.alloc_block(&raw, 44, 0, birth, order))
+    } else {
+        bonus.extend_from_slice(&acl.aces);
+        bonus.resize(bonus.len().next_multiple_of(8), 0);
+        None
+    };
+    (44, bonus, spill)
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct DatasetSpaceTotals {
     dsize: u64,
@@ -1046,6 +1149,7 @@ fn build_zpl_objectset(
             spec.malformed_project_id,
             spec.hello_ownership.is_some(),
             !spec.hello_sa_xattrs.is_empty(),
+            !spec.directory_acls.is_empty(),
         );
         (Some(r), Some((m_dn, r_dn, l_dn)))
     } else {
@@ -1367,14 +1471,11 @@ fn build_zpl_objectset(
             times: [ts; 4],
             inline_symlink: None,
         };
-        let (sub_bonus_type, sub_bonus_bytes, sub_spill) = encode_zpl_bonus_for_fixture(
+        let (sub_bonus_type, sub_bonus_bytes, sub_spill) = encode_directory_bonus_for_fixture(
             &sub_meta,
-            spec.zpl_version,
+            spec,
+            6,
             sa_reg.as_ref(),
-            spec.directory_projects
-                .get(&6)
-                .copied()
-                .map_or(SaSpillFixture::None, SaSpillFixture::ProjectCompact),
             arena,
             birth,
             order,
@@ -1778,14 +1879,11 @@ fn build_zpl_objectset(
         times: [ts; 4],
         inline_symlink: None,
     };
-    let (rbt, rbbytes, rspill) = encode_zpl_bonus_for_fixture(
+    let (rbt, rbbytes, rspill) = encode_directory_bonus_for_fixture(
         &root_meta,
-        spec.zpl_version,
+        spec,
+        2,
         sa_reg.as_ref(),
-        spec.directory_projects
-            .get(&2)
-            .copied()
-            .map_or(SaSpillFixture::None, SaSpillFixture::ProjectCompact),
         arena,
         birth,
         order,

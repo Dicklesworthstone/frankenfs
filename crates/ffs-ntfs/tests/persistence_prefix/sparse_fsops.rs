@@ -10,6 +10,8 @@ use ffs_types::InodeNumber;
 use std::ffi::OsStr;
 
 const PUNCH_KEEP_SIZE: i32 = 0x03;
+const ZERO_RANGE: i32 = 0x10;
+const ZERO_KEEP_SIZE: i32 = 0x11;
 
 struct Fixture {
     device: Arc<FaultInjectingNtfsDevice>,
@@ -199,7 +201,7 @@ fn fallocate_refuses_bad_modes_ranges_and_read_only_targets_without_writes() {
         (0, 4096, 0x02, libc::EINVAL),
         (0, 4096, 0, libc::EOPNOTSUPP),
         (0, 4096, 0x01, libc::EOPNOTSUPP),
-        (0, 4096, 0x10, libc::EOPNOTSUPP),
+        (0, 4096, 0x13, libc::EOPNOTSUPP),
         (0, 4096, 0x4000, libc::EOPNOTSUPP),
         (i64::MAX as u64, 1, PUNCH_KEEP_SIZE, libc::EFBIG),
         (u64::MAX, 1, PUNCH_KEEP_SIZE, libc::EFBIG),
@@ -309,6 +311,130 @@ fn fallocate_finishes_live_publication_after_committed_cancellation() {
             read_all(&fs, &next, &mut scope, file, expected.len()),
             expected
         );
+        assert_clean(&fixture.device);
+    }
+}
+
+#[test]
+fn zero_range_fsops_fills_holes_preserves_aliases_and_allocates_keep_size_tail() {
+    let cx = Cx::for_testing();
+    let fixture = fixture();
+    let fs = NtfsFs::from_engine(&cx, fixture.engine, 1000, 1000).unwrap();
+    let mut scope = RequestScope::empty();
+    let file = lookup(&fs, &cx, &mut scope, "data");
+    let alias = lookup(&fs, &cx, &mut scope, "alias");
+    let ads = lookup(&fs, &cx, &mut scope, "data:audit");
+    let cb = CLUSTER_BYTES as u64;
+    assert_eq!(file, alias);
+    fs.fallocate(&cx, &mut scope, file, cb, 2 * cb, PUNCH_KEEP_SIZE)
+        .unwrap();
+    let mut expected = fixture.data;
+    expected[CLUSTER_BYTES..3 * CLUSTER_BYTES].fill(0);
+    assert_eq!(
+        read_all(&fs, &cx, &mut scope, alias, expected.len()),
+        expected
+    );
+    let before = fs.getattr(&cx, &mut scope, file).unwrap();
+    fs.fallocate(&cx, &mut scope, alias, cb + 3, 2 * cb, ZERO_RANGE)
+        .unwrap();
+    expected[CLUSTER_BYTES + 3..3 * CLUSTER_BYTES + 3].fill(0);
+    assert_eq!(
+        read_all(&fs, &cx, &mut scope, file, expected.len()),
+        expected
+    );
+    let filled = fs.getattr(&cx, &mut scope, file).unwrap();
+    assert_eq!(
+        (filled.size, filled.nlink, filled.generation),
+        (before.size, 2, before.generation)
+    );
+    assert_eq!(filled.blocks, before.blocks + 2 * cb / 512);
+    assert_eq!(
+        fs.lseek(&cx, &mut scope, alias, cb, SeekWhence::Hole)
+            .unwrap(),
+        filled.size
+    );
+
+    fs.fallocate(&cx, &mut scope, file, 8 * cb + 7, cb, ZERO_KEEP_SIZE)
+        .unwrap();
+    let retained = fs.getattr(&cx, &mut scope, alias).unwrap();
+    assert_eq!(retained.size, filled.size);
+    assert_eq!(retained.blocks, filled.blocks + 2 * cb / 512);
+    assert_eq!(
+        read_all(
+            &fs,
+            &cx,
+            &mut scope,
+            file,
+            expected.len() + 3 * CLUSTER_BYTES
+        ),
+        expected
+    );
+    assert_eq!(
+        read_all(&fs, &cx, &mut scope, ads, fixture.ads.len()),
+        fixture.ads
+    );
+
+    // The named stream grows independently; the base file's size/allocation
+    // stay unchanged while the common reader cache publishes the new bytes.
+    fs.fallocate(&cx, &mut scope, ads, cb + 5, 5 * cb, ZERO_RANGE)
+        .unwrap();
+    let mut named = fixture.ads;
+    named.resize(6 * CLUSTER_BYTES + 5, 0);
+    named[CLUSTER_BYTES + 5..].fill(0);
+    assert_eq!(read_all(&fs, &cx, &mut scope, ads, named.len()), named);
+    let unchanged = fs.getattr(&cx, &mut scope, file).unwrap();
+    assert_eq!(
+        (unchanged.size, unchanged.blocks),
+        (retained.size, retained.blocks)
+    );
+    assert!(fs.last_durable_token().unwrap().is_some());
+    assert_clean(&fixture.device);
+}
+
+#[test]
+fn zero_range_fsops_finishes_publication_after_committed_cancellation() {
+    for stage in [
+        NtfsPersistenceStage::LogCommitBarrier,
+        NtfsPersistenceStage::TargetMetadataBarrier,
+        NtfsPersistenceStage::AckPublished,
+    ] {
+        let cx = Cx::for_testing();
+        let mut fixture = fixture();
+        let cancelled = cx.clone();
+        fixture.engine.set_stage_hook(Some(Box::new(move |event| {
+            if event.stage == stage {
+                cancelled.set_cancel_requested(true);
+            }
+            Ok(())
+        })));
+        let fs = NtfsFs::from_engine(&cx, fixture.engine, 1000, 1000).unwrap();
+        let mut scope = RequestScope::empty();
+        let file = lookup(&fs, &cx, &mut scope, "data");
+        let old_size = fixture.data.len();
+        fs.fallocate(
+            &cx,
+            &mut scope,
+            file,
+            7,
+            7 * CLUSTER_BYTES as u64,
+            ZERO_RANGE,
+        )
+        .unwrap_or_else(|error| panic!("committed zero range must publish at {stage:?}: {error}"));
+        assert!(cx.checkpoint().is_err());
+        assert!(fs.last_durable_token().unwrap().is_some());
+        let next = Cx::for_testing();
+        let mut expected = fixture.data;
+        expected.resize(7 * CLUSTER_BYTES + 7, 0);
+        expected[7..].fill(0);
+        assert_eq!(
+            read_all(&fs, &next, &mut scope, file, expected.len()),
+            expected
+        );
+        assert_eq!(
+            fs.getattr(&next, &mut scope, file).unwrap().size,
+            expected.len() as u64
+        );
+        assert!(expected.len() > old_size);
         assert_clean(&fixture.device);
     }
 }

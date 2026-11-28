@@ -128,6 +128,7 @@ jobs:
               ;;
             native-freshness)
               required=(
+                tests::native_freshness_btrfs_refreshes_healed_inode_caches_before_cow
                 tests::native_freshness_constructor_admits_authority_before_journal_replay
                 tests::native_freshness_constructor_replays_and_seals_a_committed_journal
                 tests::native_freshness_constructor_refuses_skipped_or_external_journal_recovery

@@ -1029,6 +1029,7 @@ enum ExpansionCrashCut {
     DataAuthorityWrite,
     DataAuthorityBarrier,
     CompletionRootBarrier,
+    CompletionRootCancelled,
     CompletionUberblockBarrier,
     CompletionLabelWrite,
     CompletionSeedBarrier,
@@ -1109,7 +1110,7 @@ impl ExpansionCrashCut {
                         }
                     )
             }
-            Self::CompletionRootBarrier => {
+            Self::CompletionRootBarrier | Self::CompletionRootCancelled => {
                 operation == "zfs_pool_expand_raidz_complete"
                     && matches!(
                         event.stage,
@@ -1169,7 +1170,7 @@ fn raidz_expansion_reopens_every_scratch_and_completion_authority_cut() {
     );
     let mut engine = open_wide_engine(&cx, &initial, pool_guid, created.initial_slot).unwrap();
     let payload = routing_payload();
-    create_routing_file(&cx, &mut engine, &payload);
+    let (file, _) = create_routing_file(&cx, &mut engine, &payload);
     let new_disk = FaultableMemberDevice::new(vec![0; 12 * 1024 * 1024]);
     let (_, token) = engine
         .expand_raidz(&cx, expansion_leaf(&cx, &new_disk), 1024 * 1024, 8)
@@ -1191,6 +1192,7 @@ fn raidz_expansion_reopens_every_scratch_and_completion_authority_cut() {
         ExpansionCrashCut::DataAuthorityWrite,
         ExpansionCrashCut::DataAuthorityBarrier,
         ExpansionCrashCut::CompletionRootBarrier,
+        ExpansionCrashCut::CompletionRootCancelled,
         ExpansionCrashCut::CompletionUberblockBarrier,
         ExpansionCrashCut::CompletionLabelWrite,
         ExpansionCrashCut::CompletionSeedBarrier,
@@ -1205,11 +1207,17 @@ fn raidz_expansion_reopens_every_scratch_and_completion_authority_cut() {
         let observed = fired.clone();
         engine.with_fault_hook(move |event| {
             if cut.matches(event) && !observed.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                return Err(if matches!(cut, ExpansionCrashCut::CopyCancelled) {
-                    FfsError::Cancelled
-                } else {
-                    FfsError::Io(std::io::Error::other(format!("expansion cut {cut:?}")))
-                });
+                return Err(
+                    if matches!(
+                        cut,
+                        ExpansionCrashCut::CopyCancelled
+                            | ExpansionCrashCut::CompletionRootCancelled
+                    ) {
+                        FfsError::Cancelled
+                    } else {
+                        FfsError::Io(std::io::Error::other(format!("expansion cut {cut:?}")))
+                    },
+                );
             }
             Ok(())
         });
@@ -1226,12 +1234,59 @@ fn raidz_expansion_reopens_every_scratch_and_completion_authority_cut() {
                 } else {
                     assert!(!outcome.is_committed(), "fault must be observed at {cut:?}");
                 }
-                if matches!(cut, ExpansionCrashCut::CompletionSeedBarrier) {
+                if matches!(
+                    cut,
+                    ExpansionCrashCut::CompletionSeedBarrier
+                        | ExpansionCrashCut::CompletionRootBarrier
+                        | ExpansionCrashCut::CompletionRootCancelled
+                ) {
                     assert!(
                         engine.requires_recovery(),
-                        "a failed completion seed must reconcile the admitted member's labels"
+                        "completion has changed an admitted member's labels before the failed TXG"
                     );
                     assert!(outcome.is_not_committed());
+                    assert_eq!(engine.committed_slot(), previous);
+                    if matches!(cut, ExpansionCrashCut::CompletionRootCancelled) {
+                        assert!(matches!(
+                            &outcome,
+                            ZfsTxOutcome::NotCommitted(FfsError::Cancelled)
+                        ));
+                    }
+                    let writes: Vec<_> = devices
+                        .iter()
+                        .map(FaultableMemberDevice::write_calls)
+                        .collect();
+                    engine.with_fault_hook(|_| Ok(()));
+                    assert!(
+                        engine
+                            .expand_raidz(&cx, expansion_leaf(&cx, &devices[3]), 1024 * 1024, 8)
+                            .is_not_committed(),
+                        "a fresh request cannot reuse the unreconciled completion owner"
+                    );
+                    assert!(
+                        engine
+                            .write_file_data(
+                                &cx,
+                                &[],
+                                file,
+                                0,
+                                b"must recover",
+                                Timestamp {
+                                    seconds: 1_735_001_001,
+                                    nanos: 0
+                                },
+                                ZfsDataChecksum::Fletcher4,
+                            )
+                            .is_not_committed()
+                    );
+                    assert_eq!(
+                        devices
+                            .iter()
+                            .map(FaultableMemberDevice::write_calls)
+                            .collect::<Vec<_>>(),
+                        writes,
+                        "recovery fencing precedes every subsequent physical write"
+                    );
                 }
                 if matches!(cut, ExpansionCrashCut::CompletionLabelWrite) {
                     assert!(

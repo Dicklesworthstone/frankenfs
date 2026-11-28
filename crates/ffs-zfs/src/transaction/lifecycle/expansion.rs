@@ -736,6 +736,11 @@ impl ZfsTransactionEngine {
             ZfsTxOutcome::NotCommitted(error) => {
                 self.current_uberblock.raidz_reflow_info = previous_reflow;
                 self.storage_identity = previous_identity;
+                // The successor configuration seed is already durable on an
+                // admitted member even though no successor uberblock was
+                // attempted. Reconcile those native label generations before
+                // this owner can perform another mutation.
+                self.poisoned_uncertain = true;
                 ZfsTxOutcome::NotCommitted(error)
             }
             ZfsTxOutcome::Uncertain {

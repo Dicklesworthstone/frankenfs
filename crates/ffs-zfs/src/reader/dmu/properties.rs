@@ -73,6 +73,8 @@ enum DefaultValue {
 enum Index {
     None,
     Range(u64, u64),
+    AclMode,
+    AclInherit,
     Checksum,
     /// Includes the pinned native synthetic zstd and zstd-fast levels.
     Compression,
@@ -198,6 +200,22 @@ impl Spec {
                 true,
                 false,
                 Index::Compression,
+            ),
+            "aclmode" => (
+                DefaultValue::Number(0),
+                true,
+                true,
+                false,
+                false,
+                Index::AclMode,
+            ),
+            "aclinherit" => (
+                DefaultValue::Number(4),
+                true,
+                true,
+                false,
+                false,
+                Index::AclInherit,
             ),
             "recordsize" => (
                 DefaultValue::Number(131_072),
@@ -336,6 +354,8 @@ impl Spec {
         match self.index {
             Index::None => false,
             Index::Range(first, last) => (first..=last).contains(value),
+            Index::AclMode => matches!(*value, 0 | 2..=4),
+            Index::AclInherit => matches!(*value, 0 | 1 | 3..=5),
             Index::Checksum => matches!(*value, 1 | 2 | 6..=8 | 10..=14),
             Index::Compression => {
                 matches!(*value, 1..=3 | 5..=16)

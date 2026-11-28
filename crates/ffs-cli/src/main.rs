@@ -16010,11 +16010,14 @@ mod tests {
             .unwrap()
             .prepare_native_ext4_repair(&cx, 500)
             .expect("reserve native ownership");
-        let fs = OpenFs::open_read_write(&cx, &path, &preparation).unwrap();
-        fs.initialize_native_ext4_validation(&cx).unwrap();
-        fs.initialize_native_ext4_repair(&cx, 256 * 1024 * 1024)
+        OpenFs::open_read_write(&cx, &path, &preparation)
+            .unwrap()
+            .initialize_native_ext4_validation(&cx)
+            .unwrap();
+        OpenFs::open_read_write(&cx, &path, &preparation)
+            .unwrap()
+            .initialize_native_ext4_repair(&cx, 256 * 1024 * 1024)
             .expect("seal fixture authority");
-        drop(fs);
         (tmp, path, storage.tails[0].start.0, payload.ino)
     }
 

@@ -8955,6 +8955,121 @@ impl OpenFs {
         Ok(fs)
     }
 
+    /// Rebuild Btrfs semantics from the admitted physical view after native
+    /// repair. Ownership discovery itself reads and caches filesystem nodes;
+    /// their native checksums do not establish the sealed source digest.
+    fn refresh_native_btrfs_view(&mut self, cx: &Cx) -> Result<(), FfsError> {
+        if !self.is_btrfs() {
+            return Ok(());
+        }
+        // Retained nested views share this flag. A failed rebuild must leave
+        // every old view unusable, even when the physical repair succeeded.
+        *self.btrfs_semantic_view_stale.write() = true;
+        if self.native_repair_device.is_none()
+            || self.btrfs_alloc_state.is_some()
+            || self.mvcc_version_count() != 0
+            || self.btrfs_devices.is_some()
+            || self.btrfs_superblock().is_none_or(|sb| sb.num_devices != 1)
+            || self.btrfs_context.as_ref().is_none_or(|ctx| {
+                ctx.subvol_objectid != BTRFS_FS_TREE_OBJECTID
+                    || ctx.subvol_root_dirid != BTRFS_FIRST_FREE_OBJECTID
+            })
+        {
+            return Err(FfsError::Format(
+                "native Btrfs refresh requires an admitted offline single-device default root"
+                    .into(),
+            ));
+        }
+        // Reuse the complete bootstrap parser rather than retaining a chunk
+        // map, superblock, log overlay or removal set derived before healing.
+        // No activation budget means no recursive admission; Skip and denied
+        // write authority prevent format recovery in this temporary view.
+        let options = OpenOptions {
+            mount_mode: self.mount_mode,
+            ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+            btrfs_rw_ephemeral_ok: self.btrfs_rw_ephemeral_ok,
+            btrfs_verify_data_on_read: self.btrfs_verify_data_on_read,
+            ..OpenOptions::default()
+        };
+        let fresh = Self::from_device_with_btrfs_devices(
+            cx,
+            Box::new(Arc::clone(&self.dev)),
+            &options,
+            None,
+            None,
+            Vec::new(),
+            false,
+        )?;
+        if !fresh.btrfs_inventory_verified
+            || fresh.btrfs_devices.is_some()
+            || fresh
+                .btrfs_superblock()
+                .is_none_or(|sb| sb.num_devices != 1)
+            || fresh.btrfs_context.as_ref().is_none_or(|ctx| {
+                ctx.subvol_objectid != BTRFS_FS_TREE_OBJECTID
+                    || ctx.subvol_root_dirid != BTRFS_FIRST_FREE_OBJECTID
+            })
+        {
+            return Err(FfsError::Format(
+                "repaired Btrfs bootstrap no longer describes the admitted default root".into(),
+            ));
+        }
+
+        self.flavor = fresh.flavor;
+        self.btrfs_context = fresh.btrfs_context;
+        self.btrfs_devices = fresh.btrfs_devices;
+        self.btrfs_inventory_verified = fresh.btrfs_inventory_verified;
+        self.btrfs_tree_log_items = fresh.btrfs_tree_log_items;
+        self.btrfs_tree_log_dir_ranges = fresh.btrfs_tree_log_dir_ranges;
+        self.btrfs_tree_log_hidden = fresh.btrfs_tree_log_hidden;
+        self.btrfs_tree_log_overlay_active.store(
+            fresh.btrfs_tree_log_overlay_active.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+        self.btrfs_foreign_tree_log = fresh.btrfs_foreign_tree_log;
+        self.btrfs_nested = fresh.btrfs_nested;
+        self.btrfs_nested_has_entries.store(
+            fresh.btrfs_nested_has_entries.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+        self.btrfs_subvol_links_active.store(
+            fresh.btrfs_subvol_links_active.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+
+        self.btrfs_fs_tree_root_cache.lock().clear();
+        self.btrfs_fs_tree_root_fast.store(0, Ordering::Relaxed);
+        self.btrfs_verified_dir_inode.store(0, Ordering::Relaxed);
+        self.btrfs_parsed_node_cache.clear();
+        for slot in self.btrfs_floor_leaf_memo.lock().iter_mut() {
+            *slot = None;
+        }
+        self.btrfs_floor_memo_next_slot.store(0, Ordering::Relaxed);
+        self.btrfs_floor_memo_consecutive_misses
+            .store(0, Ordering::Relaxed);
+        self.btrfs_inode_path_cache.lock().take();
+        self.btrfs_csum_read_cache.lock().take();
+        self.btrfs_read_plan_index.take();
+        self.btrfs_ro_inode_extents.clear();
+        self.btrfs_grown_chunks.store(None);
+        self.btrfs_hot_inode_extents.store(None);
+        self.btrfs_dir_entry_cache.clear();
+        self.btrfs_decompressed_extent_cache.clear();
+        // Inode attributes, file data and directory snapshots are shared with
+        // ext4; they also carry Btrfs bytes and must not bypass the fresh view.
+        self.ext4_inode_attr_cache.clear();
+        self.file_data_extent_cache.clear();
+        self.extent_cache.invalidate_all();
+        clear_readdir_snapshot(&self.readdir_snapshot);
+        for index in self.dir_name_index.iter() {
+            *index.lock() = None;
+        }
+        // Preserve the existing MVCC store, registered snapshots, policies,
+        // native device and runtime settings. Only semantics were rebuilt.
+        self.btrfs_semantic_view_stale = fresh.btrfs_semantic_view_stale;
+        Ok(())
+    }
+
     fn ext4_native_recovery_journal_state(
         &self,
         cx: &Cx,
@@ -86791,6 +86906,166 @@ mod tests {
             ));
             assert!(events.lock().unwrap().is_empty());
             assert!(dev.snapshot_bytes() == bytes);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn native_freshness_btrfs_refreshes_healed_inode_caches_before_cow() {
+        let (seed, dev, _tmp, _image) = open_writable_btrfs_mkfs_args(
+            16,
+            &["-M", "-d", "single", "-m", "single", "--csum", "crc32c"],
+        )
+        .expect("native Btrfs cache regression requires actual mkfs.btrfs execution");
+        drop(seed);
+        let cx = Cx::for_testing();
+        let preparation = native_preparation_options();
+        OpenFs::from_device(&cx, Box::new(dev.clone()), &preparation)
+            .unwrap()
+            .prepare_native_btrfs_repair(&cx, 500)
+            .unwrap();
+        OpenFs::from_device(&cx, Box::new(dev.clone()), &preparation)
+            .unwrap()
+            .initialize_native_btrfs_validation(&cx)
+            .unwrap();
+        OpenFs::from_device(&cx, Box::new(dev.clone()), &preparation)
+            .unwrap()
+            .initialize_native_btrfs_repair(&cx, NATIVE_PARITY_TEST_BUDGET)
+            .unwrap();
+        let sealed = dev.snapshot_bytes();
+        let inspect = OpenFs::from_device(&cx, Box::new(dev), &preparation).unwrap();
+        let root = InodeNumber(BTRFS_FIRST_FREE_OBJECTID);
+        let expected_uid = inspect.getattr(&cx, root).unwrap().uid;
+        let forged_uid = expected_uid ^ 0x4000;
+        let expected_generation = inspect.btrfs_superblock().unwrap().generation;
+        let forged_generation = expected_generation.checked_add(7).unwrap();
+        let fs_root = inspect
+            .btrfs_fs_tree_root_bytenr(&cx, BTRFS_FS_TREE_OBJECTID)
+            .unwrap();
+        let mut damaged = sealed.clone();
+        let mut altered_leaf = None;
+        for logical in inspect.btrfs_tree_node_addresses(&cx, fs_root).unwrap() {
+            let node = inspect.btrfs_read_parsed_node(&cx, logical).unwrap();
+            let BtrfsParsedNode::Leaf { block, items } = node.as_ref() else {
+                continue;
+            };
+            let Some(item) = items.iter().find(|item| {
+                item.key.objectid == root.0 && item.key.item_type == BTRFS_ITEM_INODE_ITEM
+            }) else {
+                continue;
+            };
+            let mut bytes = block.as_ref().clone();
+            let uid = usize::try_from(item.data_offset).unwrap() + 44;
+            bytes[uid..uid + 4].copy_from_slice(&forged_uid.to_le_bytes());
+            bytes[..32].fill(0);
+            let checksum = crc32c::crc32c(&bytes[32..]);
+            bytes[..4].copy_from_slice(&checksum.to_le_bytes());
+            ffs_ondisk::btrfs::verify_tree_block_checksum(
+                &bytes,
+                ffs_types::BTRFS_CSUM_TYPE_CRC32C,
+            )
+            .unwrap();
+            let mapping =
+                map_logical_to_physical(&inspect.btrfs_context().unwrap().chunks, logical)
+                    .unwrap()
+                    .unwrap();
+            let physical = usize::try_from(mapping.physical).unwrap();
+            damaged[physical..physical + bytes.len()].copy_from_slice(&bytes);
+            altered_leaf = Some(physical..physical + bytes.len());
+            break;
+        }
+        let altered_leaf = altered_leaf.expect("default root INODE_ITEM must be present");
+        assert_ne!(
+            &damaged[altered_leaf.clone()],
+            &sealed[altered_leaf.clone()]
+        );
+        // The superblock is parsed before even the ownership lookup. Repairing
+        // disk alone must not leave its forged generation in the COW seed.
+        let superblock = usize::try_from(ffs_types::BTRFS_SUPER_INFO_OFFSET).unwrap();
+        damaged[superblock + 0x48..superblock + 0x50]
+            .copy_from_slice(&forged_generation.to_le_bytes());
+        let checksum = crc32c::crc32c(&damaged[superblock + 0x20..superblock + 4096]);
+        damaged[superblock..superblock + 4].copy_from_slice(&checksum.to_le_bytes());
+        drop(inspect);
+
+        for prewarm_before_admission in [false, true] {
+            let changed = TestDevice::from_vec(damaged.clone());
+            let mut fs = if prewarm_before_admission {
+                let mut fs =
+                    OpenFs::from_device(&cx, Box::new(changed.clone()), &preparation).unwrap();
+                assert_eq!(fs.getattr(&cx, root).unwrap().uid, forged_uid);
+                assert_eq!(fs.btrfs_superblock().unwrap().generation, forged_generation);
+                assert!(fs.prewarm_btrfs_read_plan_index(&cx).unwrap());
+                let old_view = Arc::clone(&fs.btrfs_semantic_view_stale);
+                fs.reconcile_and_activate_native_repair(
+                    &cx,
+                    NATIVE_PARITY_TEST_BUDGET,
+                    &BTreeSet::new(),
+                )
+                .unwrap();
+                assert!(
+                    *old_view.read(),
+                    "retained pre-admission views must be stale"
+                );
+                fs
+            } else {
+                OpenFs::from_device(
+                    &cx,
+                    Box::new(changed.clone()),
+                    &OpenOptions {
+                        native_repair_max_working_bytes: Some(NATIVE_PARITY_TEST_BUDGET),
+                        ..preparation.clone()
+                    },
+                )
+                .unwrap()
+            };
+            assert!(fs.has_native_repair_device());
+            assert!(
+                changed.snapshot_bytes() == sealed,
+                "admission must physically heal the valid-checksum altered leaf"
+            );
+            assert_eq!(
+                fs.btrfs_superblock().unwrap().generation,
+                expected_generation
+            );
+            assert_eq!(
+                fs.getattr(&cx, root).unwrap().uid,
+                expected_uid,
+                "a successful native open must not return pre-healing inode attributes"
+            );
+            fs.enable_writes(&cx).unwrap();
+            let alloc = fs.btrfs_alloc_state.as_ref().unwrap().read();
+            assert_eq!(
+                fs.btrfs_read_inode_from_tree(&alloc, root.0).unwrap().uid,
+                expected_uid,
+                "write admission must seed COW from the repaired physical view"
+            );
+            drop(alloc);
+            assert_eq!(fs.getattr(&cx, root).unwrap().uid, expected_uid);
+            assert!(changed.snapshot_bytes() == sealed);
+            fs.btrfs_full_transaction_commit(&cx, "native-repaired-cache-regression")
+                .expect("persist the repaired COW seed");
+            drop(fs);
+            assert!(
+                changed.snapshot_bytes() != sealed,
+                "full commit must write a new root"
+            );
+            let cold = OpenFs::from_device(
+                &cx,
+                Box::new(changed),
+                &OpenOptions {
+                    native_repair_max_working_bytes: Some(NATIVE_PARITY_TEST_BUDGET),
+                    ..preparation.clone()
+                },
+            )
+            .expect("reopen the committed native image");
+            assert_eq!(cold.getattr(&cx, root).unwrap().uid, expected_uid);
+            assert_eq!(
+                cold.btrfs_superblock().unwrap().generation,
+                expected_generation.checked_add(1).unwrap(),
+                "the forged bootstrap generation must never reach a later commit"
+            );
+            cold.check_native_repair(&cx).unwrap();
         }
     }
 

@@ -1,4 +1,4 @@
-//! Hole-punch allocation, metadata and recovery through the native transaction engine.
+//! Hole-punch and allocated zero-range metadata and recovery through the native engine.
 
 use super::{
     Arc, ByteDevice, CLUSTER_BYTES, Cx, DEFAULT_FILETIME, FaultInjectingNtfsDevice, FfsError,
@@ -15,8 +15,9 @@ use ffs_ondisk::ntfs::ea::{FILE_NEED_EA, NtfsEa};
 use ffs_ondisk::ntfs::index::NtfsFileName;
 use ffs_ondisk::ntfs::reparse::{NtfsReparseData, NtfsReparsePoint};
 use ffs_ondisk::ntfs::usn::{
-    USN_REASON_BASIC_INFO_CHANGE, USN_REASON_CLOSE, USN_REASON_DATA_OVERWRITE,
-    USN_REASON_NAMED_DATA_OVERWRITE, UsnRecordV2, parse_usn_journal_slice,
+    USN_REASON_BASIC_INFO_CHANGE, USN_REASON_CLOSE, USN_REASON_DATA_EXTEND,
+    USN_REASON_DATA_OVERWRITE, USN_REASON_NAMED_DATA_EXTEND, USN_REASON_NAMED_DATA_OVERWRITE,
+    UsnRecordV2, parse_usn_journal_slice,
 };
 use ffs_ondisk::ntfs::{ATTRIBUTE_LIST, DATA, NtfsValue, SPARSE, decode_mapping_pairs};
 use ffs_types::InodeNumber;
@@ -48,6 +49,406 @@ fn fixture(
         .into_result()
         .unwrap();
     (device, engine, file)
+}
+
+#[test]
+fn zero_range_resident_and_keep_size_allocation_preserve_existing_bytes() {
+    let cx = Cx::for_testing();
+    let cb = CLUSTER_BYTES as u64;
+    let (device, mut engine, file) = fixture(128, b"ABCDEFGHIJKLMNO");
+    let before = used_clusters(&device);
+    let mut expected = b"ABCDEFGHIJKLMNO".to_vec();
+    expected[3..8].fill(0);
+    engine
+        .zero_range_at(&cx, file, &[], 3, 5, false, DEFAULT_FILETIME)
+        .into_result()
+        .unwrap();
+    assert_stream(&engine, file, &[], &expected, 15, 15);
+    assert_eq!(used_clusters(&device), before);
+
+    // KEEP_SIZE still allocates past EOF; promotion must retain all old resident
+    // bytes even though none overlaps the requested range.
+    engine
+        .zero_range_at(&cx, file, &[], 2 * cb + 7, 13, true, DEFAULT_FILETIME + 1)
+        .into_result()
+        .unwrap();
+    assert_stream(&engine, file, &[], &expected, 3 * cb, 15);
+    assert_eq!(used_clusters(&device), before + 3);
+    assert_name_copies(&device, &engine, file, 3 * cb, 15);
+    let durable = device.snapshot_durable_only();
+    for (vcn, lcn) in mapped_clusters(&engine, file, &[]) {
+        let at = lcn.unwrap() as usize * CLUSTER_BYTES;
+        let mut physical = vec![0; CLUSTER_BYTES];
+        if vcn == 0 {
+            physical[..expected.len()].copy_from_slice(&expected);
+        }
+        assert_eq!(&durable[at..at + CLUSTER_BYTES], physical);
+    }
+    let mut reopened = NtfsTransactionEngine::from_device(
+        &cx,
+        FaultInjectingNtfsDevice::new(durable.clone()) as Arc<dyn ByteDevice>,
+        0,
+        durable.len() as u64 - SECTOR_BYTES as u64,
+        write_options_clean(),
+    )
+    .unwrap();
+    assert_stream(&reopened, file, &[], &expected, 3 * cb, 15);
+    reopened
+        .write_stream_range(&cx, file, &[], 2 * cb + 7, b"tail")
+        .into_result()
+        .unwrap();
+    expected.resize(2 * CLUSTER_BYTES + 11, 0);
+    expected[2 * CLUSTER_BYTES + 7..].copy_from_slice(b"tail");
+    assert_stream(
+        &reopened,
+        file,
+        &[],
+        &expected,
+        3 * cb,
+        expected.len() as u64,
+    );
+    reopened.check_clean_consistency(&cx).unwrap();
+}
+
+#[test]
+fn zero_range_sparse_ads_preserves_valid_prefix_extension_catalogs_and_holes() {
+    let cx = Cx::for_testing();
+    let cb = CLUSTER_BYTES as u64;
+    let (device, mut engine, file, name) = large_sparse_stream_fixture();
+    let sentinels: Vec<Vec<u16>> = (0..8)
+        .map(|index| {
+            format!("sentinel-stream-with-a-long-name-{index}")
+                .encode_utf16()
+                .collect()
+        })
+        .collect();
+    for sentinel in &sentinels {
+        engine
+            .create_stream(&cx, file, sentinel, b"sentinel payload")
+            .into_result()
+            .unwrap();
+    }
+    let (_, record) = view(&engine, file);
+    assert!(
+        record
+            .attributes()
+            .unwrap()
+            .iter()
+            .any(|attribute| attribute.kind == ATTRIBUTE_LIST)
+    );
+    let before = used_clusters(&device);
+    // VDL is five bytes. Zeroing later bytes in the same physical cluster must
+    // preserve those five bytes, not clear the whole uninitialized boundary.
+    engine
+        .zero_range_at(&cx, file, &name, 7, 3, true, DEFAULT_FILETIME)
+        .into_result()
+        .unwrap();
+    let far = (1_u64 << 29) + 13;
+    engine
+        .zero_range_at(&cx, file, &name, far, 2 * cb, true, DEFAULT_FILETIME)
+        .into_result()
+        .unwrap();
+    let (volume, record) = view(&engine, file);
+    let stream = volume.data_stream(&cx, &record, &name).unwrap();
+    assert_eq!(
+        (stream.size, stream.initialized, stream.allocated),
+        (1 << 30, 5, 6 * cb)
+    );
+    let mut prefix = [0; 16];
+    prefix[..5].fill(0xA6);
+    assert_eq!(volume.read(&cx, &stream, 0, 16).unwrap(), prefix);
+    assert_eq!(
+        volume
+            .read(&cx, &stream, far - 1, 2 * CLUSTER_BYTES + 2)
+            .unwrap(),
+        vec![0; 2 * CLUSTER_BYTES + 2]
+    );
+    assert_eq!(used_clusters(&device), before + 3);
+    assert_eq!(
+        standard_flags(&record) & 0x200,
+        0,
+        "ADS allocation must not change unnamed DATA policy"
+    );
+    assert_stream(&engine, file, &[], b"BASE", 4, 4);
+    for sentinel in &sentinels {
+        assert_stream(&engine, file, sentinel, b"sentinel payload", 16, 16);
+    }
+    engine
+        .write_stream_range(&cx, file, &name, cb + 7, b"X")
+        .into_result()
+        .unwrap();
+    let (volume, record) = view(&engine, file);
+    let stream = volume.data_stream(&cx, &record, &name).unwrap();
+    let prefix = volume.read(&cx, &stream, 0, CLUSTER_BYTES + 8).unwrap();
+    assert_eq!(&prefix[..5], [0xA6; 5]);
+    assert!(prefix[5..CLUSTER_BYTES + 7].iter().all(|&byte| byte == 0));
+    assert_eq!(prefix[CLUSTER_BYTES + 7], b'X');
+    engine.check_clean_consistency(&cx).unwrap();
+}
+
+#[test]
+fn zero_range_rejects_invalid_and_unaffordable_edits_without_writes() {
+    let cx = Cx::for_testing();
+    let cb = CLUSTER_BYTES as u64;
+    let (device, mut engine, file) = fixture(99, &vec![0x79; 5 * CLUSTER_BYTES]);
+    let before = device.snapshot_durable_only();
+    let written = device.write_bytes_total();
+    let stale = NtfsReference {
+        record: file.record,
+        sequence: file.sequence.wrapping_add(1),
+    };
+    for (target, name, offset, length, errno) in [
+        (file, &[][..], 0, 0, libc::EINVAL),
+        (file, &[][..], u64::MAX, 2, libc::EFBIG),
+        (file, &[][..], i64::MAX as u64 - 1, 1, libc::EFBIG),
+        (
+            file,
+            &[][..],
+            0,
+            ffs_ntfs::transaction::MAX_FILE_EDIT_BYTES + 3 * cb,
+            libc::EFBIG,
+        ),
+        (stale, &[][..], 0, 1, libc::ESTALE),
+        (file, &[u16::from(b'x')][..], 0, 1, libc::ENOENT),
+        (file, &[u16::from(b':')][..], 0, 1, libc::EINVAL),
+        (file, &[][..], 1, 4 * cb - 2, libc::ENOSPC),
+    ] {
+        let outcome =
+            engine.zero_range_at(&cx, target, name, offset, length, true, DEFAULT_FILETIME);
+        let NtfsTxOutcome::NotCommitted(error) = outcome else {
+            panic!("zero-range admission must precede writes: {outcome:?}");
+        };
+        assert_eq!(error.to_errno(), errno);
+        assert_eq!(device.write_bytes_total(), written);
+        assert_eq!(device.snapshot_live(), before);
+        assert_eq!(device.snapshot_durable_only(), before);
+    }
+    let cancelled = Cx::for_testing();
+    cancelled.set_cancel_requested(true);
+    assert!(matches!(
+        engine.zero_range_at(&cancelled, file, &[], 0, 1, false, DEFAULT_FILETIME),
+        NtfsTxOutcome::NotCommitted(FfsError::Cancelled)
+    ));
+    assert_eq!(device.write_bytes_total(), written);
+}
+
+#[test]
+fn zero_range_transformed_and_provider_refusals_preserve_native_state() {
+    let cx = Cx::for_testing();
+    for transform in ["compressed", "encrypted", "reparse"] {
+        let (device, mut engine, file) = journal_fixture(&vec![0x4B; 3 * CLUSTER_BYTES]);
+        match transform {
+            "compressed" => engine
+                .set_compression_at(&cx, file, true, DEFAULT_FILETIME)
+                .into_result()
+                .unwrap(),
+            "encrypted" => engine
+                .encrypt_file_at(
+                    &cx,
+                    file,
+                    &NtfsEfsKey::from_raw_bytes([0x37; 32]),
+                    DEFAULT_FILETIME,
+                )
+                .into_result()
+                .unwrap(),
+            "reparse" => engine
+                .set_reparse_point_at(
+                    &cx,
+                    file,
+                    &NtfsReparsePoint {
+                        tag: 0x9000_0017,
+                        guid: None,
+                        data: NtfsReparseData::Opaque(vec![0xAC; 16]),
+                    },
+                    true,
+                    DEFAULT_FILETIME,
+                )
+                .into_result()
+                .unwrap(),
+            _ => unreachable!(),
+        };
+        let before = device.snapshot_durable_only();
+        let writes = device.write_bytes_total();
+        for keep_size in [false, true] {
+            assert!(
+                matches!(
+                    engine.zero_range_at(
+                        &cx,
+                        file,
+                        &[],
+                        1,
+                        CLUSTER_BYTES as u64,
+                        keep_size,
+                        DEFAULT_FILETIME + 1
+                    ),
+                    NtfsTxOutcome::NotCommitted(FfsError::UnsupportedFeature(_))
+                ),
+                "{transform}"
+            );
+            assert_eq!(device.write_bytes_total(), writes);
+            assert_eq!(device.snapshot_live(), before);
+            assert_eq!(device.snapshot_durable_only(), before);
+        }
+    }
+}
+
+#[test]
+fn zero_range_recovers_complete_allocations_and_eof_at_every_publication_cut() {
+    let cx = Cx::for_testing();
+    let cb = CLUSTER_BYTES as u64;
+    for keep_size in [false, true] {
+        let mut original = vec![0x68; 3 * CLUSTER_BYTES + 17];
+        let (device, mut engine, file) = fixture(160, &original);
+        engine
+            .punch_hole_at(&cx, file, &[], cb, cb, DEFAULT_FILETIME)
+            .into_result()
+            .unwrap();
+        original[CLUSTER_BYTES..2 * CLUSTER_BYTES].fill(0);
+        engine
+            .link_file(&cx, "/punch.bin", "/", "alias.bin")
+            .into_result()
+            .unwrap();
+        let ads: Vec<_> = "audit".encode_utf16().collect();
+        engine
+            .create_stream(&cx, file, &ads, b"unchanged stream")
+            .into_result()
+            .unwrap();
+        let before = used_clusters(&device);
+        let mut expected = original.clone();
+        if !keep_size {
+            expected.resize(5 * CLUSTER_BYTES + 5, 0);
+        }
+        expected[CLUSTER_BYTES + 5..].fill(0);
+        type Cut = (NtfsPersistenceStage, bool, Vec<u8>, Vec<u8>);
+        let cuts: Arc<Mutex<Vec<Cut>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&cuts);
+        let source = Arc::clone(&device);
+        let mut committed = false;
+        engine.set_stage_hook(Some(Box::new(move |event| {
+            committed |= event.stage == NtfsPersistenceStage::LogCommitBarrier;
+            captured.lock().unwrap().push((
+                event.stage,
+                committed,
+                source.snapshot_durable_only(),
+                source.snapshot_reordered_pending(true),
+            ));
+            Ok(())
+        })));
+        engine
+            .zero_range_at(
+                &cx,
+                file,
+                &[],
+                cb + 5,
+                4 * cb,
+                keep_size,
+                DEFAULT_FILETIME + 1,
+            )
+            .into_result()
+            .unwrap();
+        engine.set_stage_hook(None);
+        let captured = cuts.lock().unwrap();
+        assert!(captured.iter().any(|(_, committed, _, _)| !committed));
+        assert!(captured.iter().any(|(_, committed, _, _)| *committed));
+        for (stage, committed, durable, reordered) in captured.iter() {
+            for (image, may_be_newer) in [(durable, false), (reordered, true)] {
+                let recovered_device = FaultInjectingNtfsDevice::new(image.clone());
+                let recovered = NtfsTransactionEngine::from_device(
+                    &cx,
+                    Arc::clone(&recovered_device) as Arc<dyn ByteDevice>,
+                    0,
+                    image.len() as u64 - SECTOR_BYTES as u64,
+                    write_options_recover(),
+                )
+                .unwrap_or_else(|error| panic!("zero-range recovery at {stage:?}: {error}"));
+                recovered.check_clean_consistency(&cx).unwrap();
+                let (volume, record) = view(&recovered, file);
+                let stream = volume.data_stream(&cx, &record, &[]).unwrap();
+                let observed = volume.read(&cx, &stream, 0, 6 * CLUSTER_BYTES).unwrap();
+                let applied = observed == expected;
+                assert!(applied || observed == original, "mixed bytes at {stage:?}");
+                if *committed || !may_be_newer {
+                    assert_eq!(applied, *committed, "wrong committed prefix at {stage:?}");
+                }
+                let allocated = if applied { 6 * cb } else { 3 * cb };
+                assert_eq!(stream.allocated, allocated);
+                assert_eq!(stream.initialized, original.len() as u64);
+                assert_eq!(
+                    used_clusters(&recovered_device),
+                    if applied { before + 3 } else { before }
+                );
+                assert_stream(&recovered, file, &ads, b"unchanged stream", 16, 16);
+                assert_name_copies(
+                    &recovered_device,
+                    &recovered,
+                    file,
+                    allocated,
+                    observed.len() as u64,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn zero_range_payload_failure_and_native_usn_publication_remain_consistent() {
+    let cx = Cx::for_testing();
+    let cb = CLUSTER_BYTES as u64;
+    let original = vec![0xA9; 3 * CLUSTER_BYTES];
+    let (device, mut engine, file) = journal_fixture(&original);
+    let ads: Vec<_> = "audit".encode_utf16().collect();
+    engine
+        .create_stream(&cx, file, &ads, b"named bytes")
+        .into_result()
+        .unwrap();
+    let before = journal_records(&engine.volume_view(&cx).unwrap());
+    device.set_fail_sync_call(Some(1));
+    assert!(matches!(
+        engine.zero_range_at(&cx, file, &[], 7, 4 * cb, false, DEFAULT_FILETIME + 1),
+        NtfsTxOutcome::NotCommitted(_)
+    ));
+    device.set_fail_sync_call(None);
+    assert_stream(&engine, file, &[], &original, 3 * cb, 3 * cb);
+    assert_eq!(journal_records(&engine.volume_view(&cx).unwrap()), before);
+    assert!(!engine.requires_recovery());
+    engine
+        .zero_range_at(&cx, file, &[], 7, 4 * cb, false, DEFAULT_FILETIME + 2)
+        .into_result()
+        .unwrap();
+    let after = assert_punch_record(
+        &engine,
+        file,
+        &before,
+        USN_REASON_DATA_OVERWRITE | USN_REASON_DATA_EXTEND | USN_REASON_CLOSE,
+        DEFAULT_FILETIME + 2,
+    );
+    engine
+        .zero_range_at(&cx, file, &ads, 5, cb, false, DEFAULT_FILETIME + 3)
+        .into_result()
+        .unwrap();
+    assert_punch_record(
+        &engine,
+        file,
+        &after,
+        USN_REASON_NAMED_DATA_OVERWRITE | USN_REASON_NAMED_DATA_EXTEND | USN_REASON_CLOSE,
+        DEFAULT_FILETIME + 3,
+    );
+    let durable = device.snapshot_durable_only();
+    let reopened = NtfsTransactionEngine::from_device(
+        &cx,
+        FaultInjectingNtfsDevice::new(durable.clone()) as Arc<dyn ByteDevice>,
+        0,
+        durable.len() as u64 - SECTOR_BYTES as u64,
+        write_options_clean(),
+    )
+    .unwrap();
+    let mut expected = vec![0; 4 * CLUSTER_BYTES + 7];
+    expected[..7].fill(0xA9);
+    assert_stream(&reopened, file, &[], &expected, 5 * cb, 3 * cb);
+    let mut named = vec![0; CLUSTER_BYTES + 5];
+    named[..5].copy_from_slice(b"named");
+    assert_stream(&reopened, file, &ads, &named, 2 * cb, 11);
+    reopened.check_clean_consistency(&cx).unwrap();
 }
 
 fn view(engine: &NtfsTransactionEngine, file: NtfsReference) -> (NtfsVolume, NtfsFileRecord) {
