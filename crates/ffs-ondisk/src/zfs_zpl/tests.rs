@@ -926,6 +926,7 @@ fn directory_reference_legacy_bonus_and_sa_bonus_encoders_roundtrip_and_preserve
                 true,
                 None,
                 None,
+                None,
                 320,
                 256,
             )
@@ -958,6 +959,7 @@ fn directory_reference_legacy_bonus_and_sa_bonus_encoders_roundtrip_and_preserve
                     None,
                     &child_meta,
                     true,
+                    None,
                     None,
                     None,
                     320,
@@ -1015,42 +1017,46 @@ fn trivial_acl_matches_posix_class_precedence_for_all_modes() {
         for is_dir in [false, true] {
             for sticky in [0_u64, 0o1000] {
                 for mode in 0_u64..=0o777 {
-                    let aces = encode_trivial_nfsv4_aces(mode | sticky, is_dir, order);
-                    assert!(aces.len().is_multiple_of(8));
-                    assert!((24..=48).contains(&aces.len()));
-                    for (owner, group) in
-                        [(true, false), (true, true), (false, true), (false, false)]
-                    {
-                        let shift = match (owner, group) {
-                            (true, _) => 6,
-                            (false, true) => 3,
-                            (false, false) => 0,
-                        };
-                        let permissions = (mode >> shift) & 7;
-                        for rwx in 1_u32..=7 {
-                            let mut requested = 0;
-                            if rwx & 4 != 0 {
-                                requested |= 0x01; // READ_DATA / LIST_DIRECTORY
-                            }
-                            if rwx & 2 != 0 {
-                                requested |= 0x06; // WRITE_DATA and APPEND_DATA
-                                if is_dir {
-                                    requested |= 0x40; // DELETE_CHILD
+                    for aces in [
+                        encode_trivial_nfsv4_aces(mode | sticky, is_dir, order),
+                        acl::NativeAcl::trivial(mode | sticky, is_dir).encode_v1(order),
+                    ] {
+                        assert!(aces.len().is_multiple_of(8));
+                        assert!((24..=48).contains(&aces.len()));
+                        for (owner, group) in
+                            [(true, false), (true, true), (false, true), (false, false)]
+                        {
+                            let shift = match (owner, group) {
+                                (true, _) => 6,
+                                (false, true) => 3,
+                                (false, false) => 0,
+                            };
+                            let permissions = (mode >> shift) & 7;
+                            for rwx in 1_u32..=7 {
+                                let mut requested = 0;
+                                if rwx & 4 != 0 {
+                                    requested |= 0x01; // READ_DATA / LIST_DIRECTORY
                                 }
+                                if rwx & 2 != 0 {
+                                    requested |= 0x06; // WRITE_DATA and APPEND_DATA
+                                    if is_dir {
+                                        requested |= 0x40; // DELETE_CHILD
+                                    }
+                                }
+                                if rwx & 1 != 0 {
+                                    requested |= 0x20; // EXECUTE / SEARCH
+                                }
+                                assert_eq!(
+                                    grants(&aces, order, owner, group, requested),
+                                    permissions & u64::from(rwx) == u64::from(rwx),
+                                    "mode={mode:o}, sticky={sticky:o}, directory={is_dir}, owner={owner}, group={group}, request={rwx:o}, order={order:?}",
+                                );
                             }
-                            if rwx & 1 != 0 {
-                                requested |= 0x20; // EXECUTE / SEARCH
-                            }
-                            assert_eq!(
-                                grants(&aces, order, owner, group, requested),
-                                permissions & u64::from(rwx) == u64::from(rwx),
-                                "mode={mode:o}, sticky={sticky:o}, directory={is_dir}, owner={owner}, group={group}, request={rwx:o}, order={order:?}",
-                            );
+                            // OpenZFS always allows metadata/ACL reads. Only the
+                            // owner receives metadata/ACL/ownership write rights.
+                            assert!(grants(&aces, order, owner, group, 0x0012_0088));
+                            assert_eq!(grants(&aces, order, owner, group, 0x000c_0110), owner);
                         }
-                        // OpenZFS always allows metadata/ACL reads. Only the
-                        // owner receives metadata/ACL/ownership write rights.
-                        assert!(grants(&aces, order, owner, group, 0x0012_0088));
-                        assert_eq!(grants(&aces, order, owner, group, 0x000c_0110), owner);
                     }
                 }
             }
@@ -1077,6 +1083,7 @@ fn trivial_acl_create_and_chmod_store_actual_ace_counts() {
                     None,
                     &metadata,
                     true,
+                    None,
                     None,
                     None,
                     320,
@@ -1121,5 +1128,97 @@ fn trivial_acl_create_and_chmod_store_actual_ace_counts() {
                 created.values[b"ZPL_DACL_ACES".as_slice()].bytes.as_slice(),
             );
         }
+    }
+}
+
+#[test]
+fn native_acl_creation_and_chmod_split_spills_preserve_quota_offsets_and_fuid_counts() {
+    use super::acl::{Ace, AceKind, AclMode, NativeAcl, Principal};
+
+    for order in [Endian::Little, Endian::Big] {
+        let parent_attrs = attributes(order, 0o040_755, 2);
+        let mut layouts = vec![layout(2, &parent_attrs)];
+        let mut registrations = Vec::new();
+        let mut registry = SaRegistry::from_zaps(&registrations, &layouts).unwrap();
+        let parent = packed(2, &parent_attrs, &[], order);
+        let mut metadata = registry.decode(&parent, None).unwrap().metadata().unwrap();
+        metadata.flags = (1 << 47) | acl::ZFS_INHERIT_ACE;
+        let native = NativeAcl::new(
+            (0..18)
+                .map(|index| Ace {
+                    kind: if index == 0 {
+                        AceKind::Deny
+                    } else {
+                        AceKind::Allow
+                    },
+                    flags: 3,
+                    access_mask: if index == 0 { 0x20 } else { 0x27 },
+                    principal: Principal::User(0x0000_0007_0000_0000 + index),
+                })
+                .collect(),
+        )
+        .unwrap();
+        let (bonus, spill) = registry
+            .encode_new_with_acl(
+                &mut registrations,
+                &mut layouts,
+                &parent,
+                &metadata,
+                Some(42),
+                &native,
+                320,
+                192,
+            )
+            .unwrap();
+        assert!(bonus.len() <= 192);
+        assert!(spill.is_some());
+        // Fixed native zpl_get_file_info ownership offsets follow an 8-byte header.
+        assert_eq!(order.u64(&bonus, 8 + 24).unwrap(), metadata.uid);
+        assert_eq!(order.u64(&bonus, 8 + 32).unwrap(), metadata.gid);
+        let decoded = registry.decode(&bonus, spill.as_deref()).unwrap();
+        assert_eq!(decoded.metadata().unwrap(), metadata);
+        assert_eq!(decoded.project_id().unwrap(), 42);
+        assert_eq!(decoded.integer("ZPL_DACL_COUNT").unwrap(), 18);
+        assert_eq!(decoded.native_acl().unwrap().unwrap(), native);
+        assert_eq!(
+            decoded.values[b"ZPL_DACL_ACES".as_slice()].bytes.len(),
+            18 * 16
+        );
+        assert_eq!(
+            decoded.reclamation_ownership().unwrap().external_acl_object,
+            0
+        );
+
+        let changed = native
+            .chmod(
+                Kind::Directory,
+                0o040_640,
+                metadata.uid,
+                metadata.gid,
+                AclMode::Passthrough,
+            )
+            .unwrap();
+        metadata.mode = changed.mode;
+        metadata.flags = (metadata.flags & !acl::COMPUTED_FLAGS) | changed.flags;
+        let (updated, updated_spill) = registry
+            .encode_updated_with_options(
+                &mut registrations,
+                &mut layouts,
+                &bonus,
+                spill.as_deref(),
+                &metadata,
+                false,
+                Some(&changed.acl),
+                None,
+                None,
+                320,
+                192,
+            )
+            .unwrap();
+        assert!(updated_spill.is_some());
+        let decoded = registry.decode(&updated, updated_spill.as_deref()).unwrap();
+        assert_eq!(decoded.native_acl().unwrap().unwrap(), changed.acl);
+        assert_eq!(decoded.project_id().unwrap(), 42);
+        assert_eq!(decoded.metadata().unwrap(), metadata);
     }
 }

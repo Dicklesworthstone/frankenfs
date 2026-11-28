@@ -13,6 +13,8 @@ use crate::zfs_zap::Entry;
 use ffs_types::ParseError;
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod acl;
+
 pub const LEGACY_BYTES: usize = 264;
 pub const SA_BYTES: usize = 128 * 1024;
 pub const XATTR_BYTES: usize = 65_536;
@@ -1053,6 +1055,115 @@ impl SaRegistry {
         Ok(encoded)
     }
 
+    /// Encode a fresh SA child with an explicit native ACL. Keep core quota
+    /// ownership fields in native `zfs_mknode` order and move only ACE bytes to
+    /// a new spill when they do not fit the dnode. No parent ownership pointer
+    /// or unrelated attribute is copied into the new object.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_new_with_acl(
+        &mut self,
+        reg_entries: &mut Vec<Entry>,
+        layout_entries: &mut Vec<Entry>,
+        template_bonus: &[u8],
+        metadata: &Metadata,
+        project_id: Option<u64>,
+        acl: &acl::NativeAcl,
+        max_bonus_no_spill: usize,
+        max_bonus_with_spill: usize,
+    ) -> Result<(Vec<u8>, Option<Vec<u8>>), ParseError> {
+        if !matches!(metadata.kind, Kind::Regular | Kind::Directory)
+            || metadata.inline_symlink.is_some()
+        {
+            return Err(invalid(
+                "native ACL creation requires a regular file or directory",
+            ));
+        }
+        let (order, _) = self.parse_buffer_header(template_bonus)?;
+        let mut metadata = metadata.clone();
+        if project_id.is_some() {
+            metadata.flags |= 0x0000_8000_0000_0000;
+        } else if metadata.flags & 0x0000_8000_0000_0000 != 0 {
+            return Err(invalid("new ZPL project flag lacks a project owner"));
+        }
+        let mut map = BTreeMap::new();
+        Self::apply_metadata_to_map(&mut map, &metadata, order, false)?;
+        if let Some(project) = project_id {
+            map.insert(b"ZPL_PROJID".to_vec(), order.encode(project).to_vec());
+        }
+        map.insert(
+            b"ZPL_DACL_COUNT".to_vec(),
+            order.encode(acl.aces().len() as u64).to_vec(),
+        );
+        map.insert(b"ZPL_DACL_ACES".to_vec(), acl.encode_v1(order));
+        let native_order: [&[u8]; 15] = [
+            b"ZPL_MODE",
+            b"ZPL_SIZE",
+            b"ZPL_GEN",
+            b"ZPL_UID",
+            b"ZPL_GID",
+            b"ZPL_PARENT",
+            b"ZPL_FLAGS",
+            b"ZPL_ATIME",
+            b"ZPL_MTIME",
+            b"ZPL_CTIME",
+            b"ZPL_CRTIME",
+            b"ZPL_LINKS",
+            b"ZPL_PROJID",
+            b"ZPL_DACL_COUNT",
+            b"ZPL_DACL_ACES",
+        ];
+        let mut ids = Vec::with_capacity(native_order.len());
+        for name in native_order {
+            let Some(value) = map.get(name) else {
+                continue;
+            };
+            let (length, swap) = if name == b"ZPL_DACL_ACES" {
+                (0, 4)
+            } else {
+                (
+                    u16::try_from(value.len())
+                        .map_err(|_| invalid("new SA attribute is too large"))?,
+                    0,
+                )
+            };
+            ids.push(self.ensure_attribute(reg_entries, name, length, swap)?);
+        }
+        let layout = self.ensure_layout(layout_entries, &ids)?;
+        let complete = self.pack_layout(layout, &map, order)?;
+        let (bonus, spill) = if complete.len() <= max_bonus_no_spill {
+            (complete, None)
+        } else {
+            let ace_id = ids
+                .pop()
+                .ok_or_else(|| invalid("new SA ACL layout is empty"))?;
+            let aces = map
+                .remove(b"ZPL_DACL_ACES".as_slice())
+                .ok_or_else(|| invalid("new SA ACL payload is missing"))?;
+            let bonus_layout = self.ensure_layout(layout_entries, &ids)?;
+            let bonus = self.pack_layout(bonus_layout, &map, order)?;
+            if bonus.len() > max_bonus_with_spill {
+                return Err(invalid(
+                    "new SA core metadata exceeds dnode capacity with a spill",
+                ));
+            }
+            let spill_layout = self.ensure_layout(layout_entries, &[ace_id])?;
+            let spill = self.pack_layout(
+                spill_layout,
+                &BTreeMap::from([(b"ZPL_DACL_ACES".to_vec(), aces)]),
+                order,
+            )?;
+            (bonus, Some(spill))
+        };
+        let verified = self.decode(&bonus, spill.as_deref())?;
+        if verified.metadata()? != metadata
+            || verified.project_id()? != project_id.unwrap_or(0)
+            || verified.native_acl()?.as_ref() != Some(acl)
+        {
+            return Err(invalid("new SA ACL metadata did not round-trip"));
+        }
+        Ok((bonus, spill))
+    }
+
     /// Update an SA node's bonus + optional `DMU_OT_SA` spill block with optional
     /// trivial DACL rebuild (`chmod`), inline/spill `ZPL_DXATTR` xattr map update,
     /// and/or `ZPL_XATTR` directory pointer override.
@@ -1065,12 +1176,17 @@ impl SaRegistry {
         existing_spill: Option<&[u8]>,
         metadata: &Metadata,
         rebuild_trivial_dacl: bool,
+        native_acl: Option<&acl::NativeAcl>,
         inline_xattrs: Option<&BTreeMap<String, Vec<u8>>>,
         xattr_dir_override: Option<u64>,
         max_bonus_no_spill: usize,
         max_bonus_with_spill: usize,
     ) -> Result<(Vec<u8>, Option<Vec<u8>>), ParseError> {
-        if !rebuild_trivial_dacl && inline_xattrs.is_none() && xattr_dir_override.is_none() {
+        if !rebuild_trivial_dacl
+            && native_acl.is_none()
+            && inline_xattrs.is_none()
+            && xattr_dir_override.is_none()
+        {
             return self.encode_updated_bonus_and_spill(existing_bonus, existing_spill, metadata);
         }
         let (order, bonus_layout) = self.parse_buffer_header(existing_bonus)?;
@@ -1115,9 +1231,14 @@ impl SaRegistry {
             }
         }
 
-        if rebuild_trivial_dacl {
-            let aces =
-                encode_trivial_nfsv4_aces(metadata.mode, metadata.kind == Kind::Directory, order);
+        if rebuild_trivial_dacl || native_acl.is_some() {
+            let trivial = native_acl
+                .is_none()
+                .then(|| acl::NativeAcl::trivial(metadata.mode, metadata.kind == Kind::Directory));
+            let acl = native_acl
+                .or(trivial.as_ref())
+                .ok_or_else(|| invalid("native ACL update payload is missing"))?;
+            let aces = acl.encode_v1(order);
             let _ = self.ensure_attribute(reg_entries, b"ZPL_DACL_COUNT", 8, 0)?;
             // OpenZFS registers ZPL_DACL_ACES with variable length (0) and SA_ACL (swap == 4).
             let _ = self.ensure_attribute(reg_entries, b"ZPL_DACL_ACES", 0, 4)?;
@@ -1125,7 +1246,7 @@ impl SaRegistry {
             spill_map.remove(b"ZPL_DACL_ACES".as_slice());
             bonus_map.insert(
                 b"ZPL_DACL_COUNT".to_vec(),
-                order.encode((aces.len() / 8) as u64).to_vec(),
+                order.encode(acl.aces().len() as u64).to_vec(),
             );
             bonus_map.insert(b"ZPL_DACL_ACES".to_vec(), aces);
             if let Some(zacl) = bonus_map
@@ -1193,7 +1314,21 @@ impl SaRegistry {
 
         let bonus_ids = self.ordered_ids_for_map(Some(bonus_layout), &bonus_map)?;
         let new_bonus_lid = self.ensure_layout(layout_entries, &bonus_ids)?;
-        let new_bonus = self.pack_layout(new_bonus_lid, &bonus_map, order)?;
+        let mut new_bonus = self.pack_layout(new_bonus_lid, &bonus_map, order)?;
+        let initial_limit = if spill_map.is_empty() {
+            max_bonus_no_spill
+        } else {
+            max_bonus_with_spill
+        };
+        if new_bonus.len() > initial_limit
+            && (rebuild_trivial_dacl || native_acl.is_some())
+            && let Some(aces) = bonus_map.remove(b"ZPL_DACL_ACES".as_slice())
+        {
+            spill_map.insert(b"ZPL_DACL_ACES".to_vec(), aces);
+            let ids = self.ordered_ids_for_map(Some(bonus_layout), &bonus_map)?;
+            let layout = self.ensure_layout(layout_entries, &ids)?;
+            new_bonus = self.pack_layout(layout, &bonus_map, order)?;
+        }
         let max_allowed = if spill_map.is_empty() {
             max_bonus_no_spill
         } else {
@@ -1298,6 +1433,28 @@ pub struct Attributes {
     values: BTreeMap<Vec<u8>, Attribute>,
 }
 impl Attributes {
+    /// Decode a native SA FUID-v1 DACL using the ACL buffer's own byte order.
+    /// Missing ACL attributes are distinct from a present empty ACL. Legacy
+    /// external ACL ownership must be handled by the caller before using this
+    /// profile; its bytes are never silently substituted with mode entries.
+    pub fn native_acl(&self) -> Result<Option<acl::NativeAcl>, ParseError> {
+        let count = self.values.get(b"ZPL_DACL_COUNT".as_slice());
+        let aces = self.values.get(b"ZPL_DACL_ACES".as_slice());
+        match (count, aces) {
+            (None, None) => Ok(None),
+            (Some(_), Some(aces)) => {
+                if aces.swap != 4 {
+                    return Err(invalid("native DACL attribute has the wrong swap class"));
+                }
+                let count = self.integer("ZPL_DACL_COUNT")?;
+                acl::NativeAcl::parse_v1(&aces.bytes, count, aces.order).map(Some)
+            }
+            _ => Err(invalid(
+                "native DACL count and ACE attributes must both be present",
+            )),
+        }
+    }
+
     fn required(&self, name: &str, len: usize) -> Result<&Attribute, ParseError> {
         let attr = self
             .values
