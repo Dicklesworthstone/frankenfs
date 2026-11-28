@@ -10020,51 +10020,61 @@ fn open_filesystem_for_mount(image_path: &Path, options: &MountCmdOptions) -> Re
         open_opts.mvcc_wal_path = Some(image_path.with_extension("ffs-metadata-wal"));
         open_opts.metadata_log_enabled = true;
     }
-    let mut open_fs = if options.read_write {
+    if options.read_write
+        && options.mount_mode.is_native()
+        && open_opts.native_repair_max_working_bytes.is_none()
+        && !open_opts.metadata_log_enabled
+        && matches!(
+            options.btrfs_mount_selection,
+            BtrfsMountSelection::DefaultRoot
+        )
+    {
+        // Discover ownership through a read-only recovered view. The path
+        // constructor maps Apply to SimulateOverlay, so an owner visible only
+        // after journal replay is still found without changing home blocks.
+        // An explicit budget then admits native authority before the actual
+        // writable constructor can replay or clean up any physical metadata.
+        let preflight_fs = OpenFs::open_with_options(&cx, image_path, &open_opts)
+            .map_err(anyhow::Error::new)
+            .with_context(|| {
+                format!(
+                    "failed to inspect native repair ownership before opening image for writes: {}",
+                    image_path.display()
+                )
+            })?;
+        let root_ino = match &preflight_fs.flavor {
+            FsFlavor::Ext4(_) => Some(ffs_types::InodeNumber(2)),
+            FsFlavor::Btrfs(_) if preflight_fs.btrfs_device_inventory_verified() => {
+                Some(ffs_types::InodeNumber(ffs_btrfs::BTRFS_FIRST_FREE_OBJECTID))
+            }
+            FsFlavor::Btrfs(_) => None,
+        };
+        if let Some(root) = root_ino {
+            match preflight_fs.lookup(&cx, root, std::ffi::OsStr::new(".frankenfs-repair")) {
+                Ok(_) => {
+                    const DEFAULT_NATIVE_REPAIR_WORKING_BYTES: u64 = 512 * 1024 * 1024;
+                    open_opts.native_repair_max_working_bytes =
+                        Some(DEFAULT_NATIVE_REPAIR_WORKING_BYTES);
+                }
+                Err(ffs_error::FfsError::NotFound(_)) => {}
+                Err(error) => {
+                    return Err(anyhow::Error::new(error)).with_context(|| {
+                        format!(
+                            "failed to inspect native repair owner on {}",
+                            image_path.display()
+                        )
+                    });
+                }
+            }
+        }
+    }
+    let open_fs = if options.read_write {
         OpenFs::open_read_write(&cx, image_path, &open_opts)
     } else {
         OpenFs::open_with_options(&cx, image_path, &open_opts)
     }
     .map_err(anyhow::Error::new)
     .with_context(|| format!("failed to open filesystem image: {}", image_path.display()))?;
-    if options.read_write
-        && options.mount_mode.is_native()
-        && open_opts.native_repair_max_working_bytes.is_none()
-        && !open_fs.metadata_log_enabled()
-        && matches!(
-            options.btrfs_mount_selection,
-            BtrfsMountSelection::DefaultRoot
-        )
-    {
-        let root_ino = match &open_fs.flavor {
-            FsFlavor::Ext4(_) => Some(ffs_types::InodeNumber(2)),
-            FsFlavor::Btrfs(_) if open_fs.btrfs_device_inventory_verified() => {
-                Some(ffs_types::InodeNumber(ffs_btrfs::BTRFS_FIRST_FREE_OBJECTID))
-            }
-            FsFlavor::Btrfs(_) => None,
-        };
-        if let Some(root) = root_ino
-            && open_fs
-                .lookup(&cx, root, std::ffi::OsStr::new(".frankenfs-repair"))
-                .is_ok()
-        {
-            const DEFAULT_NATIVE_REPAIR_WORKING_BYTES: u64 = 512 * 1024 * 1024;
-            let recovery_touched = open_fs.native_recovery_touched_blocks().clone();
-            open_fs
-                .reconcile_and_activate_native_repair(
-                    &cx,
-                    DEFAULT_NATIVE_REPAIR_WORKING_BYTES,
-                    &recovery_touched,
-                )
-                .map_err(anyhow::Error::new)
-                .with_context(|| {
-                    format!(
-                        "failed to reconcile and activate native repair on {}",
-                        image_path.display()
-                    )
-                })?;
-        }
-    }
     if open_fs.metadata_log_enabled() {
         eprintln!(
             "mount: append-only ext4 metadata WAL ENABLED ({})",
@@ -15937,6 +15947,181 @@ mod tests {
             let persisted = std::fs::read(&path).unwrap();
             assert_eq!(&persisted[14 * 4096..15 * 4096], payload.as_slice());
         });
+    }
+
+    fn native_mount_preflight_fixture() -> (tempfile::TempDir, PathBuf, u64, ffs_types::InodeNumber)
+    {
+        let tmp = tempfile::tempdir().expect("native mount fixture");
+        let path = tmp.path().join("native-mount.ext4");
+        std::fs::File::create(&path)
+            .and_then(|file| file.set_len(4 * 1024 * 1024))
+            .expect("size native mount image");
+        let formatted = std::process::Command::new("mke2fs")
+            .args([
+                "-q",
+                "-F",
+                "-t",
+                "ext4",
+                "-O",
+                "extent,metadata_csum,^fast_commit",
+                "-b",
+                "1024",
+                "-g",
+                "2048",
+                "-J",
+                "size=1",
+                "-N",
+                "128",
+            ])
+            .arg(&path)
+            .output()
+            .expect("native mount regression requires mke2fs");
+        assert!(
+            formatted.status.success(),
+            "mke2fs: {}",
+            String::from_utf8_lossy(&formatted.stderr)
+        );
+        let cx = Cx::for_testing();
+        let mut options = test_mount_cmd_options(true, MountWritebackCacheConfig::disabled());
+        options.mount_mode = MountMode::Native;
+        let mut ordinary = open_filesystem_for_mount(&path, &options)
+            .expect("a native image without a repair owner remains writable");
+        assert!(!ordinary.has_native_repair_device());
+        ordinary.enable_writes(&cx).expect("enable fixture writes");
+        let payload = ordinary
+            .create(
+                &cx,
+                ffs_types::InodeNumber(2),
+                std::ffi::OsStr::new("payload"),
+                0o644,
+                0,
+                0,
+            )
+            .expect("create fixture payload");
+        ordinary.write(&cx, payload.ino, 0, &[0xA7; 1024]).unwrap();
+        ordinary.flush_mvcc_to_device(&cx).unwrap();
+        drop(ordinary);
+        let preparation = OpenOptions {
+            mount_mode: MountMode::Native,
+            ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+            ..OpenOptions::default()
+        };
+        let storage = OpenFs::open_read_write(&cx, &path, &preparation)
+            .unwrap()
+            .prepare_native_ext4_repair(&cx, 500)
+            .expect("reserve native ownership");
+        OpenFs::open_read_write(&cx, &path, &preparation)
+            .unwrap()
+            .initialize_native_ext4_validation(&cx)
+            .unwrap();
+        OpenFs::open_read_write(&cx, &path, &preparation)
+            .unwrap()
+            .initialize_native_ext4_repair(&cx, 256 * 1024 * 1024)
+            .expect("seal fixture authority");
+        (tmp, path, storage.tails[0].start.0, payload.ino)
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn native_mount_preflight_admits_authority_before_journal_replay() {
+        use ffs_block::{BlockDevice, ByteBlockDevice, FileByteDevice};
+        use ffs_journal::{Jbd2Superblock, Jbd2Writer, JournalSegment};
+
+        let (_tmp, path, owner_block, payload) = native_mount_preflight_fixture();
+        let cx = Cx::for_testing();
+        let mut options = test_mount_cmd_options(true, MountWritebackCacheConfig::disabled());
+        options.mount_mode = MountMode::Native;
+        let sealed = std::fs::read(&path).unwrap();
+        let fs = open_filesystem_for_mount(&path, &options)
+            .expect("default native mount must discover and activate sealed repair");
+        assert!(fs.has_native_repair_device());
+        fs.check_native_repair(&cx).unwrap();
+        assert_eq!(fs.block_size(), 1024);
+        let scope = ffs_core::RequestScope::empty();
+        let physical = |ino| {
+            let inode = fs.read_inode(&cx, ino).unwrap();
+            let (block, unwritten) = fs.resolve_extent(&cx, &scope, &inode, 0).unwrap().unwrap();
+            assert!(!unwritten);
+            BlockNumber(block)
+        };
+        let payload_block = physical(payload);
+        let root_block = physical(ffs_types::InodeNumber(2));
+        let journal_inode = fs
+            .read_inode(
+                &cx,
+                ffs_types::InodeNumber(u64::from(fs.ext4_superblock().unwrap().journal_inum)),
+            )
+            .unwrap();
+        let segments: Vec<_> = (0..u32::try_from(journal_inode.size / 1024).unwrap())
+            .map(|logical| {
+                let (block, unwritten) = fs
+                    .resolve_extent(&cx, &scope, &journal_inode, logical)
+                    .unwrap()
+                    .unwrap();
+                assert!(!unwritten);
+                JournalSegment {
+                    start: BlockNumber(block),
+                    blocks: 1,
+                }
+            })
+            .collect();
+        drop(fs);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            sealed,
+            "clean discovery must not write"
+        );
+
+        // A directory checksum failure cannot masquerade as an absent owner
+        // and silently disable protection on the following writable open.
+        let mut corrupted_lookup = sealed.clone();
+        let root_checksum = usize::try_from(root_block.0).unwrap() * 1024 + 1023;
+        corrupted_lookup[root_checksum] ^= 0x40;
+        std::fs::write(&path, &corrupted_lookup).unwrap();
+        let error = open_filesystem_for_mount(&path, &options)
+            .expect_err("owner lookup corruption must abort automatic admission");
+        assert!(format!("{error:#}").contains("failed to inspect native repair owner"));
+        assert_eq!(std::fs::read(&path).unwrap(), corrupted_lookup);
+        std::fs::write(&path, &sealed).unwrap();
+
+        // Plant a valid committed JBD2 payload with no native intent. Discovery
+        // may inspect its recovered view, but the actual writable constructor
+        // must refuse its untrusted authority before checkpointing that payload.
+        let direct =
+            ByteBlockDevice::new(FileByteDevice::open_read_write(&path).unwrap(), 1024).unwrap();
+        let journal_sb = Jbd2Superblock::parse(
+            direct
+                .read_block(&cx, segments[0].start)
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(journal_sb.start_block, 0);
+        let mut journal =
+            Jbd2Writer::open_segmented(&cx, &direct, segments, journal_sb.start_sequence).unwrap();
+        let mut transaction = journal.begin_transaction();
+        transaction.add_write(payload_block, vec![0x3D; 1024]);
+        journal.mark_log_live(&cx, &direct).unwrap();
+        journal
+            .commit_transaction(&cx, &direct, &transaction)
+            .unwrap();
+        direct.sync(&cx).unwrap();
+        drop(direct);
+        let mut interrupted = std::fs::read(&path).unwrap();
+        interrupted[usize::try_from(owner_block).unwrap() * 1024 + 320] ^= 0x40;
+        std::fs::write(&path, &interrupted).unwrap();
+        let overlay = OpenFs::open_with_options(&cx, &path, &OpenOptions::default()).unwrap();
+        assert_eq!(
+            overlay.read(&cx, payload, 0, 1024).unwrap(),
+            vec![0x3D; 1024]
+        );
+        drop(overlay);
+        assert_eq!(std::fs::read(&path).unwrap(), interrupted);
+        open_filesystem_for_mount(&path, &options)
+            .expect_err("native authority must be checked before physical journal replay");
+        assert_eq!(std::fs::read(&path).unwrap(), interrupted);
+        let home = usize::try_from(payload_block.0).unwrap() * 1024;
+        assert_eq!(&interrupted[home..home + 1024], &[0xA7; 1024]);
     }
 
     #[test]

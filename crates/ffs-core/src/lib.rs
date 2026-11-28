@@ -8775,6 +8775,68 @@ impl OpenFs {
             btrfs_dev_stats: Mutex::new(std::collections::BTreeMap::new()),
         };
 
+        if fs.btrfs_tree_log_overlay_active.load(Ordering::Acquire) {
+            fs.btrfs_tree_log_hidden =
+                fs.resolve_btrfs_tree_log_removals(cx, &btrfs_tree_log_deleted_keys)?;
+        }
+
+        if let Some(max_working_bytes) = options.native_repair_max_working_bytes {
+            if fs.ext4_superblock().is_some_and(|sb| sb.journal_dev != 0) {
+                return Err(FfsError::UnsupportedFeature(
+                    "native write freshness cannot verify an external ext4 journal".into(),
+                ));
+            }
+            if options.ext4_journal_replay_mode == Ext4JournalReplayMode::Skip
+                && fs.ext4_superblock().is_some_and(|sb| {
+                    ext4_superblock_requires_journal_recovery(sb)
+                        || sb.has_incompat(ffs_ondisk::Ext4IncompatFeatures::RECOVER)
+                        || sb.last_orphan != 0
+                })
+            {
+                return Err(FfsError::UnsupportedFeature(
+                    "native write freshness cannot skip required ext4 recovery".into(),
+                ));
+            }
+            if options.ext4_journal_replay_mode == Ext4JournalReplayMode::Skip
+                && fs
+                    .ext4_native_recovery_journal_state(cx)?
+                    .is_some_and(|journal| journal.start_block != 0)
+            {
+                return Err(FfsError::UnsupportedFeature(
+                    "native write freshness cannot skip a live ext4 journal".into(),
+                ));
+            }
+            // Admit source authority before journal, fast-commit or orphan
+            // replay can change even one physical home block. Recovery uses
+            // the same fenced device as subsequent filesystem mutations.
+            fs.reconcile_and_activate_native_repair(cx, max_working_bytes, &BTreeSet::new())?;
+            if fs.is_ext4() {
+                fs.invalidate_ext4_read_caches_after_recovery();
+                let sb_region = read_ext4_superblock_region(cx, fs.dev.as_ref())?;
+                if let FsFlavor::Ext4(sb) = &mut fs.flavor {
+                    **sb = Ext4Superblock::parse_superblock_region(&sb_region)
+                        .map_err(|error| parse_to_ffs_error(&error))?;
+                }
+            }
+        }
+
+        // Borrow the guard from an independent Arc so replay can update
+        // OpenFs's cached superblock and evidence while the guard is held.
+        let native_recovery_device = fs.native_repair_device.clone().filter(|_| {
+            fs.is_ext4() && options.ext4_journal_replay_mode != Ext4JournalReplayMode::Skip
+        });
+        let mut native_recovery_guard = if let Some(device) = native_recovery_device.as_deref() {
+            let pre_commit_seq = fs
+                .ext4_native_recovery_journal_state(cx)?
+                .map_or(0, |journal| {
+                    u64::from(journal.start_sequence.saturating_sub(1))
+                });
+            let (superblock, _) = fs.ext4_superblock_location();
+            Some(device.begin_durability_commit(cx, pre_commit_seq, &[superblock])?)
+        } else {
+            None
+        };
+
         let recovery_touched_blocks = Arc::new(Mutex::new(BTreeSet::new()));
         let saved_recovery_dev = ((options.native_repair_max_working_bytes.is_some()
             || (write_authority && options.mount_mode.is_native()))
@@ -8790,11 +8852,6 @@ impl OpenFs {
                 });
                 saved
             });
-
-        if fs.btrfs_tree_log_overlay_active.load(Ordering::Acquire) {
-            fs.btrfs_tree_log_hidden =
-                fs.resolve_btrfs_tree_log_removals(cx, &btrfs_tree_log_deleted_keys)?;
-        }
 
         if fs.is_ext4() && !options.skip_validation {
             let external_journal = fs.external_journal_device.clone();
@@ -8868,11 +8925,23 @@ impl OpenFs {
                             error = %err,
                             "ext4 orphan recovery failed; filesystem remains read-only"
                         );
+                        if native_recovery_guard.is_some() {
+                            // Drop the guard and fence any escaped writes.
+                            // Partial cleanup cannot become fresh protection
+                            // or a successfully opened, poisoned filesystem.
+                            return Err(err);
+                        }
                         fs.ext4_orphan_recovery_error = Some(err.to_string());
                         fs.ext4_forced_read_only.store(true, Ordering::SeqCst);
                     }
                 }
             }
+        }
+
+        if let Some(guard) = native_recovery_guard.as_mut() {
+            fs.finalize_replayed_ext4_journal_for_native_repair(cx)?;
+            guard.arm_final_seal(cx)?;
+            fs.dev.sync(cx)?;
         }
 
         if let Some(restored) = saved_recovery_dev {
@@ -8883,12 +8952,22 @@ impl OpenFs {
 
         fs.rebuild_metadata_log_index(cx)?;
 
-        if let Some(max_working_bytes) = options.native_repair_max_working_bytes {
-            let touched = fs.native_recovery_touched_blocks.clone();
-            fs.reconcile_and_activate_native_repair(cx, max_working_bytes, &touched)?;
-        }
-
         Ok(fs)
+    }
+
+    fn ext4_native_recovery_journal_state(
+        &self,
+        cx: &Cx,
+    ) -> Result<Option<Jbd2Superblock>, FfsError> {
+        let Some(sb) = self.ext4_superblock() else {
+            return Ok(None);
+        };
+        if sb.journal_inum == 0 || sb.journal_dev != 0 {
+            return Ok(None);
+        }
+        let inode = self.read_inode(cx, InodeNumber(u64::from(sb.journal_inum)))?;
+        let segments = self.collect_ext4_journal_segments(cx, &inode)?;
+        self.read_ext4_journal_superblock(cx, sb.block_size, &segments)
     }
 
     fn resolve_btrfs_mount_selection(
@@ -86549,6 +86628,172 @@ mod tests {
             .expect_err("dirty or failed freshness publication cannot authorize cold recovery");
     }
 
+    fn native_freshness_committed_journal_cut() -> (Vec<u8>, BlockNumber, Vec<u8>) {
+        let baseline = native_freshness_baseline();
+        let cx = Cx::for_testing();
+        let dev = TestDevice::from_vec(baseline.sealed.clone());
+        let mut fs =
+            OpenFs::from_device(&cx, Box::new(dev.clone()), &native_preparation_options()).unwrap();
+        let payload = native_existing_payload_block(&fs, &cx);
+        fs.activate_native_ext4_repair(&cx, NATIVE_PARITY_TEST_BUDGET)
+            .unwrap();
+        let replacement = vec![0x3D; 1024];
+        {
+            let direct = fs.direct_block_device_adapter();
+            let mut journal = fs.open_ext4_internal_jbd2_writer(&cx).unwrap().unwrap();
+            let (superblock, _) = fs.ext4_superblock_location();
+            let _guard = fs
+                .begin_durability_commit(
+                    &cx,
+                    u64::from(journal.next_seq().saturating_sub(1)),
+                    &[superblock, payload],
+                )
+                .unwrap();
+            let mut transaction = journal.begin_transaction();
+            transaction.add_write(payload, replacement.clone());
+            fs.ext4_write_needs_recovery(&cx, &direct, true).unwrap();
+            journal.mark_log_live(&cx, &direct).unwrap();
+            journal
+                .commit_transaction(&cx, &direct, &transaction)
+                .unwrap();
+            fs.dev.sync(&cx).unwrap();
+            assert_eq!(
+                direct.read_block(&cx, payload).unwrap().as_slice(),
+                &[0xA7; 1024],
+                "the committed journal has not checkpointed its home payload"
+            );
+            // Drop the operation at its committed-journal / pre-checkpoint
+            // boundary. The live handle is fenced; the durable intention must
+            // allow a new constructor to replay through its own fenced handle.
+        }
+        drop(fs);
+        let bytes = dev.snapshot_bytes();
+        let owner = baseline.storage.tails[0].start.0 as usize * 1024;
+        assert_eq!(&bytes[owner + 448..owner + 456], b"FFSEPK02");
+        (bytes, payload, replacement)
+    }
+
+    #[test]
+    fn native_freshness_constructor_admits_authority_before_journal_replay() {
+        let baseline = native_freshness_baseline();
+        let (mut bytes, payload, _) = native_freshness_committed_journal_cut();
+        let owner = baseline.storage.tails.last().unwrap().start.0 as usize * 1024;
+        bytes[owner + 320] ^= 0x40;
+        let cx = Cx::for_testing();
+        let dev = TestDevice::from_vec(bytes.clone());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = ValidationFaultDevice {
+            inner: dev.clone(),
+            attempts: Arc::new(AtomicUsize::new(0)),
+            fail_on: usize::MAX,
+            events: Arc::clone(&events),
+        };
+        let options = OpenOptions {
+            native_repair_max_working_bytes: Some(NATIVE_PARITY_TEST_BUDGET),
+            ext4_journal_replay_mode: Ext4JournalReplayMode::Apply,
+            ..native_preparation_options()
+        };
+        assert!(
+            OpenFs::from_device(&cx, Box::new(observed), &options).is_err(),
+            "invalid repair authority must refuse before replaying a valid committed journal"
+        );
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "constructor performed recovery I/O before admitting native authority"
+        );
+        assert!(dev.snapshot_bytes() == bytes);
+        let offset = payload.0 as usize * 1024;
+        assert_eq!(&bytes[offset..offset + 1024], &[0xA7; 1024]);
+    }
+
+    #[test]
+    fn native_freshness_constructor_replays_and_seals_a_committed_journal() {
+        let baseline = native_freshness_baseline();
+        let (bytes, payload, replacement) = native_freshness_committed_journal_cut();
+        let cx = Cx::for_testing();
+        let dev = TestDevice::from_vec(bytes);
+        let options = OpenOptions {
+            native_repair_max_working_bytes: Some(NATIVE_PARITY_TEST_BUDGET),
+            ext4_journal_replay_mode: Ext4JournalReplayMode::Apply,
+            ..native_preparation_options()
+        };
+        let fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &options)
+            .expect("cold recovery must retain admitted source authority through replay");
+        assert!(fs.has_native_repair_device());
+        assert!(fs.native_recovery_touched_blocks().contains(&payload));
+        assert_eq!(
+            fs.direct_block_device_adapter()
+                .read_block(&cx, payload)
+                .unwrap()
+                .as_slice(),
+            replacement
+        );
+        let file = fs
+            .lookup(&cx, InodeNumber(2), OsStr::new("existing.bin"))
+            .unwrap();
+        assert_eq!(fs.read(&cx, file.ino, 0, 1024).unwrap(), replacement);
+        let report = fs.check_native_repair(&cx).unwrap();
+        assert!(report.generations.iter().any(|generation| *generation > 1));
+        let sealed = dev.snapshot_bytes();
+        let owner = baseline.storage.tails[0].start.0 as usize * 1024;
+        assert!(
+            sealed[owner + 448..owner + 768]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        drop(fs);
+
+        let reopened = OpenFs::from_device(&cx, Box::new(dev.clone()), &options).unwrap();
+        assert_eq!(reopened.check_native_repair(&cx).unwrap(), report);
+        assert_eq!(reopened.read(&cx, file.ino, 0, 1024).unwrap(), replacement);
+        assert!(
+            dev.snapshot_bytes() == sealed,
+            "clean reopen rewrote source authority"
+        );
+    }
+
+    #[test]
+    fn native_freshness_constructor_refuses_skipped_or_external_journal_recovery() {
+        let baseline = native_freshness_baseline();
+        let (dirty, _, _) = native_freshness_committed_journal_cut();
+        let mut external = baseline.sealed.clone();
+        let superblock = ffs_types::EXT4_SUPERBLOCK_OFFSET;
+        external[superblock + 0xE4..superblock + 0xE8].copy_from_slice(&1_u32.to_le_bytes());
+        let checksum = ffs_ondisk::ext4::ext4_chksum_skip_zero_tail(
+            !0_u32,
+            &external[superblock..superblock + EXT4_SB_CHECKSUM_OFFSET],
+        );
+        external[superblock + EXT4_SB_CHECKSUM_OFFSET..superblock + EXT4_SB_CHECKSUM_OFFSET + 4]
+            .copy_from_slice(&checksum.to_le_bytes());
+        for (bytes, mode, skip_validation) in [
+            (dirty.clone(), Ext4JournalReplayMode::Skip, false),
+            (dirty, Ext4JournalReplayMode::Apply, true),
+            (external, Ext4JournalReplayMode::Apply, false),
+        ] {
+            let cx = Cx::for_testing();
+            let dev = TestDevice::from_vec(bytes.clone());
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let observed = ValidationFaultDevice {
+                inner: dev.clone(),
+                attempts: Arc::new(AtomicUsize::new(0)),
+                fail_on: usize::MAX,
+                events: Arc::clone(&events),
+            };
+            let options = OpenOptions {
+                native_repair_max_working_bytes: Some(NATIVE_PARITY_TEST_BUDGET),
+                ext4_journal_replay_mode: mode,
+                skip_validation,
+                ..native_preparation_options()
+            };
+            assert!(matches!(
+                OpenFs::from_device(&cx, Box::new(observed), &options),
+                Err(FfsError::UnsupportedFeature(_))
+            ));
+            assert!(events.lock().unwrap().is_empty());
+            assert!(dev.snapshot_bytes() == bytes);
+        }
+    }
+
     #[test]
     fn native_freshness_cancelled_final_seal_releases_guard_and_fences_escaped_writes() {
         let baseline = native_freshness_baseline();
@@ -86980,6 +87225,10 @@ mod tests {
                 bytes[token + 56] ^= 0x40;
                 let checksum = ffs_ondisk::ext4::ext4_chksum(!0, &bytes[token..token + 152]);
                 bytes[token + 152..token + 156].copy_from_slice(&checksum.to_le_bytes());
+                // Isolate legacy token-only Dirty admission's whole-plan root
+                // gate. A present intent binds the token too and would reject
+                // this forgery earlier, before the root gate under test.
+                bytes[owner + 608..owner + 768].fill(0);
             }
             let clean_source = (baseline.storage.tails[1].start.0 as usize - 1) * 1024;
             bytes[clean_source + 11] ^= 0x40;
@@ -117773,7 +118022,8 @@ pub(crate) mod scrub;\n";
                 let latest = vec![0x93; bs];
                 let mut write = fs.begin_transaction();
                 fs.stage_block_write(&mut write, block, latest.clone());
-                fs.commit_transaction(&cx, write)?;
+                fs.commit_transaction(&cx, write)
+                    .expect("publish the newer block through the current-view helper");
                 assert_eq!(fs.read_block_with_scope(&cx, current, block)?, latest);
                 assert_eq!(fs.read_block_with_scope(&cx, &write_scope, block)?, latest);
                 Ok(())
@@ -129848,7 +130098,6 @@ pub(crate) mod scrub;\n";
             0x21_000,
             BtrfsBlockGroupItem {
                 used_bytes: 0,
-                chunk_objectid: 256,
                 flags: BTRFS_BLOCK_GROUP_DATA,
                 total_bytes: bytes,
             },
